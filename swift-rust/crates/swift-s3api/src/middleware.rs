@@ -209,6 +209,10 @@ use crate::website::{
 };
 use crate::xml::Element;
 
+/// Private proxy-to-object-server generation guard. Unlike an ETag, the
+/// version id distinguishes two generations containing identical bytes.
+const EXPECTED_S3_VERSION_ID_HEADER: &str = "X-Backend-Expected-S3-Version-Id";
+
 /// One S3 credential mapped onto a Swift storage account.
 #[derive(Debug, Clone)]
 pub struct S3Credential {
@@ -11324,6 +11328,7 @@ fn commit_new_version_record(
 fn stamp_object_write_precondition(headers: &mut HeaderKeyDict, current: Option<&Response>) {
     match current {
         Some(cur) => {
+            stamp_expected_object_generation(headers, cur);
             if let Some(etag) = cur
                 .headers
                 .get("ETag")
@@ -11336,6 +11341,12 @@ fn stamp_object_write_precondition(headers: &mut HeaderKeyDict, current: Option<
         None => {
             headers.set("If-None-Match", "*");
         }
+    }
+}
+
+fn stamp_expected_object_generation(headers: &mut HeaderKeyDict, current: &Response) {
+    if let Some(version_id) = current.headers.get(SYS_VERSION_ID) {
+        headers.set(EXPECTED_S3_VERSION_ID_HEADER, version_id);
     }
 }
 
@@ -11907,6 +11918,7 @@ async fn handle_versioned_delete_once_async(
             {
                 if head.headers.get(SYS_VERSION_ID) == Some(vid) {
                     let mut del = make_swift_req("DELETE", &cur_path);
+                    stamp_expected_object_generation(&mut del.headers, &head);
                     stamp_auth(&mut del, cred);
                     let resp = async_call(next, del).await;
                     if !swift_write_applied(resp.status) && resp.status != 404 {
@@ -11975,6 +11987,7 @@ async fn handle_versioned_delete_once_async(
         {
             if head.headers.get(SYS_VERSION_ID) == Some(vid) {
                 let mut del = make_swift_req("DELETE", &cur_path);
+                stamp_expected_object_generation(&mut del.headers, &head);
                 stamp_auth(&mut del, cred);
                 let resp = async_call(next, del).await;
                 if !swift_write_applied(resp.status) && resp.status != 404 {
@@ -14836,6 +14849,25 @@ mod tests {
             },
         );
         m
+    }
+
+    #[test]
+    fn object_write_precondition_stamps_etag_and_exact_s3_generation() {
+        let mut current = Response::new(200);
+        current.headers.set("ETag", "\"same-etag\"");
+        current.headers.set(SYS_VERSION_ID, "version-42");
+        let mut headers = HeaderKeyDict::new();
+        stamp_object_write_precondition(&mut headers, Some(&current));
+        assert_eq!(headers.get("If-Match"), Some("same-etag"));
+        assert_eq!(
+            headers.get(EXPECTED_S3_VERSION_ID_HEADER),
+            Some("version-42")
+        );
+
+        let mut create_headers = HeaderKeyDict::new();
+        stamp_object_write_precondition(&mut create_headers, None);
+        assert_eq!(create_headers.get("If-None-Match"), Some("*"));
+        assert!(create_headers.get(EXPECTED_S3_VERSION_ID_HEADER).is_none());
     }
 
     fn api_with_worm_bypass_permission() -> S3Api {
@@ -25279,15 +25311,11 @@ mod tests {
 
     // ===================== cross-proxy version-index CAS =====================
     //
-    // Hermetic model of the LIVE fleet: several `S3Api` instances (one per
-    // proxy) share ONE backend store with the deployed conditional-write
-    // semantics:
-    //   * object PUT enforces `If-None-Match: *` (412 when the object exists)
-    //     — the Wave-2 object-server has carried this since the monorepo
-    //     import (swift-object-server/src/lib.rs, `if_none_match_has_star`).
-    //   * object PUT IGNORES `If-Match` — `put_if_match_precondition` only
-    //     exists from 414b76e (2026-08-16); the deployed Wave-2 object layer
-    //     (`e1d4f1cc…`) predates it, so the header is a silent no-op there.
+    // Hermetic model of the candidate fleet: several `S3Api` instances (one
+    // per proxy) share one backend store. The model enforces create-only,
+    // ETag, and exact S3 version-generation conditions just like the object
+    // mutation transaction; an older production binary is never the oracle
+    // for candidate CAS behavior.
     //
     // The gate mechanism gives tests deterministic interleavings without
     // touching product code: a gated (method, path) parks inside the backend
@@ -25581,16 +25609,33 @@ mod tests {
                 "PUT" => {
                     let body = r.body.into_vec(u64::MAX).unwrap_or_default();
                     let mut store = self.store.lock().unwrap();
-                    // Wave-2 object-server semantics: `If-None-Match: *` is
-                    // enforced (412 on existing object) …
                     if let Some(inm) = r.headers.get("If-None-Match") {
                         if inm.split(',').any(|tok| tok.trim() == "*") && store.contains_key(&path)
                         {
                             return Response::new(412);
                         }
                     }
-                    // … while `If-Match` on PUT is silently ignored (the
-                    // deployed object layer predates 414b76e).
+                    if let Some(if_match) = r.headers.get("If-Match") {
+                        let current = store
+                            .get(&path)
+                            .and_then(|(headers, _)| headers.get("ETag"));
+                        let matched = if_match.split(',').any(|candidate| {
+                            let candidate = candidate.trim().trim_matches('"');
+                            candidate == "*" && current.is_some()
+                                || current.is_some_and(|etag| etag.trim_matches('"') == candidate)
+                        });
+                        if !matched {
+                            return Response::new(412);
+                        }
+                    }
+                    if let Some(expected) = r.headers.get(EXPECTED_S3_VERSION_ID_HEADER) {
+                        let current = store
+                            .get(&path)
+                            .and_then(|(headers, _)| headers.get(SYS_VERSION_ID));
+                        if current != Some(expected) {
+                            return Response::new(412);
+                        }
+                    }
                     let mut h = HeaderKeyDict::new();
                     for (k, v) in r.headers.iter() {
                         let kl = k.to_ascii_lowercase();
@@ -25621,6 +25666,27 @@ mod tests {
                 }
                 "DELETE" => {
                     let mut store = self.store.lock().unwrap();
+                    if let Some(if_match) = r.headers.get("If-Match") {
+                        let current = store
+                            .get(&path)
+                            .and_then(|(headers, _)| headers.get("ETag"));
+                        let matched = if_match.split(',').any(|candidate| {
+                            let candidate = candidate.trim().trim_matches('"');
+                            candidate == "*" && current.is_some()
+                                || current.is_some_and(|etag| etag.trim_matches('"') == candidate)
+                        });
+                        if !matched {
+                            return Response::new(412);
+                        }
+                    }
+                    if let Some(expected) = r.headers.get(EXPECTED_S3_VERSION_ID_HEADER) {
+                        let current = store
+                            .get(&path)
+                            .and_then(|(headers, _)| headers.get(SYS_VERSION_ID));
+                        if current != Some(expected) {
+                            return Response::new(412);
+                        }
+                    }
                     if store.remove(&path).is_some() {
                         Response::new(204)
                     } else {
@@ -25654,9 +25720,8 @@ mod tests {
     ) {
         // (1) The immutable fence chain is the authoritative commit order.
         //     Every applied fence path is unique and generations are strictly
-        //     increasing. The legacy backend modeled here ignores PUT
-        //     If-Match, so an old writer may temporarily regress advisory
-        //     index.json; a real snapshot load must adopt the fence and heal.
+        //     increasing. A snapshot load must adopt the newest fence and
+        //     heal a stale advisory index.json after any interrupted mirror.
         let fences = be.fence_writes();
         let fence_gens: Vec<u64> = fences.iter().map(|(_, index)| index.generation).collect();
         assert_eq!(

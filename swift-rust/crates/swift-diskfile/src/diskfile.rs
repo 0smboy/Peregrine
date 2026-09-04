@@ -252,6 +252,51 @@ impl DiskFile {
         &self.datadir
     }
 
+    /// Acquire the cross-process mutation stripe for this object.
+    ///
+    /// The lock lives below the policy-specific tmp directory rather than the
+    /// hash directory.  Its name is derived from the final three hex digits of
+    /// the object hash, giving a fixed upper bound of 4096 persistent lock
+    /// files per policy while ensuring every process that can mutate the same
+    /// object contends on the same `flock` inode.  The caller must acquire this
+    /// only after any request body has been staged, and must hold it across a
+    /// fresh precondition check and the durable filesystem mutation.
+    pub fn acquire_mutation_lock(
+        &self,
+        timeout: f64,
+    ) -> Result<swift_core::lockutil::PathLock, DiskFileError> {
+        let hash = self
+            .datadir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                name.len() == 32
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                DiskFileError::ContractBroken(format!(
+                    "object mutation lock requires a lowercase MD5 hash directory: {}",
+                    self.datadir.display()
+                ))
+            })?;
+        let stripe = &hash[hash.len() - 3..];
+        let name = format!("obj-{stripe}");
+        let directory = self.tmpdir.join("object-mutation-locks");
+        swift_core::lockutil::lock_path(&directory, timeout, Some(&name)).map_err(|error| {
+            match error.io {
+                Some(io) if io.raw_os_error() == Some(28) => DiskFileError::NoSpace,
+                Some(io) => DiskFileError::Io(io),
+                None => DiskFileError::LockTimeout(format!(
+                    "{} seconds: {}",
+                    error.timeout,
+                    error.lockpath.display()
+                )),
+            }
+        })
+    }
+
     fn quarantine(&self, data_file: &Path, msg: &str) -> DiskFileError {
         let _ = quarantine_renamer(&self.device_path, data_file);
         DiskFileError::Quarantined(msg.to_string())

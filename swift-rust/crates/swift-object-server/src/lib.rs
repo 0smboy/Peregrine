@@ -84,6 +84,9 @@ use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
 
 pub const MAX_FILE_SIZE: i64 = 5_368_709_122;
 const MISPLACED_OBJECTS_ACCOUNT: &str = ".misplaced_objects";
+const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 15.0;
+const EXPECTED_S3_VERSION_ID_HEADER: &str = "X-Backend-Expected-S3-Version-Id";
+const S3_VERSION_ID_SYSMETA: &str = "X-Object-Sysmeta-S3-Version-Id";
 
 fn validate_internal_name(name: &str, type_: &str) -> Result<(), Response> {
     if name.contains(RESERVED_STR) && !name.starts_with(RESERVED_STR) {
@@ -737,6 +740,7 @@ struct PendingDurable {
 
 struct PutCompletion {
     drive: String,
+    part: u64,
     etag: String,
     upload_size: u64,
     content_type: String,
@@ -747,6 +751,7 @@ struct PutCompletion {
     container: String,
     obj: String,
     policy_index: u32,
+    policy: PolicyKind,
     headers: HeaderKeyDict,
     path: String,
 }
@@ -1157,6 +1162,26 @@ fn put_if_match_precondition(
     }
 }
 
+/// Internal ABA guard used by the S3 versioning layer.  An ETag alone is not
+/// a generation identifier: two different versions may legitimately contain
+/// identical bytes.  When the proxy names the version it observed, the object
+/// server verifies that sysmeta under the same mutation lock as the write.
+fn expected_s3_version_precondition(
+    req: &Request,
+    orig_exists: bool,
+    orig_metadata: Option<&Metadata>,
+) -> Option<Response> {
+    let Some(expected) = req.headers.get(EXPECTED_S3_VERSION_ID_HEADER) else {
+        return None;
+    };
+    let actual = orig_metadata.and_then(|metadata| meta_get(metadata, S3_VERSION_ID_SYSMETA));
+    if orig_exists && actual == Some(expected) {
+        None
+    } else {
+        Some(swob_response(412))
+    }
+}
+
 /// Shared PUT pre-body checks (If-None-Match, X-Delete-*, timestamp, lock).
 fn evaluate_put_preconditions(
     req: &Request,
@@ -1182,6 +1207,9 @@ fn evaluate_put_preconditions(
         return Err(resp);
     }
     if let Some(resp) = put_if_match_precondition(req, orig_exists, orig_metadata) {
+        return Err(resp);
+    }
+    if let Some(resp) = expected_s3_version_precondition(req, orig_exists, orig_metadata) {
         return Err(resp);
     }
     if orig_exists || orig_metadata.is_some() {
@@ -1223,6 +1251,63 @@ fn open_put_original(
         }
         Err(e) => Err(plain_response(500, &e.to_string())),
     }
+}
+
+fn mutation_lock_error_response(error: DiskFileError) -> Response {
+    match error {
+        DiskFileError::LockTimeout(_) => swob_response(503),
+        DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
+        other => plain_response(500, &other.to_string()),
+    }
+}
+
+/// Acquire the object's fixed mutation stripe, then re-open and re-evaluate
+/// every PUT condition while that stripe is held.  Returning the guard makes
+/// the lock lifetime explicit at each durability barrier.
+fn acquire_checked_put_guard(
+    df: DiskFile,
+    req: &Request,
+    req_timestamp: &Timestamp,
+    ssync_frag_index: Option<i64>,
+    clock_ok: bool,
+) -> Result<swift_core::lockutil::PathLock, Response> {
+    let guard = df
+        .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        .map_err(mutation_lock_error_response)?;
+    let (exists, orig_ts, orig_meta) = open_put_original(df, ssync_frag_index)?;
+    evaluate_put_preconditions(
+        req,
+        req_timestamp,
+        exists,
+        orig_ts,
+        orig_meta.as_ref(),
+        clock_ok,
+    )?;
+    Ok(guard)
+}
+
+/// Reacquire the stripe for an EC multiphase durable transition. The first
+/// phase already published this request's nondurable fragment, so equality
+/// with the request timestamp is expected and the original If-* generation
+/// guard must not be applied a second time. A strictly newer on-disk
+/// generation still wins and prevents a late commit from reviving stale data.
+fn acquire_ec_commit_guard(
+    df: DiskFile,
+    req_timestamp: &Timestamp,
+    ssync_frag_index: Option<i64>,
+) -> Result<swift_core::lockutil::PathLock, Response> {
+    let guard = df
+        .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        .map_err(mutation_lock_error_response)?;
+    let (_, current_timestamp, _) = open_put_original(df, ssync_frag_index)?;
+    if current_timestamp > *req_timestamp {
+        let mut response = swob_response(409);
+        response
+            .headers
+            .set("X-Backend-Timestamp", current_timestamp.internal());
+        return Err(response);
+    }
+    Ok(guard)
 }
 
 /// Python `fallocate()`'s FALLOCATE_RESERVE check, absolute-bytes mode: would
@@ -1803,6 +1888,7 @@ impl ObjectServer {
         }
         let completion = PutCompletion {
             drive,
+            part,
             etag,
             upload_size,
             content_type,
@@ -1813,6 +1899,7 @@ impl ObjectServer {
             container,
             obj,
             policy_index,
+            policy,
             headers: req.headers.clone(),
             path: req.path.clone(),
         };
@@ -1820,19 +1907,47 @@ impl ObjectServer {
             let Some(boundary) = mime_boundary else {
                 return plain_response(400, "multiphase commit requires a MIME body");
             };
+            let pre_df = match self.diskfile_for(
+                &completion.drive,
+                completion.part,
+                &completion.account,
+                &completion.container,
+                &completion.obj,
+                (completion.policy_index, completion.policy),
+            ) {
+                Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
+                Err(error) => return plain_response(500, &error.to_string()),
+            };
+            let pre_req = Request {
+                method: "PUT".into(),
+                path: completion.path.clone(),
+                query_string: String::new(),
+                headers: completion.headers.clone(),
+                body: Body::empty(),
+            };
+            let pre_timestamp = completion.req_timestamp.clone();
+            let ssync_frag_index = completion
+                .headers
+                .get("X-Backend-Ssync-Frag-Index")
+                .and_then(|raw| raw.trim().parse().ok());
+            let clock_ok = self.worm_clock.clock_ok();
             writer = match self
                 .storage()
                 .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                    writer.put(metadata)?;
-                    Ok::<_, DiskFileError>(writer)
+                    let _guard = acquire_checked_put_guard(
+                        pre_df,
+                        &pre_req,
+                        &pre_timestamp,
+                        ssync_frag_index,
+                        clock_ok,
+                    )?;
+                    writer.put(metadata).map_err(mutation_lock_error_response)?;
+                    Ok::<_, Response>(writer)
                 })
                 .await
             {
                 Ok(Ok(writer)) => writer,
-                Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
-                    return swob_response(507)
-                }
-                Ok(Err(error)) => return plain_response(500, &error.to_string()),
+                Ok(Err(response)) => return response,
                 Err(error) => return plain_response(500, &error.to_string()),
             };
             if areq.body.send_continue(&[]).await.is_err() {
@@ -1849,27 +1964,47 @@ impl ObjectServer {
                 .is_some_and(config_true_value);
             if !no_commit {
                 let req_timestamp = completion.req_timestamp.clone();
+                let commit_df = match self.diskfile_for(
+                    &completion.drive,
+                    completion.part,
+                    &completion.account,
+                    &completion.container,
+                    &completion.obj,
+                    (completion.policy_index, completion.policy),
+                ) {
+                    Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
+                    Err(error) => return plain_response(500, &error.to_string()),
+                };
+                let commit_pre_timestamp = completion.req_timestamp.clone();
+                let commit_ssync_frag_index = completion
+                    .headers
+                    .get("X-Backend-Ssync-Frag-Index")
+                    .and_then(|raw| raw.trim().parse().ok());
                 let stall = self.commit_stall.clone();
                 let exec = self.storage().clone();
                 let commit_device = device.clone();
                 let commit = DurabilityBarrier::run_shielded(async move {
                     exec.run_finite(commit_device, TrafficClass::Foreground, move || {
+                        let _guard = acquire_ec_commit_guard(
+                            commit_df,
+                            &commit_pre_timestamp,
+                            commit_ssync_frag_index,
+                        )?;
                         if let Some(stall) = stall.as_ref() {
                             stall();
                         }
-                        writer.commit(&req_timestamp)?;
+                        writer
+                            .commit(&req_timestamp)
+                            .map_err(mutation_lock_error_response)?;
                         writer.close();
-                        Ok::<(), DiskFileError>(())
+                        Ok::<(), Response>(())
                     })
                     .await
                 })
                 .await;
                 match commit {
                     Ok(Ok(())) => {}
-                    Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
-                        return swob_response(507)
-                    }
-                    Ok(Err(error)) => return plain_response(500, &error.to_string()),
+                    Ok(Err(response)) => return response,
                     Err(error) => return plain_response(500, &error.to_string()),
                 }
             }
@@ -2102,6 +2237,36 @@ impl ObjectServer {
             .get("X-Backend-No-Commit")
             .is_some_and(config_true_value);
         let drive = completion.drive.clone();
+        let pre_df = match self.diskfile_for(
+            &completion.drive,
+            completion.part,
+            &completion.account,
+            &completion.container,
+            &completion.obj,
+            (completion.policy_index, completion.policy),
+        ) {
+            Ok(df) => df.with_next_part_power(backend_next_part_power(&Request {
+                method: "PUT".into(),
+                path: completion.path.clone(),
+                query_string: String::new(),
+                headers: completion.headers.clone(),
+                body: Body::empty(),
+            })),
+            Err(error) => return plain_response(500, &error.to_string()),
+        };
+        let pre_req = Request {
+            method: "PUT".into(),
+            path: completion.path.clone(),
+            query_string: String::new(),
+            headers: completion.headers.clone(),
+            body: Body::empty(),
+        };
+        let pre_timestamp = completion.req_timestamp.clone();
+        let ssync_frag_index = completion
+            .headers
+            .get("X-Backend-Ssync-Frag-Index")
+            .and_then(|raw| raw.trim().parse().ok());
+        let clock_ok = self.worm_clock.clock_ok();
         let stall = self.commit_stall.clone();
         let exec = self.storage().clone();
         let device = DeviceId::new(drive);
@@ -2109,24 +2274,29 @@ impl ObjectServer {
         // HTTP future does not abort commit or panic-drop the guard.
         let commit = DurabilityBarrier::run_shielded(async move {
             exec.run_finite(device, TrafficClass::Foreground, move || {
+                let _guard = acquire_checked_put_guard(
+                    pre_df,
+                    &pre_req,
+                    &pre_timestamp,
+                    ssync_frag_index,
+                    clock_ok,
+                )?;
                 if let Some(stall) = stall.as_ref() {
                     stall();
                 }
-                if no_commit {
+                let committed = if no_commit {
                     durable.commit_nondurable(metadata)
                 } else {
                     durable.commit(metadata)
-                }
+                };
+                committed.map_err(mutation_lock_error_response)
             })
             .await
         })
         .await;
         match commit {
             Ok(Ok(())) => {}
-            Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
-                return swob_response(507)
-            }
-            Ok(Err(e)) => return plain_response(500, &e.to_string()),
+            Ok(Err(response)) => return response,
             Err(e) => return plain_response(500, &e.to_string()),
         }
         self.finish_put_completion(completion).await
@@ -2135,6 +2305,7 @@ impl ObjectServer {
     async fn finish_put_completion(&self, completion: PutCompletion) -> Response {
         let PutCompletion {
             drive,
+            part: _,
             etag,
             upload_size,
             content_type,
@@ -2145,6 +2316,7 @@ impl ObjectServer {
             container,
             obj,
             policy_index,
+            policy: _,
             headers,
             path,
         } = completion;
@@ -2959,6 +3131,7 @@ impl ObjectServer {
                     metadata,
                     completion: PutCompletion {
                         drive: drive.clone(),
+                        part,
                         etag: etag.clone(),
                         upload_size,
                         content_type: content_type.clone(),
@@ -2969,6 +3142,7 @@ impl ObjectServer {
                         container: container.clone(),
                         obj: obj.clone(),
                         policy_index,
+                        policy,
                         headers: req.headers.clone(),
                         path: req.path.clone(),
                     },
@@ -2978,6 +3152,27 @@ impl ObjectServer {
             // PendingDurable on StorageExecutor. Not a process-wide slot.
             return Response::new(201);
         }
+        let commit_df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
+            Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
+            Err(error) => return plain_response(500, &error.to_string()),
+        };
+        let mut mutation_guard = match acquire_checked_put_guard(
+            commit_df,
+            req,
+            &req_timestamp,
+            ssync_frag_index,
+            self.worm_clock.clock_ok(),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(response) => return response,
+        };
         if let Err(e) = writer.put(metadata) {
             writer.close();
             return match e {
@@ -2992,6 +3187,9 @@ impl ObjectServer {
         // require the commit confirmation document before making it
         // durable.
         if multiphase {
+            // Never hold an object stripe while waiting on the proxy's
+            // second phase. The durable transition reacquires and rechecks.
+            drop(mutation_guard.take());
             let Some(docs) = &mut mime_docs else {
                 writer.close();
                 return plain_response(400, "multiphase commit requires a MIME body");
@@ -3029,10 +3227,33 @@ impl ObjectServer {
             .get("X-Backend-No-Commit")
             .is_some_and(config_true_value)
         {
+            let second_phase_guard = if multiphase {
+                let commit_df = match self.diskfile_for(
+                    &drive,
+                    part,
+                    &account,
+                    &container,
+                    &obj,
+                    (policy_index, policy),
+                ) {
+                    Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
+                    Err(error) => return plain_response(500, &error.to_string()),
+                };
+                match acquire_ec_commit_guard(commit_df, &req_timestamp, ssync_frag_index) {
+                    Ok(guard) => Some(guard),
+                    Err(response) => return response,
+                }
+            } else {
+                None
+            };
             if let Err(e) = writer.commit(&req_timestamp) {
                 writer.close();
                 return plain_response(500, &e.to_string());
             }
+            drop(second_phase_guard);
+        }
+        if !multiphase {
+            drop(mutation_guard.take());
         }
         writer.close();
         // Drain any remaining MIME docs (there should be none, but the
@@ -3143,6 +3364,10 @@ impl ObjectServer {
         {
             df = df.with_open_expired(true);
         }
+        let mutation_guard = match df.acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT) {
+            Ok(guard) => guard,
+            Err(error) => return mutation_lock_error_response(error),
+        };
         let orig = match df.open(None) {
             Ok(opened) => opened,
             Err(DiskFileError::NotExist) | Err(DiskFileError::Deleted { .. }) => {
@@ -3209,6 +3434,12 @@ impl ObjectServer {
             Ok(metadata) => metadata.clone(),
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        if let Some(response) = put_if_match_precondition(req, true, Some(&orig_metadata)) {
+            return response;
+        }
+        if let Some(response) = expected_s3_version_precondition(req, true, Some(&orig_metadata)) {
+            return response;
+        }
         let content_length = meta_get(&orig_metadata, "Content-Length")
             .unwrap_or("0")
             .to_string();
@@ -3271,11 +3502,10 @@ impl ObjectServer {
                 None => return plain_response(500, "POST preserving absent .meta metadata"),
             }
         };
-        // Python server.py:_conditional_delete_at_update.  A metadata POST
-        // may create a new expiry task and must remove the old task when the
-        // delete-at changes or is cleared.  The queue row records the data
-        // file's byte length and timestamp, not the POST timestamp.
-        if req_timestamp > orig_timestamp {
+        // Save the expirer side effects, but do not issue network/container
+        // updates while the object stripe is held. The metadata publish below
+        // is the transaction's durability boundary.
+        let pending_delete_at_update = if req_timestamp > orig_timestamp {
             let orig_delete_at = orig
                 .get_metadata()
                 .ok()
@@ -3290,35 +3520,15 @@ impl ObjectServer {
                 .map(|value| value as i64)
                 .unwrap_or(0);
             let expirer_bytes = content_length.parse::<u64>().unwrap_or(0);
-            if new_delete_at != 0 {
-                self.delete_at_update(
-                    "PUT",
-                    new_delete_at,
-                    &drive,
-                    &account,
-                    &container,
-                    &obj,
-                    req,
-                    policy_index,
-                    Some(expirer_bytes),
-                    Some(data_timestamp.internal()),
-                );
-            }
-            if orig_delete_at != 0 && orig_delete_at != new_delete_at {
-                self.delete_at_update(
-                    "DELETE",
-                    orig_delete_at,
-                    &drive,
-                    &account,
-                    &container,
-                    &obj,
-                    req,
-                    policy_index,
-                    None,
-                    None,
-                );
-            }
-        }
+            Some((
+                orig_delete_at,
+                new_delete_at,
+                expirer_bytes,
+                data_timestamp.internal(),
+            ))
+        } else {
+            None
+        };
 
         // server.py 733-748: resolve which content-type wins. A newer request
         // content-type goes into the .meta stamped with its own timestamp;
@@ -3361,6 +3571,44 @@ impl ObjectServer {
                 DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
                 other => plain_response(500, &other.to_string()),
             };
+        }
+        drop(mutation_guard);
+
+        // Python server.py:_conditional_delete_at_update. A metadata POST may
+        // create a new expiry task and must remove the old task when the
+        // delete-at changes or is cleared. These side effects happen only
+        // after the object metadata is durably published.
+        if let Some((orig_delete_at, new_delete_at, expirer_bytes, data_timestamp)) =
+            pending_delete_at_update
+        {
+            if new_delete_at != 0 {
+                self.delete_at_update(
+                    "PUT",
+                    new_delete_at,
+                    &drive,
+                    &account,
+                    &container,
+                    &obj,
+                    req,
+                    policy_index,
+                    Some(expirer_bytes),
+                    Some(data_timestamp),
+                );
+            }
+            if orig_delete_at != 0 && orig_delete_at != new_delete_at {
+                self.delete_at_update(
+                    "DELETE",
+                    orig_delete_at,
+                    &drive,
+                    &account,
+                    &container,
+                    &obj,
+                    req,
+                    policy_index,
+                    None,
+                    None,
+                );
+            }
         }
 
         // server.py 755-768: when the winning content-type is not the
@@ -3516,6 +3764,10 @@ impl ObjectServer {
         if if_delete_at.is_some() {
             df = df.with_open_expired(true);
         }
+        let mutation_guard = match df.acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT) {
+            Ok(guard) => guard,
+            Err(error) => return (mutation_lock_error_response(error), false),
+        };
         let (orig_timestamp, was_live, orig_delete_at, orig_metadata) = match df.open(None) {
             Ok(_) => {
                 let ts = df.data_timestamp().unwrap_or_else(|_| "0".parse().unwrap());
@@ -3574,6 +3826,14 @@ impl ObjectServer {
             }
             Err(e) => return (plain_response(500, &e.to_string()), false),
         };
+        if let Some(response) = put_if_match_precondition(req, was_live, orig_metadata.as_ref()) {
+            return (response, false);
+        }
+        if let Some(response) =
+            expected_s3_version_precondition(req, was_live, orig_metadata.as_ref())
+        {
+            return (response, false);
+        }
         if let Some(req_if) = if_delete_at {
             if !was_live {
                 let mut resp = swob_response(404);
@@ -3631,16 +3891,11 @@ impl ObjectServer {
                 Err(e) => return (plain_response(500, &e.to_string()), false),
             };
             if let Err(e) = fresh.delete(&req_timestamp) {
-                return (
-                    match e {
-                        DiskFileError::NoSpace => swob_response(507),
-                        other => plain_response(500, &other.to_string()),
-                    },
-                    false,
-                );
+                return (mutation_lock_error_response(e), false);
             }
             did_cu = true;
         }
+        drop(mutation_guard);
         let mut resp = match response_class {
             // Swift's swob response keeps the default HTML content type even
             // for an empty successful DELETE body. The Python golden oracle
@@ -6320,6 +6575,169 @@ mod fallocate_reserve_tests {
         let b2 = g2.body.materialize(u64::MAX).unwrap().to_vec();
         assert_eq!(b1, b"alpha-payload");
         assert_eq!(b2, b"beta-payload!!");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_object_if_none_match_is_rechecked_under_mutation_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cas-create-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let second_server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let observer = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut first = put_named("cas-create", "7001", b"first");
+        first.headers.set("If-None-Match", "*");
+        let first_task =
+            tokio::spawn(async move { first_server.handle_buffered_async(first).await });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        let mut second = put_named("cas-create", "7002", b"second");
+        second.headers.set("If-None-Match", "*");
+        let second_task =
+            tokio::spawn(async move { second_server.handle_buffered_async(second).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let first_response = first_task.await.unwrap();
+        let second_response = second_task.await.unwrap();
+        assert_eq!(first_response.status, 201, "{}", first_response.reason);
+        assert_eq!(second_response.status, 412, "{}", second_response.reason);
+        let mut get = observer.handle(get_named("cas-create"));
+        assert_eq!(get.status, 200);
+        assert_eq!(get.body.materialize(u64::MAX).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_object_if_match_is_rechecked_under_mutation_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cas-update-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let observer = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let seed = observer.handle(put_named("cas-update", "7100", b"seed"));
+        assert_eq!(seed.status, 201);
+        let old_etag = seed.headers.get("ETag").unwrap().to_string();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let second_server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut first = put_named("cas-update", "7101", b"first-wins");
+        first.headers.set("If-Match", &old_etag);
+        let first_task =
+            tokio::spawn(async move { first_server.handle_buffered_async(first).await });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        let mut second = put_named("cas-update", "7102", b"must-lose");
+        second.headers.set("If-Match", &old_etag);
+        let second_task =
+            tokio::spawn(async move { second_server.handle_buffered_async(second).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first_task.await.unwrap().status, 201);
+        assert_eq!(second_task.await.unwrap().status, 412);
+        let mut get = observer.handle(get_named("cas-update"));
+        assert_eq!(get.status, 200);
+        assert_eq!(get.body.materialize(u64::MAX).unwrap(), b"first-wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_etag_s3_version_aba_is_rejected_under_mutation_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-version-aba-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let observer = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut seed = put_named("version-aba", "7200", b"same-bytes");
+        seed.headers.set(S3_VERSION_ID_SYSMETA, "version-1");
+        assert_eq!(observer.handle(seed).status, 201);
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let second_server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut first = put_named("version-aba", "7201", b"same-bytes");
+        first.headers.set(S3_VERSION_ID_SYSMETA, "version-2");
+        first
+            .headers
+            .set(EXPECTED_S3_VERSION_ID_HEADER, "version-1");
+        let first_task =
+            tokio::spawn(async move { first_server.handle_buffered_async(first).await });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        let mut second = put_named("version-aba", "7202", b"same-bytes");
+        second.headers.set(S3_VERSION_ID_SYSMETA, "version-3");
+        second
+            .headers
+            .set(EXPECTED_S3_VERSION_ID_HEADER, "version-1");
+        let second_task =
+            tokio::spawn(async move { second_server.handle_buffered_async(second).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first_task.await.unwrap().status, 201);
+        assert_eq!(second_task.await.unwrap().status, 412);
+        let head = observer.handle(Request {
+            method: "HEAD".into(),
+            path: "/sda1/0/AUTH_test/c/version-aba".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        });
+        assert_eq!(head.headers.get(S3_VERSION_ID_SYSMETA), Some("version-2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
