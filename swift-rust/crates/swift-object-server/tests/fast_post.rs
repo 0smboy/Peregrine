@@ -183,7 +183,8 @@ fn test_post_replaces_user_meta_instead_of_merging() {
     // Python DiskFile: after a .meta exists, GET metadata is .meta plus
     // datafile reserved/system/sysmeta only. PUT Food then POST Color must
     // drop Food (func TestObject::test_metadata / versioned_writes overwriting).
-    let dir = std::env::temp_dir().join(format!("swift-os-fastpost-replace-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("swift-os-fastpost-replace-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let device = dir.join("sda1");
     std::fs::create_dir_all(&device).unwrap();

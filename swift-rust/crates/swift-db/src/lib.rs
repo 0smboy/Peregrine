@@ -62,7 +62,10 @@ pub use shard::{
     sift_shard_ranges, state as shard_state, ShardRange, CLEAVING_STATES, SHARD_RANGE_KEYS,
     SHARD_STATS_STATES, SHARD_UPDATE_STATES,
 };
-pub use util::{chexor, is_corruption_error, is_lock_contention, is_readonly_dbmoved, quarantine_db, renamer, DbError};
+pub use util::{
+    chexor, is_corruption_error, is_lock_contention, is_readonly_dbmoved, quarantine_db, renamer,
+    DbError,
+};
 pub use vacuum::{
     sample_db_space, sample_device_db_space, vacuum_db, vacuum_device_dbs, DbSpaceSample,
     DbSpaceTotals,

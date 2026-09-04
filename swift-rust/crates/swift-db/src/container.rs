@@ -1187,12 +1187,10 @@ impl ContainerBroker {
                 if let Some(mut retiring) = self.retiring_broker() {
                     retiring.commit_pending()?;
                     let conn = retiring.conn()?;
-                    oc = conn.query_row("SELECT object_count FROM container_stat", [], |r| {
-                        r.get(0)
-                    })?;
-                    bu = conn.query_row("SELECT bytes_used FROM container_stat", [], |r| {
-                        r.get(0)
-                    })?;
+                    oc = conn
+                        .query_row("SELECT object_count FROM container_stat", [], |r| r.get(0))?;
+                    bu =
+                        conn.query_row("SELECT bytes_used FROM container_stat", [], |r| r.get(0))?;
                 }
                 // After the first cleaved ranges, retiring policy_stat can
                 // already be 0 while shard-range rows still hold live objects.

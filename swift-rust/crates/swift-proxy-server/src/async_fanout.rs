@@ -1483,9 +1483,10 @@ impl ProxyApp {
             .max()
             .cloned();
         let Some(chosen_timestamp) = chosen_timestamp else {
-            let has_reconstructable_nondurable_bucket = buckets.iter().any(|(timestamp, bucket)| {
-                !tombstone_trumps(timestamp) && bucket.sources.len() >= required
-            });
+            let has_reconstructable_nondurable_bucket =
+                buckets.iter().any(|(timestamp, bucket)| {
+                    !tombstone_trumps(timestamp) && bucket.sources.len() >= required
+                });
             let all_good_older_than_tombstone = latest_404_timestamp.is_truthy()
                 && buckets.keys().all(|timestamp| tombstone_trumps(timestamp));
             if all_good_older_than_tombstone {
