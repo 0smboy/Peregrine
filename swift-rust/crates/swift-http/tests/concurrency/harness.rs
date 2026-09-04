@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -15,6 +15,105 @@ pub struct Server {
     pub addr: std::net::SocketAddr,
     pub shutdown: Arc<AtomicBool>,
     pub join: Option<thread::JoinHandle<std::io::Result<()>>>,
+}
+
+pub struct OpenManyOutcome {
+    pub streams: Vec<TcpStream>,
+    pub attempts: usize,
+    pub errors: Vec<String>,
+}
+
+/// Establish a large socket population without accidentally benchmarking one
+/// blocking client thread. Each worker owns its sockets until every worker is
+/// joined, so the returned population was concurrent at its high-water mark.
+pub fn open_many(
+    addrs: &[SocketAddr],
+    target: usize,
+    workers: usize,
+    timeout: Duration,
+) -> OpenManyOutcome {
+    if addrs.is_empty() || workers == 0 {
+        return OpenManyOutcome {
+            streams: Vec::new(),
+            attempts: 0,
+            errors: vec!["open_many requires at least one address and worker".into()],
+        };
+    }
+
+    let addrs = Arc::new(addrs.to_vec());
+    let deadline = Instant::now() + timeout;
+    let mut joins = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let addrs = Arc::clone(&addrs);
+        let quota = target / workers + usize::from(worker < target % workers);
+        joins.push(thread::spawn(move || {
+            let mut streams = Vec::with_capacity(quota);
+            let mut attempts = 0usize;
+            let mut last_transient = None;
+            let mut fatal = None;
+            while streams.len() < quota && Instant::now() < deadline {
+                let addr = addrs[(worker + attempts) % addrs.len()];
+                attempts += 1;
+                match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                    Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
+                        streams.push(stream);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::AddrNotAvailable
+                        ) =>
+                    {
+                        last_transient =
+                            Some(format!("{error} kind={:?} addr={addr}", error.kind()));
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => {
+                        fatal = Some(format!(
+                            "worker={worker} fatal after {} sockets: {error} kind={:?} addr={addr}",
+                            streams.len(),
+                            error.kind()
+                        ));
+                        break;
+                    }
+                }
+            }
+            if streams.len() < quota && fatal.is_none() {
+                fatal = Some(format!(
+                    "worker={worker} time cap at {}/{} sockets after {attempts} attempts; \
+                     last transient={last_transient:?}",
+                    streams.len(),
+                    quota
+                ));
+            }
+            (streams, attempts, fatal)
+        }));
+    }
+
+    let mut streams = Vec::with_capacity(target);
+    let mut attempts = 0usize;
+    let mut errors = Vec::new();
+    for join in joins {
+        match join.join() {
+            Ok((mut worker_streams, worker_attempts, error)) => {
+                streams.append(&mut worker_streams);
+                attempts += worker_attempts;
+                if let Some(error) = error {
+                    errors.push(error);
+                }
+            }
+            Err(_) => errors.push("socket opener thread panicked".into()),
+        }
+    }
+    OpenManyOutcome {
+        streams,
+        attempts,
+        errors,
+    }
 }
 
 impl Drop for Server {

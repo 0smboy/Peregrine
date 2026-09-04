@@ -7,13 +7,33 @@
 mod harness;
 
 use std::io::Write;
-use std::net::TcpStream;
-use std::sync::atomic::AtomicBool;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use swift_http::server::{serve_forever_with_config, ServerConfig};
+use swift_http::server::{serve_forever_multi, set_listen_backlog, ServerConfig};
+
+struct IdleServer {
+    addrs: Vec<SocketAddr>,
+    shutdown: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl Drop for IdleServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        for addr in &self.addrs {
+            if let Ok(poke) = TcpStream::connect_timeout(addr, Duration::from_millis(50)) {
+                let _ = poke.shutdown(Shutdown::Both);
+            }
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
 
 fn probe_once(stream: &mut TcpStream) -> String {
     stream
@@ -62,14 +82,24 @@ struct IdleOutcome {
 }
 
 fn try_idle(target: usize) -> IdleOutcome {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+    // One IPv4 source/destination tuple has fewer than 100k ephemeral ports.
+    // Two destination listeners let a single-host test legitimately exercise
+    // 100k concurrent connections without pretending that tuple exhaustion is
+    // a server admission failure.
+    let mut listeners = Vec::with_capacity(2);
+    let mut addrs = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        set_listen_backlog(&listener, 65_535).unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
     let config = ServerConfig {
         worker_threads: 2,
         connection_queue: 1024,
         max_connections: target.saturating_add(64),
-        max_active_requests: target.saturating_add(64),
+        max_active_requests: 64,
         client_timeout_secs: 5,
         head_deadline_secs: 5,
         max_requests_per_connection: 1024,
@@ -78,20 +108,22 @@ fn try_idle(target: usize) -> IdleOutcome {
     };
     let flag = Arc::clone(&shutdown);
     let handler = Arc::new(harness::tiny_ok);
-    let join = thread::spawn(move || serve_forever_with_config(listener, handler, config));
+    let join = thread::spawn(move || serve_forever_multi(listeners, handler, config));
     let ready = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < ready {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_ok() {
-            break;
+    for addr in &addrs {
+        while Instant::now() < ready {
+            if TcpStream::connect_timeout(addr, Duration::from_millis(20)).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
         }
-        thread::sleep(Duration::from_millis(5));
     }
-    let server = harness::Server {
-        addr,
+    let server = IdleServer {
+        addrs,
         shutdown: flag,
         join: Some(join),
     };
-    let mut probe = match harness::get_keepalive(server.addr) {
+    let mut probe = match harness::get_keepalive(server.addrs[0]) {
         Ok(p) => p,
         Err(e) => {
             return IdleOutcome {
@@ -101,52 +133,20 @@ fn try_idle(target: usize) -> IdleOutcome {
             };
         }
     };
-    let mut held = Vec::new();
-    let mut opened = 0usize;
-    let cap = Instant::now() + Duration::from_secs(12);
-    for i in 0..target {
-        if Instant::now() >= cap {
-            let health = occupancy_health(&mut probe, &mut held);
-            return IdleOutcome {
-                opened,
-                health: health.clone(),
-                err: Some(format!(
-                    "time cap after {opened} sockets (i={i}) {health} worker_threads=2"
-                )),
-            };
-        }
-        match TcpStream::connect_timeout(&server.addr, Duration::from_millis(50)) {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                held.push(s);
-                opened += 1;
-            }
-            Err(e) => {
-                let health = occupancy_health(&mut probe, &mut held);
-                return IdleOutcome {
-                    opened,
-                    health: health.clone(),
-                    err: Some(format!(
-                        "stopped after {opened} sockets at i={i}: {e} kind={:?} {health} worker_threads=2",
-                        e.kind()
-                    )),
-                };
-            }
-        }
-        if opened > 0 && opened % 2000 == 0 {
-            let health = occupancy_health(&mut probe, &mut held);
-            if health != "health=200" {
-                return IdleOutcome {
-                    opened,
-                    health: health.clone(),
-                    err: Some(format!(
-                        "health failed at {opened} idle sockets: {health} worker_threads=2"
-                    )),
-                };
-            }
-        }
-    }
+    let outcome = harness::open_many(&server.addrs, target, 8, Duration::from_secs(900));
+    let opened = outcome.streams.len();
+    let mut held = outcome.streams;
     let health = occupancy_health(&mut probe, &mut held);
+    if opened != target || !outcome.errors.is_empty() {
+        return IdleOutcome {
+            opened,
+            health: health.clone(),
+            err: Some(format!(
+                "opened={opened}/{target} attempts={} errors={:?} {health} worker_threads=2",
+                outcome.attempts, outcome.errors
+            )),
+        };
+    }
     if health != "health=200" {
         return IdleOutcome {
             opened,

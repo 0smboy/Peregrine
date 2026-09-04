@@ -5,14 +5,13 @@
 #[path = "harness.rs"]
 mod harness;
 
-use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use swift_http::server::{serve_forever_with_config, ServerConfig};
+use swift_http::server::{serve_forever_with_config, set_listen_backlog, ServerConfig};
 
 #[test]
 fn idle_50000_keepalives_or_capture_unavailability() {
@@ -20,6 +19,10 @@ fn idle_50000_keepalives_or_capture_unavailability() {
     // Connection cap is independent of worker_threads=2 (Gate 1). Request cap
     // stays small so a health GET still admits while keep-alives sit idle.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // std::net::TcpListener::bind uses a small platform backlog. A tight local
+    // connect loop can overflow that queue before Tokio gets scheduled and
+    // falsely report a connection-cap failure at roughly 2x the backlog.
+    set_listen_backlog(&listener, (TARGET + 8) as i32).unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let config = ServerConfig {
@@ -48,57 +51,17 @@ fn idle_50000_keepalives_or_capture_unavailability() {
         shutdown: flag,
         join: Some(join),
     };
-    let mut held = Vec::new();
-    held.reserve(TARGET.min(1024));
-    let mut opened = 0usize;
-    let mut unavailable: Option<String> = None;
-    let cap = Instant::now() + Duration::from_secs(8);
-    for i in 0..TARGET {
-        if Instant::now() >= cap {
-            unavailable = Some(format!(
-                "idle-50k time cap after {opened} sockets (target {TARGET})"
-            ));
-            break;
-        }
-        match TcpStream::connect_timeout(&server.addr, Duration::from_millis(50)) {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                held.push(s);
-                opened += 1;
-            }
-            Err(e) => {
-                unavailable = Some(format!(
-                    "idle-50k stopped after {opened} sockets at i={i}: {e} kind={:?}",
-                    e.kind()
-                ));
-                break;
-            }
-        }
-        if opened > 0 && opened % 5000 == 0 {
-            // A health request must still complete while keep-alives sit idle.
-            match harness::get_close_timed(server.addr, Duration::from_millis(400)) {
-                Ok((200, _)) => {}
-                Ok((status, _)) => {
-                    unavailable = Some(format!("health failed at {opened} idle sockets: {status}"));
-                    break;
-                }
-                Err(e) => {
-                    unavailable = Some(format!("health connect failed at {opened}: {e}"));
-                    break;
-                }
-            }
-        }
-    }
-    if let Some(msg) = unavailable {
-        panic!("ENVIRONMENT BLOCKED: idle-50k target={TARGET} opened={opened}: {msg}");
-    }
+    let outcome = harness::open_many(&[server.addr], TARGET, 8, Duration::from_secs(600));
+    let opened = outcome.streams.len();
+    let held = outcome.streams;
     assert_eq!(
         opened, TARGET,
-        "ENVIRONMENT BLOCKED: idle-50k opened {opened} != target {TARGET}"
+        "ENVIRONMENT BLOCKED: idle-50k opened {opened} != target {TARGET}; \
+         attempts={} errors={:?}",
+        outcome.attempts, outcome.errors
     );
     let (status, _) = harness::get_close_timed(server.addr, Duration::from_secs(1))
         .expect("health GET with 50k idle keep-alives");
     assert_eq!(status, 200, "health must work with {opened} idle sockets");
     drop(held);
-    let _ = ErrorKind::AddrInUse;
 }
