@@ -479,6 +479,24 @@ fn ssync_check_missing_owned(
 /// Network wait is `IncomingBody::next_chunk` (async socket via Hyper).
 /// Disk work is a finite `StorageExecutor` job (`TrafficClass::Replication`).
 /// The HTTP 200 head is already on the wire before this future runs.
+async fn acquire_replication_session_lock(
+    storage: &StorageExecutor,
+    device: DeviceId,
+    part_path: PathBuf,
+    timeout: f64,
+) -> Result<swift_core::lockutil::PathLock, Response> {
+    match storage
+        .run_finite(device, TrafficClass::Replication, move || {
+            swift_core::lockutil::lock_path(&part_path, timeout, Some("replication"))
+        })
+        .await
+    {
+        Ok(Ok(guard)) => Ok(guard),
+        Ok(Err(_)) => Err(swob_response(503)),
+        Err(_) => Err(swob_response(503)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_ssync_session(
     mut body: swift_http::IncomingBody,
@@ -490,6 +508,7 @@ async fn drive_ssync_session(
     policy_index: u32,
     policy: PolicyKind,
     frag_index: Option<i64>,
+    replication_lock: std::sync::Arc<swift_core::lockutil::PathLock>,
 ) {
     // Python's first yield: a bare b'\r\n' so WSGI/Hyper flushes the 200
     // head before the sender writes `:MISSING_CHECK:` (ssync_receiver.py:294-296).
@@ -525,7 +544,9 @@ async fn drive_ssync_session(
                             let devices = config.devices.clone();
                             let hash_config = config.hash_config.clone();
                             let diskfile_cfg = config.diskfile.clone();
+                            let replication_lock = std::sync::Arc::clone(&replication_lock);
                             move || {
+                                let _replication_lock = replication_lock;
                                 ssync_check_missing_owned(
                                     devices,
                                     hash_config,
@@ -599,8 +620,10 @@ async fn drive_ssync_session(
                     let cfg = config.clone();
                     let device = device.clone();
                     let partition = partition.clone();
+                    let replication_lock = std::sync::Arc::clone(&replication_lock);
                     let result = storage
                         .run_finite(device_id.clone(), TrafficClass::Replication, move || {
+                            let _replication_lock = replication_lock;
                             ObjectServer::new(cfg).apply_ssync_update(
                                 &device,
                                 &partition,
@@ -2135,6 +2158,15 @@ impl ObjectServer {
     }
 
     async fn ssync_async(&self, areq: AsyncRequest) -> Response {
+        self.ssync_async_with_lock_timeout(areq, Self::REPLICATION_LOCK_TIMEOUT)
+            .await
+    }
+
+    async fn ssync_async_with_lock_timeout(
+        &self,
+        areq: AsyncRequest,
+        lock_timeout: f64,
+    ) -> Response {
         // Validation matches Python `Receiver.initialize_request`: it runs
         // before start_response, so 400/507 never become a 200 hijack.
         let req = Request {
@@ -2184,6 +2216,23 @@ impl ObjectServer {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
         let scope = TaskScope::bounded(1);
         let storage = self.storage().clone();
+        let part_path = self
+            .config
+            .devices
+            .join(&device)
+            .join(get_data_dir(policy_index))
+            .join(&partition);
+        let replication_lock = match acquire_replication_session_lock(
+            &storage,
+            DeviceId::new(device.clone()),
+            part_path,
+            lock_timeout,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
         let config = self.config.clone();
         let body = areq.body;
         let _ = scope.spawn(drive_ssync_session(
@@ -2196,6 +2245,7 @@ impl ObjectServer {
             policy_index,
             policy,
             frag_index,
+            std::sync::Arc::new(replication_lock),
         ));
         let mut resp = Response::new(200);
         resp.headers.set("X-Backend-Accept-No-Commit", "True");
@@ -5542,7 +5592,9 @@ impl SsyncSession<'_> {
             if remote.durable {
                 // We have the frag, just missing durable state, so make the
                 // frag durable now. Try this just once to avoid looping.
-                if make_durable && self.commit_frag(&hash_dir, &remote.ts_data, frag_index) {
+                if make_durable
+                    && self.commit_frag(&diskfile, &hash_dir, &remote.ts_data, frag_index)
+                {
                     return self.check_local(remote, false);
                 }
                 // commit failed: fall back to wanting a full update
@@ -5559,7 +5611,23 @@ impl SsyncSession<'_> {
     /// `ECDiskFileWriter.commit` for a fragment that is already on disk:
     /// rename `<ts>#<fi>.data` to its durable `#d` name, fsync the hash dir,
     /// clean up obsolete files.
-    fn commit_frag(&self, hash_dir: &Path, timestamp: &Timestamp, frag_index: i64) -> bool {
+    fn commit_frag(
+        &self,
+        diskfile: &DiskFile,
+        hash_dir: &Path,
+        timestamp: &Timestamp,
+        frag_index: i64,
+    ) -> bool {
+        // The enclosing SSYNC session already holds the partition's
+        // `.lock-replication`.  Keep the global lock order here:
+        // replication -> object mutation stripe -> partition hash lock.
+        // This prevents a missing-check durable promotion from racing a
+        // foreground PUT/POST/DELETE for the same object while still allowing
+        // unrelated objects in the partition to proceed.
+        let Ok(_mutation_guard) = diskfile.acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        else {
+            return false;
+        };
         let (Ok(src), Ok(dst)) = (
             make_ec_ondisk_filename(timestamp, frag_index, false),
             make_ec_ondisk_filename(timestamp, frag_index, true),
@@ -5571,6 +5639,12 @@ impl SsyncSession<'_> {
         }
         if let Ok(dir) = std::fs::File::open(hash_dir) {
             let _ = dir.sync_all();
+        }
+        let Some(suffix_dir) = hash_dir.parent() else {
+            return false;
+        };
+        if invalidate_hash(suffix_dir).is_err() {
+            return false;
         }
         let _ = swift_diskfile::cleanup_ondisk_files(
             hash_dir,
@@ -5905,6 +5979,14 @@ mod fallocate_reserve_tests {
                      :UPDATES: END\r\n"
             .to_vec();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let replication_lock = std::sync::Arc::new(
+            swift_core::lockutil::lock_path(
+                &dir.join("sda1").join(get_data_dir(0)).join("0"),
+                1.0,
+                Some("replication"),
+            )
+            .unwrap(),
+        );
 
         drive_ssync_session(
             swift_http::IncomingBody::from_bytes(body, u64::MAX),
@@ -5916,6 +5998,7 @@ mod fallocate_reserve_tests {
             0,
             PolicyKind::Replication,
             None,
+            replication_lock,
         )
         .await;
 
@@ -7705,6 +7788,18 @@ mod fallocate_reserve_tests {
             resp.headers.get("X-Backend-Accept-No-Commit").unwrap_or(""),
             "True"
         );
+        let part_path = dir.join("sda1").join(get_data_dir(0)).join("0");
+        let busy = acquire_replication_session_lock(
+            server.storage(),
+            DeviceId::new("sda1"),
+            part_path.clone(),
+            0.05,
+        )
+        .await;
+        assert!(
+            matches!(busy, Err(response) if response.status == 503),
+            "the partition replication lock must remain held after the 200 head"
+        );
         let before = server.storage().stats().blocking.started_total;
         let offer = crate::ssync::encode_missing(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -7732,6 +7827,51 @@ mod fallocate_reserve_tests {
             server.storage().stats().blocking.started_total > before,
             "missing-check FS must run on StorageExecutor after 200"
         );
+        let released = acquire_replication_session_lock(
+            server.storage(),
+            DeviceId::new("sda1"),
+            part_path,
+            0.2,
+        )
+        .await;
+        assert!(
+            released.is_ok(),
+            "the replication lock must be released when the SSYNC session ends"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ssync_busy_replication_lock_is_503_before_channel() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-busy-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let part_path = dir.join("sda1").join(get_data_dir(0)).join("0");
+        let held = swift_core::lockutil::lock_path(&part_path, 1.0, Some("replication")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let response = server
+            .ssync_async_with_lock_timeout(
+                AsyncRequest {
+                    method: "SSYNC".into(),
+                    path: "/sda1/0".into(),
+                    query_string: String::new(),
+                    headers: HeaderKeyDict::new(),
+                    body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                },
+                0.05,
+            )
+            .await;
+        assert_eq!(response.status, 503);
+        assert!(response.headers.get("X-Backend-Accept-No-Commit").is_none());
+        assert!(
+            !matches!(response.body, Body::Channel(_)),
+            "a busy partition must fail before constructing the SSYNC channel"
+        );
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

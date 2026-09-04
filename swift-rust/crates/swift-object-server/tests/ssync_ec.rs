@@ -314,6 +314,23 @@ fn duplex_ec_frag_index_missing_check_and_fragment_puts_over_a_real_socket() {
         vec![format!("{ts}#3.data")],
         "non-durable fragment file"
     );
+    let suffix = dir
+        .parent()
+        .and_then(Path::file_name)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let invalidations = dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("hashes.invalid");
+    let invalidation_count_before = std::fs::read_to_string(&invalidations)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == suffix)
+        .count();
 
     // 2. Offering the same fragment as DURABLE makes the receiver commit its
     //    local non-durable copy instead of re-requesting the data
@@ -336,6 +353,16 @@ fn duplex_ec_frag_index_missing_check_and_fragment_puts_over_a_real_socket() {
         dir_files(&dir),
         vec![format!("{ts}#3#d.data")],
         "the offer made the local fragment durable"
+    );
+    let invalidation_count_after = std::fs::read_to_string(&invalidations)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == suffix)
+        .count();
+    assert_eq!(
+        invalidation_count_after,
+        invalidation_count_before + 1,
+        "making a local non-durable fragment durable must invalidate its suffix hash"
     );
 
     // 3. Frag-index-aware missing check: the same object offered under a
