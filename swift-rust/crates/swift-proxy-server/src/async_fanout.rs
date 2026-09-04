@@ -1370,6 +1370,7 @@ impl ProxyApp {
         let mut durable_timestamps: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut saw_404 = false;
+        let mut latest_404_timestamp = Timestamp::zero();
         // Python may issue up to twice the replica count. The second pass is
         // essential when every primary has a newer non-durable generation:
         // pass one discovers and excludes those fragment indexes, then pass
@@ -1443,7 +1444,15 @@ impl ProxyApp {
                             }
                         }
                     }
-                    Ok(head) if head.status == 404 => saw_404 = true,
+                    Ok(head) if head.status == 404 => {
+                        saw_404 = true;
+                        let ts = super::backend_404_timestamp(&head.headers);
+                        if !node.handoff || ts.is_truthy() {
+                            if ts > latest_404_timestamp {
+                                latest_404_timestamp = ts;
+                            }
+                        }
+                    }
                     Ok(head) if head.status == 507 => self.error_limiter.limit(node),
                     Ok(head) if head.status >= 500 => self.error_limiter.increment(node),
                     Ok(_) => {}
@@ -1456,18 +1465,32 @@ impl ProxyApp {
                 }
             }
         }
+        let tombstone_trumps = |timestamp: &str| -> bool {
+            timestamp
+                .parse::<Timestamp>()
+                .ok()
+                .map(|ts| ts < latest_404_timestamp)
+                .unwrap_or(false)
+        };
         let chosen_timestamp = buckets
             .iter()
             .filter(|(timestamp, bucket)| {
-                durable_timestamps.contains(*timestamp) && bucket.sources.len() >= required
+                !tombstone_trumps(timestamp)
+                    && durable_timestamps.contains(*timestamp)
+                    && bucket.sources.len() >= required
             })
             .map(|(timestamp, _)| timestamp)
             .max()
             .cloned();
         let Some(chosen_timestamp) = chosen_timestamp else {
-            let has_reconstructable_nondurable_bucket = buckets
-                .values()
-                .any(|bucket| bucket.sources.len() >= required);
+            let has_reconstructable_nondurable_bucket = buckets.iter().any(|(timestamp, bucket)| {
+                !tombstone_trumps(timestamp) && bucket.sources.len() >= required
+            });
+            let all_good_older_than_tombstone = latest_404_timestamp.is_truthy()
+                && buckets.keys().all(|timestamp| tombstone_trumps(timestamp));
+            if all_good_older_than_tombstone {
+                return swob_response(404);
+            }
             return swob_response(ec_no_durable_status(
                 has_reconstructable_nondurable_bucket,
                 saw_404,

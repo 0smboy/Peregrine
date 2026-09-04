@@ -5874,34 +5874,50 @@ impl ProxyApp {
         }
         drop(tx);
 
-        let mut sources: HashMap<i32, (Node, BackendHead)> = HashMap::new();
-        let mut meta: Option<Vec<(String, String)>> = None;
-        let mut saw_404 = false;
+        let mut goods: Vec<(Node, BackendHead)> = Vec::new();
+        let mut latest_404_timestamp = Timestamp::zero();
+        let mut saw_auth_404 = false;
         for (node, r) in rx.iter() {
             match r {
-                Ok(head) if head.status == 200 => {
-                    let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                        .and_then(|v| v.parse::<i32>().ok());
-                    if let Some(fi) = fi {
-                        if sources.len() >= ec.ndata && !sources.contains_key(&fi) {
-                            continue; // enough sources; surplus conns just drop
+                Ok(head) if head.status == 200 => goods.push((node, head)),
+                Ok(head) if head.status == 404 => {
+                    let ts = backend_404_timestamp(&head.headers);
+                    if !node.handoff || ts.is_truthy() {
+                        saw_auth_404 = true;
+                        if ts > latest_404_timestamp {
+                            latest_404_timestamp = ts;
                         }
-                        if meta.is_none() {
-                            meta = Some(head.headers.clone());
-                        }
-                        sources.entry(fi).or_insert((node, head));
                     }
                 }
-                Ok(head) if head.status == 404 => saw_404 = true,
                 Ok(head) if head.status == 507 => self.error_limiter.limit(&node),
                 Ok(head) if head.status >= 500 => self.error_limiter.increment(&node),
                 Ok(_) => {}
                 Err(_) => self.error_limiter.increment(&node),
             }
         }
+        let mut sources: HashMap<i32, (Node, BackendHead)> = HashMap::new();
+        let mut meta: Option<Vec<(String, String)>> = None;
+        for (node, head) in goods {
+            // obj.py ECGetResponseCollection.best_bucket: a newer tombstone
+            // trumps older fragment archives left on nodes that missed DELETE.
+            if source_timestamp(&head.headers) < latest_404_timestamp {
+                continue;
+            }
+            let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
+                .and_then(|v| v.parse::<i32>().ok());
+            if let Some(fi) = fi {
+                if sources.len() >= ec.ndata && !sources.contains_key(&fi) {
+                    continue;
+                }
+                if meta.is_none() {
+                    meta = Some(head.headers.clone());
+                }
+                sources.entry(fi).or_insert((node, head));
+            }
+        }
 
         if sources.len() < ec.ndata {
-            return if saw_404 && sources.is_empty() {
+            return if sources.is_empty() && saw_auth_404 {
                 swob_response(404)
             } else {
                 swob_response(503)
