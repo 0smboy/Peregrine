@@ -710,12 +710,24 @@ impl<'a> DeadlineSocketReader<'a> {
 
     fn read_exact_vec(&mut self, len: usize) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
+        self.append_exact(&mut out, len)?;
+        Ok(out)
+    }
+
+    fn append_exact(&mut self, out: &mut Vec<u8>, mut len: usize) -> Result<(), String> {
         out.try_reserve_exact(len)
             .map_err(|_| format!("could not reserve {len} response bytes"))?;
-        while out.len() < len {
-            out.push(self.read_byte().map_err(|error| error.to_string())?);
+        while len > 0 {
+            if self.start == self.end {
+                out.push(self.read_byte().map_err(|error| error.to_string())?);
+                len -= 1;
+            }
+            let count = len.min(self.end - self.start);
+            out.extend_from_slice(&self.buffer[self.start..self.start + count]);
+            self.start += count;
+            len -= count;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn read_crlf_line(&mut self, limit: usize) -> Result<Vec<u8>, String> {
@@ -861,15 +873,55 @@ fn read_internal_http_body(
             if next_len > limit {
                 return Err(format!("decoded response body exceeds {limit} bytes"));
             }
-            body.try_reserve_exact(size)
-                .map_err(|_| format!("could not reserve {size} response bytes"))?;
-            body.extend_from_slice(&reader.read_exact_vec(size)?);
+            reader.append_exact(&mut body, size)?;
             if reader.read_exact_vec(2)? != b"\r\n" {
                 return Err("HTTP chunk payload missing CRLF".to_string());
             }
         }
     }
     Err("response has no explicit body framing".to_string())
+}
+
+/// Shared REPLICATE transport for both maintenance daemons. Errors are
+/// classified from the head before any body read; successful bodies require
+/// exact framing, an allocation bound and an absolute request deadline.
+#[allow(clippy::too_many_arguments)]
+pub fn bounded_replicate_rpc(
+    address: std::net::SocketAddr,
+    path: &str,
+    policy_index: u32,
+    conn_timeout: Duration,
+    idle_timeout: Duration,
+    request_timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<(u16, Vec<u8>), String> {
+    if conn_timeout.is_zero()
+        || idle_timeout.is_zero()
+        || request_timeout.is_zero()
+        || !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err("invalid REPLICATE request bounds or target".into());
+    }
+    let mut conn = std::net::TcpStream::connect_timeout(&address, conn_timeout)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now()
+        .checked_add(request_timeout)
+        .ok_or_else(|| "invalid REPLICATE deadline".to_string())?;
+    let request = format!("REPLICATE {path} HTTP/1.1\r\nHost: {address}\r\nX-Backend-Storage-Policy-Index: {policy_index}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    write_all_before(&mut conn, request.as_bytes(), idle_timeout, deadline)
+        .map_err(|error| error.to_string())?;
+    let mut reader = DeadlineSocketReader::new(&mut conn, idle_timeout, deadline);
+    let head = read_internal_http_head(&mut reader)?;
+    if head.status != 200 {
+        return Ok((head.status, Vec::new()));
+    }
+    Ok((
+        head.status,
+        read_internal_http_body(&mut reader, &head.headers, max_body_bytes)?,
+    ))
 }
 
 pub struct HttpFragmentFetcher {
@@ -1067,7 +1119,9 @@ impl HttpFragmentFetcher {
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use swift_core::pickle::{self, Value};
+#[cfg(test)]
+use swift_core::pickle;
+use swift_core::pickle::Value;
 use swift_diskfile::{get_partition_hashes, CleanupConfig, Hashes};
 use swift_ring::{HandoffNode, PartNode};
 
@@ -1526,32 +1580,81 @@ impl HttpSuffixHashFetcher {
     ) -> Result<Value, SuffixSyncError> {
         let sock = socket_addr(&node.replication_ip, node.replication_port)
             .map_err(|_| SuffixSyncError::Failed)?;
-        let mut conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout)
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let deadline = Instant::now()
-            .checked_add(self.request_timeout)
-            .ok_or(SuffixSyncError::Failed)?;
-        let req = format!(
-            "REPLICATE /{}/{partition} HTTP/1.1\r\nHost: {addr}\r\n\
-             X-Backend-Storage-Policy-Index: {policy_index}\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n",
-            node.device,
-            addr = sock
-        );
-        write_all_before(&mut conn, req.as_bytes(), self.node_timeout, deadline)
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let mut reader = DeadlineSocketReader::new(&mut conn, self.node_timeout, deadline);
-        let head = read_internal_http_head(&mut reader).map_err(|_| SuffixSyncError::Failed)?;
-        if head.status == 507 {
+        let (status, body) = bounded_replicate_rpc(
+            sock,
+            &format!("/{}/{partition}", node.device),
+            policy_index,
+            self.conn_timeout,
+            self.node_timeout,
+            self.request_timeout,
+            self.max_response_bytes,
+        )
+        .map_err(|_| SuffixSyncError::Failed)?;
+        if status == 507 {
             return Err(SuffixSyncError::InsufficientStorage);
         }
-        if head.status != 200 {
+        if status != 200 {
             return Err(SuffixSyncError::Failed);
         }
-        let body = read_internal_http_body(&mut reader, &head.headers, self.max_response_bytes)
-            .map_err(|_| SuffixSyncError::Failed)?;
-        pickle::loads(&body).map_err(|_| SuffixSyncError::Failed)
+        let decoded =
+            crate::replicator::decode_suffix_hashes(&body).ok_or(SuffixSyncError::Failed)?;
+        validate_ec_suffix_hashes(decoded, 256)
     }
+}
+
+/// Normalize Python 2 byte strings at this wire boundary, then reject any
+/// malformed suffix table before it can be interpreted as an empty peer.
+fn validate_ec_suffix_hashes(value: Value, n_unique: u32) -> Result<Value, SuffixSyncError> {
+    let Value::Dict(pairs) = value else {
+        return Err(SuffixSyncError::Failed);
+    };
+    if pairs.len() > 4096 {
+        return Err(SuffixSyncError::Failed);
+    }
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(pairs.len());
+    for (suffix, subdict) in pairs {
+        let suffix =
+            crate::replicator::suffix_ascii_string(suffix).ok_or(SuffixSyncError::Failed)?;
+        if !lower_hex(&suffix, 3) || !seen.insert(suffix.clone()) {
+            return Err(SuffixSyncError::Failed);
+        }
+        let subdict = match subdict {
+            Value::None => Value::None,
+            Value::Dict(entries) => {
+                if entries.len() > n_unique as usize + 1 {
+                    return Err(SuffixSyncError::Failed);
+                }
+                let mut indexes = BTreeSet::new();
+                let mut valid = Vec::with_capacity(entries.len());
+                for (key, digest) in entries {
+                    let index = match key {
+                        Value::None => None,
+                        Value::Int(index) if index >= 0 && index < i64::from(n_unique) => {
+                            Some(index)
+                        }
+                        _ => return Err(SuffixSyncError::Failed),
+                    };
+                    if !indexes.insert(index) {
+                        return Err(SuffixSyncError::Failed);
+                    }
+                    let digest = crate::replicator::suffix_ascii_string(digest)
+                        .ok_or(SuffixSyncError::Failed)?;
+                    if !lower_hex(&digest, 32) {
+                        return Err(SuffixSyncError::Failed);
+                    }
+                    valid.push((
+                        index.map(Value::Int).unwrap_or(Value::None),
+                        Value::Str(digest),
+                    ));
+                }
+                Value::Dict(valid)
+            }
+            _ => return Err(SuffixSyncError::Failed),
+        };
+        normalized.push((Value::Str(suffix), subdict));
+    }
+    Ok(Value::Dict(normalized))
 }
 
 impl SuffixHashFetcher for HttpSuffixHashFetcher {
@@ -1590,6 +1693,11 @@ pub fn get_suffixes_to_sync(
     fetcher: &dyn SuffixHashFetcher,
 ) -> Result<Vec<String>, SuffixSyncError> {
     let remote = fetcher.fetch_hashes_with_status(node, partition, policy_index)?;
+    let n_unique = match policy {
+        PolicyKind::Ec { n_unique_fragments } => n_unique_fragments.unwrap_or(256),
+        PolicyKind::Replication => return Err(SuffixSyncError::Failed),
+    };
+    let remote = validate_ec_suffix_hashes(remote, n_unique)?;
     let (_hashed, local) = get_partition_hashes(part_path, policy, &[], false, cleanup)
         .map_err(|_| SuffixSyncError::Failed)?;
     let suffixes = get_suffix_delta(
@@ -2418,6 +2526,92 @@ mod suffix_sync_tests {
             Err(SuffixSyncError::Failed)
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ec_suffix_schema_rejects_invalid_shapes_and_fragment_indexes() {
+        let digest = Value::Str("a".repeat(32));
+        let valid_subdict = Value::Dict(vec![(Value::Int(0), digest.clone())]);
+        for invalid in [
+            Value::None,
+            Value::Dict(vec![(Value::Str("ABC".into()), valid_subdict.clone())]),
+            Value::Dict(vec![(Value::Str("abc".into()), digest.clone())]),
+            Value::Dict(vec![
+                (Value::Str("abc".into()), Value::None),
+                (Value::Bytes(b"abc".to_vec()), valid_subdict.clone()),
+            ]),
+        ] {
+            assert_eq!(
+                validate_ec_suffix_hashes(invalid, 4),
+                Err(SuffixSyncError::Failed)
+            );
+        }
+        for invalid_entries in [
+            vec![(Value::Int(-1), digest.clone())],
+            vec![(Value::Int(4), digest.clone())],
+            vec![(Value::Str("0".into()), digest.clone())],
+            vec![(Value::Int(0), Value::Str("hash".into()))],
+            vec![(Value::Int(0), Value::None)],
+            vec![
+                (Value::Int(0), digest.clone()),
+                (Value::Int(0), digest.clone()),
+            ],
+            vec![(Value::None, digest.clone()), (Value::None, digest.clone())],
+        ] {
+            let invalid = Value::Dict(vec![(
+                Value::Str("abc".into()),
+                Value::Dict(invalid_entries),
+            )]);
+            assert_eq!(
+                validate_ec_suffix_hashes(invalid, 4),
+                Err(SuffixSyncError::Failed)
+            );
+        }
+    }
+
+    #[test]
+    fn ec_suffix_schema_accepts_full_table_and_python2_strings() {
+        let value = Value::Dict(
+            (0..4096)
+                .map(|suffix| {
+                    (
+                        Value::Bytes(format!("{suffix:03x}").into_bytes()),
+                        if suffix == 0 {
+                            Value::None
+                        } else {
+                            Value::Dict(
+                                [
+                                    Value::None,
+                                    Value::Int(0),
+                                    Value::Int(1),
+                                    Value::Int(2),
+                                    Value::Int(3),
+                                ]
+                                .into_iter()
+                                .map(|index| (index, Value::Bytes(vec![b'a'; 32])))
+                                .collect(),
+                            )
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let wire = pickle::dumps(&value).unwrap();
+        let bounded = crate::replicator::decode_suffix_hashes(&wire).unwrap();
+        let normalized = validate_ec_suffix_hashes(bounded, 4).unwrap();
+        let Value::Dict(entries) = normalized else {
+            panic!("expected dict")
+        };
+        assert_eq!(entries.len(), 4096);
+        assert_eq!(entries[0], (Value::Str("000".into()), Value::None));
+        assert_eq!(entries[4095].0, Value::Str("fff".into()));
+        let Value::Dict(last) = &entries[4095].1 else {
+            panic!("expected fragment hashes")
+        };
+        assert_eq!(last.len(), 5);
+        assert!(last
+            .iter()
+            .all(|(_, digest)| *digest == Value::Str("a".repeat(32))));
     }
 
     /// One suffix's `{None | Int(fi): hash}` entries.

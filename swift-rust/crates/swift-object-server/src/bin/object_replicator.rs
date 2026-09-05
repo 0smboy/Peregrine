@@ -22,11 +22,10 @@
 //! default replication policy (index 0) is handled here; EC policies replicate
 //! via the reconstructor.
 
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use swift_core::config::{config_true_value, SwiftConfig};
 use swift_core::hashing::HashPathConfig;
@@ -108,7 +107,6 @@ struct ReplicationPolicyState {
 }
 
 const MAX_REPLICATE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_REPLICATE_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
 
 fn ring_device_socket(peer: &RingDevice) -> Option<SocketAddr> {
     let ip = peer
@@ -131,39 +129,16 @@ fn replicate_rpc(
     http_timeout: Duration,
 ) -> Option<(u16, Vec<u8>)> {
     let peer_addr = ring_device_socket(peer)?;
-    let mut conn = TcpStream::connect_timeout(&peer_addr, conn_timeout).ok()?;
-    conn.set_write_timeout(Some(http_timeout)).ok()?;
-    let req = format!(
-        "REPLICATE {path} HTTP/1.1\r\nHost: {peer_addr}\r\n\
-         X-Backend-Storage-Policy-Index: {policy_index}\r\n\
-         Content-Length: 0\r\nConnection: close\r\n\r\n"
-    );
-    conn.write_all(req.as_bytes()).ok()?;
-    let mut raw = Vec::new();
-    let deadline = Instant::now().checked_add(http_timeout)?;
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        conn.set_read_timeout(Some(remaining)).ok()?;
-        let read = conn.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-        if raw.len().saturating_add(read) > MAX_REPLICATE_RESPONSE_BYTES {
-            return None;
-        }
-        raw.extend_from_slice(&chunk[..read]);
-    }
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    if split > MAX_REPLICATE_RESPONSE_HEAD_BYTES {
-        return None;
-    }
-    let status: u16 = String::from_utf8_lossy(&raw[..split])
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())?;
-    Some((status, raw[split + 4..].to_vec()))
+    swift_object_server::reconstructor::bounded_replicate_rpc(
+        peer_addr,
+        path,
+        policy_index,
+        conn_timeout,
+        http_timeout,
+        http_timeout,
+        MAX_REPLICATE_RESPONSE_BYTES,
+    )
+    .ok()
 }
 
 /// Real REPLICATE-verb client.

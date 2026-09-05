@@ -32,8 +32,8 @@
 //! HTTP/SSYNC adapters live in the `swift-object-replicator` binary.
 
 use std::collections::{BTreeMap, HashMap};
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use swift_core::pickle::{self, Value};
 use swift_diskfile::{
@@ -122,25 +122,52 @@ pub enum ReplicationJobGuard {
     DeviceUnavailable,
 }
 
-/// Parse a pickled `{suffix: md5hex}` dict into a map, keeping only
-/// string->string pairs (Python may store `None` for a suffix pending rehash).
+/// Decode a bounded `{suffix: md5hex | None}` response. Invalid wire data
+/// must not become an apparently empty or partially populated peer.
 pub fn hashes_from_pickle(body: &[u8]) -> Option<SuffixHashMap> {
-    dict_value_to_map(pickle::loads(body).ok()?)
+    dict_value_to_map(decode_suffix_hashes(body)?)
+}
+
+pub(crate) fn decode_suffix_hashes(body: &[u8]) -> Option<Value> {
+    pickle::loads_with_limits(
+        body,
+        pickle::DecodeLimits {
+            max_container_depth: 4,
+            ..pickle::DecodeLimits::default()
+        },
+    )
+    .ok()
+}
+
+pub(crate) fn suffix_ascii_string(value: Value) -> Option<String> {
+    match value {
+        Value::Str(value) if value.is_ascii() => Some(value),
+        Value::Bytes(value) if value.is_ascii() => String::from_utf8(value).ok(),
+        _ => None,
+    }
 }
 
 fn dict_value_to_map(value: Value) -> Option<SuffixHashMap> {
     match value {
         Value::Dict(pairs) => {
+            if pairs.len() > 4096 {
+                return None;
+            }
             let mut out = HashMap::new();
             for (k, v) in pairs {
-                let Value::Str(k) = k else { return None };
+                let k = suffix_ascii_string(k)?;
                 if !is_lower_hex(&k, 3) {
                     return None;
                 }
                 let value = match v {
-                    Value::Str(value) => Some(value),
                     Value::None => None,
-                    _ => return None,
+                    value => {
+                        let hash = suffix_ascii_string(value)?;
+                        if !is_lower_hex(&hash, 32) {
+                            return None;
+                        }
+                        Some(hash)
+                    }
                 };
                 if out.insert(k, value).is_some() {
                     return None;
@@ -306,6 +333,45 @@ struct ObjectSnapshot {
     identity: HashDirIdentity,
 }
 
+const MAX_HANDOFF_CENSUS_OBJECTS: usize = 100_000;
+const MAX_HANDOFF_SNAPSHOT_FILES: usize = 1024;
+const MAX_HANDOFF_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Keep deletion attached to the opened directory even if an administrator
+/// replaces a mount or pathname during a maintenance pass.
+struct PinnedDirectory {
+    file: std::fs::File,
+    #[cfg(not(target_os = "linux"))]
+    path: PathBuf,
+}
+
+impl PinnedDirectory {
+    fn open(path: &Path) -> Option<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file,
+            #[cfg(not(target_os = "linux"))]
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", self.file.as_raw_fd()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.clone()
+        }
+    }
+}
+
 /// Derive the same logical timestamp tuple that the SSYNC sender offers during
 /// missing-check. A meta-only or otherwise invalid directory has no offerable
 /// object state and must never become handoff-deletion authority.
@@ -321,6 +387,9 @@ fn snapshot_hash_dir(hash_dir: &Path) -> Option<HashDirIdentity> {
     let entries = std::fs::read_dir(hash_dir).ok()?;
     let mut files = Vec::new();
     for entry in entries {
+        if files.len() >= MAX_HANDOFF_SNAPSHOT_FILES {
+            return None;
+        }
         let entry = entry.ok()?;
         let metadata = entry.path().symlink_metadata().ok()?;
         if !metadata.file_type().is_file() {
@@ -359,6 +428,20 @@ fn snapshot_all_object_files(
     partition_path: &Path,
     policy_index: u32,
 ) -> Option<BTreeMap<String, PreObjectSnapshot>> {
+    snapshot_all_object_files_bounded(
+        partition_path,
+        policy_index,
+        MAX_HANDOFF_CENSUS_OBJECTS,
+        MAX_HANDOFF_SNAPSHOT_BYTES,
+    )
+}
+
+fn snapshot_all_object_files_bounded(
+    partition_path: &Path,
+    policy_index: u32,
+    max_objects: usize,
+    mut remaining_bytes: usize,
+) -> Option<BTreeMap<String, PreObjectSnapshot>> {
     let device_path = partition_path.parent().and_then(Path::parent)?;
     let lock_dir = device_path
         .join(get_tmp_dir(policy_index))
@@ -379,13 +462,10 @@ fn snapshot_all_object_files(
         if !metadata.file_type().is_dir() || !is_lower_hex(&name, 3) {
             return None;
         }
-        let _mutation_guard = swift_core::lockutil::lock_path(
-            &lock_dir,
-            HANDOFF_OBJECT_LOCK_TIMEOUT,
-            Some(&format!("obj-{name}")),
-        )
-        .ok()?;
         for hash_entry in std::fs::read_dir(partition_entry.path()).ok()? {
+            if snapshots.len() >= max_objects {
+                return None;
+            }
             let hash_entry = hash_entry.ok()?;
             let object_hash = hash_entry.file_name().to_str()?.to_string();
             let hash_metadata = hash_entry.path().symlink_metadata().ok()?;
@@ -395,17 +475,71 @@ fn snapshot_all_object_files(
             {
                 return None;
             }
+            let _mutation_guard = swift_core::lockutil::lock_path(
+                &lock_dir,
+                HANDOFF_OBJECT_LOCK_TIMEOUT,
+                Some(&format!("obj-{name}")),
+            )
+            .ok()?;
             let snapshot = PreObjectSnapshot {
                 suffix: name.clone(),
                 timestamps: current_object_timestamps(&hash_entry.path()),
                 identity: snapshot_hash_dir(&hash_entry.path())?,
             };
+            // Include allocation slack and map-node overhead. The largest
+            // temporary before this check is one bounded hash directory.
+            let file_bytes = snapshot
+                .identity
+                .files
+                .iter()
+                .try_fold(0usize, |sum, file| {
+                    sum.checked_add(2 * (std::mem::size_of::<FileIdentity>() + file.name.len()))
+                })?;
+            remaining_bytes = remaining_bytes.checked_sub(file_bytes.checked_add(512)?)?;
             if snapshots.insert(object_hash, snapshot).is_some() {
                 return None;
             }
         }
     }
     Some(snapshots)
+}
+
+/// Empty-partition proof does not materialize any object census. Unknown
+/// entries and I/O failures retain the handoff for a later pass.
+fn partition_has_no_objects(partition_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(partition_path) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let Ok(metadata) = entry.path().symlink_metadata() else {
+            return false;
+        };
+        if metadata.is_file()
+            && matches!(
+                name,
+                ".lock" | ".lock-replication" | "hashes.pkl" | "hashes.invalid"
+            )
+        {
+            continue;
+        }
+        if !metadata.is_dir() || !is_lower_hex(name, 3) {
+            return false;
+        }
+        let Ok(mut hashes) = std::fs::read_dir(entry.path()) else {
+            return false;
+        };
+        if hashes.next().is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Freeze only source generations that SSYNC successfully confirmed on every
@@ -481,6 +615,7 @@ fn purge_handoff_snapshot(
     partition_path: &Path,
     policy_index: u32,
     snapshots: &[ObjectSnapshot],
+    before_each_object: &mut dyn FnMut() -> bool,
 ) -> bool {
     let Some(device_path) = partition_path.parent().and_then(Path::parent) else {
         return false;
@@ -488,6 +623,10 @@ fn purge_handoff_snapshot(
     let lock_dir = device_path
         .join(get_tmp_dir(policy_index))
         .join("object-mutation-locks");
+    let Some(partition_pin) = PinnedDirectory::open(partition_path) else {
+        return false;
+    };
+    let pinned_partition_path = partition_pin.path();
     let mut complete = true;
     for snapshot in snapshots {
         let stripe = &snapshot.object_hash[snapshot.object_hash.len() - 3..];
@@ -500,8 +639,20 @@ fn purge_handoff_snapshot(
             complete = false;
             continue;
         };
-        let suffix_dir = partition_path.join(&snapshot.suffix);
-        let hash_dir = suffix_dir.join(&snapshot.object_hash);
+        if !before_each_object() {
+            return false;
+        }
+        let suffix_dir = pinned_partition_path.join(&snapshot.suffix);
+        let Some(suffix_pin) = PinnedDirectory::open(&suffix_dir) else {
+            complete = false;
+            continue;
+        };
+        let requested_hash_dir = suffix_pin.path().join(&snapshot.object_hash);
+        let Some(hash_pin) = PinnedDirectory::open(&requested_hash_dir) else {
+            complete = false;
+            continue;
+        };
+        let hash_dir = hash_pin.path();
         if current_object_timestamps(&hash_dir).as_ref() != Some(&snapshot.timestamps) {
             complete = false;
             continue;
@@ -524,7 +675,7 @@ fn purge_handoff_snapshot(
                 }
             }
         }
-        if let Err(error) = std::fs::remove_dir(&hash_dir) {
+        if let Err(error) = std::fs::remove_dir(&requested_hash_dir) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 object_removed = false;
             }
@@ -538,10 +689,7 @@ fn purge_handoff_snapshot(
             complete = false;
         }
     }
-    match snapshot_all_object_files(partition_path, policy_index) {
-        Some(remaining) if remaining.is_empty() => complete,
-        _ => false,
-    }
+    complete && before_each_object() && partition_has_no_objects(&pinned_partition_path)
 }
 
 /// Python `update_deleted` (revert): the local device is NOT a primary for this
@@ -640,7 +788,7 @@ pub fn revert_handoff_guarded(
             stats.failures += 1;
             return false;
         };
-        if purge_handoff_snapshot(partition_path, policy_index, &snapshot) {
+        if purge_handoff_snapshot(partition_path, policy_index, &snapshot, before_purge) {
             stats.reverts += 1;
             return true;
         }
@@ -992,6 +1140,53 @@ mod tests {
         let invalid = Value::Dict(vec![(Value::Str("def".to_string()), Value::None)]);
         let invalid_map = hashes_from_pickle(&pickle::dumps(&invalid).unwrap()).unwrap();
         assert_eq!(invalid_map.get("def"), Some(&None));
+    }
+
+    #[test]
+    fn suffix_hash_schema_rejects_malformed_or_duplicate_entries() {
+        let digest = Value::Str("a".repeat(32));
+        for invalid in [
+            Value::List(Vec::new()),
+            Value::Dict(vec![(Value::Str("ABC".into()), digest.clone())]),
+            Value::Dict(vec![(Value::Str("../".into()), digest.clone())]),
+            Value::Dict(vec![(Value::Str("abc".into()), Value::Str("hash".into()))]),
+            Value::Dict(vec![(Value::Str("abc".into()), Value::Int(42))]),
+            Value::Dict(vec![
+                (Value::Str("abc".into()), Value::None),
+                (Value::Bytes(b"abc".to_vec()), digest.clone()),
+            ]),
+        ] {
+            assert!(hashes_from_pickle(&pickle::dumps(&invalid).unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    fn suffix_hash_schema_accepts_dense_python2_byte_strings() {
+        let value = Value::Dict(
+            (0..4096)
+                .map(|suffix| {
+                    (
+                        Value::Bytes(format!("{suffix:03x}").into_bytes()),
+                        if suffix == 0 {
+                            Value::None
+                        } else {
+                            Value::Bytes(vec![b'a'; 32])
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let decoded = hashes_from_pickle(&pickle::dumps(&value).unwrap()).unwrap();
+        assert_eq!(decoded.len(), 4096);
+        assert_eq!(decoded.get("000"), Some(&None));
+        assert_eq!(decoded.get("fff"), Some(&Some("a".repeat(32))));
+    }
+
+    #[test]
+    fn suffix_hash_wire_requires_complete_single_pickle() {
+        let mut body = pickle::dumps(&Value::Dict(Vec::new())).unwrap();
+        body.extend_from_slice(b"unparsed-tail");
+        assert!(hashes_from_pickle(&body).is_none());
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -1635,6 +1830,87 @@ mod tests {
             b"replacement-at-the-same-timestamp",
             "logical timestamp equality cannot authorize deleting a replaced inode"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn handoff_census_enforces_object_and_allocation_limits() {
+        let root = tmpdir("handoff-census-bounds");
+        let part = root.join("sda1/objects/0");
+        for index in 1..=2 {
+            let hash_dir = part.join("abc").join(format!("{index:029x}abc"));
+            std::fs::create_dir_all(&hash_dir).unwrap();
+            std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        }
+        assert!(snapshot_all_object_files_bounded(&part, 0, 1, 1024 * 1024).is_none());
+        assert!(snapshot_all_object_files_bounded(&part, 0, 2, 511).is_none());
+        assert_eq!(
+            snapshot_all_object_files_bounded(&part, 0, 2, 1024 * 1024)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!partition_has_no_objects(&part));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ring_change_between_handoff_objects_revokes_remaining_deletes() {
+        let root = tmpdir("handoff-ring-change-between-objects");
+        let device = root.join("sdb9");
+        let part = device.join("objects/0");
+        let first = part.join("abc").join(format!("{:029x}abc", 1));
+        let second = part.join("abc").join(format!("{:029x}abc", 2));
+        for hash_dir in [&first, &second] {
+            std::fs::create_dir_all(hash_dir).unwrap();
+            std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        }
+        let syncer = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let mut guard_calls = 0;
+        let stats = run_once_guarded(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &FakeHashClient::default(),
+            &syncer,
+            &mut || {
+                guard_calls += 1;
+                if guard_calls <= 3 {
+                    ReplicationJobGuard::Continue
+                } else {
+                    ReplicationJobGuard::RingChanged
+                }
+            },
+        );
+        assert!(stats.aborted_ring_change);
+        assert_eq!(stats.reverts, 0);
+        assert!(!first.exists());
+        assert!(second.join("1700000000.00000.data").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pinned_handoff_directory_does_not_follow_replacement_path() {
+        let root = tmpdir("handoff-pin-replacement");
+        let path = root.join("hash");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("data"), b"old").unwrap();
+        let pin = PinnedDirectory::open(&path).unwrap();
+        std::fs::rename(&path, root.join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("data"), b"replacement").unwrap();
+        std::fs::remove_file(pin.path().join("data")).unwrap();
+        assert_eq!(std::fs::read(path.join("data")).unwrap(), b"replacement");
+        assert!(!root.join("original/data").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
