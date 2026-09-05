@@ -755,7 +755,7 @@ pub trait SyncDiskfileBuilder {
         object_hash: &str,
         datafile_metadata: &Metadata,
         target_frag_index: i64,
-    ) -> Result<(Metadata, Vec<u8>), String>;
+    ) -> Result<(Metadata, crate::reconstruction_spool::ArchiveBody), String>;
 }
 
 impl Sender<'_> {
@@ -1120,7 +1120,8 @@ impl Sender<'_> {
                     // must be rebuilt on the fly (reconstruct_fa); with no
                     // builder or a failed rebuild the object is skipped,
                     // like Python's DiskFileError from reconstruct_fa.
-                    let mut rebuilt: Option<(Metadata, Vec<u8>)> = None;
+                    let mut rebuilt: Option<(Metadata, crate::reconstruction_spool::ArchiveBody)> =
+                        None;
                     if let (true, Some(target)) = (want.data, self.sync_frag_target) {
                         let local_frag = df.get_datafile_metadata().ok().and_then(|meta| {
                             meta.iter().find_map(|(k, v)| match (k, v) {
@@ -1145,6 +1146,15 @@ impl Sender<'_> {
                             };
                             match builder.rebuild(object_hash, datafile_metadata, target) {
                                 Ok(built) => rebuilt = Some(built),
+                                Err(error) if error.contains("(retryable)") => {
+                                    // Resource admission is a failed attempt,
+                                    // not a successful-but-empty SYNC page.
+                                    // Abort without END/ack and keep sources
+                                    // available for the next reconstructor pass.
+                                    return Err(SsyncSenderError::new(format!(
+                                        "rebuild resource refusal: {error}"
+                                    )));
+                                }
                                 Err(_) => continue 'objects,
                             }
                         }
@@ -1274,7 +1284,7 @@ impl Sender<'_> {
         Ok(())
     }
 
-    /// `send_put` over an already-materialized (rebuilt) fragment archive
+    /// `send_put` over a rebuilt fragment archive held by an owned reader
     /// — the `RebuildingECDiskFileStream` path: the builder supplied the
     /// metadata (frag index swapped, ETag dropped so the receiver
     /// recomputes it) and the rebuilt bytes.
@@ -1283,7 +1293,7 @@ impl Sender<'_> {
         wire: &mut dyn SsyncWire,
         url_path: &str,
         metadata: &Metadata,
-        body: &[u8],
+        body: &crate::reconstruction_spool::ArchiveBody,
         durable: bool,
     ) -> Result<(), SsyncSenderError> {
         let mut headers: Vec<(String, String)> =
@@ -1304,8 +1314,16 @@ impl Sender<'_> {
             headers.push((key.clone(), value));
         }
         self.send_subrequest_head(wire, "PUT", url_path, &headers)?;
-        for chunk in body.chunks(swift_http::STREAM_CHUNK) {
-            wire.send(&chunk_frame(chunk))?;
+        let mut reader = body.reader();
+        let mut buffer = [0u8; swift_http::STREAM_CHUNK];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| SsyncSenderError::new(format!("rebuilt archive read: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            wire.send(&chunk_frame(&buffer[..read]))?;
         }
         Ok(())
     }

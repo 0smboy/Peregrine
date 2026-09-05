@@ -32,6 +32,7 @@ use std::pin::Pin;
 pub mod daemonutil;
 pub mod expirer;
 pub mod localdev;
+pub mod reconstruction_spool;
 /// The EC object reconstructor: ssync-driven SYNC/REVERT partition jobs
 /// (feature-independent) plus the fragment rebuild path, which links
 /// liberasurecode and is behind the `ec` feature.
@@ -497,12 +498,49 @@ async fn acquire_replication_session_lock(
     }
 }
 
+/// Keep parser input/event batches bounded even when an in-memory adapter
+/// supplies a large frame. Network waits remain on this async task.
+struct SsyncInput {
+    body: swift_http::IncomingBody,
+    frame: Vec<u8>,
+    offset: usize,
+}
+
+impl SsyncInput {
+    async fn next_events(
+        &mut self,
+        parser: &mut SsyncParser,
+    ) -> Result<Option<Vec<SsyncEvent>>, String> {
+        while self.offset == self.frame.len() {
+            self.frame = match self.body.next_chunk().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            self.offset = 0;
+        }
+        let end = self
+            .offset
+            .saturating_add(ssync::STREAM_CHUNK_BYTES)
+            .min(self.frame.len());
+        let events = parser
+            .push(&self.frame[self.offset..end])
+            .map_err(|e| e.to_string())?;
+        self.offset = end;
+        if self.offset == self.frame.len() {
+            self.frame = Vec::new();
+            self.offset = 0;
+        }
+        Ok(Some(events))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_ssync_session(
-    mut body: swift_http::IncomingBody,
+    body: swift_http::IncomingBody,
     tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     storage: StorageExecutor,
-    config: ObjectServerConfig,
+    server: ObjectServer,
     device: String,
     partition: String,
     policy_index: u32,
@@ -510,24 +548,32 @@ async fn drive_ssync_session(
     frag_index: Option<i64>,
     replication_lock: std::sync::Arc<swift_core::lockutil::PathLock>,
 ) {
+    let config = server.config.clone();
     // Python's first yield: a bare b'\r\n' so WSGI/Hyper flushes the 200
     // head before the sender writes `:MISSING_CHECK:` (ssync_receiver.py:294-296).
     let _ = tx.send(Ok(b"\r\n".to_vec())).await;
     let device_id = DeviceId::new(device.clone());
-    let mut parser = SsyncParser::new();
+    let mut input = SsyncInput {
+        body,
+        frame: Vec::new(),
+        offset: 0,
+    };
+    let max_object = MAX_FILE_SIZE as usize;
+    let max_wire = max_object
+        .saturating_add(ssync::MAX_HEADER_BYTES)
+        .saturating_mul(ssync::MAX_UPDATES)
+        .saturating_add(ssync::MAX_MISSING_OFFERS.saturating_mul(ssync::MAX_LINE_LENGTH));
+    let mut parser = SsyncParser::streaming(max_object, max_wire);
     let mut wanted: Vec<String> = Vec::new();
     let mut missing_done = false;
     while !missing_done {
-        let chunk = match body.next_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) | Err(_) => return,
-        };
-        let events = match parser.push(&chunk) {
-            Ok(e) => e,
+        let events = match input.next_events(&mut parser).await {
+            Ok(Some(events)) => events,
+            Ok(None) => return,
             Err(error) => {
                 let _ = tx
                     .send(Ok(
-                        format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
+                        format!(":ERROR: 0 {}\n", python_repr(&error)).into_bytes()
                     ))
                     .await;
                 return;
@@ -613,110 +659,220 @@ async fn drive_ssync_session(
     };
     let mut successes = 0usize;
     let mut failures = 0usize;
-    loop {
-        for event in events {
-            match event {
-                SsyncEvent::Update(update) => {
-                    let cfg = config.clone();
-                    let device = device.clone();
-                    let partition = partition.clone();
-                    let replication_lock = std::sync::Arc::clone(&replication_lock);
-                    let result = storage
-                        .run_finite(device_id.clone(), TrafficClass::Replication, move || {
-                            let _replication_lock = replication_lock;
-                            ObjectServer::new(cfg).apply_ssync_update(
-                                &device,
-                                &partition,
-                                policy_index,
-                                frag_index,
-                                update,
-                            )
-                        })
-                        .await;
-                    match result {
-                        Ok(response)
-                            if (200..300).contains(&response.status) || response.status == 404 =>
-                        {
-                            successes += 1;
+    let mut update_scope: Option<TaskScope> = None;
+    let mut update_tx: Option<tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>> = None;
+    let mut update_task = None;
+    async {
+        loop {
+            for event in events {
+                match event {
+                    SsyncEvent::UpdateStart(update) => {
+                        if update_task.is_some() {
+                            let _ = tx
+                                .send(Ok(b":ERROR: 0 'overlapping SSYNC updates'\n".to_vec()))
+                                .await;
+                            return;
                         }
-                        Ok(_) | Err(_) => failures += 1,
+                        let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
+                        let mut headers = update.headers;
+                        headers.set("X-Backend-Storage-Policy-Index", policy_index);
+                        headers.set("X-Backend-Replication", "True");
+                        if let Some(frag_index) = frag_index {
+                            headers.set("X-Backend-Ssync-Frag-Index", frag_index);
+                        }
+                        if !update.replication_headers.is_empty() {
+                            headers.set(
+                                "X-Backend-Replication-Headers",
+                                update.replication_headers.join(" "),
+                            );
+                        }
+                        let content_length = headers
+                            .get("Content-Length")
+                            .and_then(|value| value.parse().ok());
+                        let request = AsyncRequest {
+                            method: update.method,
+                            path: format!("/{device}/{partition}{}", unquote(&update.path)),
+                            query_string: String::new(),
+                            headers,
+                            body: swift_http::IncomingBody::from_channel(
+                                body_rx,
+                                content_length,
+                                None,
+                                max_object as u64,
+                            ),
+                        };
+                        let mut child_server = server.clone_execution_context();
+                        child_server.replication_session_lock =
+                            Some(std::sync::Arc::clone(&replication_lock));
+                        let scope = TaskScope::bounded(1);
+                        update_task = match scope
+                            .spawn(async move { child_server.put_streaming_async(request).await })
+                        {
+                            Ok(task) => Some(task),
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Ok(format!(
+                                        ":ERROR: 0 {}\n",
+                                        python_repr(&error.to_string())
+                                    )
+                                    .into_bytes()))
+                                    .await;
+                                return;
+                            }
+                        };
+                        update_scope = Some(scope);
+                        update_tx = Some(body_tx);
                     }
-                    if failures >= REPLICATION_FAILURE_THRESHOLD
-                        && (successes == 0
-                            || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
-                    {
-                        let message =
-                            format!("Too many {failures} failures to {successes} successes");
-                        let _ = tx
-                            .send(Ok(
-                                format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
-                            ))
+                    SsyncEvent::UpdateChunk(bytes) => {
+                        // An early HTTP rejection may close its receiver. Continue
+                        // draining the bounded wire body and count that response at
+                        // UpdateEnd; never retain the rest of a rejected object.
+                        if let Some(sender) = update_tx.as_ref() {
+                            if sender.send(Ok(bytes)).await.is_err() {
+                                update_tx = None;
+                            }
+                        }
+                    }
+                    SsyncEvent::UpdateEnd => {
+                        drop(update_tx.take());
+                        let Some(task) = update_task.take() else {
+                            let _ = tx
+                                .send(Ok(b":ERROR: 0 'missing SSYNC update task'\n".to_vec()))
+                                .await;
+                            return;
+                        };
+                        match task.join().await {
+                            Ok(response)
+                                if (200..300).contains(&response.status)
+                                    || response.status == 404 =>
+                            {
+                                successes += 1
+                            }
+                            _ => failures += 1,
+                        }
+                        if let Some(scope) = update_scope.take() {
+                            if scope.join().await.is_err() {
+                                failures += 1;
+                            }
+                        }
+                        if failures >= REPLICATION_FAILURE_THRESHOLD
+                            && (successes == 0
+                                || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
+                        {
+                            let message =
+                                format!("Too many {failures} failures to {successes} successes");
+                            let _ = tx
+                                .send(Ok(
+                                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                    SsyncEvent::Update(update) => {
+                        let child_server = server.clone_execution_context();
+                        let device = device.clone();
+                        let partition = partition.clone();
+                        let replication_lock = std::sync::Arc::clone(&replication_lock);
+                        let result = storage
+                            .run_finite(device_id.clone(), TrafficClass::Replication, move || {
+                                let _replication_lock = replication_lock;
+                                child_server.apply_ssync_update(
+                                    &device,
+                                    &partition,
+                                    policy_index,
+                                    frag_index,
+                                    update,
+                                )
+                            })
                             .await;
-                        return;
+                        match result {
+                            Ok(response)
+                                if (200..300).contains(&response.status)
+                                    || response.status == 404 =>
+                            {
+                                successes += 1;
+                            }
+                            Ok(_) | Err(_) => failures += 1,
+                        }
+                        if failures >= REPLICATION_FAILURE_THRESHOLD
+                            && (successes == 0
+                                || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
+                        {
+                            let message =
+                                format!("Too many {failures} failures to {successes} successes");
+                            let _ = tx
+                                .send(Ok(
+                                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                                ))
+                                .await;
+                            return;
+                        }
                     }
+                    SsyncEvent::UpdatesEnd => updates_done = true,
+                    _ => {}
                 }
-                SsyncEvent::UpdatesEnd => updates_done = true,
-                _ => {}
             }
+            if let Some(message) = parser.failure().map(|error| error.message().to_string()) {
+                let _ = tx
+                    .send(Ok(
+                        format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                    ))
+                    .await;
+                return;
+            }
+            if updates_done {
+                break;
+            }
+            events = match input.next_events(&mut parser).await {
+                Ok(Some(events)) => events,
+                Ok(None) => {
+                    let _ = tx
+                        .send(Ok(
+                            b":ERROR: 0 'Unexpected EOF before :UPDATES: END'\n".to_vec()
+                        ))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Ok(format!(
+                            ":ERROR: 0 {}\n",
+                            python_repr(&format!(
+                                "Request body failed before :UPDATES: END: {error}"
+                            ))
+                        )
+                        .into_bytes()))
+                        .await;
+                    return;
+                }
+            };
         }
-        if let Some(message) = parser.failure().map(|error| error.message().to_string()) {
+        if failures != 0 {
+            let body =
+                format!("ERROR: With :UPDATES: {failures} failures to {successes} successes");
             let _ = tx
                 .send(Ok(
-                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                    format!(":ERROR: 500 b{}\n", python_repr(&body)).into_bytes()
                 ))
                 .await;
             return;
         }
-        if updates_done {
-            break;
-        }
-        let chunk = match body.next_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                let _ = tx
-                    .send(Ok(
-                        b":ERROR: 0 'Unexpected EOF before :UPDATES: END'\n".to_vec()
-                    ))
-                    .await;
-                return;
-            }
-            Err(error) => {
-                let _ = tx
-                    .send(Ok(format!(
-                        ":ERROR: 0 {}\n",
-                        python_repr(&format!(
-                            "Request body failed before :UPDATES: END: {error}"
-                        ))
-                    )
-                    .into_bytes()))
-                    .await;
-                return;
-            }
-        };
-        events = match parser.push(&chunk) {
-            Ok(e) => e,
-            Err(error) => {
-                let _ = tx
-                    .send(Ok(
-                        format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
-                    ))
-                    .await;
-                return;
-            }
-        };
-    }
-    if failures != 0 {
-        let body = format!("ERROR: With :UPDATES: {failures} failures to {successes} successes");
         let _ = tx
-            .send(Ok(
-                format!(":ERROR: 500 b{}\n", python_repr(&body)).into_bytes()
-            ))
+            .send(Ok(b":UPDATES: START\r\n:UPDATES: END\r\n".to_vec()))
             .await;
-        return;
     }
-    let _ = tx
-        .send(Ok(b":UPDATES: START\r\n:UPDATES: END\r\n".to_vec()))
-        .await;
+    .await;
+    // EOF/error must close and join the partial PUT before releasing the
+    // session lease. A cancelled channel cannot leave an unobserved child
+    // holding the next session's replication lock.
+    drop(update_tx.take());
+    if let Some(task) = update_task.take() {
+        let _ = task.join().await;
+    }
+    if let Some(scope) = update_scope.take() {
+        let _ = scope.join().await;
+    }
 }
 
 /// How the object server applies the container-listing side channel after a
@@ -772,6 +928,9 @@ pub struct ObjectServer {
     /// (xattr/fsync/rename). Production is `None`. Tests use it to occupy
     /// the executor during finalize without a dummy `run_finite`.
     commit_stall: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Streaming SSYNC commit jobs keep the partition lease alive even if
+    /// the response future is cancelled during a protected durable commit.
+    replication_session_lock: Option<std::sync::Arc<swift_core::lockutil::PathLock>>,
 }
 
 struct PendingDurable {
@@ -1381,6 +1540,21 @@ fn backend_next_part_power(req: &Request) -> Option<u32> {
 }
 
 impl ObjectServer {
+    /// An internal request keeps the parent's operational settings and
+    /// execution domain. Constructing it with `new(config)` would silently
+    /// reset reserve, clock-health and commit hooks.
+    fn clone_execution_context(&self) -> Self {
+        ObjectServer {
+            config: self.config.clone(),
+            recon_cache_path: self.recon_cache_path.clone(),
+            fallocate_reserve: self.fallocate_reserve,
+            worm_clock: self.worm_clock.clone(),
+            storage: std::sync::OnceLock::from(self.storage().clone()),
+            commit_stall: self.commit_stall.clone(),
+            replication_session_lock: self.replication_session_lock.clone(),
+        }
+    }
+
     pub fn new(config: ObjectServerConfig) -> Self {
         ObjectServer {
             config,
@@ -1390,6 +1564,7 @@ impl ObjectServer {
             worm_clock: std::sync::Arc::new(ClockHealth::disabled()),
             storage: std::sync::OnceLock::new(),
             commit_stall: None,
+            replication_session_lock: None,
         }
     }
 
@@ -1575,6 +1750,7 @@ impl ObjectServer {
                         worm_clock,
                         storage: std::sync::OnceLock::new(),
                         commit_stall: None,
+                        replication_session_lock: None,
                     }
                     .delete_apply_tombstone(
                         &req_for_disk,
@@ -1644,6 +1820,7 @@ impl ObjectServer {
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
                     commit_stall: None,
+                    replication_session_lock: None,
                 }
                 .handle(req)
             })
@@ -1655,6 +1832,11 @@ impl ObjectServer {
     }
 
     async fn put_streaming_async(&self, mut areq: AsyncRequest) -> Response {
+        let traffic_class = if self.replication_session_lock.is_some() {
+            TrafficClass::Replication
+        } else {
+            TrafficClass::Foreground
+        };
         let req = Request {
             method: areq.method.clone(),
             path: areq.path.clone(),
@@ -1671,7 +1853,7 @@ impl ObjectServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
-        if let Err(resp) = self.check_drive(&drive) {
+        if let Err(resp) = self.check_drive_async(&drive, traffic_class).await {
             return resp;
         }
         let Some(content_type) = req.headers.get("Content-Type").map(str::to_string) else {
@@ -1719,7 +1901,18 @@ impl ObjectServer {
                 return plain_response(400, "If-None-Match only supports *");
             }
         }
-        if let Ok(free) = swift_core::fsutil::free_bytes(&self.config.devices.join(&drive)) {
+        let device_path = self.config.devices.join(&drive);
+        let free = match self
+            .storage()
+            .run_finite(DeviceId::new(drive.clone()), traffic_class, move || {
+                swift_core::fsutil::free_bytes(&device_path)
+            })
+            .await
+        {
+            Ok(free) => free,
+            Err(error) => return plain_response(500, &error.to_string()),
+        };
+        if let Ok(free) = free {
             if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
             {
                 return swob_response(507);
@@ -1746,7 +1939,7 @@ impl ObjectServer {
         let ts_for_pre = req_timestamp.clone();
         let resolved_delete_at = match self
             .storage()
-            .run_finite(device.clone(), TrafficClass::Foreground, move || {
+            .run_finite(device.clone(), traffic_class, move || {
                 let (exists, orig_ts, orig_meta) = open_put_original(pre_df, ssync_frag_index)?;
                 let pre_req = Request {
                     method: "PUT".into(),
@@ -1783,9 +1976,7 @@ impl ObjectServer {
         };
         let mut writer = match self
             .storage()
-            .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                df.create(".data")
-            })
+            .run_finite(device.clone(), traffic_class, move || df.create(".data"))
             .await
         {
             Ok(Ok(w)) => w,
@@ -1859,7 +2050,7 @@ impl ObjectServer {
                 };
                 writer = match self
                     .storage()
-                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                    .run_finite(device.clone(), traffic_class, move || {
                         writer.write(&chunk)?;
                         Ok::<_, DiskFileError>(writer)
                     })
@@ -1973,9 +2164,11 @@ impl ObjectServer {
                 .get("X-Backend-Ssync-Frag-Index")
                 .and_then(|raw| raw.trim().parse().ok());
             let clock_ok = self.worm_clock.clock_ok();
+            let replication_session_lock = self.replication_session_lock.clone();
             writer = match self
                 .storage()
-                .run_finite(device.clone(), TrafficClass::Foreground, move || {
+                .run_finite(device.clone(), traffic_class, move || {
+                    let _replication_session_lock = replication_session_lock;
                     let _guard = acquire_checked_put_guard(
                         pre_df,
                         &pre_req,
@@ -2023,10 +2216,12 @@ impl ObjectServer {
                     .get("X-Backend-Ssync-Frag-Index")
                     .and_then(|raw| raw.trim().parse().ok());
                 let stall = self.commit_stall.clone();
+                let replication_session_lock = self.replication_session_lock.clone();
                 let exec = self.storage().clone();
                 let commit_device = device.clone();
                 let commit = DurabilityBarrier::run_shielded(async move {
-                    exec.run_finite(commit_device, TrafficClass::Foreground, move || {
+                    exec.run_finite(commit_device, traffic_class, move || {
+                        let _replication_session_lock = replication_session_lock;
                         let _guard = acquire_ec_commit_guard(
                             commit_df,
                             &commit_pre_timestamp,
@@ -2103,6 +2298,7 @@ impl ObjectServer {
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
                     commit_stall: None,
+                    replication_session_lock: None,
                 };
                 tmp.get(
                     &Request {
@@ -2211,7 +2407,10 @@ impl ObjectServer {
             Ok(p) => p,
             Err(resp) => return resp,
         };
-        if let Err(resp) = self.check_drive(&device) {
+        if let Err(resp) = self
+            .check_drive_async(&device, TrafficClass::Replication)
+            .await
+        {
             return resp;
         }
         let frag_index: Option<i64> = match req.headers.get("X-Backend-Ssync-Frag-Index") {
@@ -2252,13 +2451,12 @@ impl ObjectServer {
             Ok(guard) => guard,
             Err(response) => return response,
         };
-        let config = self.config.clone();
         let body = areq.body;
         let _ = scope.spawn(drive_ssync_session(
             body,
             tx,
             storage,
-            config,
+            self.clone_execution_context(),
             device,
             partition,
             policy_index,
@@ -2337,12 +2535,19 @@ impl ObjectServer {
             .and_then(|raw| raw.trim().parse().ok());
         let clock_ok = self.worm_clock.clock_ok();
         let stall = self.commit_stall.clone();
+        let replication_session_lock = self.replication_session_lock.clone();
+        let traffic_class = if replication_session_lock.is_some() {
+            TrafficClass::Replication
+        } else {
+            TrafficClass::Foreground
+        };
         let exec = self.storage().clone();
         let device = DeviceId::new(drive);
         // Barrier lives on a non-cancelled shield task (L7). Dropping this
         // HTTP future does not abort commit or panic-drop the guard.
         let commit = DurabilityBarrier::run_shielded(async move {
-            exec.run_finite(device, TrafficClass::Foreground, move || {
+            exec.run_finite(device, traffic_class, move || {
+                let _replication_session_lock = replication_session_lock;
                 let _guard = acquire_checked_put_guard(
                     pre_df,
                     &pre_req,
@@ -2463,6 +2668,24 @@ impl ObjectServer {
         let mut resp = Response::new(201);
         resp.headers.set("ETag", format!("\"{etag}\""));
         resp
+    }
+
+    async fn check_drive_async(
+        &self,
+        drive: &str,
+        traffic_class: TrafficClass,
+    ) -> Result<(), Response> {
+        let devices = self.config.devices.clone();
+        let mount_check = self.config.mount_check;
+        let drive = drive.to_string();
+        self.storage()
+            .run_finite(DeviceId::new(drive.clone()), traffic_class, move || {
+                swift_core::constraints::check_drive(&devices, &drive, mount_check)
+                    .map(|_| ())
+                    .map_err(|_| swob_response(507))
+            })
+            .await
+            .map_err(|error| plain_response(500, &error.to_string()))?
     }
 
     fn check_drive(&self, drive: &str) -> Result<(), Response> {
@@ -5988,7 +6211,6 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
-        let config = server.config.clone();
         let storage = server.storage().clone();
         let body = b":MISSING_CHECK: START\r\n\
                      :MISSING_CHECK: END\r\n\
@@ -6011,7 +6233,7 @@ mod fallocate_reserve_tests {
             swift_http::IncomingBody::from_bytes(body, u64::MAX),
             tx,
             storage,
-            config,
+            server.clone_execution_context(),
             "sda1".to_string(),
             "0".to_string(),
             0,
@@ -6072,7 +6294,7 @@ mod fallocate_reserve_tests {
                 );
                 drive_ssync_session(
                     swift_http::IncomingBody::from_channel(body_rx, None, None, u64::MAX),
-                    tx, server.storage().clone(), server.config.clone(),
+                    tx, server.storage().clone(), server.clone_execution_context(),
                     "sda1".into(), "0".into(), 0, PolicyKind::Replication, None,
                     replication_lock,
                 ).await;
@@ -6086,6 +6308,151 @@ mod fallocate_reserve_tests {
                 assert_eq!(server.handle(get_named("incomplete")).status, 404);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ssync_preserves_runtime_settings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-settings-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        for (name, reserve, expected_commit) in [
+            ("denied", FallocateReserve::Bytes(i64::MAX), 0),
+            ("allowed", FallocateReserve::Bytes(1), 1),
+        ] {
+            let commits = std::sync::Arc::new(AtomicUsize::new(0));
+            let server = tiny_server(&dir, reserve).with_commit_stall({
+                let commits = commits.clone();
+                std::sync::Arc::new(move || {
+                    commits.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+            let cloned = server.clone_execution_context();
+            assert!(std::sync::Arc::ptr_eq(
+                &server.worm_clock,
+                &cloned.worm_clock
+            ));
+            let wire = format!(
+                ":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n\
+                 PUT /AUTH_test/c/{name}\r\nContent-Length: 1\r\n\
+                 Content-Type: text/plain\r\nX-Timestamp: 1700000000.00000\r\n\r\nx:UPDATES: END\r\n"
+            );
+            let response = server
+                .handle_async(AsyncRequest {
+                    method: "SSYNC".into(),
+                    path: "/sda1/0".into(),
+                    query_string: String::new(),
+                    headers: HeaderKeyDict::new(),
+                    body: swift_http::IncomingBody::from_bytes(wire.into_bytes(), u64::MAX),
+                })
+                .await;
+            assert_eq!(response.status, 200);
+            let bytes = response.body.collect_async().await.unwrap();
+            let output = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                output.contains(":ERROR:"),
+                expected_commit == 0,
+                "{name}: {output}"
+            );
+            assert_eq!(commits.load(Ordering::SeqCst), expected_commit, "{name}");
+            assert_eq!(
+                server.handle(get_named(name)).status,
+                if expected_commit == 0 { 404 } else { 200 }
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_ssync_streams_large_put_and_next_update() {
+        use md5::{Digest, Md5};
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-large-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let total = 65 * 1024 * 1024 + 17;
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
+        let producer_scope = TaskScope::bounded(1);
+        let producer = producer_scope.spawn(async move {
+            body_tx.send(Ok(format!(
+                ":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n\
+                 PUT /AUTH_test/c/large-ssync\r\nContent-Length: {total}\r\n\
+                 Content-Type: application/octet-stream\r\nX-Timestamp: 1700000000.00000\r\n\r\n"
+            ).into_bytes())).await.unwrap();
+            let mut hash = Md5::new();
+            let mut sent = 0;
+            while sent < total {
+                let size = ssync::STREAM_CHUNK_BYTES.min(total - sent);
+                let chunk = vec![((sent / ssync::STREAM_CHUNK_BYTES) % 251) as u8; size];
+                hash.update(&chunk);
+                body_tx.send(Ok(chunk)).await.unwrap();
+                sent += size;
+            }
+            body_tx.send(Ok(b"PUT /AUTH_test/c/empty-ssync\r\nContent-Length: 0\r\nContent-Type: text/plain\r\nX-Timestamp: 1700000000.00000\r\n\r\n:UPDATES: END\r\n".to_vec())).await.unwrap();
+            format!("{:x}", hash.finalize())
+        }).unwrap();
+        let before = server.storage().stats().blocking.started_total;
+        let response = server
+            .handle_async(AsyncRequest {
+                method: "SSYNC".into(),
+                path: "/sda1/0".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_channel(body_rx, None, None, u64::MAX),
+            })
+            .await;
+        assert_eq!(response.status, 200);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            response.body.collect_async(),
+        )
+        .await
+        .expect("streaming SSYNC must finish")
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains(":UPDATES: END") && !output.contains(":ERROR:"),
+            "{output}"
+        );
+        let expected_etag = producer.join().await.unwrap();
+        producer_scope.join().await.unwrap();
+        assert!(
+            server.storage().stats().blocking.started_total - before
+                >= (total / ssync::STREAM_CHUNK_BYTES) as u64
+        );
+        let got = server.handle(get_named("large-ssync"));
+        assert_eq!(got.status, 200);
+        let quoted_etag = format!("\"{expected_etag}\"");
+        assert_eq!(got.headers.get("Etag"), Some(quoted_etag.as_str()));
+        let (mut reader, length) = got.body.into_reader();
+        assert_eq!(length, Some(total as u64));
+        let mut buffer = vec![0; ssync::STREAM_CHUNK_BYTES];
+        let mut received = 0;
+        loop {
+            let n = reader.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            for (i, byte) in buffer[..n].iter().enumerate() {
+                assert_eq!(
+                    *byte,
+                    (((received + i) / ssync::STREAM_CHUNK_BYTES) % 251) as u8
+                );
+            }
+            received += n;
+        }
+        assert_eq!(received, total);
+        drop(reader);
+        assert_eq!(server.handle(get_named("empty-ssync")).status, 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

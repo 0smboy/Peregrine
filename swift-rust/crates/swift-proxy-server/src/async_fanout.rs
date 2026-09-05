@@ -2325,6 +2325,7 @@ impl ProxyApp {
                     fan.headers.set("X-Container-Object-Count", count);
                     fan.headers.set("X-Container-Bytes-Used", bytes);
                 }
+                super::finalize_container_listing_headers(&req, &mut fan);
                 return fan;
             }
         }
@@ -2355,6 +2356,7 @@ impl ProxyApp {
             }
             stamp_container_last_modified(&mut resp);
         }
+        super::finalize_container_listing_headers(&req, &mut resp);
         resp
     }
 
@@ -4917,6 +4919,144 @@ mod tests {
         let listing: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(listing, serde_json::json!([]));
         h.abort();
+    }
+
+    async fn spawn_record_header_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut head = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while find_header_end(&head).is_none() {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buffer[..count]);
+                    assert!(head.len() <= 64 * 1024);
+                }
+                let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+                let is_head = head.starts_with("head ");
+                let record_type = if head
+                    .lines()
+                    .any(|line| line == "x-backend-record-type: shard")
+                {
+                    "shard"
+                } else {
+                    "object"
+                };
+                let body = if is_head { "" } else { "[]" };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Backend-Sharding-State: unsharded\r\nX-Container-Object-Count: 0\r\nX-Backend-Record-Type: {record_type}\r\nX-Backend-Record-Shard-Format: namespace\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn container_get_async_record_headers_match_python_direct_backend_contract() {
+        let (port, handle) = spawn_record_header_backend().await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        for record_type in [
+            None,
+            Some("auto"),
+            Some("banana"),
+            Some("object"),
+            Some("OBJECT"),
+            Some("shard"),
+            Some("SHARD"),
+        ] {
+            let mut headers = HeaderKeyDict::new();
+            if let Some(kind) = record_type {
+                headers.set("X-Backend-Record-Type", kind);
+            }
+            let req = swift_http::Request {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: "format=json".into(),
+                headers,
+                body: Body::empty(),
+            };
+            let resp = app.container_get_head_async(req, "AUTH_test", "c").await;
+            assert_eq!(resp.status, 200, "record_type={record_type:?}");
+            let explicit = record_type.is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("object") || kind.eq_ignore_ascii_case("shard")
+            });
+            let expected = record_type
+                .filter(|_| explicit)
+                .map(str::to_ascii_lowercase);
+            assert_eq!(
+                resp.headers.get("X-Backend-Record-Type"),
+                expected.as_deref(),
+                "record_type={record_type:?}"
+            );
+            assert_eq!(
+                resp.headers.get("X-Backend-Record-Shard-Format"),
+                explicit.then_some("namespace"),
+                "record_type={record_type:?}"
+            );
+            assert_eq!(
+                resp.headers.get("X-Backend-Sharding-State"),
+                Some("unsharded")
+            );
+            assert_eq!(resp.body.collect_async().await.unwrap().as_slice(), b"[]");
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn container_get_async_record_headers_are_removed_after_shard_fanout() {
+        let (port, handle) = spawn_sharded_listing_backend().await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        for record_type in [None, Some("auto"), Some("banana")] {
+            let mut headers = HeaderKeyDict::new();
+            if let Some(kind) = record_type {
+                headers.set("X-Backend-Record-Type", kind);
+            }
+            let req = swift_http::Request {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: "format=json".into(),
+                headers,
+                body: Body::empty(),
+            };
+            let resp = app.container_get_head_async(req, "AUTH_test", "c").await;
+            assert_eq!(resp.status, 200, "record_type={record_type:?}");
+            assert!(!resp.headers.contains_key("X-Backend-Record-Type"));
+            assert!(!resp.headers.contains_key("X-Backend-Record-Shard-Format"));
+            let body = resp.body.collect_async().await.unwrap();
+            let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                listing,
+                serde_json::json!([{"name": "obj-a"}, {"name": "obj-b"}])
+            );
+        }
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

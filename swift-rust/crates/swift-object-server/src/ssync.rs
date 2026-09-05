@@ -32,6 +32,8 @@ pub const MAX_HEADERS: usize = 128;
 pub const MAX_SUBREQUEST_BODY: usize = 64 * 1024 * 1024;
 pub const MAX_MISSING_OFFERS: usize = 100_000;
 pub const MAX_UPDATES: usize = 10_000;
+pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_STREAM_BUFFER_BYTES: usize = 2 * MAX_HEADER_BYTES + STREAM_CHUNK_BYTES;
 
 const MISSING_START: &[u8] = b":MISSING_CHECK: START";
 const MISSING_END: &[u8] = b":MISSING_CHECK: END";
@@ -119,6 +121,11 @@ pub enum SsyncEvent {
     Missing(MissingOffer),
     MissingEnd,
     Update(SsyncSubrequest),
+    /// Streaming PUT metadata, followed by bounded chunks and UpdateEnd.
+    /// Its body is empty; only the legacy parser emits a materialized Update.
+    UpdateStart(SsyncSubrequest),
+    UpdateChunk(Vec<u8>),
+    UpdateEnd,
     UpdatesEnd,
 }
 
@@ -166,6 +173,7 @@ enum ParserState {
     UpdateLine,
     UpdateHeaders(PendingUpdate),
     UpdateBody(PendingUpdate, usize),
+    StreamingBody(usize),
     Done,
     Transition,
     Failed,
@@ -185,6 +193,9 @@ pub struct SsyncParser {
     missing_offers: usize,
     updates: usize,
     failure: Option<SsyncError>,
+    stream_puts: bool,
+    max_subrequest_body: usize,
+    max_session_bytes: usize,
 }
 
 impl Default for SsyncParser {
@@ -203,6 +214,21 @@ impl SsyncParser {
             missing_offers: 0,
             updates: 0,
             failure: None,
+            stream_puts: false,
+            max_subrequest_body: MAX_SUBREQUEST_BODY,
+            max_session_bytes: MAX_SESSION_BYTES,
+        }
+    }
+
+    /// Async receiver mode: no complete PUT body is retained. Callers feed
+    /// at most STREAM_CHUNK_BYTES per push and consume events with backpressure.
+    /// Session wire and individual object sizes remain independently bounded.
+    pub fn streaming(max_subrequest_body: usize, max_session_bytes: usize) -> Self {
+        Self {
+            stream_puts: true,
+            max_subrequest_body,
+            max_session_bytes,
+            ..Self::new()
         }
     }
 
@@ -212,8 +238,14 @@ impl SsyncParser {
             Some(total_bytes) => total_bytes,
             None => return self.record_error(SsyncError::new("SSYNC session too large")),
         };
-        if self.total_bytes > MAX_SESSION_BYTES {
+        if self.total_bytes > self.max_session_bytes {
             return self.record_error(SsyncError::new("SSYNC session too large"));
+        }
+        if self.stream_puts
+            && (bytes.len() > STREAM_CHUNK_BYTES
+                || self.available().saturating_add(bytes.len()) > MAX_STREAM_BUFFER_BYTES)
+        {
+            return self.record_error(SsyncError::new("SSYNC streaming input buffer too large"));
         }
         self.buffer.extend_from_slice(bytes);
         self.process()
@@ -243,6 +275,7 @@ impl SsyncParser {
                 "updates ended early"
             }
             ParserState::UpdateBody(_, _) => "subrequest body truncated",
+            ParserState::StreamingBody(_) => "subrequest body truncated",
             ParserState::Done => "trailing data after updates end",
             ParserState::Transition => "invalid parser state",
             ParserState::Failed => return Err(self.failure.clone().unwrap()),
@@ -370,8 +403,18 @@ impl SsyncParser {
                         break;
                     };
                     if line.is_empty() {
-                        let content_length = validate_content_length(&pending)?;
-                        if content_length == 0 {
+                        let content_length =
+                            validate_content_length(&pending, self.max_subrequest_body)?;
+                        if self.stream_puts && pending.method == "PUT" {
+                            events
+                                .push(SsyncEvent::UpdateStart(finish_update(pending, Vec::new())));
+                            if content_length == 0 {
+                                events.push(SsyncEvent::UpdateEnd);
+                                self.state = ParserState::UpdateLine;
+                            } else {
+                                self.state = ParserState::StreamingBody(content_length);
+                            }
+                        } else if content_length == 0 {
                             events.push(SsyncEvent::Update(finish_update(pending, Vec::new())));
                             self.state = ParserState::UpdateLine;
                         } else {
@@ -406,6 +449,20 @@ impl SsyncParser {
                     let body = self.take_bytes(content_length);
                     events.push(SsyncEvent::Update(finish_update(pending, body)));
                     self.state = ParserState::UpdateLine;
+                }
+                ParserState::StreamingBody(remaining) => {
+                    let available = self.available().min(remaining).min(STREAM_CHUNK_BYTES);
+                    if available == 0 {
+                        self.state = ParserState::StreamingBody(remaining);
+                        break;
+                    }
+                    events.push(SsyncEvent::UpdateChunk(self.take_bytes(available)));
+                    if available == remaining {
+                        events.push(SsyncEvent::UpdateEnd);
+                        self.state = ParserState::UpdateLine;
+                    } else {
+                        self.state = ParserState::StreamingBody(remaining - available);
+                    }
                 }
                 ParserState::Done => {
                     self.state = ParserState::Done;
@@ -481,7 +538,7 @@ fn finish_update(pending: PendingUpdate, body: Vec<u8>) -> SsyncSubrequest {
     }
 }
 
-fn validate_content_length(pending: &PendingUpdate) -> Result<usize, SsyncError> {
+fn validate_content_length(pending: &PendingUpdate, max_body: usize) -> Result<usize, SsyncError> {
     let raw = pending.headers.get("Content-Length");
     let content_length = match raw {
         None if pending.method == "PUT" => {
@@ -490,7 +547,7 @@ fn validate_content_length(pending: &PendingUpdate) -> Result<usize, SsyncError>
         None => 0,
         Some(value) => parse_content_length(value)?,
     };
-    if content_length > MAX_SUBREQUEST_BODY {
+    if content_length > max_body {
         return Err(SsyncError::new("subrequest body too large"));
     }
     if pending.method != "PUT" && content_length != 0 {
@@ -738,4 +795,85 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
         bytes = &bytes[..bytes.len() - 1];
     }
     bytes
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn begin(length: usize, max_body: usize, max_session: usize) -> SsyncParser {
+        let mut parser = SsyncParser::streaming(max_body, max_session);
+        let events = parser
+            .push(b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n")
+            .unwrap();
+        assert_eq!(events, vec![SsyncEvent::MissingEnd]);
+        assert!(parser.start_updates().unwrap().is_empty());
+        let head = format!(":UPDATES: START\r\nPUT /a/c/o\r\nContent-Length: {length}\r\n\r\n");
+        let events = parser.push(head.as_bytes()).unwrap();
+        assert!(matches!(&events[0], SsyncEvent::UpdateStart(update) if update.body.is_empty()));
+        parser
+    }
+
+    #[test]
+    fn streaming_body_exceeds_legacy_limits_with_constant_buffer() {
+        let length = MAX_SESSION_BYTES + 17;
+        let mut parser = begin(length, length, length + 1024);
+        let chunk = vec![b'x'; STREAM_CHUNK_BYTES];
+        let mut sent = 0;
+        let mut received = 0;
+        let mut ended = 0;
+        while sent < length {
+            let take = chunk.len().min(length - sent);
+            for event in parser.push(&chunk[..take]).unwrap() {
+                match event {
+                    SsyncEvent::UpdateChunk(bytes) => {
+                        assert!(bytes.len() <= STREAM_CHUNK_BYTES);
+                        assert!(bytes.iter().all(|b| *b == b'x'));
+                        received += bytes.len();
+                    }
+                    SsyncEvent::UpdateEnd => ended += 1,
+                    _ => panic!("streaming body emitted a materialized update"),
+                }
+            }
+            sent += take;
+            assert!(parser.buffer.capacity() <= MAX_STREAM_BUFFER_BYTES);
+        }
+        assert_eq!(received, length);
+        assert_eq!(ended, 1);
+        assert_eq!(
+            parser.push(b":UPDATES: END\r\n").unwrap(),
+            vec![SsyncEvent::UpdatesEnd]
+        );
+        parser.finish().unwrap();
+    }
+
+    #[test]
+    fn streaming_truncation_and_input_batch_limits_are_errors() {
+        let mut parser = begin(10, 10, 1024);
+        assert_eq!(
+            parser.push(b"abc").unwrap(),
+            vec![SsyncEvent::UpdateChunk(b"abc".to_vec())]
+        );
+        assert!(parser.finish().unwrap_err().message().contains("truncated"));
+        let mut parser = SsyncParser::streaming(10, 10_000_000);
+        assert!(parser.push(&vec![0; STREAM_CHUNK_BYTES + 1]).is_err());
+        assert_eq!(
+            parser.buffer.capacity(),
+            0,
+            "reject oversized input before copying it"
+        );
+    }
+
+    #[test]
+    fn streaming_size_and_session_budgets_still_apply() {
+        let mut parser = SsyncParser::streaming(9, 1024);
+        parser
+            .push(b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n")
+            .unwrap();
+        parser.start_updates().unwrap();
+        let _ = parser.push(b":UPDATES: START\r\nPUT /a/c/o\r\nContent-Length: 10\r\n\r\n");
+        assert!(parser.failure().is_some());
+        let mut parser = begin(10, 10, 140);
+        assert!(parser.push(&[0; 100]).is_err());
+    }
 }

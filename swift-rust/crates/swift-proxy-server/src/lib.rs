@@ -3757,7 +3757,10 @@ impl ProxyApp {
                     .get("X-Backend-Record-Type")
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if record_type != "shard" && !req.query_string.contains("states=") {
+                if record_type != "object"
+                    && record_type != "shard"
+                    && !req.query_string.contains("states=")
+                {
                     if let Some(mut fan) =
                         self.maybe_sharded_container_listing(req, account, container)
                     {
@@ -3780,6 +3783,7 @@ impl ProxyApp {
                             fan.headers.set("X-Container-Object-Count", count);
                             fan.headers.set("X-Container-Bytes-Used", bytes);
                         }
+                        finalize_container_listing_headers(req, &mut fan);
                         return fan;
                     }
                 }
@@ -3815,6 +3819,7 @@ impl ProxyApp {
                         self.patch_sharded_head_counts(req, account, container, &mut resp);
                     }
                 }
+                finalize_container_listing_headers(req, &mut resp);
                 resp
             }
             "PUT" | "POST" | "DELETE" => {
@@ -6441,6 +6446,24 @@ pub(crate) fn constrain_listing_limit(req: &Request) -> Result<usize, Response> 
     }
 }
 
+/// Python container.GET owns this response contract, not InternalClient.
+/// Auto/default (including unknown) GET record types return an object listing
+/// without backend record-type/format headers. Explicit object/shard requests
+/// are internal direct-backend operations and must preserve their headers.
+/// HEAD is not container.GET and must not inherit its response filtering.
+pub(crate) fn finalize_container_listing_headers(req: &Request, resp: &mut Response) {
+    let explicit_record_type = req
+        .headers
+        .get("X-Backend-Record-Type")
+        .is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("object") || kind.eq_ignore_ascii_case("shard")
+        });
+    if req.method == "GET" && !explicit_record_type {
+        resp.headers.remove("X-Backend-Record-Type");
+        resp.headers.remove("X-Backend-Record-Shard-Format");
+    }
+}
+
 fn finish_account_resp(swift_owner: bool, mut resp: Response) -> Response {
     expose_account_acl_header(&mut resp);
     strip_owner_headers(&mut resp, swift_owner);
@@ -8902,6 +8925,58 @@ mod stale_read_and_post_tests {
         // and a non-404 final pick is never rewritten
         let resp = app.best_response_with_quorum(&combined, 2);
         assert_eq!(post_existence_proof_guard(resp, 1).status, 202);
+    }
+
+    #[test]
+    fn container_listing_record_headers_follow_python_get_contract() {
+        for method in ["GET", "HEAD", "POST"] {
+            for record_type in [
+                None,
+                Some(""),
+                Some("auto"),
+                Some("AuTo"),
+                Some("banana"),
+                Some("object"),
+                Some("OBJECT"),
+                Some("shard"),
+                Some("SHARD"),
+            ] {
+                let mut req = Request {
+                    method: method.into(),
+                    path: "/v1/AUTH_test/c".into(),
+                    query_string: "format=json".into(),
+                    headers: HeaderKeyDict::new(),
+                    body: swift_http::Body::empty(),
+                };
+                if let Some(kind) = record_type {
+                    req.headers.set("X-Backend-Record-Type", kind);
+                }
+                let mut resp = Response::with_body(200, b"[]".to_vec());
+                resp.headers.set("X-Backend-Record-Type", "shard");
+                resp.headers
+                    .set("X-Backend-Record-Shard-Format", "namespace");
+                resp.headers.set("X-Backend-Sharding-State", "sharded");
+                let preserve = method != "GET"
+                    || record_type.is_some_and(|kind| {
+                        kind.eq_ignore_ascii_case("object") || kind.eq_ignore_ascii_case("shard")
+                    });
+                finalize_container_listing_headers(&req, &mut resp);
+                assert_eq!(
+                    resp.headers.get("X-Backend-Record-Type").as_deref(),
+                    preserve.then_some("shard"),
+                    "method={method} record_type={record_type:?}"
+                );
+                assert_eq!(
+                    resp.headers.get("X-Backend-Record-Shard-Format").as_deref(),
+                    preserve.then_some("namespace"),
+                    "method={method} record_type={record_type:?}"
+                );
+                assert_eq!(
+                    resp.headers.get("X-Backend-Sharding-State").as_deref(),
+                    Some("sharded")
+                );
+            }
+        }
     }
 
     #[test]

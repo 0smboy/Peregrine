@@ -29,6 +29,7 @@ use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::parse_storage_policies;
 use swift_diskfile::{get_data_dir, CleanupConfig, DiskFileConfig, PolicyKind};
 use swift_object_server::daemonutil;
+use swift_object_server::reconstruction_spool::SpoolBudget;
 use swift_object_server::reconstructor::{
     build_part_jobs, process_part_job, EcScheme, EcSsyncStats, HttpSuffixHashFetcher,
     TcpSsyncPusher,
@@ -159,6 +160,75 @@ fn main() {
         return;
     }
 
+    #[cfg(feature = "ec")]
+    let spool = {
+        // One sweep is sequential, so size the host-shared default for the
+        // largest legal object/policy, all candidate peers, and one output.
+        // Operators may set a smaller explicit budget; admission then fails
+        // retryably without changing max_file_size or discarding source data.
+        let recommended = ec_policies
+            .iter()
+            .try_fold(0u64, |largest, policy| {
+                let archive = swift_object_server::reconstructor::fragment_archive_size_bound(
+                    policy.scheme,
+                    max_original_size,
+                )? as u64;
+                let replicas = policy.ring.replica_count().ceil();
+                if !replicas.is_finite() || replicas < 1.0 || replicas > u32::MAX as f64 {
+                    return None;
+                }
+                let bytes = archive.checked_mul((replicas as u64).checked_add(1)?)?;
+                Some(largest.max(bytes))
+            })
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                logger.error(
+                    "could not derive reconstruction spool budget from max_file_size and EC rings",
+                );
+                std::process::exit(1);
+            });
+        let configured = get(
+            "object-reconstructor",
+            "reconstruction_spool_max_bytes",
+            &recommended.to_string(),
+        )
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            logger.error("reconstruction_spool_max_bytes must be a positive byte count");
+            std::process::exit(1);
+        });
+        let min_free = get(
+            "object-reconstructor",
+            "reconstruction_spool_min_free_bytes",
+            "67108864",
+        )
+        .parse::<u64>()
+        .unwrap_or_else(|_| {
+            logger.error("invalid reconstruction_spool_min_free_bytes");
+            std::process::exit(1);
+        });
+        let directory = get(
+            "object-reconstructor",
+            "reconstruction_spool_directory",
+            "/var/tmp/peregrine-reconstruction-spool",
+        );
+        let budget = SpoolBudget::open(Path::new(&directory), configured, min_free).unwrap_or_else(
+            |error| {
+                logger.error(&format!("reconstruction spool configuration: {error}"));
+                std::process::exit(1);
+            },
+        );
+        if configured < recommended {
+            logger.warning(&format!("reconstruction spool budget {configured} is below largest-object requirement {recommended}; oversized concurrent reservations will be retried"));
+        }
+        logger.info(&format!("reconstruction spool: directory={directory} host_budget={configured} recommended={recommended} min_free={min_free}"));
+        Some(budget)
+    };
+    #[cfg(not(feature = "ec"))]
+    let spool: Option<SpoolBudget> = None;
+
     let diskfile_config = DiskFileConfig::default();
     let reclaim_age: f64 = get("object-reconstructor", "reclaim_age", "604800")
         .parse()
@@ -194,6 +264,7 @@ fn main() {
                 &cleanup,
                 rebuild_handoff_node_count,
                 max_original_size,
+                spool.as_ref(),
                 &pusher,
                 &hash_fetcher,
                 &mut total,
@@ -254,12 +325,13 @@ fn sweep_policy(
     cleanup: &CleanupConfig,
     rebuild_handoff_node_count: i64,
     max_original_size: usize,
+    spool: Option<&SpoolBudget>,
     pusher: &TcpSsyncPusher,
     hash_fetcher: &HttpSuffixHashFetcher,
     total: &mut EcSsyncStats,
 ) {
     #[cfg(not(feature = "ec"))]
-    let _ = max_original_size;
+    let _ = (max_original_size, spool);
     let Ok(entries) = std::fs::read_dir(devices_path) else {
         return;
     };
@@ -340,6 +412,7 @@ fn sweep_policy(
                     .unwrap_or(0),
                 max_original_size,
                 scheme: Some(policy.scheme),
+                spool: spool.cloned(),
                 ..Default::default()
             };
             for job in &jobs {

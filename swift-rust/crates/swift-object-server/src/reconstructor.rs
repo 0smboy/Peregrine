@@ -23,16 +23,18 @@
 //!    purge the local copies on success. These move existing fragment
 //!    archives as opaque bytes and are feature-independent.
 //!
-//! 2. The fragment REBUILD path ([`EcDriver::reconstruct_object`]): given
-//!    `ndata` peer fragment archives it rebuilds the archive for a specific
-//!    fragment index, byte-identical to what the original PUT stored. This
-//!    links liberasurecode, so it is behind the `ec` feature (Linux-only).
+//! 2. The fragment REBUILD path spools peer archives on disk and invokes
+//!    [`EcDriver::reconstruct`] one codec segment at a time. The rebuilt
+//!    archive remains byte-identical to the original PUT without retaining
+//!    full-object payloads in memory. This links liberasurecode, so it is
+//!    behind the `ec` feature (Linux-only).
 
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::reconstruction_spool::{ArchiveBody, SpoolBudget};
 use swift_core::hashing::HashPathConfig;
 #[cfg(feature = "ec")]
 use swift_core::timestamp::Timestamp;
@@ -58,18 +60,25 @@ impl EcScheme {
 
 #[cfg(feature = "ec")]
 pub fn fragment_archive_size_bound(scheme: EcScheme, original_size: usize) -> Option<usize> {
-    if scheme.ndata == 0 || scheme.segment_size == 0 {
+    if scheme.ndata == 0
+        || scheme.segment_size == 0
+        || scheme.segment_size > i32::MAX as usize
+        || scheme
+            .ndata
+            .checked_add(scheme.nparity)
+            .is_none_or(|total| total > i32::MAX as usize)
+    {
         return None;
     }
     let driver = EcDriver::new(scheme.ndata, scheme.nparity).ok()?;
-    let mut total = 0usize;
-    let mut remaining = original_size;
-    while remaining > 0 {
-        let segment = remaining.min(scheme.segment_size);
-        total = total.checked_add(driver.fragment_size(segment))?;
-        remaining -= segment;
-    }
-    Some(total)
+    let full = original_size / scheme.segment_size;
+    let tail = original_size % scheme.segment_size;
+    let total = full.checked_mul(driver.fragment_size(scheme.segment_size))?;
+    total.checked_add(if tail == 0 {
+        0
+    } else {
+        driver.fragment_size(tail)
+    })
 }
 
 /// A fragment archive fetched from a peer node, with the EC sysmeta needed to
@@ -77,7 +86,7 @@ pub fn fragment_archive_size_bound(scheme: EcScheme, original_size: usize) -> Op
 #[derive(Debug, Clone)]
 pub struct FetchedFragment {
     pub frag_index: i32,
-    pub archive: Vec<u8>,
+    pub archive: ArchiveBody,
     pub ec_etag: String,
     pub ec_content_length: usize,
     /// The object's data timestamp (internal form), so the rebuilt fragment
@@ -89,6 +98,12 @@ pub struct FetchedFragment {
 /// Fetches a peer's fragment archive for an object. Pluggable so the rebuild
 /// logic is unit-tested without a live cluster.
 pub trait FragmentFetcher {
+    /// The same reservation domain covers peer input and rebuilt output.
+    /// Production HTTP fetchers require an explicit disk spool configuration.
+    fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+        None
+    }
+
     fn fetch(
         &self,
         node: &RingDevice,
@@ -111,6 +126,27 @@ pub trait FragmentFetcher {
         _preferred_timestamp: Option<&str>,
     ) -> Option<FetchedFragment> {
         self.fetch(node, partition, account, container, object)
+    }
+
+    /// Distinguish a local retryable resource denial from one unavailable
+    /// peer, so a full spool cannot be misreported as an EC quorum defect.
+    fn fetch_at_checked(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Result<Option<FetchedFragment>, String> {
+        Ok(self.fetch_at(
+            node,
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        ))
     }
 }
 
@@ -141,7 +177,7 @@ pub struct ReconstructorStats {
     pub failed: u64,
 }
 
-#[cfg(feature = "ec")]
+#[cfg(all(feature = "ec", test))]
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
     format!("{:x}", Md5::digest(data))
@@ -177,18 +213,21 @@ fn gather_coherent_archives(
     ndata: usize,
     fetcher: &dyn FragmentFetcher,
     preferred_timestamp: Option<&str>,
-) -> Result<(FetchedFragment, Vec<Vec<u8>>), ReconstructError> {
+) -> Result<(FetchedFragment, Vec<ArchiveBody>), ReconstructError> {
     type VersionKey = (String, String, usize);
     let mut versions: BTreeMap<VersionKey, BTreeMap<i32, FetchedFragment>> = BTreeMap::new();
     for node in peers {
-        let Some(frag) = fetcher.fetch_at(
-            node,
-            partition,
-            account,
-            container,
-            object,
-            preferred_timestamp,
-        ) else {
+        let Some(frag) = fetcher
+            .fetch_at_checked(
+                node,
+                partition,
+                account,
+                container,
+                object,
+                preferred_timestamp,
+            )
+            .map_err(ReconstructError::DiskFile)?
+        else {
             continue;
         };
         if frag.frag_index < 0
@@ -220,7 +259,7 @@ fn gather_coherent_archives(
         .ok_or(ReconstructError::NotEnoughFragments)?;
     let chosen = FetchedFragment {
         frag_index: first.frag_index,
-        archive: Vec::new(),
+        archive: Vec::new().into(),
         ec_etag: first.ec_etag.clone(),
         ec_content_length: first.ec_content_length,
         timestamp: first.timestamp.clone(),
@@ -230,6 +269,90 @@ fn gather_coherent_archives(
     archives.push(first.archive);
     archives.extend(fragments.map(|fragment| fragment.archive));
     Ok((chosen, archives))
+}
+
+/// Reconstruct one codec segment at a time into an anonymous output archive.
+/// Rust-owned resident payload is k fragment segments plus one output
+/// fragment segment (in addition to the codec's bounded per-segment FFI
+/// workspace); full-object archives are never materialized in RAM.
+#[cfg(feature = "ec")]
+fn reconstruct_archives_to_spool(
+    scheme: EcScheme,
+    archives: &[ArchiveBody],
+    original_size: usize,
+    destination_index: usize,
+    budget: &SpoolBudget,
+) -> Result<ArchiveBody, String> {
+    if scheme.ndata == 0
+        || scheme.segment_size == 0
+        || scheme.segment_size > i32::MAX as usize
+        || scheme
+            .ndata
+            .checked_add(scheme.nparity)
+            .is_none_or(|total| total > i32::MAX as usize)
+        || destination_index >= scheme.n_unique()
+        || archives.len() < scheme.ndata
+    {
+        return Err("invalid reconstruction scheme, target, or source count".into());
+    }
+    let expected = fragment_archive_size_bound(scheme, original_size)
+        .ok_or("fragment archive length overflow")?;
+    if archives
+        .iter()
+        .any(|archive| archive.len() != expected as u64)
+    {
+        return Err("source archive length does not match EC object metadata".into());
+    }
+    let driver = EcDriver::new(scheme.ndata, scheme.nparity).map_err(|error| error.to_string())?;
+    let mut output = budget
+        .reserve(expected as u64)
+        .map_err(|error| error.to_string())?;
+    let mut readers: Vec<_> = archives
+        .iter()
+        .take(scheme.ndata)
+        .map(ArchiveBody::reader)
+        .collect();
+    let mut fragments = vec![Vec::new(); scheme.ndata];
+    let mut indexes = vec![None; scheme.ndata];
+    let mut remaining = original_size;
+    while remaining > 0 {
+        let segment = remaining.min(scheme.segment_size);
+        let fragment_len = driver.fragment_size(segment);
+        let mut seen = BTreeSet::new();
+        for (index, (reader, fragment)) in readers.iter_mut().zip(fragments.iter_mut()).enumerate()
+        {
+            if fragment.len() < fragment_len {
+                fragment
+                    .try_reserve_exact(fragment_len - fragment.len())
+                    .map_err(|_| "could not reserve EC segment buffer (retryable)".to_string())?;
+            }
+            fragment.resize(fragment_len, 0);
+            reader
+                .read_exact(fragment)
+                .map_err(|error| format!("incomplete EC segment: {error}"))?;
+            let actual =
+                EcDriver::fragment_index(fragment).ok_or("invalid fragment segment header")?;
+            if actual < 0
+                || actual as usize >= scheme.n_unique()
+                || !seen.insert(actual)
+                || indexes[index].is_some_and(|expected| expected != actual)
+            {
+                return Err("inconsistent or duplicate fragment segment index".into());
+            }
+            indexes[index] = Some(actual);
+        }
+        let rebuilt = driver
+            .reconstruct(&fragments, destination_index)
+            .map_err(|error| error.to_string())?;
+        if rebuilt.len() != fragment_len {
+            return Err("rebuilt segment length mismatch".into());
+        }
+        output
+            .write_all(&rebuilt)
+            .map_err(|error| format!("reconstruction spool write (retryable): {error}"))?;
+        remaining -= segment;
+    }
+    output.finish().map_err(|error| error.to_string())
 }
 
 /// `reconstruct_fa` for the ssync SYNC path (`sync_diskfile_builder`): the
@@ -255,7 +378,11 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
         _object_hash: &str,
         datafile_metadata: &Metadata,
         target_frag_index: i64,
-    ) -> Result<(Metadata, Vec<u8>), String> {
+    ) -> Result<(Metadata, ArchiveBody), String> {
+        let spool = self
+            .fetcher
+            .reconstruction_spool()
+            .ok_or("reconstruction spool is not configured (retryable)")?;
         let get = |name: &str| {
             datafile_metadata.iter().find_map(|(k, v)| match (k, v) {
                 (MetaValue::Str(k), MetaValue::Str(v)) if k == name => Some(v.clone()),
@@ -291,16 +418,13 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
                 chosen.timestamp
             ));
         }
-        let driver =
-            EcDriver::new(self.scheme.ndata, self.scheme.nparity).map_err(|e| format!("{e:?}"))?;
-        let rebuilt = driver
-            .reconstruct_object(
-                &archives,
-                chosen.ec_content_length,
-                self.scheme.segment_size,
-                target_frag_index as usize,
-            )
-            .map_err(|e| format!("{e:?}"))?;
+        let rebuilt = reconstruct_archives_to_spool(
+            self.scheme,
+            &archives,
+            chosen.ec_content_length,
+            target_frag_index as usize,
+            &spool,
+        )?;
         let mut metadata: Metadata = Vec::with_capacity(datafile_metadata.len());
         for (k, v) in datafile_metadata {
             if let MetaValue::Str(key) = k {
@@ -334,8 +458,9 @@ pub fn rebuild_job(
     job: &ReconstructJob,
     fetcher: &dyn FragmentFetcher,
 ) -> Result<(), ReconstructError> {
-    let driver = EcDriver::new(scheme.ndata, scheme.nparity)
-        .map_err(|e| ReconstructError::Ec(format!("{e:?}")))?;
+    let spool = fetcher.reconstruction_spool().ok_or_else(|| {
+        ReconstructError::DiskFile("reconstruction spool is not configured (retryable)".into())
+    })?;
 
     let (chosen, archives) = gather_coherent_archives(
         &job.peers,
@@ -348,14 +473,15 @@ pub fn rebuild_job(
         None,
     )?;
 
-    let rebuilt = driver
-        .reconstruct_object(
-            &archives,
-            chosen.ec_content_length,
-            scheme.segment_size,
-            job.destination_index,
-        )
-        .map_err(|e| ReconstructError::Ec(format!("{e:?}")))?;
+    let rebuilt = reconstruct_archives_to_spool(
+        scheme,
+        &archives,
+        chosen.ec_content_length,
+        job.destination_index,
+        &spool,
+    )
+    .map_err(ReconstructError::Ec)?;
+    drop(archives);
 
     let ts: Timestamp = chosen
         .timestamp
@@ -396,7 +522,7 @@ pub fn rebuild_job(
         ),
         (
             MetaValue::Str("ETag".into()),
-            MetaValue::Str(md5_hex(&rebuilt)),
+            MetaValue::Str(rebuilt.md5_hex().to_string()),
         ),
         (
             MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
@@ -422,9 +548,19 @@ pub fn rebuild_job(
     let mut writer = df
         .create(".data")
         .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
-    writer
-        .write(&rebuilt)
-        .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
+    let mut reader = rebuilt.reader();
+    let mut buffer = [0u8; swift_http::STREAM_CHUNK];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| ReconstructError::DiskFile(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write(&buffer[..read])
+            .map_err(|error| ReconstructError::DiskFile(error.to_string()))?;
+    }
     writer
         .put(metadata)
         .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
@@ -932,6 +1068,10 @@ pub struct HttpFragmentFetcher {
     pub max_response_bytes: usize,
     pub max_original_size: usize,
     pub scheme: Option<EcScheme>,
+    /// Shared across peer downloads, rebuilt outputs, and daemon processes.
+    /// Explicit configuration prevents a default constructor from creating
+    /// temp files in an unknown data or RAM filesystem.
+    pub spool: Option<SpoolBudget>,
 }
 
 impl Default for HttpFragmentFetcher {
@@ -944,11 +1084,16 @@ impl Default for HttpFragmentFetcher {
             max_response_bytes: DEFAULT_FRAGMENT_RESPONSE_LIMIT,
             max_original_size: swift_core::constraints::MAX_FILE_SIZE as usize,
             scheme: None,
+            spool: None,
         }
     }
 }
 
 impl FragmentFetcher for HttpFragmentFetcher {
+    fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+        self.spool.clone()
+    }
+
     fn fetch(
         &self,
         node: &RingDevice,
@@ -957,7 +1102,9 @@ impl FragmentFetcher for HttpFragmentFetcher {
         container: &str,
         object: &str,
     ) -> Option<FetchedFragment> {
-        self.fetch_with_preference(node, partition, account, container, object, None)
+        self.fetch_at_checked(node, partition, account, container, object, None)
+            .ok()
+            .flatten()
     }
 
     fn fetch_at(
@@ -969,7 +1116,7 @@ impl FragmentFetcher for HttpFragmentFetcher {
         object: &str,
         preferred_timestamp: Option<&str>,
     ) -> Option<FetchedFragment> {
-        self.fetch_with_preference(
+        self.fetch_at_checked(
             node,
             partition,
             account,
@@ -977,6 +1124,33 @@ impl FragmentFetcher for HttpFragmentFetcher {
             object,
             preferred_timestamp,
         )
+        .ok()
+        .flatten()
+    }
+
+    fn fetch_at_checked(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Result<Option<FetchedFragment>, String> {
+        let mut resource_error = None;
+        let result = self.fetch_with_preference(
+            node,
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+            &mut resource_error,
+        );
+        match resource_error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
     }
 }
 
@@ -1008,7 +1182,9 @@ impl HttpFragmentFetcher {
         container: &str,
         object: &str,
         preferred_timestamp: Option<&str>,
+        resource_error: &mut Option<String>,
     ) -> Option<FetchedFragment> {
+        let spool = self.spool.as_ref()?;
         let replication_ip = node.replication_ip.as_deref().unwrap_or(&node.ip);
         let replication_port = node.replication_port.unwrap_or(node.port);
         let sock = socket_addr(replication_ip, replication_port).ok()?;
@@ -1068,6 +1244,9 @@ impl HttpFragmentFetcher {
             .or_else(|| head.headers.get("x-backend-timestamp"))?
             .clone();
         timestamp.parse::<swift_core::timestamp::Timestamp>().ok()?;
+        if preferred_timestamp.is_some_and(|expected| timestamp != expected) {
+            return None;
+        }
         let content_type = head
             .headers
             .get("content-type")
@@ -1088,14 +1267,44 @@ impl HttpFragmentFetcher {
             }
             body_limit = expected;
         }
-        let body = read_internal_http_body(&mut reader, &head.headers, body_limit).ok()?;
+        #[cfg(feature = "ec")]
+        let expected = match self.scheme {
+            Some(scheme) => Some(fragment_archive_size_bound(scheme, ec_content_length)?),
+            None => None,
+        };
+        #[cfg(not(feature = "ec"))]
+        let expected: Option<usize> = None;
+        let body = match read_internal_http_body_spooled(
+            &mut reader,
+            &head.headers,
+            body_limit,
+            expected,
+            spool,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                if error.contains("(retryable)") {
+                    *resource_error = Some(error);
+                }
+                return None;
+            }
+        };
         #[cfg(feature = "ec")]
         if let Some(scheme) = self.scheme {
             let expected = fragment_archive_size_bound(scheme, ec_content_length)?;
-            if body.len() != expected
-                || (!body.is_empty() && EcDriver::fragment_index(&body) != Some(frag_index))
-            {
+            if body.len() != expected as u64 {
                 return None;
+            }
+            if !body.is_empty() {
+                let driver = EcDriver::new(scheme.ndata, scheme.nparity).ok()?;
+                let first_len = driver.fragment_size(ec_content_length.min(scheme.segment_size));
+                let mut first = Vec::new();
+                first.try_reserve_exact(first_len).ok()?;
+                first.resize(first_len, 0);
+                body.reader().read_exact(&mut first).ok()?;
+                if EcDriver::fragment_index(&first) != Some(frag_index) {
+                    return None;
+                }
             }
         }
         Some(FetchedFragment {
@@ -1106,6 +1315,113 @@ impl HttpFragmentFetcher {
             timestamp,
             content_type,
         })
+    }
+}
+
+/// Same strict framing as the bounded RPC reader, with a disk sink rather
+/// than a full-response Vec. No chunk or Content-Length controls allocation.
+fn read_internal_http_body_spooled(
+    reader: &mut DeadlineSocketReader<'_>,
+    headers: &BTreeMap<String, String>,
+    limit: usize,
+    expected: Option<usize>,
+    budget: &SpoolBudget,
+) -> Result<ArchiveBody, String> {
+    fn copy_bytes(
+        reader: &mut DeadlineSocketReader<'_>,
+        output: &mut impl Write,
+        mut count: usize,
+    ) -> Result<(), String> {
+        while count > 0 {
+            if reader.start == reader.end {
+                let byte = reader.read_byte().map_err(|error| error.to_string())?;
+                output
+                    .write_all(&[byte])
+                    .map_err(|error| format!("reconstruction spool write (retryable): {error}"))?;
+                count -= 1;
+            } else {
+                let next = count.min(reader.end - reader.start);
+                output
+                    .write_all(&reader.buffer[reader.start..reader.start + next])
+                    .map_err(|error| format!("reconstruction spool write (retryable): {error}"))?;
+                reader.start += next;
+                count -= next;
+            }
+        }
+        Ok(())
+    }
+    let content_length = headers.get("content-length");
+    let transfer_encoding = headers.get("transfer-encoding");
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err("response contains both Content-Length and Transfer-Encoding".into());
+    }
+    if let Some(value) = content_length {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid response Content-Length".into());
+        }
+        let length = value
+            .parse::<usize>()
+            .map_err(|_| "response Content-Length overflow")?;
+        if length > limit || expected.is_some_and(|expected| length != expected) {
+            return Err("fragment body length exceeds limit or disagrees with EC metadata".into());
+        }
+        let mut output = budget
+            .reserve(length as u64)
+            .map_err(|error| format!("reconstruction spool reservation (retryable): {error}"))?;
+        copy_bytes(reader, &mut output, length)?;
+        return output.finish().map_err(|error| error.to_string());
+    }
+    if !transfer_encoding.is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+        return Err("fragment response requires Content-Length or single chunked framing".into());
+    }
+    let reserved = expected.unwrap_or(limit);
+    if reserved > limit {
+        return Err("fragment expected length exceeds limit".into());
+    }
+    let mut output = budget
+        .reserve(reserved as u64)
+        .map_err(|error| format!("reconstruction spool reservation (retryable): {error}"))?;
+    let mut total = 0usize;
+    loop {
+        let line = reader.read_crlf_line(128)?;
+        let text = std::str::from_utf8(&line).map_err(|_| "non-ASCII HTTP chunk size")?;
+        let size = text.split(';').next().unwrap_or_default().trim();
+        if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid HTTP chunk size".into());
+        }
+        let size = usize::from_str_radix(size, 16).map_err(|_| "HTTP chunk size overflow")?;
+        if size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let trailer = reader.read_crlf_line(INTERNAL_HTTP_TRAILER_LINE_LIMIT)?;
+                trailer_bytes = trailer_bytes
+                    .checked_add(trailer.len() + 2)
+                    .ok_or("HTTP trailers length overflow")?;
+                if trailer_bytes > INTERNAL_HTTP_TRAILER_LIMIT {
+                    return Err("HTTP trailers exceed aggregate limit".into());
+                }
+                if trailer.is_empty() {
+                    break;
+                }
+                if !trailer.contains(&b':') {
+                    return Err("malformed HTTP trailer".into());
+                }
+            }
+            if expected.is_some() {
+                return output.finish().map_err(|error| error.to_string());
+            }
+            return Ok(output.finish_bounded());
+        }
+        total = total
+            .checked_add(size)
+            .filter(|&next| next <= reserved)
+            .ok_or("fragment chunked body exceeds limit")?;
+        copy_bytes(reader, &mut output, size)?;
+        if reader.read_byte().map_err(|error| error.to_string())? != b'\r'
+            || reader.read_byte().map_err(|error| error.to_string())? != b'\n'
+        {
+            return Err("HTTP chunk missing CRLF".into());
+        }
     }
 }
 
@@ -1737,6 +2053,8 @@ const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 0.2;
 /// request or lets a peer's receiver limits decide our memory ceiling.
 const EC_SSYNC_PAGE_OBJECTS: usize = 10_000;
 const EC_SSYNC_PASS_OBJECTS: usize = 100_000;
+const EC_REVERT_SNAPSHOT_FILES: usize = 1024;
+const EC_REVERT_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RevertFileIdentity {
@@ -1779,12 +2097,22 @@ fn lower_hex(value: &str, len: usize) -> bool {
 }
 
 fn snapshot_revert_hash_dir(hash_dir: &Path) -> Option<RevertHashDirIdentity> {
+    snapshot_revert_hash_dir_with_limit(hash_dir, EC_REVERT_SNAPSHOT_FILES)
+}
+
+fn snapshot_revert_hash_dir_with_limit(
+    hash_dir: &Path,
+    max_files: usize,
+) -> Option<RevertHashDirIdentity> {
     let dir_metadata = hash_dir.symlink_metadata().ok()?;
     if !dir_metadata.file_type().is_dir() {
         return None;
     }
     let mut files = Vec::new();
     for entry in std::fs::read_dir(hash_dir).ok()? {
+        if files.len() >= max_files {
+            return None;
+        }
         let entry = entry.ok()?;
         let metadata = entry.path().symlink_metadata().ok()?;
         if !metadata.file_type().is_file() {
@@ -1816,6 +2144,14 @@ fn snapshot_revert_page(
     job: &EcPartJob,
     sender: &Sender<'_>,
 ) -> Result<RevertPageSnapshot, String> {
+    snapshot_revert_page_with_budget(job, sender, EC_REVERT_SNAPSHOT_BYTES)
+}
+
+fn snapshot_revert_page_with_budget(
+    job: &EcPartJob,
+    sender: &Sender<'_>,
+    max_snapshot_bytes: usize,
+) -> Result<RevertPageSnapshot, String> {
     if sender.max_objects == 0 {
         return Err("EC revert sender page must have a finite object bound".to_string());
     }
@@ -1827,6 +2163,7 @@ fn snapshot_revert_page(
         limited_by_max_objects,
         ..RevertPageSnapshot::default()
     };
+    let mut snapshot_bytes = 0usize;
     for (suffix, object_hash, timestamps) in available.into_iter().take(sender.max_objects) {
         if !lower_hex(&suffix, 3) || !lower_hex(&object_hash, 32) || !object_hash.ends_with(&suffix)
         {
@@ -1877,6 +2214,28 @@ fn snapshot_revert_page(
                 job.partition
             )
         })?;
+        // Bound the physical census as well as the number of logical objects.
+        // Charge spare Vec capacity, filenames and tree-node overhead before
+        // retaining another snapshot. On exhaustion leave all sources intact.
+        let file_bytes = identity
+            .files
+            .iter()
+            .try_fold(0usize, |total, file| {
+                total
+                    .checked_add(std::mem::size_of::<RevertFileIdentity>())?
+                    .checked_add(file.name.capacity())
+            })
+            .and_then(|total| total.checked_mul(2));
+        snapshot_bytes = file_bytes
+            .and_then(|bytes| bytes.checked_add(512))
+            .and_then(|bytes| snapshot_bytes.checked_add(bytes))
+            .filter(|bytes| *bytes <= max_snapshot_bytes)
+            .ok_or_else(|| {
+                format!(
+                "revert part {} exceeded its {max_snapshot_bytes}-byte physical snapshot budget",
+                job.partition
+            )
+            })?;
         page.last_offered = Some((suffix.clone(), object_hash.clone()));
         if page
             .objects
@@ -2316,14 +2675,10 @@ fn delete_reverted_objs(
                 job.partition
             ));
         }
-        let filenames: Vec<String> = std::fs::read_dir(&hash_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The strict snapshot above just validated these names under the
+        // mutation stripe. Do not rescan with lossy names or silently turn
+        // an I/O error into an empty directory during a destructive decision.
+        let filenames: Vec<&String> = snapshot.identity.files.iter().map(|f| &f.name).collect();
         // legacy durable data files look like modern nondurable data files;
         // override nondurable_purge_delay when we know the file is durable
         let nondurable_purge_delay = if snapshot.timestamps.durable == Some(true) {
@@ -2331,7 +2686,10 @@ fn delete_reverted_objs(
         } else {
             cfg.cleanup.commit_window
         };
-        let data_files: Vec<&String> = filenames.iter().filter(|f| f.ends_with(".data")).collect();
+        let data_files: Vec<&String> = filenames
+            .into_iter()
+            .filter(|f| f.ends_with(".data"))
+            .collect();
         let purgable: Vec<&&String> = data_files
             .iter()
             .filter(|f| f.starts_with(&snapshot.timestamps.ts_data.internal()))
@@ -2984,6 +3342,9 @@ mod suffix_sync_tests {
             diskfile_builder: None,
         };
         let first_page = snapshot_revert_page(&job, &first_sender).unwrap();
+        let too_small = snapshot_revert_page_with_budget(&job, &first_sender, 1);
+        assert!(too_small.unwrap_err().contains("physical snapshot budget"));
+        assert!(part_path.join(suffix).join(&first_hash).is_dir());
         assert_eq!(first_page.objects.keys().collect::<Vec<_>>(), [&first_hash]);
         assert!(first_page.limited_by_max_objects);
         let second_sender = Sender {
@@ -2997,6 +3358,19 @@ mod suffix_sync_tests {
         );
         assert!(!second_page.limited_by_max_objects);
         let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn ec_revert_physical_snapshot_has_a_file_limit() {
+        let root = tmp_root("revert-physical-limit");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("1751500123.00000#1#d.data"), b"archive").unwrap();
+        assert!(snapshot_revert_hash_dir_with_limit(&root, 1).is_some());
+        std::fs::write(root.join("1751500123.00001.meta"), b"metadata").unwrap();
+        assert!(snapshot_revert_hash_dir_with_limit(&root, 1).is_none());
+        assert!(snapshot_revert_hash_dir_with_limit(&root, 2).is_some());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- process_part_job SYNC with a fake REPLICATE responder -----------
@@ -3748,8 +4122,222 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    struct TestSpool {
+        path: PathBuf,
+        budget: SpoolBudget,
+    }
+    impl TestSpool {
+        fn new(bytes: u64) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = PathBuf::from(format!(
+                "/var/tmp/peregrine-reconstructor-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let budget = SpoolBudget::open(&path, bytes, 0).unwrap();
+            Self { path, budget }
+        }
+    }
+    impl Drop for TestSpool {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    fn body_bytes(body: &ArchiveBody) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        body.reader().read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn disk_body(budget: &SpoolBudget, bytes: &[u8]) -> ArchiveBody {
+        let mut writer = budget.reserve(bytes.len() as u64).unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[test]
+    fn segment_spool_reconstruction_matches_every_fragment_and_tail() {
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 4096,
+        };
+        let driver = EcDriver::new(2, 1).unwrap();
+        let spool = TestSpool::new(1024 * 1024);
+        for size in [0usize, 1, 4095, 4096, 4113, 4 * 4096 + 9] {
+            let data: Vec<u8> = (0..size)
+                .map(|index| (index.wrapping_mul(7) % 251) as u8)
+                .collect();
+            let expected = driver.encode_object(&data, scheme.segment_size).unwrap();
+            for destination in 0..scheme.n_unique() {
+                let sources: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != destination)
+                    .map(|(_, bytes)| disk_body(&spool.budget, bytes))
+                    .collect();
+                let rebuilt = reconstruct_archives_to_spool(
+                    scheme,
+                    &sources,
+                    size,
+                    destination,
+                    &spool.budget,
+                )
+                .unwrap();
+                assert!(rebuilt.is_disk_backed());
+                assert_eq!(
+                    body_bytes(&rebuilt),
+                    expected[destination],
+                    "size={size} destination={destination}"
+                );
+            }
+            assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn spool_exhaustion_preserves_inputs_and_retry_succeeds() {
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 4096,
+        };
+        let data = vec![7u8; 8193];
+        let driver = EcDriver::new(2, 1).unwrap();
+        let expected = driver.encode_object(&data, scheme.segment_size).unwrap();
+        let length = expected[0].len() as u64;
+        let spool = TestSpool::new(3 * length);
+        let inputs = vec![
+            disk_body(&spool.budget, &expected[0]),
+            disk_body(&spool.budget, &expected[1]),
+        ];
+        let held = disk_body(&spool.budget, &expected[2]);
+        let error = reconstruct_archives_to_spool(scheme, &inputs, data.len(), 2, &spool.budget)
+            .unwrap_err();
+        assert!(error.contains("retryable"), "{error}");
+        assert_eq!(body_bytes(&inputs[0]), expected[0]);
+        assert_eq!(body_bytes(&inputs[1]), expected[1]);
+        drop(held);
+        let rebuilt =
+            reconstruct_archives_to_spool(scheme, &inputs, data.len(), 2, &spool.budget).unwrap();
+        assert_eq!(body_bytes(&rebuilt), expected[2]);
+        drop(rebuilt);
+        drop(inputs);
+        assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn reconstruction_keeps_large_archives_on_disk_end_to_end() {
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 1024 * 1024,
+        };
+        let original = 32 * 1024 * 1024 + 9;
+        let length = fragment_archive_size_bound(scheme, original).unwrap() as u64;
+        let spool = TestSpool::new(4 * length);
+        let driver = EcDriver::new(2, 1).unwrap();
+        let mut writers: Vec<_> = (0..3)
+            .map(|_| spool.budget.reserve(length).unwrap())
+            .collect();
+        let mut offset = 0usize;
+        while offset < original {
+            let size = (original - offset).min(scheme.segment_size);
+            let segment: Vec<u8> = (offset..offset + size)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let encoded = driver.encode(&segment).unwrap();
+            for (writer, fragment) in writers.iter_mut().zip(encoded.iter()) {
+                writer.write_all(fragment).unwrap();
+            }
+            offset += size;
+        }
+        let archives: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.finish().unwrap())
+            .collect();
+        assert!(archives.iter().all(ArchiveBody::is_disk_backed));
+        let rebuilt =
+            reconstruct_archives_to_spool(scheme, &archives[..2], original, 2, &spool.budget)
+                .unwrap();
+        assert!(rebuilt.is_disk_backed());
+        assert_eq!(rebuilt.md5_hex(), archives[2].md5_hex());
+        let mut expected = archives[2].reader();
+        let mut actual = rebuilt.reader();
+        let mut a = [0u8; 64 * 1024];
+        let mut b = [0u8; 64 * 1024];
+        loop {
+            let count = expected.read(&mut a).unwrap();
+            if count == 0 {
+                assert_eq!(actual.read(&mut b).unwrap(), 0);
+                break;
+            }
+            actual.read_exact(&mut b[..count]).unwrap();
+            assert_eq!(a[..count], b[..count]);
+        }
+        drop(expected);
+        drop(actual);
+        drop(rebuilt);
+        drop(archives);
+        assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+    }
+
+    fn read_spool_response(
+        response: &[u8],
+        expected: Option<usize>,
+        budget: &SpoolBudget,
+    ) -> Result<ArchiveBody, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let bytes = response.to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(&bytes);
+        });
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut reader = DeadlineSocketReader::new(
+            &mut stream,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+        );
+        let result = read_internal_http_head(&mut reader).and_then(|head| {
+            read_internal_http_body_spooled(
+                &mut reader,
+                &head.headers,
+                1024 * 1024,
+                expected,
+                budget,
+            )
+        });
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn spooled_http_framing_abort_cleans_and_chunked_retry_succeeds() {
+        let spool = TestSpool::new(2 * 1024 * 1024);
+        for bad in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabcd".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 8\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nabcdefghi\r\n0\r\n\r\n"
+                .as_slice(),
+        ] {
+            assert!(read_spool_response(bad, Some(8), &spool.budget).is_err());
+            assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+        }
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
+        let body = read_spool_response(response, Some(8), &spool.budget).unwrap();
+        assert!(body.is_disk_backed());
+        assert_eq!(body_bytes(&body), b"abcdefgh");
+        drop(body);
+        assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+    }
+
     #[test]
     fn http_fragment_fetcher_prefers_data_timestamp_over_header_order() {
+        let spool = TestSpool::new(1024 * 1024);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
@@ -3805,6 +4393,7 @@ mod tests {
         };
         let fetched = HttpFragmentFetcher {
             policy_index: 2,
+            spool: Some(spool.budget.clone()),
             conn_timeout: Duration::from_secs(2),
             node_timeout: Duration::from_secs(2),
             ..Default::default()
@@ -3833,11 +4422,13 @@ mod tests {
         );
         assert_eq!(fetched.timestamp, "1751500123.45678");
         assert_eq!(fetched.frag_index, 2);
-        assert_eq!(fetched.archive, b"fragment-archive");
+        assert!(fetched.archive.is_disk_backed());
+        assert_eq!(body_bytes(&fetched.archive), b"fragment-archive");
     }
 
     #[test]
     fn http_fragment_fetcher_uses_replication_plane() {
+        let spool = TestSpool::new(1024 * 1024);
         let service_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         service_listener.set_nonblocking(true).unwrap();
         let service_port = service_listener.local_addr().unwrap().port();
@@ -3877,6 +4468,7 @@ mod tests {
         };
         let fetched = HttpFragmentFetcher {
             policy_index: 2,
+            spool: Some(spool.budget.clone()),
             conn_timeout: Duration::from_secs(1),
             node_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(2),
@@ -3884,7 +4476,8 @@ mod tests {
         }
         .fetch(&node, 17, "a", "c", "o")
         .expect("replication-plane response");
-        assert_eq!(fetched.archive, b"replication-plane-fragment");
+        assert!(fetched.archive.is_disk_backed());
+        assert_eq!(body_bytes(&fetched.archive), b"replication-plane-fragment");
         assert!(
             matches!(service_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "the client/service plane must not receive reconstruction GETs"
@@ -3912,7 +4505,7 @@ mod tests {
     fn fetched_fragment(index: i32, timestamp: &str, etag: &str, byte: u8) -> FetchedFragment {
         FetchedFragment {
             frag_index: index,
-            archive: vec![byte],
+            archive: vec![byte].into(),
             ec_etag: etag.to_string(),
             ec_content_length: 1,
             timestamp: timestamp.to_string(),
@@ -3936,7 +4529,10 @@ mod tests {
             gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None)
                 .expect("later coherent quorum");
         assert_eq!(chosen.timestamp, "1751500001.00000");
-        assert_eq!(archives, [vec![1], vec![2]]);
+        assert_eq!(
+            archives.iter().map(body_bytes).collect::<Vec<_>>(),
+            [vec![1], vec![2]]
+        );
 
         let duplicate_fetcher = VersionFetcher {
             by_node: HashMap::from([
@@ -3955,12 +4551,16 @@ mod tests {
     /// (node `i` returns fragment `i`) — the same layout a real cluster holds.
     struct FakeFetcher {
         archives: Vec<Vec<u8>>,
+        spool: SpoolBudget,
         ec_etag: String,
         ec_content_length: usize,
         timestamp: String,
     }
 
     impl FragmentFetcher for FakeFetcher {
+        fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+            Some(self.spool.clone())
+        }
         fn fetch(
             &self,
             node: &RingDevice,
@@ -3972,7 +4572,7 @@ mod tests {
             let i = node.id as usize;
             Some(FetchedFragment {
                 frag_index: i as i32,
-                archive: self.archives.get(i)?.clone(),
+                archive: self.archives.get(i)?.clone().into(),
                 ec_etag: self.ec_etag.clone(),
                 ec_content_length: self.ec_content_length,
                 timestamp: self.timestamp.clone(),
@@ -3999,6 +4599,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_job_persists_identical_durable_fragment() {
+        let spool = TestSpool::new(1024 * 1024);
         let k = 4usize;
         let m = 2usize;
         let seg = 1000usize;
@@ -4023,6 +4624,7 @@ mod tests {
             .collect();
         let fetcher = FakeFetcher {
             archives: archives.clone(),
+            spool: spool.budget.clone(),
             ec_etag: ec_etag.clone(),
             ec_content_length: data.len(),
             timestamp: ts.to_string(),
@@ -4074,6 +4676,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_job_not_enough_fragments() {
+        let spool = TestSpool::new(1024 * 1024);
         let scheme = EcScheme {
             ndata: 4,
             nparity: 2,
@@ -4091,6 +4694,7 @@ mod tests {
         // only 2 peers available -> fewer than ndata=4
         let fetcher = FakeFetcher {
             archives,
+            spool: spool.budget.clone(),
             ec_etag: md5_hex(&data),
             ec_content_length: data.len(),
             timestamp: "1751500000.00000".to_string(),

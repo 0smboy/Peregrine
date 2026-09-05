@@ -607,16 +607,24 @@ fn reconstructor_revert_moves_a_handoff_fragment_and_purges_it() {
 #[test]
 fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
     use swift_diskfile::{MetaValue, Metadata};
+    use swift_object_server::reconstruction_spool::ArchiveBody;
     use swift_object_server::ssync_sender::SyncDiskfileBuilder;
 
-    struct FakeRebuilder;
+    const REBUILT_SIZE: usize = 2 * swift_http::STREAM_CHUNK + 17;
+    fn rebuilt_bytes() -> Vec<u8> {
+        (0..REBUILT_SIZE).map(|index| (index % 251) as u8).collect()
+    }
+    struct FakeRebuilder {
+        #[cfg(target_os = "linux")]
+        spool: swift_object_server::reconstruction_spool::SpoolBudget,
+    }
     impl SyncDiskfileBuilder for FakeRebuilder {
         fn rebuild(
             &self,
             _object_hash: &str,
             datafile_metadata: &Metadata,
             target_frag_index: i64,
-        ) -> Result<(Metadata, Vec<u8>), String> {
+        ) -> Result<(Metadata, ArchiveBody), String> {
             // The real EcSyncRebuilder contract: local datafile metadata
             // with the frag index swapped and ETag removed.
             let mut metadata: Metadata = Vec::new();
@@ -632,7 +640,23 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
                 }
                 metadata.push((k.clone(), v.clone()));
             }
-            Ok((metadata, b"rebuilt-at-target-index".to_vec()))
+            #[cfg(target_os = "linux")]
+            let body = {
+                use std::io::Write;
+                let mut writer = self
+                    .spool
+                    .reserve(REBUILT_SIZE as u64)
+                    .map_err(|error| error.to_string())?;
+                writer
+                    .write_all(&rebuilt_bytes())
+                    .map_err(|error| error.to_string())?;
+                let body = writer.finish().map_err(|error| error.to_string())?;
+                assert!(body.is_disk_backed());
+                body
+            };
+            #[cfg(not(target_os = "linux"))]
+            let body: ArchiveBody = rebuilt_bytes().into();
+            Ok((metadata, body))
         }
     }
 
@@ -695,6 +719,25 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
     );
 
     // With the builder: the rebuilt fragment lands durable at index 4.
+    // Linux exercises an anonymous, disk-backed archive through the real
+    // TCP sender/receiver with more than two transport chunks.
+    #[cfg(target_os = "linux")]
+    let spool_root = TestTree {
+        root: PathBuf::from(format!(
+            "/var/tmp/peregrine-ssync-spool-{}-{}",
+            std::process::id(),
+            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+        )),
+    };
+    let builder = FakeRebuilder {
+        #[cfg(target_os = "linux")]
+        spool: swift_object_server::reconstruction_spool::SpoolBudget::open(
+            &spool_root.root,
+            REBUILT_SIZE as u64,
+            0,
+        )
+        .unwrap(),
+    };
     let sender = Sender {
         devices: &source.root,
         hash_config: &hc,
@@ -705,8 +748,34 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
         max_objects: 0,
         start_after: None,
         sync_frag_target: Some(4),
-        diskfile_builder: Some(&FakeRebuilder),
+        diskfile_builder: Some(&builder),
     };
+    #[cfg(target_os = "linux")]
+    {
+        // A busy disk budget must fail the SYNC attempt explicitly, leave
+        // the source and destination intact, and permit a fresh retry.
+        let held = builder.spool.reserve(REBUILT_SIZE as u64).unwrap();
+        let mut blocked_wire = TcpSsyncWire::connect(
+            &node,
+            &job,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("connect resource-denied attempt");
+        let error = sender
+            .run(&mut blocked_wire)
+            .expect_err("spool refusal is not successful SYNC");
+        assert!(error.to_string().contains("retryable"), "{error}");
+        blocked_wire.disconnect();
+        assert!(!dir.exists() || dir_files(&dir).is_empty());
+        let source_dir = hash_dir(&source.root, partition, "obj");
+        assert_eq!(
+            std::fs::read(source_dir.join(format!("{ts}#1#d.data"))).unwrap(),
+            b"local-frag-index-1"
+        );
+        drop(held);
+        assert_eq!(builder.spool.reserved_bytes().unwrap(), 0);
+    }
     let mut wire = TcpSsyncWire::connect(
         &node,
         &job,
@@ -719,7 +788,13 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
     assert_eq!(dir_files(&dir), vec![format!("{ts}#4#d.data")]);
     assert_eq!(
         std::fs::read(dir.join(format!("{ts}#4#d.data"))).unwrap(),
-        b"rebuilt-at-target-index"
+        rebuilt_bytes()
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        builder.spool.reserved_bytes().unwrap(),
+        0,
+        "socket send must release the archive lease"
     );
 }
 
