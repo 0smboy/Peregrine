@@ -672,7 +672,26 @@ async fn drive_ssync_session(
         }
         let chunk = match body.next_chunk().await {
             Ok(Some(c)) => c,
-            Ok(None) | Err(_) => break,
+            Ok(None) => {
+                let _ = tx
+                    .send(Ok(
+                        b":ERROR: 0 'Unexpected EOF before :UPDATES: END'\n".to_vec()
+                    ))
+                    .await;
+                return;
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(Ok(format!(
+                        ":ERROR: 0 {}\n",
+                        python_repr(&format!(
+                            "Request body failed before :UPDATES: END: {error}"
+                        ))
+                    )
+                    .into_bytes()))
+                    .await;
+                return;
+            }
         };
         events = match parser.push(&chunk) {
             Ok(e) => e,
@@ -6015,6 +6034,58 @@ mod fallocate_reserve_tests {
             !output.contains(":UPDATES: START"),
             "failed update must not receive success frames: {output:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ssync_does_not_ack_truncated_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-async-ssync-truncated-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        for tail in [
+            "",
+            ":UPDATES: START\r\n",
+            ":UPDATES: START\r\nPUT /AUTH_test/c/incomplete\r\nContent-Length:",
+            ":UPDATES: START\r\nPUT /AUTH_test/c/incomplete\r\nContent-Length: 10\r\nX-Timestamp: 1700000000.00000\r\n\r\nabc",
+        ] {
+            for transport_error in [false, true] {
+                let prefix = format!(":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n{tail}");
+                let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
+                body_tx.send(Ok(prefix.into_bytes())).await.unwrap();
+                if transport_error {
+                    body_tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset, "peer reset during updates"
+                    ))).await.unwrap();
+                }
+                drop(body_tx);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                let replication_lock = std::sync::Arc::new(
+                    swift_core::lockutil::lock_path(
+                        &dir.join("sda1").join(get_data_dir(0)).join("0"),
+                        1.0, Some("replication"),
+                    ).unwrap(),
+                );
+                drive_ssync_session(
+                    swift_http::IncomingBody::from_channel(body_rx, None, None, u64::MAX),
+                    tx, server.storage().clone(), server.config.clone(),
+                    "sda1".into(), "0".into(), 0, PolicyKind::Replication, None,
+                    replication_lock,
+                ).await;
+                let mut output = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    output.extend_from_slice(&chunk.unwrap());
+                }
+                let output = String::from_utf8_lossy(&output);
+                assert!(output.contains(":ERROR:"), "truncated tail={tail:?}, reset={transport_error}: {output:?}");
+                assert!(!output.contains(":UPDATES: START"), "incomplete session was acknowledged: {output:?}");
+                assert_eq!(server.handle(get_named("incomplete")).status, 404);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
