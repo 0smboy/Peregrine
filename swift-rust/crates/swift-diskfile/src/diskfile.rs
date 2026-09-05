@@ -830,6 +830,52 @@ fn relink_next_path(
     Ok(())
 }
 
+/// Resolve EC data sysmeta identically for the two-phase writer and the
+/// owned durability/no-commit path. Explicit metadata wins; only an absent
+/// value may use the diskfile's index, which is then persisted in sysmeta.
+/// Non-data files and replicated objects must keep their normal filenames.
+fn resolve_ec_data_fragment_index(
+    policy: PolicyKind,
+    extension: &str,
+    writer_index: Option<i64>,
+    metadata: &mut Metadata,
+) -> Result<Option<i64>, DiskFileError> {
+    let PolicyKind::Ec { n_unique_fragments } = policy else {
+        return Ok(None);
+    };
+    if extension != ".data" {
+        return Ok(None);
+    }
+    const KEY: &str = "X-Object-Sysmeta-Ec-Frag-Index";
+    let supplied = meta_get(metadata, KEY).cloned();
+    let needs_backfill = supplied.is_none();
+    let value = supplied
+        .or_else(|| writer_index.map(MetaValue::Int))
+        .ok_or_else(|| DiskFileError::BadFragmentIndex("Bad fragment index: None".into()))?;
+    let index = match &value {
+        MetaValue::Int(index) => Some(*index),
+        MetaValue::Str(text) => crate::naming::python_int(text),
+        MetaValue::Bytes(_) => None,
+    }
+    .ok_or_else(|| DiskFileError::BadFragmentIndex(format!("Bad fragment index: {value:?}")))?;
+    if index < 0 {
+        return Err(DiskFileError::BadFragmentIndex(format!(
+            "Fragment index must not be negative: {index}"
+        )));
+    }
+    if let Some(limit) = n_unique_fragments {
+        if index >= i64::from(limit) {
+            return Err(DiskFileError::BadFragmentIndex(format!(
+                "Fragment index must be less than {limit}: {index}"
+            )));
+        }
+    }
+    if needs_backfill {
+        meta_set(metadata, KEY, MetaValue::Int(index));
+    }
+    Ok(Some(index))
+}
+
 /// The Rust `BaseDiskFileWriter` (+ repl/EC `put`/`commit` overrides).
 ///
 /// Owned (`'static`, `Send`) so a finite `write` can run on
@@ -906,45 +952,13 @@ impl DiskFileWriter {
     /// `put()`: finalize on disk. For EC `.data` files the fragment index
     /// is stamped into sysmeta and cleanup is deferred to `commit()`.
     pub fn put(&mut self, mut metadata: Metadata) -> Result<(), DiskFileError> {
-        let mut cleanup = true;
-        let mut frag_index_arg: Option<i64> = None;
-        if matches!(self.policy, PolicyKind::Ec { .. }) && self.extension == ".data" {
-            let n = match self.policy {
-                PolicyKind::Ec { n_unique_fragments } => n_unique_fragments,
-                PolicyKind::Replication => None,
-            };
-            let fi_value = match meta_get(&metadata, "X-Object-Sysmeta-Ec-Frag-Index") {
-                Some(v) => v.clone(),
-                None => {
-                    let fi = self.frag_index.ok_or_else(|| {
-                        DiskFileError::BadFragmentIndex("Bad fragment index: None".into())
-                    })?;
-                    let v = MetaValue::Int(fi);
-                    meta_set(&mut metadata, "X-Object-Sysmeta-Ec-Frag-Index", v.clone());
-                    v
-                }
-            };
-            let fi = match &fi_value {
-                MetaValue::Int(i) => Some(*i),
-                MetaValue::Str(s) => crate::naming::python_int(s),
-                MetaValue::Bytes(_) => None,
-            }
-            .ok_or_else(|| {
-                DiskFileError::BadFragmentIndex(format!("Bad fragment index: {fi_value:?}"))
-            })?;
-            if fi < 0 {
-                return Err(DiskFileError::BadFragmentIndex(format!(
-                    "Fragment index must not be negative: {fi}"
-                )));
-            }
-            if let Some(n) = n {
-                if fi >= n as i64 {
-                    return Err(DiskFileError::BadFragmentIndex(format!(
-                        "Fragment index must be less than {n}: {fi}"
-                    )));
-                }
-            }
-            frag_index_arg = Some(fi);
+        let frag_index_arg = resolve_ec_data_fragment_index(
+            self.policy,
+            &self.extension,
+            self.frag_index,
+            &mut metadata,
+        )?;
+        if let Some(fi) = frag_index_arg {
             // Persist the resolved fragment index so a subsequent commit()
             // (which reads self.frag_index) can rename the .data to its durable
             // ts#N#d.data name. The proxy supplies the index in the PUT
@@ -952,9 +966,8 @@ impl DiskFileWriter {
             // sees frag_index=None and the fragment never becomes durable.
             // Python: ECDiskFileWriter.put sets self._diskfile._frag_index = fi.
             self.frag_index = Some(fi);
-            cleanup = false;
         }
-        self.finalize_put(metadata, cleanup, frag_index_arg)
+        self.finalize_put(metadata, frag_index_arg.is_none(), frag_index_arg)
     }
 
     fn finalize_put(
@@ -1145,19 +1158,12 @@ impl DurablePut {
                 DiskFileError::InvalidFilename("missing X-Timestamp in metadata".into())
             })?;
         let ctype_timestamp = parse_ts(meta_get(&metadata, "Content-Type-Timestamp"));
-        let mut frag_index = self.frag_index;
-        if frag_index.is_none()
-            && matches!(self.policy, PolicyKind::Ec { .. })
-            && self.extension == ".data"
-        {
-            if let Some(v) = meta_get(&metadata, "X-Object-Sysmeta-Ec-Frag-Index") {
-                frag_index = match v {
-                    MetaValue::Int(i) => Some(*i),
-                    MetaValue::Str(s) => crate::naming::python_int(s),
-                    MetaValue::Bytes(_) => None,
-                };
-            }
-        }
+        let frag_index = resolve_ec_data_fragment_index(
+            self.policy,
+            &self.extension,
+            self.frag_index,
+            &mut metadata,
+        )?;
         let filename = match frag_index {
             // DurablePut::commit is the durability barrier: write the
             // durable EC name (`ts#N#d.data`) in one step. The two-phase

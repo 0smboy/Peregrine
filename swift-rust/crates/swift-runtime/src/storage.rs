@@ -572,8 +572,9 @@ impl StorageExecutor {
         path: PathBuf,
         bytes: Vec<u8>,
     ) -> Result<(), StorageError> {
-        let _permit = self.try_acquire_device(device, class)?;
-        self.io.write(path, bytes).await
+        self.run_finite(device, class, move || posix_write(&path, &bytes))
+            .await?
+            .map_err(StorageError::from_io)
     }
 
     pub async fn write_at(
@@ -584,8 +585,9 @@ impl StorageExecutor {
         offset: u64,
         bytes: Vec<u8>,
     ) -> Result<usize, StorageError> {
-        let _permit = self.try_acquire_device(device, class)?;
-        self.io.write_at(path, offset, bytes).await
+        self.run_finite(device, class, move || posix_write_at(&path, offset, &bytes))
+            .await?
+            .map_err(StorageError::from_io)
     }
 
     pub async fn sync_all(
@@ -594,8 +596,9 @@ impl StorageExecutor {
         class: TrafficClass,
         path: PathBuf,
     ) -> Result<(), StorageError> {
-        let _permit = self.try_acquire_device(device, class)?;
-        self.io.sync_all(path).await
+        self.run_finite(device, class, move || posix_sync_all(&path))
+            .await?
+            .map_err(StorageError::from_io)
     }
 
     pub async fn rename(
@@ -605,8 +608,9 @@ impl StorageExecutor {
         from: PathBuf,
         to: PathBuf,
     ) -> Result<(), StorageError> {
-        let _permit = self.try_acquire_device(device, class)?;
-        self.io.rename(from, to).await
+        self.run_finite(device, class, move || posix_rename(&from, &to))
+            .await?
+            .map_err(StorageError::from_io)
     }
 
     /// Device-admitted durability closure. The permit is held until `f`
@@ -621,8 +625,16 @@ impl StorageExecutor {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let _permit = self.try_acquire_device(device, class)?;
-        self.io.run_finite(f).await
+        let permit = self.try_acquire_device(device, class)?;
+        self.io
+            .run_finite(move || {
+                // Cancellation only abandons the waiter. Once started, the
+                // physical operation still owns the device/class budget until
+                // it returns or unwinds on the blocking thread.
+                let _permit = permit;
+                f()
+            })
+            .await
     }
 }
 
@@ -962,5 +974,60 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(job.await.unwrap().unwrap(), 9);
         assert_eq!(exec.stats().device_ops_active, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_keeps_device_permit_until_physical_job_returns() {
+        let exec = StorageExecutor::new(
+            StorageExecutorConfig::new(2, 4, DeviceIoLimits::new(1, 2, 2, 2, 2)).unwrap(),
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std_mpsc::sync_channel::<()>(1);
+        let waiter = tokio::spawn({
+            let exec = exec.clone();
+            async move {
+                exec.run_finite(sda(), TrafficClass::Foreground, move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test must release the physical job");
+                })
+                .await
+            }
+        });
+        wait_until(|| entered_rx.try_recv().is_ok()).await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        assert_eq!(exec.stats().device_ops_active, 1);
+        let started = exec.stats().blocking.started_total;
+        assert!(matches!(
+            exec.run_finite(sda(), TrafficClass::Foreground, || ())
+                .await,
+            Err(StorageError::DeviceBusy {
+                active: 1,
+                cap: 1,
+                ..
+            })
+        ));
+        assert_eq!(exec.stats().blocking.started_total, started);
+
+        // The retained permit belongs only to this device, not the reactor
+        // or the entire storage domain.
+        assert_eq!(
+            exec.run_finite(sdb(), TrafficClass::Foreground, || 17u8)
+                .await
+                .unwrap(),
+            17
+        );
+        release_tx.send(()).unwrap();
+        wait_until(|| exec.stats().device_ops_active == 0).await;
+        assert_eq!(
+            exec.run_finite(sda(), TrafficClass::Foreground, || 23u8)
+                .await
+                .unwrap(),
+            23
+        );
     }
 }
