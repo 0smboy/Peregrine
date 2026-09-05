@@ -114,6 +114,18 @@ fn main() {
         logger.error(&format!("bad swift.conf storage policies: {e}"));
         std::process::exit(1);
     });
+    let constraints = swift_core::constraints::Constraints::from_swift_conf(&swift_conf)
+        .unwrap_or_else(|e| {
+            logger.error(&format!("bad swift.conf constraints: {e}"));
+            std::process::exit(1);
+        });
+    let max_original_size = usize::try_from(constraints.max_file_size)
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            logger.error("max_file_size must be a positive usize");
+            std::process::exit(1);
+        });
     // Every EC policy with a loadable ring; a missing ring at startup is
     // fatal, like the replicator.
     let mut ec_policies: Vec<EcPolicy> = Vec::new();
@@ -181,6 +193,7 @@ fn main() {
                 &diskfile_config,
                 &cleanup,
                 rebuild_handoff_node_count,
+                max_original_size,
                 &pusher,
                 &hash_fetcher,
                 &mut total,
@@ -240,10 +253,13 @@ fn sweep_policy(
     diskfile_config: &DiskFileConfig,
     cleanup: &CleanupConfig,
     rebuild_handoff_node_count: i64,
+    max_original_size: usize,
     pusher: &TcpSsyncPusher,
     hash_fetcher: &HttpSuffixHashFetcher,
     total: &mut EcSsyncStats,
 ) {
+    #[cfg(not(feature = "ec"))]
+    let _ = max_original_size;
     let Ok(entries) = std::fs::read_dir(devices_path) else {
         return;
     };
@@ -316,6 +332,14 @@ fn sweep_policy(
             #[cfg(feature = "ec")]
             let frag_fetcher = swift_object_server::reconstructor::HttpFragmentFetcher {
                 policy_index: policy.index,
+                max_response_bytes:
+                    swift_object_server::reconstructor::fragment_archive_size_bound(
+                        policy.scheme,
+                        max_original_size,
+                    )
+                    .unwrap_or(0),
+                max_original_size,
+                scheme: Some(policy.scheme),
                 ..Default::default()
             };
             for job in &jobs {

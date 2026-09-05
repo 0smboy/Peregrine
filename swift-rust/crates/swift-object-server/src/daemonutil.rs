@@ -133,6 +133,7 @@ mod tests {
             suffix_syncs: 3,
             reverts: 2,
             failures: 1,
+            ..ReplicatorStats::default()
         };
         let update = replicator_recon_update(&stats, Duration::from_secs(90), 1_700_000_000.0);
         let obj = update.as_object().unwrap();

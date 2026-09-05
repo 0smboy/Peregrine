@@ -29,8 +29,9 @@
 //!    links liberasurecode, so it is behind the `ec` feature (Linux-only).
 
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use swift_core::hashing::HashPathConfig;
 #[cfg(feature = "ec")]
@@ -53,6 +54,22 @@ impl EcScheme {
     pub fn n_unique(&self) -> usize {
         self.ndata + self.nparity
     }
+}
+
+#[cfg(feature = "ec")]
+pub fn fragment_archive_size_bound(scheme: EcScheme, original_size: usize) -> Option<usize> {
+    if scheme.ndata == 0 || scheme.segment_size == 0 {
+        return None;
+    }
+    let driver = EcDriver::new(scheme.ndata, scheme.nparity).ok()?;
+    let mut total = 0usize;
+    let mut remaining = original_size;
+    while remaining > 0 {
+        let segment = remaining.min(scheme.segment_size);
+        total = total.checked_add(driver.fragment_size(segment))?;
+        remaining -= segment;
+    }
+    Some(total)
 }
 
 /// A fragment archive fetched from a peer node, with the EC sysmeta needed to
@@ -147,8 +164,9 @@ pub fn local_frag_index(
 }
 
 /// Gather `ndata` fragment archives for one object from its peers. Keeps
-/// only fragments that agree with the first-fetched one on the object's EC
-/// etag + timestamp (one coherent version).
+/// only unique fragment indexes that agree on the object's EC etag, original
+/// length, and data timestamp. A stale first peer must not anchor the entire
+/// attempt when a later coherent quorum exists.
 #[cfg(feature = "ec")]
 fn gather_coherent_archives(
     peers: &[RingDevice],
@@ -160,12 +178,9 @@ fn gather_coherent_archives(
     fetcher: &dyn FragmentFetcher,
     preferred_timestamp: Option<&str>,
 ) -> Result<(FetchedFragment, Vec<Vec<u8>>), ReconstructError> {
-    let mut archives: Vec<Vec<u8>> = Vec::new();
-    let mut chosen: Option<FetchedFragment> = None;
+    type VersionKey = (String, String, usize);
+    let mut versions: BTreeMap<VersionKey, BTreeMap<i32, FetchedFragment>> = BTreeMap::new();
     for node in peers {
-        if archives.len() >= ndata {
-            break;
-        }
         let Some(frag) = fetcher.fetch_at(
             node,
             partition,
@@ -176,22 +191,45 @@ fn gather_coherent_archives(
         ) else {
             continue;
         };
-        match &chosen {
-            None => {
-                chosen = Some(frag.clone());
-                archives.push(frag.archive);
-            }
-            Some(c) => {
-                if c.ec_etag == frag.ec_etag && c.timestamp == frag.timestamp {
-                    archives.push(frag.archive);
-                }
-            }
+        if frag.frag_index < 0
+            || preferred_timestamp.is_some_and(|expected| frag.timestamp != expected)
+        {
+            continue;
         }
+        let key = (
+            frag.timestamp.clone(),
+            frag.ec_etag.clone(),
+            frag.ec_content_length,
+        );
+        versions
+            .entry(key)
+            .or_default()
+            .entry(frag.frag_index)
+            .or_insert(frag);
     }
-    if archives.len() < ndata {
+    let Some((_key, coherent)) = versions
+        .into_iter()
+        .rev()
+        .find(|(_key, fragments)| fragments.len() >= ndata)
+    else {
         return Err(ReconstructError::NotEnoughFragments);
-    }
-    Ok((chosen.unwrap(), archives))
+    };
+    let mut fragments = coherent.into_values().take(ndata);
+    let first = fragments
+        .next()
+        .ok_or(ReconstructError::NotEnoughFragments)?;
+    let chosen = FetchedFragment {
+        frag_index: first.frag_index,
+        archive: Vec::new(),
+        ec_etag: first.ec_etag.clone(),
+        ec_content_length: first.ec_content_length,
+        timestamp: first.timestamp.clone(),
+        content_type: first.content_type.clone(),
+    };
+    let mut archives = Vec::with_capacity(ndata);
+    archives.push(first.archive);
+    archives.extend(fragments.map(|fragment| fragment.archive));
+    Ok((chosen, archives))
 }
 
 /// `reconstruct_fa` for the ssync SYNC path (`sync_diskfile_builder`): the
@@ -374,6 +412,13 @@ pub fn rebuild_job(
         ),
     ];
 
+    // Rebuild publication is a maintenance mutation of the same hash directory
+    // used by foreground PUT/DELETE and EC revert purge. Serialize the entire
+    // create/write/metadata/commit transition on the shared object stripe so a
+    // purge or newer foreground generation cannot interleave with durability.
+    let _mutation_guard = df
+        .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        .map_err(|error| ReconstructError::DiskFile(error.to_string()))?;
     let mut writer = df
         .create(".data")
         .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
@@ -564,10 +609,277 @@ fn partition_of(hash_dir: &Path, _policy_index: u32) -> Option<u64> {
 
 /// A real HTTP fragment fetcher: a backend GET to the peer object server,
 /// reading the fragment archive body plus its EC sysmeta headers.
+const INTERNAL_HTTP_HEAD_LIMIT: usize = 64 * 1024;
+const INTERNAL_HTTP_LINE_LIMIT: usize = 16 * 1024;
+const INTERNAL_HTTP_TRAILER_LIMIT: usize = 64 * 1024;
+const INTERNAL_HTTP_TRAILER_LINE_LIMIT: usize = 8 * 1024;
+const DEFAULT_FRAGMENT_RESPONSE_LIMIT: usize = 512 * 1024 * 1024;
+const DEFAULT_SUFFIX_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+fn socket_addr(ip: &str, port: u32) -> Result<std::net::SocketAddr, String> {
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| format!("invalid replication IP {ip:?}"))?;
+    let port = u16::try_from(port).map_err(|_| format!("invalid replication port {port}"))?;
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+fn remaining_socket_timeout(deadline: Instant, idle: Duration) -> std::io::Result<Duration> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline"))?;
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request deadline",
+        ));
+    }
+    Ok(remaining.min(idle).max(Duration::from_millis(1)))
+}
+
+fn write_all_before(
+    stream: &mut std::net::TcpStream,
+    mut bytes: &[u8],
+    idle: Duration,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining_socket_timeout(deadline, idle)?))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "peer stopped accepting request bytes",
+                ))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+struct DeadlineSocketReader<'a> {
+    stream: &'a mut std::net::TcpStream,
+    idle: Duration,
+    deadline: Instant,
+    buffer: [u8; 8192],
+    start: usize,
+    end: usize,
+}
+
+impl<'a> DeadlineSocketReader<'a> {
+    fn new(stream: &'a mut std::net::TcpStream, idle: Duration, deadline: Instant) -> Self {
+        Self {
+            stream,
+            idle,
+            deadline,
+            buffer: [0; 8192],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    fn read_byte(&mut self) -> std::io::Result<u8> {
+        if self.start == self.end {
+            self.stream
+                .set_read_timeout(Some(remaining_socket_timeout(self.deadline, self.idle)?))?;
+            loop {
+                match self.stream.read(&mut self.buffer) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "peer closed response",
+                        ))
+                    }
+                    Ok(read) => {
+                        self.start = 0;
+                        self.end = read;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let byte = self.buffer[self.start];
+        self.start += 1;
+        Ok(byte)
+    }
+
+    fn read_exact_vec(&mut self, len: usize) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| format!("could not reserve {len} response bytes"))?;
+        while out.len() < len {
+            out.push(self.read_byte().map_err(|error| error.to_string())?);
+        }
+        Ok(out)
+    }
+
+    fn read_crlf_line(&mut self, limit: usize) -> Result<Vec<u8>, String> {
+        let mut line = Vec::new();
+        loop {
+            let byte = self.read_byte().map_err(|error| error.to_string())?;
+            if byte == b'\n' {
+                if line.pop() != Some(b'\r') {
+                    return Err("HTTP line ended without CRLF".to_string());
+                }
+                return Ok(line);
+            }
+            line.push(byte);
+            if line.len() > limit.saturating_add(1) {
+                return Err(format!("HTTP line exceeds {limit} bytes"));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InternalHttpHead {
+    status: u16,
+    headers: BTreeMap<String, String>,
+}
+
+fn read_internal_http_head(
+    reader: &mut DeadlineSocketReader<'_>,
+) -> Result<InternalHttpHead, String> {
+    let status_line = reader.read_crlf_line(INTERNAL_HTTP_LINE_LIMIT)?;
+    let status_line =
+        std::str::from_utf8(&status_line).map_err(|_| "non-UTF8 HTTP status line".to_string())?;
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts
+        .next()
+        .ok_or_else(|| "missing HTTP version".to_string())?;
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(format!("unsupported HTTP version {version:?}"));
+    }
+    let status = status_parts
+        .next()
+        .ok_or_else(|| "missing HTTP status".to_string())?
+        .parse::<u16>()
+        .map_err(|_| "invalid HTTP status".to_string())?;
+    let mut total = status_line.len() + 2;
+    let mut headers = BTreeMap::new();
+    loop {
+        let raw = reader.read_crlf_line(INTERNAL_HTTP_LINE_LIMIT)?;
+        total = total
+            .checked_add(raw.len() + 2)
+            .ok_or_else(|| "HTTP response head length overflow".to_string())?;
+        if total > INTERNAL_HTTP_HEAD_LIMIT {
+            return Err(format!(
+                "HTTP response head exceeds {INTERNAL_HTTP_HEAD_LIMIT} bytes"
+            ));
+        }
+        if raw.is_empty() {
+            break;
+        }
+        if raw.first().is_some_and(u8::is_ascii_whitespace) {
+            return Err("folded HTTP response headers are not supported".to_string());
+        }
+        let line =
+            std::str::from_utf8(&raw).map_err(|_| "non-UTF8 HTTP response header".to_string())?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "malformed HTTP response header".to_string())?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!("invalid HTTP response header name {name:?}"));
+        }
+        let name = name.to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if headers.insert(name.clone(), value).is_some() {
+            return Err(format!("duplicate HTTP response header {name}"));
+        }
+    }
+    Ok(InternalHttpHead { status, headers })
+}
+
+fn read_internal_http_body(
+    reader: &mut DeadlineSocketReader<'_>,
+    headers: &BTreeMap<String, String>,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let content_length = headers.get("content-length");
+    let transfer_encoding = headers.get("transfer-encoding");
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err("response contains both Content-Length and Transfer-Encoding".to_string());
+    }
+    if let Some(value) = content_length {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid response Content-Length".to_string());
+        }
+        let len = value
+            .parse::<usize>()
+            .map_err(|_| "response Content-Length overflow".to_string())?;
+        if len > limit {
+            return Err(format!("response body exceeds {limit} bytes"));
+        }
+        return reader.read_exact_vec(len);
+    }
+    if let Some(value) = transfer_encoding {
+        if !value.eq_ignore_ascii_case("chunked") {
+            return Err(format!("unsupported response Transfer-Encoding {value:?}"));
+        }
+        let mut body = Vec::new();
+        loop {
+            let line = reader.read_crlf_line(128)?;
+            let text =
+                std::str::from_utf8(&line).map_err(|_| "non-ASCII HTTP chunk size".to_string())?;
+            let size_text = text.split(';').next().unwrap_or_default().trim();
+            if size_text.is_empty() || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("invalid HTTP chunk size".to_string());
+            }
+            let size = usize::from_str_radix(size_text, 16)
+                .map_err(|_| "HTTP chunk size overflow".to_string())?;
+            if size == 0 {
+                let mut trailer_bytes = 0usize;
+                loop {
+                    let trailer = reader.read_crlf_line(INTERNAL_HTTP_TRAILER_LINE_LIMIT)?;
+                    trailer_bytes = trailer_bytes
+                        .checked_add(trailer.len() + 2)
+                        .ok_or_else(|| "HTTP trailers length overflow".to_string())?;
+                    if trailer_bytes > INTERNAL_HTTP_TRAILER_LIMIT {
+                        return Err("HTTP trailers exceed aggregate limit".to_string());
+                    }
+                    if trailer.is_empty() {
+                        return Ok(body);
+                    }
+                    if !trailer.contains(&b':') {
+                        return Err("malformed HTTP trailer".to_string());
+                    }
+                }
+            }
+            let next_len = body
+                .len()
+                .checked_add(size)
+                .ok_or_else(|| "decoded HTTP body length overflow".to_string())?;
+            if next_len > limit {
+                return Err(format!("decoded response body exceeds {limit} bytes"));
+            }
+            body.try_reserve_exact(size)
+                .map_err(|_| format!("could not reserve {size} response bytes"))?;
+            body.extend_from_slice(&reader.read_exact_vec(size)?);
+            if reader.read_exact_vec(2)? != b"\r\n" {
+                return Err("HTTP chunk payload missing CRLF".to_string());
+            }
+        }
+    }
+    Err("response has no explicit body framing".to_string())
+}
+
 pub struct HttpFragmentFetcher {
     pub policy_index: u32,
     pub conn_timeout: Duration,
     pub node_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_response_bytes: usize,
+    pub max_original_size: usize,
+    pub scheme: Option<EcScheme>,
 }
 
 impl Default for HttpFragmentFetcher {
@@ -576,6 +888,10 @@ impl Default for HttpFragmentFetcher {
             policy_index: 0,
             conn_timeout: Duration::from_millis(500),
             node_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(120),
+            max_response_bytes: DEFAULT_FRAGMENT_RESPONSE_LIMIT,
+            max_original_size: swift_core::constraints::MAX_FILE_SIZE as usize,
+            scheme: None,
         }
     }
 }
@@ -641,12 +957,11 @@ impl HttpFragmentFetcher {
         object: &str,
         preferred_timestamp: Option<&str>,
     ) -> Option<FetchedFragment> {
-        let addr = format!("{}:{}", node.ip, node.port);
-        let sock: std::net::SocketAddr = addr.parse().ok()?;
-        let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
-        conn.set_read_timeout(Some(self.node_timeout)).ok()?;
-        conn.set_write_timeout(Some(self.node_timeout)).ok()?;
-        let mut conn = conn;
+        let replication_ip = node.replication_ip.as_deref().unwrap_or(&node.ip);
+        let replication_port = node.replication_port.unwrap_or(node.port);
+        let sock = socket_addr(replication_ip, replication_port).ok()?;
+        let mut conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
+        let deadline = Instant::now().checked_add(self.request_timeout)?;
         let target = Self::request_target(node, partition, account, container, object);
         let preference_header = preferred_timestamp
             .map(|timestamp| {
@@ -661,56 +976,76 @@ impl HttpFragmentFetcher {
              X-Backend-Storage-Policy-Index: {}\r\n\
              X-Backend-Replication: True\r\n\
              {preference_header}\
-             Content-Length: 0\r\nConnection: close\r\n\r\n",
-            self.policy_index
+            Content-Length: 0\r\nConnection: close\r\n\r\n",
+            self.policy_index,
+            addr = sock
         );
-        conn.write_all(req.as_bytes()).ok()?;
-        let mut raw = Vec::new();
-        conn.read_to_end(&mut raw).ok()?;
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-        let body = raw[split + 4..].to_vec();
-        let mut lines = head.lines();
-        let status: u16 = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
-        if status != 200 {
+        write_all_before(&mut conn, req.as_bytes(), self.node_timeout, deadline).ok()?;
+        let mut reader = DeadlineSocketReader::new(&mut conn, self.node_timeout, deadline);
+        let head = read_internal_http_head(&mut reader).ok()?;
+        if head.status != 200 {
             return None;
         }
-        let mut ec_etag = String::new();
-        let mut ec_content_length = 0usize;
+        let ec_etag = head.headers.get("x-object-sysmeta-ec-etag")?.clone();
+        if ec_etag.len() != 32 || !ec_etag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let ec_content_length = head
+            .headers
+            .get("x-object-sysmeta-ec-content-length")?
+            .parse::<usize>()
+            .ok()?;
+        if ec_content_length > self.max_original_size {
+            return None;
+        }
+        let frag_index = head
+            .headers
+            .get("x-object-sysmeta-ec-frag-index")?
+            .parse::<i32>()
+            .ok()?;
+        if frag_index < 0 {
+            return None;
+        }
         // Fast-POST objects carry both timestamps.  The data timestamp names
         // the fragment archive/durable set; the backend timestamp may instead
         // be the newer metadata timestamp.  Header order is not a contract, so
         // collect them independently and prefer the data timestamp explicitly.
-        let mut data_timestamp = String::new();
-        let mut backend_timestamp = String::new();
-        let mut content_type = "application/octet-stream".to_string();
-        let mut frag_index = -1i32;
-        for l in lines {
-            let Some((k, v)) = l.split_once(':') else {
-                continue;
-            };
-            let (k, v) = (k.trim(), v.trim());
-            match k.to_ascii_lowercase().as_str() {
-                "x-object-sysmeta-ec-etag" => ec_etag = v.to_string(),
-                "x-object-sysmeta-ec-content-length" => ec_content_length = v.parse().unwrap_or(0),
-                "x-object-sysmeta-ec-frag-index" => frag_index = v.parse().unwrap_or(-1),
-                "x-backend-data-timestamp" => data_timestamp = v.to_string(),
-                "x-backend-timestamp" if backend_timestamp.is_empty() => {
-                    backend_timestamp = v.to_string();
-                }
-                "content-type" => content_type = v.to_string(),
-                _ => {}
+        let timestamp = head
+            .headers
+            .get("x-backend-data-timestamp")
+            .or_else(|| head.headers.get("x-backend-timestamp"))?
+            .clone();
+        timestamp.parse::<swift_core::timestamp::Timestamp>().ok()?;
+        let content_type = head
+            .headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        #[cfg(not(feature = "ec"))]
+        let body_limit = self.max_response_bytes;
+        #[cfg(feature = "ec")]
+        let mut body_limit = self.max_response_bytes;
+        #[cfg(feature = "ec")]
+        if let Some(scheme) = self.scheme {
+            if frag_index as usize >= scheme.n_unique() {
+                return None;
+            }
+            let expected = fragment_archive_size_bound(scheme, ec_content_length)?;
+            if expected > self.max_response_bytes {
+                return None;
+            }
+            body_limit = expected;
+        }
+        let body = read_internal_http_body(&mut reader, &head.headers, body_limit).ok()?;
+        #[cfg(feature = "ec")]
+        if let Some(scheme) = self.scheme {
+            let expected = fragment_archive_size_bound(scheme, ec_content_length)?;
+            if body.len() != expected
+                || (!body.is_empty() && EcDriver::fragment_index(&body) != Some(frag_index))
+            {
+                return None;
             }
         }
-        #[cfg(feature = "ec")]
-        if frag_index < 0 {
-            frag_index = EcDriver::fragment_index(&body).unwrap_or(-1);
-        }
-        let timestamp = if data_timestamp.is_empty() {
-            backend_timestamp
-        } else {
-            data_timestamp
-        };
         Some(FetchedFragment {
             frag_index,
             archive: body,
@@ -737,7 +1072,8 @@ use swift_diskfile::{get_partition_hashes, CleanupConfig, Hashes};
 use swift_ring::{HandoffNode, PartNode};
 
 use crate::ssync_sender::{
-    ObjectTimestamps, Sender, SenderReport, SsyncJob, SsyncNode, SsyncSenderError, TcpSsyncWire,
+    object_timestamps_from_hash_dir_strict, ObjectTimestamps, Sender, SenderReport, SsyncJob,
+    SsyncNode, SsyncSenderError, TcpSsyncWire,
 };
 
 /// `reconstructor.SYNC` / `reconstructor.REVERT`.
@@ -1166,6 +1502,8 @@ pub trait SuffixHashFetcher {
 pub struct HttpSuffixHashFetcher {
     pub conn_timeout: Duration,
     pub node_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_response_bytes: usize,
 }
 
 impl Default for HttpSuffixHashFetcher {
@@ -1173,6 +1511,8 @@ impl Default for HttpSuffixHashFetcher {
         HttpSuffixHashFetcher {
             conn_timeout: Duration::from_millis(500),
             node_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(30),
+            max_response_bytes: DEFAULT_SUFFIX_RESPONSE_LIMIT,
         }
     }
 }
@@ -1184,43 +1524,33 @@ impl HttpSuffixHashFetcher {
         partition: u64,
         policy_index: u32,
     ) -> Result<Value, SuffixSyncError> {
-        let addr = format!("{}:{}", node.replication_ip, node.replication_port);
-        let sock: std::net::SocketAddr = addr.parse().map_err(|_| SuffixSyncError::Failed)?;
-        let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout)
+        let sock = socket_addr(&node.replication_ip, node.replication_port)
             .map_err(|_| SuffixSyncError::Failed)?;
-        conn.set_read_timeout(Some(self.node_timeout))
+        let mut conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout)
             .map_err(|_| SuffixSyncError::Failed)?;
-        conn.set_write_timeout(Some(self.node_timeout))
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let mut conn = conn;
+        let deadline = Instant::now()
+            .checked_add(self.request_timeout)
+            .ok_or(SuffixSyncError::Failed)?;
         let req = format!(
             "REPLICATE /{}/{partition} HTTP/1.1\r\nHost: {addr}\r\n\
              X-Backend-Storage-Policy-Index: {policy_index}\r\n\
              Content-Length: 0\r\nConnection: close\r\n\r\n",
-            node.device
+            node.device,
+            addr = sock
         );
-        conn.write_all(req.as_bytes())
+        write_all_before(&mut conn, req.as_bytes(), self.node_timeout, deadline)
             .map_err(|_| SuffixSyncError::Failed)?;
-        let mut raw = Vec::new();
-        conn.read_to_end(&mut raw)
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let split = raw
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .ok_or(SuffixSyncError::Failed)?;
-        let status: u16 = String::from_utf8_lossy(&raw[..split])
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse().ok())
-            .ok_or(SuffixSyncError::Failed)?;
-        if status == 507 {
+        let mut reader = DeadlineSocketReader::new(&mut conn, self.node_timeout, deadline);
+        let head = read_internal_http_head(&mut reader).map_err(|_| SuffixSyncError::Failed)?;
+        if head.status == 507 {
             return Err(SuffixSyncError::InsufficientStorage);
         }
-        if status != 200 {
+        if head.status != 200 {
             return Err(SuffixSyncError::Failed);
         }
-        pickle::loads(&raw[split + 4..]).map_err(|_| SuffixSyncError::Failed)
+        let body = read_internal_http_body(&mut reader, &head.headers, self.max_response_bytes)
+            .map_err(|_| SuffixSyncError::Failed)?;
+        pickle::loads(&body).map_err(|_| SuffixSyncError::Failed)
     }
 }
 
@@ -1293,6 +1623,200 @@ const REVERT_LOCK_TIMEOUT: f64 = 0.2;
 /// Reverts are maintenance work, so a busy object is left for the next pass
 /// instead of stalling the partition for the foreground 15-second budget.
 const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 0.2;
+
+/// Keep every EC SSYNC exchange finite. A job may make bounded progress over
+/// several pages, but it never materializes an entire dense partition in one
+/// request or lets a peer's receiver limits decide our memory ceiling.
+const EC_SSYNC_PAGE_OBJECTS: usize = 10_000;
+const EC_SSYNC_PASS_OBJECTS: usize = 100_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevertFileIdentity {
+    name: String,
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevertHashDirIdentity {
+    device: u64,
+    inode: u64,
+    files: Vec<RevertFileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevertObjectSnapshot {
+    suffix: String,
+    timestamps: ObjectTimestamps,
+    identity: RevertHashDirIdentity,
+}
+
+#[derive(Debug, Default)]
+struct RevertPageSnapshot {
+    objects: BTreeMap<String, RevertObjectSnapshot>,
+    last_offered: Option<(String, String)>,
+    limited_by_max_objects: bool,
+}
+
+fn lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn snapshot_revert_hash_dir(hash_dir: &Path) -> Option<RevertHashDirIdentity> {
+    let dir_metadata = hash_dir.symlink_metadata().ok()?;
+    if !dir_metadata.file_type().is_dir() {
+        return None;
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(hash_dir).ok()? {
+        let entry = entry.ok()?;
+        let metadata = entry.path().symlink_metadata().ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        files.push(RevertFileIdentity {
+            name: entry.file_name().to_str()?.to_string(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        });
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(RevertHashDirIdentity {
+        device: dir_metadata.dev(),
+        inode: dir_metadata.ino(),
+        files,
+    })
+}
+
+/// Freeze the exact logical and physical source generations that the next
+/// bounded sender page is expected to offer. The remote reports are useful
+/// only if their cursor/count shape still matches this snapshot.
+fn snapshot_revert_page(
+    job: &EcPartJob,
+    sender: &Sender<'_>,
+) -> Result<RevertPageSnapshot, String> {
+    if sender.max_objects == 0 {
+        return Err("EC revert sender page must have a finite object bound".to_string());
+    }
+    let available = sender
+        .yield_local_hashes(true)
+        .map_err(|error| error.to_string())?;
+    let limited_by_max_objects = available.len() > sender.max_objects;
+    let mut page = RevertPageSnapshot {
+        limited_by_max_objects,
+        ..RevertPageSnapshot::default()
+    };
+    for (suffix, object_hash, timestamps) in available.into_iter().take(sender.max_objects) {
+        if !lower_hex(&suffix, 3) || !lower_hex(&object_hash, 32) || !object_hash.ends_with(&suffix)
+        {
+            return Err(format!(
+                "revert part {} encountered malformed object path {suffix}/{object_hash}",
+                job.partition
+            ));
+        }
+        let hash_dir = job.path.join(&suffix).join(&object_hash);
+        let device_path = sender.devices.join(&job.device);
+        let df = DiskFile::from_hash_dir(
+            &device_path,
+            &hash_dir,
+            sender.job.policy,
+            sender.job.policy_index,
+            sender.hash_config,
+            sender.diskfile_config.clone(),
+        );
+        let _mutation_guard = df
+            .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "revert part {} could not snapshot locked object {object_hash}: {error}",
+                    job.partition
+                )
+            })?;
+        let locked_timestamps = object_timestamps_from_hash_dir_strict(
+            &hash_dir,
+            sender.job.policy,
+            sender.job.frag_index,
+            Some(&[]),
+        )
+        .map_err(|error| {
+            format!(
+                "revert part {} could not inspect locked object {object_hash}: {error}",
+                job.partition
+            )
+        })?;
+        if locked_timestamps.as_ref() != Some(&timestamps) {
+            return Err(format!(
+                "revert part {} object {object_hash} changed while its transfer snapshot was being frozen",
+                job.partition
+            ));
+        }
+        let identity = snapshot_revert_hash_dir(&hash_dir).ok_or_else(|| {
+            format!(
+                "revert part {} could not snapshot object {object_hash}",
+                job.partition
+            )
+        })?;
+        page.last_offered = Some((suffix.clone(), object_hash.clone()));
+        if page
+            .objects
+            .insert(
+                object_hash.clone(),
+                RevertObjectSnapshot {
+                    suffix,
+                    timestamps,
+                    identity,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "revert part {} offered duplicate object hash {object_hash}",
+                job.partition
+            ));
+        }
+    }
+    Ok(page)
+}
+
+fn valid_revert_report(report: &SenderReport, page: &RevertPageSnapshot) -> bool {
+    report.offered_count == page.objects.len()
+        && report.last_offered == page.last_offered
+        && report.limited_by_max_objects == page.limited_by_max_objects
+        && report
+            .can_delete_objs
+            .iter()
+            .all(|(object_hash, timestamps)| {
+                page.objects
+                    .get(object_hash)
+                    .is_some_and(|snapshot| &snapshot.timestamps == timestamps)
+            })
+}
+
+fn intersect_revert_confirmations(
+    reports: &[BTreeMap<String, ObjectTimestamps>],
+) -> BTreeMap<String, ObjectTimestamps> {
+    let Some((first, rest)) = reports.split_first() else {
+        return BTreeMap::new();
+    };
+    let mut confirmed = first.clone();
+    for report in rest {
+        confirmed.retain(|object_hash, timestamps| report.get(object_hash) == Some(timestamps));
+    }
+    confirmed
+}
 
 /// Per-pass ssync-job stats.
 ///
@@ -1377,30 +1901,100 @@ pub fn process_part_job(
                     if suffixes.is_empty() {
                         break;
                     }
-                    let sender = Sender {
-                        devices,
-                        hash_config,
-                        diskfile_config: cfg,
-                        job: &ssync_job,
-                        suffixes: Some(&suffixes),
-                        include_non_durable: false,
-                        max_objects: 0,
-                        sync_frag_target: node.backend_index,
-                        diskfile_builder,
-                    };
-                    match pusher.push(&sender, node) {
-                        Ok(_) => stats.suffix_syncs += suffixes.len() as u64,
-                        Err(e) => {
+                    let mut start_after: Option<(String, String)> = None;
+                    let mut processed_objects = 0usize;
+                    let mut complete = false;
+                    loop {
+                        let remaining = EC_SSYNC_PASS_OBJECTS.saturating_sub(processed_objects);
+                        if remaining == 0 {
                             stats.failures += 1;
                             stats.last_error = Some(format!(
-                                "sync part {} frag {:?} -> {}:{}/{}: {e}",
+                                "sync part {} frag {:?} reached the bounded {}-object pass limit",
+                                job.partition, job.frag_index, EC_SSYNC_PASS_OBJECTS
+                            ));
+                            break;
+                        }
+                        let page_limit = EC_SSYNC_PAGE_OBJECTS.min(remaining);
+                        let sender = Sender {
+                            devices,
+                            hash_config,
+                            diskfile_config: cfg,
+                            job: &ssync_job,
+                            suffixes: Some(&suffixes),
+                            include_non_durable: false,
+                            max_objects: page_limit,
+                            start_after: start_after.clone(),
+                            sync_frag_target: node.backend_index,
+                            diskfile_builder,
+                        };
+                        let report = match pusher.push(&sender, node) {
+                            Ok(report) => report,
+                            Err(e) => {
+                                stats.failures += 1;
+                                stats.last_error = Some(format!(
+                                    "sync part {} frag {:?} -> {}:{}/{}: {e}",
+                                    job.partition,
+                                    job.frag_index,
+                                    node.replication_ip,
+                                    node.replication_port,
+                                    node.device
+                                ));
+                                break;
+                            }
+                        };
+                        if report.offered_count > page_limit
+                            || (report.offered_count > 0 && report.last_offered.is_none())
+                        {
+                            stats.failures += 1;
+                            stats.last_error = Some(format!(
+                                "sync part {} frag {:?} -> {}:{}/{} returned an invalid bounded page",
                                 job.partition,
                                 job.frag_index,
                                 node.replication_ip,
                                 node.replication_port,
                                 node.device
                             ));
+                            break;
                         }
+                        processed_objects =
+                            match processed_objects.checked_add(report.offered_count) {
+                                Some(total) => total,
+                                None => {
+                                    stats.failures += 1;
+                                    stats.last_error = Some(format!(
+                                        "sync part {} object count overflow",
+                                        job.partition
+                                    ));
+                                    break;
+                                }
+                            };
+                        if !report.limited_by_max_objects {
+                            complete = true;
+                            break;
+                        }
+                        let Some(next_cursor) = report.last_offered else {
+                            stats.failures += 1;
+                            stats.last_error = Some(format!(
+                                "sync part {} returned a truncated page without a cursor",
+                                job.partition
+                            ));
+                            break;
+                        };
+                        if start_after
+                            .as_ref()
+                            .is_some_and(|cursor| &next_cursor <= cursor)
+                        {
+                            stats.failures += 1;
+                            stats.last_error = Some(format!(
+                                "sync part {} returned a non-progressing page cursor",
+                                job.partition
+                            ));
+                            break;
+                        }
+                        start_after = Some(next_cursor);
+                    }
+                    if complete {
+                        stats.suffix_syncs += suffixes.len() as u64;
                     }
                     break;
                 }
@@ -1418,50 +2012,134 @@ pub fn process_part_job(
             ) else {
                 return;
             };
-            let mut synced_with = 0usize;
-            let mut reverted: BTreeMap<String, ObjectTimestamps> = BTreeMap::new();
-            for node in &job.sync_to {
-                let sender = Sender {
+            if job.sync_to.is_empty() {
+                return;
+            }
+
+            let mut start_after: Option<(String, String)> = None;
+            let mut processed_objects = 0usize;
+            let mut processed_any = false;
+            loop {
+                let remaining = EC_SSYNC_PASS_OBJECTS.saturating_sub(processed_objects);
+                if remaining == 0 {
+                    stats.failures += 1;
+                    stats.last_error = Some(format!(
+                        "revert part {} reached the bounded {}-object pass limit",
+                        job.partition, EC_SSYNC_PASS_OBJECTS
+                    ));
+                    return;
+                }
+                let page_limit = EC_SSYNC_PAGE_OBJECTS.min(remaining);
+                let page_sender = Sender {
                     devices,
                     hash_config,
                     diskfile_config: cfg,
                     job: &ssync_job,
                     suffixes: Some(&job.suffixes),
                     include_non_durable: true,
-                    max_objects: 0,
+                    max_objects: page_limit,
+                    start_after: start_after.clone(),
                     sync_frag_target: None,
                     diskfile_builder: None,
                 };
-                match pusher.push(&sender, node) {
-                    Ok(report) => {
-                        synced_with += 1;
-                        reverted.extend(report.can_delete_objs);
-                    }
-                    Err(e) => {
+                let page = match snapshot_revert_page(job, &page_sender) {
+                    Ok(page) => page,
+                    Err(error) => {
                         stats.failures += 1;
-                        stats.last_error = Some(format!(
-                            "revert part {} -> {}:{}/{}: {e}",
-                            job.partition, node.replication_ip, node.replication_port, node.device
-                        ));
+                        stats.last_error = Some(error);
+                        return;
+                    }
+                };
+                if page.objects.is_empty() {
+                    if processed_any {
+                        stats.reverts += 1;
+                    }
+                    return;
+                }
+
+                let mut confirmations = Vec::with_capacity(job.sync_to.len());
+                for node in &job.sync_to {
+                    let sender = Sender {
+                        devices,
+                        hash_config,
+                        diskfile_config: cfg,
+                        job: &ssync_job,
+                        suffixes: Some(&job.suffixes),
+                        include_non_durable: true,
+                        max_objects: page_limit,
+                        start_after: start_after.clone(),
+                        sync_frag_target: None,
+                        diskfile_builder: None,
+                    };
+                    match pusher.push(&sender, node) {
+                        Ok(report) if valid_revert_report(&report, &page) => {
+                            confirmations.push(report.can_delete_objs);
+                        }
+                        Ok(_) => {
+                            stats.failures += 1;
+                            stats.last_error = Some(format!(
+                                "revert part {} -> {}:{}/{} returned a stale, malformed, or truncated confirmation page",
+                                job.partition,
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device
+                            ));
+                            return;
+                        }
+                        Err(e) => {
+                            stats.failures += 1;
+                            stats.last_error = Some(format!(
+                                "revert part {} -> {}:{}/{}: {e}",
+                                job.partition,
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device
+                            ));
+                            return;
+                        }
                     }
                 }
-            }
-            if !job.sync_to.is_empty() && synced_with >= job.sync_to.len() {
-                match delete_reverted_objs(
+
+                let confirmed = intersect_revert_confirmations(&confirmations);
+                let confirmed_snapshots: BTreeMap<String, RevertObjectSnapshot> = confirmed
+                    .iter()
+                    .filter_map(|(object_hash, timestamps)| {
+                        page.objects.get(object_hash).and_then(|snapshot| {
+                            (snapshot.timestamps == *timestamps)
+                                .then(|| (object_hash.clone(), snapshot.clone()))
+                        })
+                    })
+                    .collect();
+                if let Err(error) = delete_reverted_objs(
                     devices,
                     hash_config,
                     cfg,
                     policy_index,
                     policy,
                     job,
-                    &reverted,
+                    &confirmed_snapshots,
                 ) {
-                    Ok(()) => stats.reverts += 1,
-                    Err(error) => {
-                        stats.failures += 1;
-                        stats.last_error = Some(error);
-                    }
+                    stats.failures += 1;
+                    stats.last_error = Some(error);
+                    return;
                 }
+                if confirmed_snapshots.len() != page.objects.len() {
+                    stats.failures += 1;
+                    stats.last_error = Some(format!(
+                        "revert part {} did not receive identical confirmation from every target for all {} offered objects",
+                        job.partition,
+                        page.objects.len()
+                    ));
+                    return;
+                }
+
+                processed_any = true;
+                processed_objects += page.objects.len();
+                if !page.limited_by_max_objects {
+                    stats.reverts += 1;
+                    return;
+                }
+                start_after = page.last_offered;
             }
         }
     }
@@ -1478,15 +2156,18 @@ fn delete_reverted_objs(
     policy_index: u32,
     policy: PolicyKind,
     job: &EcPartJob,
-    objects: &BTreeMap<String, ObjectTimestamps>,
+    objects: &BTreeMap<String, RevertObjectSnapshot>,
 ) -> Result<(), String> {
     let device_path = devices.join(&job.device);
     let mut suffixes_to_delete: BTreeSet<String> = BTreeSet::new();
-    for (object_hash, timestamps) in objects {
-        if object_hash.len() < 3 {
-            continue;
+    for (object_hash, snapshot) in objects {
+        if !lower_hex(object_hash, 32) || !object_hash.ends_with(&snapshot.suffix) {
+            return Err(format!(
+                "revert part {} refused malformed object hash {object_hash}",
+                job.partition
+            ));
         }
-        let suffix = object_hash[object_hash.len() - 3..].to_string();
+        let suffix = snapshot.suffix.clone();
         let hash_dir = job.path.join(&suffix).join(object_hash);
         let df = DiskFile::from_hash_dir(
             &device_path,
@@ -1504,8 +2185,29 @@ fn delete_reverted_objs(
                     job.partition
                 )
             })?;
-        // Re-read only after acquiring the object stripe.  The initial SSYNC
-        // report may be stale by the time a busy foreground mutation drains.
+        // Re-read only after acquiring the object stripe. The pre-transfer
+        // logical state, the exact all-target report, and the physical inode
+        // snapshot must all still describe the same source generation.
+        let current_timestamps =
+            object_timestamps_from_hash_dir_strict(&hash_dir, policy, job.frag_index, Some(&[]))
+                .map_err(|error| {
+                    format!(
+                        "revert part {} could not inspect object {object_hash}: {error}",
+                        job.partition
+                    )
+                })?;
+        if current_timestamps.as_ref() != Some(&snapshot.timestamps) {
+            return Err(format!(
+                "revert part {} source generation changed for object {object_hash}",
+                job.partition
+            ));
+        }
+        if snapshot_revert_hash_dir(&hash_dir).as_ref() != Some(&snapshot.identity) {
+            return Err(format!(
+                "revert part {} source files changed for object {object_hash}",
+                job.partition
+            ));
+        }
         let filenames: Vec<String> = std::fs::read_dir(&hash_dir)
             .map(|entries| {
                 entries
@@ -1516,7 +2218,7 @@ fn delete_reverted_objs(
             .unwrap_or_default();
         // legacy durable data files look like modern nondurable data files;
         // override nondurable_purge_delay when we know the file is durable
-        let nondurable_purge_delay = if timestamps.durable == Some(true) {
+        let nondurable_purge_delay = if snapshot.timestamps.durable == Some(true) {
             0.0
         } else {
             cfg.cleanup.commit_window
@@ -1524,7 +2226,7 @@ fn delete_reverted_objs(
         let data_files: Vec<&String> = filenames.iter().filter(|f| f.ends_with(".data")).collect();
         let purgable: Vec<&&String> = data_files
             .iter()
-            .filter(|f| f.starts_with(&timestamps.ts_data.internal()))
+            .filter(|f| f.starts_with(&snapshot.timestamps.ts_data.internal()))
             .collect();
         let meta_timestamp = if job.primary_frag_index.is_none()
             && purgable.len() == data_files.len()
@@ -1532,12 +2234,12 @@ fn delete_reverted_objs(
         {
             // pure handoff node purging its last .data file: any reverted
             // meta file can go too
-            timestamps.ts_meta
+            snapshot.timestamps.ts_meta
         } else {
             None
         };
         df.purge(
-            &timestamps.ts_data,
+            &snapshot.timestamps.ts_data,
             job.frag_index,
             nondurable_purge_delay,
             meta_timestamp.as_ref(),
@@ -1574,6 +2276,148 @@ mod suffix_sync_tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         root
+    }
+
+    fn read_test_http_response(
+        response: Vec<u8>,
+        body_limit: usize,
+        idle_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<(InternalHttpHead, Vec<u8>), String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(&response);
+        });
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let deadline = Instant::now().checked_add(request_timeout).unwrap();
+        let mut reader = DeadlineSocketReader::new(&mut stream, idle_timeout, deadline);
+        let head = read_internal_http_head(&mut reader)?;
+        let body = read_internal_http_body(&mut reader, &head.headers, body_limit)?;
+        server.join().unwrap();
+        Ok((head, body))
+    }
+
+    #[test]
+    fn bounded_http_reader_enforces_framing_and_body_caps() {
+        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec();
+        let (head, body) =
+            read_test_http_response(valid, 3, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(body, b"abc");
+
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Proof: yes\r\n\r\n".to_vec();
+        let (_, body) =
+            read_test_http_response(chunked, 3, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(body, b"abc");
+
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\n\r\nabc".to_vec(),
+        ] {
+            assert!(
+                read_test_http_response(
+                    response,
+                    3,
+                    Duration::from_millis(100),
+                    Duration::from_millis(250),
+                )
+                .is_err(),
+                "malformed or truncated framing must fail"
+            );
+        }
+
+        let oversized = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd".to_vec();
+        assert!(read_test_http_response(
+            oversized,
+            3,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bounded_http_reader_absolute_deadline_stops_slow_drip() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n");
+            for byte in b"12345678" {
+                std::thread::sleep(Duration::from_millis(35));
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(120);
+        let mut reader = DeadlineSocketReader::new(&mut stream, Duration::from_secs(1), deadline);
+        let head = read_internal_http_head(&mut reader).unwrap();
+        assert!(read_internal_http_body(&mut reader, &head.headers, 8).is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn suffix_hash_fetcher_is_bounded_and_does_not_drain_507() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = u32::from(listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 99999999\r\n\r\n",
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let fetcher = HttpSuffixHashFetcher {
+            conn_timeout: Duration::from_secs(1),
+            node_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            max_response_bytes: 32,
+        };
+        let started = Instant::now();
+        assert_eq!(
+            fetcher.fetch_result(&node(port, 0), 1, 0),
+            Err(SuffixSyncError::InsufficientStorage)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "507 must be classified from its bounded head without draining a hostile body"
+        );
+        server.join().unwrap();
+
+        let value = hashes_value(&[("abc", &[(None, "hash")])]);
+        let body = pickle::dumps(&value).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = u32::from(listener.local_addr().unwrap().port());
+        let oversized = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                oversized.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&oversized);
+        });
+        let fetcher = HttpSuffixHashFetcher {
+            max_response_bytes: body.len().saturating_sub(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            fetcher.fetch_result(&node(port, 0), 1, 0),
+            Err(SuffixSyncError::Failed)
+        );
+        server.join().unwrap();
     }
 
     /// One suffix's `{None | Int(fi): hash}` entries.
@@ -1718,6 +2562,249 @@ mod suffix_sync_tests {
         assert_eq!(get_suffix_delta(&local, Some(0), &remote, Some(0)), ["123"]);
     }
 
+    #[test]
+    fn test_revert_requires_exact_all_target_intersection() {
+        let devices = tmp_root("revert-intersection");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let timestamp = "1751500123.00000";
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        put_frag_hash(&part_path, suffix, &object_hash, timestamp, 2);
+        let job = revert_job(&part_path, suffix, Some(2), 2);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let pusher = ScriptedPusher::new(vec![ReportBehavior::Complete, ReportBehavior::OmitFirst]);
+        let fetcher = FakeFetcher {
+            by_port: HashMap::new(),
+        };
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.reverts, 0, "{stats:?}");
+        assert_eq!(stats.failures, 1, "{stats:?}");
+        assert!(
+            part_path.join(suffix).join(object_hash).exists(),
+            "one target's omission must retain the source generation"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_revert_rejects_timestamp_or_page_shape_mismatch() {
+        for (tag, behavior) in [
+            ("timestamp", ReportBehavior::WrongMetaTimestamp),
+            ("shape", ReportBehavior::WrongPageShape),
+        ] {
+            let devices = tmp_root(&format!("revert-bad-report-{tag}"));
+            let part_path = devices
+                .join("sda1")
+                .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+                .join("3");
+            let timestamp = "1751500123.00000";
+            let suffix = "abc";
+            let object_hash = format!("{:0>29}{suffix}", 2);
+            put_frag_hash(&part_path, suffix, &object_hash, timestamp, 2);
+            let job = revert_job(&part_path, suffix, Some(2), 2);
+            let hc = HashPathConfig::new("", "changeme").unwrap();
+            let cfg = DiskFileConfig::default();
+            let pusher = ScriptedPusher::new(vec![ReportBehavior::Complete, behavior]);
+            let fetcher = FakeFetcher {
+                by_port: HashMap::new(),
+            };
+            let mut stats = EcSsyncStats::default();
+            process_part_job(
+                &devices,
+                &hc,
+                &cfg,
+                POLICY_INDEX,
+                ec_kind(),
+                &job,
+                &pusher,
+                &fetcher,
+                None,
+                &mut stats,
+            );
+            assert_eq!(stats.reverts, 0, "{tag}: {stats:?}");
+            assert_eq!(stats.failures, 1, "{tag}: {stats:?}");
+            assert!(
+                part_path.join(suffix).join(object_hash).exists(),
+                "{tag}: malformed confirmation must retain source"
+            );
+            let _ = std::fs::remove_dir_all(&devices);
+        }
+    }
+
+    #[test]
+    fn test_revert_retains_generation_mutated_after_reports() {
+        let devices = tmp_root("revert-report-mutation");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        let hash_dir = part_path.join(suffix).join(&object_hash);
+        put_frag_hash(&part_path, suffix, &object_hash, "1751500123.00000", 2);
+        let job = revert_job(&part_path, suffix, Some(2), 2);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let pusher = ScriptedPusher::new(vec![
+            ReportBehavior::Complete,
+            ReportBehavior::MutateAfter {
+                hash_dir: hash_dir.clone(),
+                timestamp: "1751500124.00000".to_string(),
+                frag_index: 2,
+            },
+        ]);
+        let fetcher = FakeFetcher {
+            by_port: HashMap::new(),
+        };
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.reverts, 0, "{stats:?}");
+        assert_eq!(stats.failures, 1, "{stats:?}");
+        assert!(
+            hash_dir.join("1751500124.00000#2#d.data").exists(),
+            "the post-report foreground generation must survive"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_tombstone_revert_requires_every_target() {
+        for (tag, behaviors, should_delete) in [
+            (
+                "complete",
+                vec![ReportBehavior::Complete, ReportBehavior::Complete],
+                true,
+            ),
+            (
+                "omitted",
+                vec![ReportBehavior::Complete, ReportBehavior::OmitFirst],
+                false,
+            ),
+        ] {
+            let devices = tmp_root(&format!("revert-tombstone-{tag}"));
+            let part_path = devices
+                .join("sda1")
+                .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+                .join("3");
+            let suffix = "abc";
+            let object_hash = format!("{:0>29}{suffix}", 9);
+            let hash_dir = part_path.join(suffix).join(&object_hash);
+            let tombstone = hash_dir.join("1751500123.00000.ts");
+            std::fs::create_dir_all(&hash_dir).unwrap();
+            std::fs::write(&tombstone, b"tombstone").unwrap();
+            let job = revert_job(&part_path, suffix, None, 2);
+            let hc = HashPathConfig::new("", "changeme").unwrap();
+            let cfg = DiskFileConfig::default();
+            let pusher = ScriptedPusher::new(behaviors);
+            let fetcher = FakeFetcher {
+                by_port: HashMap::new(),
+            };
+            let mut stats = EcSsyncStats::default();
+            process_part_job(
+                &devices,
+                &hc,
+                &cfg,
+                POLICY_INDEX,
+                ec_kind(),
+                &job,
+                &pusher,
+                &fetcher,
+                None,
+                &mut stats,
+            );
+            assert_eq!(!tombstone.exists(), should_delete, "{tag}: {stats:?}");
+            assert_eq!(stats.reverts, u64::from(should_delete), "{tag}: {stats:?}");
+            let _ = std::fs::remove_dir_all(&devices);
+        }
+    }
+
+    #[test]
+    fn test_revert_page_is_bounded_and_skips_other_fragment_indexes() {
+        let devices = tmp_root("revert-page");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let suffix = "abc";
+        let first_hash = format!("{:0>29}{suffix}", 4);
+        let second_hash = format!("{:0>29}{suffix}", 5);
+        let other_frag_hash = format!("{:0>29}{suffix}", 1);
+        let another_frag_hash = format!("{:0>29}{suffix}", 2);
+        put_frag_hash(&part_path, suffix, &first_hash, "1751500123.00000", 2);
+        put_frag_hash(&part_path, suffix, &second_hash, "1751500123.00000", 2);
+        put_frag_hash(&part_path, suffix, &other_frag_hash, "1751500123.00000", 3);
+        put_frag_hash(
+            &part_path,
+            suffix,
+            &another_frag_hash,
+            "1751500123.00000",
+            3,
+        );
+        let job = revert_job(&part_path, suffix, Some(2), 1);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let ssync_job = SsyncJob {
+            device: job.device.clone(),
+            partition: job.partition,
+            policy_index: POLICY_INDEX,
+            policy: ec_kind(),
+            frag_index: job.frag_index,
+        };
+        let first_sender = Sender {
+            devices: &devices,
+            hash_config: &hc,
+            diskfile_config: &cfg,
+            job: &ssync_job,
+            suffixes: Some(&job.suffixes),
+            include_non_durable: true,
+            max_objects: 1,
+            start_after: None,
+            sync_frag_target: None,
+            diskfile_builder: None,
+        };
+        let first_page = snapshot_revert_page(&job, &first_sender).unwrap();
+        assert_eq!(first_page.objects.keys().collect::<Vec<_>>(), [&first_hash]);
+        assert!(first_page.limited_by_max_objects);
+        let second_sender = Sender {
+            start_after: first_page.last_offered.clone(),
+            ..first_sender
+        };
+        let second_page = snapshot_revert_page(&job, &second_sender).unwrap();
+        assert_eq!(
+            second_page.objects.keys().collect::<Vec<_>>(),
+            [&second_hash]
+        );
+        assert!(!second_page.limited_by_max_objects);
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
     // ---- process_part_job SYNC with a fake REPLICATE responder -----------
 
     struct FakeFetcher {
@@ -1769,6 +2856,25 @@ mod suffix_sync_tests {
         pushes: RefCell<Vec<(u32, Vec<String>)>>,
     }
 
+    fn complete_sender_report(sender: &Sender<'_>) -> Result<SenderReport, SsyncSenderError> {
+        let available = sender.yield_local_hashes(sender.include_non_durable)?;
+        let limit = if sender.max_objects == 0 {
+            available.len()
+        } else {
+            sender.max_objects.min(available.len())
+        };
+        let mut report = SenderReport {
+            limited_by_max_objects: sender.max_objects > 0 && available.len() > sender.max_objects,
+            ..SenderReport::default()
+        };
+        for (suffix, object_hash, timestamps) in available.into_iter().take(limit) {
+            report.offered_count += 1;
+            report.last_offered = Some((suffix, object_hash.clone()));
+            report.can_delete_objs.insert(object_hash, timestamps);
+        }
+        Ok(report)
+    }
+
     impl SsyncPusher for RecordingPusher {
         fn push(
             &self,
@@ -1779,7 +2885,71 @@ mod suffix_sync_tests {
                 node.replication_port,
                 sender.suffixes.map(<[String]>::to_vec).unwrap_or_default(),
             ));
-            Ok(SenderReport::default())
+            complete_sender_report(sender)
+        }
+    }
+
+    #[derive(Clone)]
+    enum ReportBehavior {
+        Complete,
+        OmitFirst,
+        WrongMetaTimestamp,
+        WrongPageShape,
+        MutateAfter {
+            hash_dir: PathBuf,
+            timestamp: String,
+            frag_index: i64,
+        },
+    }
+
+    struct ScriptedPusher {
+        behaviors: RefCell<Vec<ReportBehavior>>,
+    }
+
+    impl ScriptedPusher {
+        fn new(behaviors: Vec<ReportBehavior>) -> Self {
+            Self {
+                behaviors: RefCell::new(behaviors),
+            }
+        }
+    }
+
+    impl SsyncPusher for ScriptedPusher {
+        fn push(
+            &self,
+            sender: &Sender<'_>,
+            _node: &SsyncNode,
+        ) -> Result<SenderReport, SsyncSenderError> {
+            let behavior = self.behaviors.borrow_mut().remove(0);
+            let mut report = complete_sender_report(sender)?;
+            match behavior {
+                ReportBehavior::Complete => {}
+                ReportBehavior::OmitFirst => {
+                    if let Some(first) = report.can_delete_objs.keys().next().cloned() {
+                        report.can_delete_objs.remove(&first);
+                    }
+                }
+                ReportBehavior::WrongMetaTimestamp => {
+                    if let Some(timestamps) = report.can_delete_objs.values_mut().next() {
+                        timestamps.ts_meta = Some("9999999999.00000".parse().unwrap());
+                    }
+                }
+                ReportBehavior::WrongPageShape => {
+                    report.offered_count = report.offered_count.saturating_add(1);
+                }
+                ReportBehavior::MutateAfter {
+                    hash_dir,
+                    timestamp,
+                    frag_index,
+                } => {
+                    std::fs::write(
+                        hash_dir.join(format!("{timestamp}#{frag_index}#d.data")),
+                        b"new-generation",
+                    )
+                    .unwrap();
+                }
+            }
+            Ok(report)
         }
     }
 
@@ -1801,9 +2971,12 @@ mod suffix_sync_tests {
 
     /// Lay a durable EC fragment file down under `part_path/<suffix>`.
     fn put_frag(part_path: &Path, suffix: &str, ts: &str, frag_index: i64) {
-        let hash_dir = part_path
-            .join(suffix)
-            .join(format!("{:0>29}{suffix}", frag_index));
+        let object_hash = format!("{:0>29}{suffix}", frag_index);
+        put_frag_hash(part_path, suffix, &object_hash, ts, frag_index);
+    }
+
+    fn put_frag_hash(part_path: &Path, suffix: &str, object_hash: &str, ts: &str, frag_index: i64) {
+        let hash_dir = part_path.join(suffix).join(object_hash);
         std::fs::create_dir_all(&hash_dir).unwrap();
         std::fs::write(hash_dir.join(format!("{ts}#{frag_index}#d.data")), b"").unwrap();
     }
@@ -1814,6 +2987,27 @@ mod suffix_sync_tests {
             replication_port: port,
             device: "sda1".to_string(),
             backend_index: Some(backend_index),
+        }
+    }
+
+    fn revert_job(
+        part_path: &Path,
+        suffix: &str,
+        frag_index: Option<i64>,
+        target_count: usize,
+    ) -> EcPartJob {
+        EcPartJob {
+            job_type: EcJobType::Revert,
+            frag_index,
+            suffixes: vec![suffix.to_string()],
+            sync_to: (0..target_count)
+                .map(|index| node(11_000 + index as u32, index as i64))
+                .collect(),
+            sync_handoffs: Vec::new(),
+            partition: 3,
+            path: part_path.to_path_buf(),
+            device: "sda1".to_string(),
+            primary_frag_index: None,
         }
     }
 
@@ -2267,11 +3461,15 @@ mod suffix_sync_tests {
         let timestamp = ts.parse().unwrap();
         let objects = BTreeMap::from([(
             object_hash,
-            ObjectTimestamps {
-                ts_data: timestamp,
-                ts_meta: None,
-                ts_ctype: None,
-                durable: Some(true),
+            RevertObjectSnapshot {
+                suffix: suffix.to_string(),
+                timestamps: ObjectTimestamps {
+                    ts_data: timestamp,
+                    ts_meta: None,
+                    ts_ctype: None,
+                    durable: Some(true),
+                },
+                identity: snapshot_revert_hash_dir(&hash_dir).unwrap(),
             },
         )]);
         let releaser = std::thread::spawn(move || {
@@ -2331,11 +3529,15 @@ mod suffix_sync_tests {
         };
         let objects = BTreeMap::from([(
             object_hash,
-            ObjectTimestamps {
-                ts_data: ts.parse().unwrap(),
-                ts_meta: None,
-                ts_ctype: None,
-                durable: Some(true),
+            RevertObjectSnapshot {
+                suffix: suffix.to_string(),
+                timestamps: ObjectTimestamps {
+                    ts_data: ts.parse().unwrap(),
+                    ts_meta: None,
+                    ts_ctype: None,
+                    durable: Some(true),
+                },
+                identity: snapshot_revert_hash_dir(&hash_dir).unwrap(),
             },
         )]);
         let error =
@@ -2350,6 +3552,7 @@ mod suffix_sync_tests {
 #[cfg(all(test, feature = "ec"))]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn http_fragment_fetcher_prefers_data_timestamp_over_header_order() {
@@ -2380,7 +3583,7 @@ mod tests {
                  X-Backend-Timestamp: 1751500999.99999\r\n\
                  X-Backend-Data-Timestamp: 1751500123.45678\r\n\
                  X-Object-Sysmeta-Ec-Frag-Index: 2\r\n\
-                 X-Object-Sysmeta-Ec-Etag: deadbeef\r\n\
+                 X-Object-Sysmeta-Ec-Etag: deadbeefdeadbeefdeadbeefdeadbeef\r\n\
                  X-Object-Sysmeta-Ec-Content-Length: {}\r\n\
                  Content-Type: application/octet-stream\r\n\
                  Content-Length: {}\r\n\
@@ -2410,6 +3613,7 @@ mod tests {
             policy_index: 2,
             conn_timeout: Duration::from_secs(2),
             node_timeout: Duration::from_secs(2),
+            ..Default::default()
         }
         .fetch_at(
             &node,
@@ -2436,6 +3640,121 @@ mod tests {
         assert_eq!(fetched.timestamp, "1751500123.45678");
         assert_eq!(fetched.frag_index, 2);
         assert_eq!(fetched.archive, b"fragment-archive");
+    }
+
+    #[test]
+    fn http_fragment_fetcher_uses_replication_plane() {
+        let service_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        service_listener.set_nonblocking(true).unwrap();
+        let service_port = service_listener.local_addr().unwrap().port();
+        let replication_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let replication_port = replication_listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = replication_listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = b"replication-plane-fragment";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 X-Backend-Data-Timestamp: 1751500123.45678\r\n\
+                 X-Object-Sysmeta-Ec-Frag-Index: 2\r\n\
+                 X-Object-Sysmeta-Ec-Etag: deadbeefdeadbeefdeadbeefdeadbeef\r\n\
+                 X-Object-Sysmeta-Ec-Content-Length: {}\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\n\r\n",
+                body.len(),
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let node = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".to_string(),
+            port: u32::from(service_port),
+            replication_ip: Some("127.0.0.1".to_string()),
+            replication_port: Some(u32::from(replication_port)),
+            device: "sda1".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let fetched = HttpFragmentFetcher {
+            policy_index: 2,
+            conn_timeout: Duration::from_secs(1),
+            node_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        }
+        .fetch(&node, 17, "a", "c", "o")
+        .expect("replication-plane response");
+        assert_eq!(fetched.archive, b"replication-plane-fragment");
+        assert!(
+            matches!(service_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "the client/service plane must not receive reconstruction GETs"
+        );
+        server.join().unwrap();
+    }
+
+    struct VersionFetcher {
+        by_node: HashMap<u64, FetchedFragment>,
+    }
+
+    impl FragmentFetcher for VersionFetcher {
+        fn fetch(
+            &self,
+            node: &RingDevice,
+            _partition: u64,
+            _account: &str,
+            _container: &str,
+            _object: &str,
+        ) -> Option<FetchedFragment> {
+            self.by_node.get(&node.id).cloned()
+        }
+    }
+
+    fn fetched_fragment(index: i32, timestamp: &str, etag: &str, byte: u8) -> FetchedFragment {
+        FetchedFragment {
+            frag_index: index,
+            archive: vec![byte],
+            ec_etag: etag.to_string(),
+            ec_content_length: 1,
+            timestamp: timestamp.to_string(),
+            content_type: "application/octet-stream".to_string(),
+        }
+    }
+
+    #[test]
+    fn coherent_gather_ignores_stale_first_peer_and_deduplicates_indexes() {
+        let stale_etag = "11111111111111111111111111111111";
+        let current_etag = "22222222222222222222222222222222";
+        let fetcher = VersionFetcher {
+            by_node: HashMap::from([
+                (0, fetched_fragment(0, "1751500000.00000", stale_etag, 0)),
+                (1, fetched_fragment(1, "1751500001.00000", current_etag, 1)),
+                (2, fetched_fragment(2, "1751500001.00000", current_etag, 2)),
+            ]),
+        };
+        let peers = vec![dev(0), dev(1), dev(2)];
+        let (chosen, archives) =
+            gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None)
+                .expect("later coherent quorum");
+        assert_eq!(chosen.timestamp, "1751500001.00000");
+        assert_eq!(archives, [vec![1], vec![2]]);
+
+        let duplicate_fetcher = VersionFetcher {
+            by_node: HashMap::from([
+                (0, fetched_fragment(0, "1751500001.00000", current_etag, 0)),
+                (1, fetched_fragment(0, "1751500001.00000", current_etag, 9)),
+                (2, fetched_fragment(1, "1751500001.00000", current_etag, 1)),
+            ]),
+        };
+        assert!(matches!(
+            gather_coherent_archives(&peers, 0, "a", "c", "o", 3, &duplicate_fetcher, None),
+            Err(ReconstructError::NotEnoughFragments)
+        ));
     }
 
     /// A fetcher backed by fragment archives held in memory, keyed by node id

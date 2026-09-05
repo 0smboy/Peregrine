@@ -434,6 +434,7 @@ fn rust_sender_moves_a_fragment_to_the_rust_receiver() {
         suffixes: None,
         include_non_durable: true,
         max_objects: 0,
+        start_after: None,
         sync_frag_target: None,
         diskfile_builder: None,
     };
@@ -476,6 +477,7 @@ fn rust_sender_moves_a_fragment_to_the_rust_receiver() {
         suffixes: None,
         include_non_durable: true,
         max_objects: 0,
+        start_after: None,
         sync_frag_target: None,
         diskfile_builder: None,
     };
@@ -673,6 +675,7 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
         suffixes: None,
         include_non_durable: false,
         max_objects: 0,
+        start_after: None,
         sync_frag_target: Some(4),
         diskfile_builder: None,
     };
@@ -700,6 +703,7 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
         suffixes: None,
         include_non_durable: false,
         max_objects: 0,
+        start_after: None,
         sync_frag_target: Some(4),
         diskfile_builder: Some(&FakeRebuilder),
     };

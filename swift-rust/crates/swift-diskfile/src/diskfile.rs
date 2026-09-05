@@ -717,30 +717,34 @@ impl DiskFile {
         nondurable_purge_delay: f64,
         meta_timestamp: Option<&Timestamp>,
     ) -> Result<(), DiskFileError> {
-        let remove = |p: PathBuf| {
-            let _ = std::fs::remove_file(p);
+        let remove = |p: PathBuf| -> Result<(), DiskFileError> {
+            match std::fs::remove_file(&p) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(DiskFileError::Io(error)),
+            }
         };
         remove(
             self.datadir
                 .join(make_ondisk_filename(timestamp, Some(".ts"), None)),
-        );
+        )?;
         if let Some(mts) = meta_timestamp {
             remove(
                 self.datadir
                     .join(make_ondisk_filename(mts, Some(".meta"), None)),
-            );
+            )?;
         }
         if let Some(fi) = frag_index {
             let nondurable = self
                 .datadir
                 .join(make_ec_ondisk_filename(timestamp, fi, false)?);
             if crate::cleanup::is_file_older(&nondurable, nondurable_purge_delay) {
-                remove(nondurable);
+                remove(nondurable)?;
             }
             remove(
                 self.datadir
                     .join(make_ec_ondisk_filename(timestamp, fi, true)?),
-            );
+            )?;
             let _ = std::fs::remove_dir(&self.datadir);
         }
         if let Some(suffix_dir) = self.datadir.parent() {
