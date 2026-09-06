@@ -2444,6 +2444,25 @@ pub struct EcSsyncStats {
     pub rebuilt: u64,
     pub failures: u64,
     pub last_error: Option<String>,
+    /// Every SSYNC / reconstruct_fa skip or failure this pass, in order.
+    /// Field `57b7456` only ERROR-logged `last_error` once; INFO of these
+    /// lines is what operators grep.
+    pub log_lines: Vec<String>,
+}
+
+impl EcSsyncStats {
+    /// Record a reconstruct_fa skip or similar without incrementing
+    /// `failures` (SSYNC itself completed).
+    pub fn note(&mut self, msg: String) {
+        self.log_lines.push(msg.clone());
+        self.last_error = Some(msg);
+    }
+
+    /// Record a hard SSYNC / revert failure.
+    pub fn fail(&mut self, msg: String) {
+        self.failures += 1;
+        self.note(msg);
+    }
 }
 
 /// `reconstructor.process_job`: run one partition job.
@@ -2519,8 +2538,7 @@ pub fn process_part_job(
                     loop {
                         let remaining = EC_SSYNC_PASS_OBJECTS.saturating_sub(processed_objects);
                         if remaining == 0 {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
+                            stats.fail(format!(
                                 "sync part {} frag {:?} reached the bounded {}-object pass limit",
                                 job.partition, job.frag_index, EC_SSYNC_PASS_OBJECTS
                             ));
@@ -2542,8 +2560,7 @@ pub fn process_part_job(
                         let report = match pusher.push(&sender, node) {
                             Ok(report) => report,
                             Err(e) => {
-                                stats.failures += 1;
-                                stats.last_error = Some(format!(
+                                stats.fail(format!(
                                     "sync part {} frag {:?} -> {}:{}/{}: {e}",
                                     job.partition,
                                     job.frag_index,
@@ -2556,7 +2573,7 @@ pub fn process_part_job(
                         };
                         stats.rebuilt += report.rebuilt;
                         if let Some(error) = report.last_rebuild_error {
-                            stats.last_error = Some(format!(
+                            stats.note(format!(
                                 "reconstruct_fa part {} -> {}:{}/{}: {error}",
                                 job.partition,
                                 node.replication_ip,
@@ -2567,8 +2584,7 @@ pub fn process_part_job(
                         if report.offered_count > page_limit
                             || (report.offered_count > 0 && report.last_offered.is_none())
                         {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
+                            stats.fail(format!(
                                 "sync part {} frag {:?} -> {}:{}/{} returned an invalid bounded page",
                                 job.partition,
                                 job.frag_index,
@@ -2582,8 +2598,7 @@ pub fn process_part_job(
                             match processed_objects.checked_add(report.offered_count) {
                                 Some(total) => total,
                                 None => {
-                                    stats.failures += 1;
-                                    stats.last_error = Some(format!(
+                                    stats.fail(format!(
                                         "sync part {} object count overflow",
                                         job.partition
                                     ));
@@ -2595,8 +2610,7 @@ pub fn process_part_job(
                             break;
                         }
                         let Some(next_cursor) = report.last_offered else {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
+                            stats.fail(format!(
                                 "sync part {} returned a truncated page without a cursor",
                                 job.partition
                             ));
@@ -2606,8 +2620,7 @@ pub fn process_part_job(
                             .as_ref()
                             .is_some_and(|cursor| &next_cursor <= cursor)
                         {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
+                            stats.fail(format!(
                                 "sync part {} returned a non-progressing page cursor",
                                 job.partition
                             ));
@@ -2644,8 +2657,7 @@ pub fn process_part_job(
             loop {
                 let remaining = EC_SSYNC_PASS_OBJECTS.saturating_sub(processed_objects);
                 if remaining == 0 {
-                    stats.failures += 1;
-                    stats.last_error = Some(format!(
+                    stats.fail(format!(
                         "revert part {} reached the bounded {}-object pass limit",
                         job.partition, EC_SSYNC_PASS_OBJECTS
                     ));
@@ -2667,8 +2679,7 @@ pub fn process_part_job(
                 let page = match snapshot_revert_page(job, &page_sender) {
                     Ok(page) => page,
                     Err(error) => {
-                        stats.failures += 1;
-                        stats.last_error = Some(error);
+                        stats.fail(error);
                         return;
                     }
                 };
@@ -2698,8 +2709,7 @@ pub fn process_part_job(
                             confirmations.push(report.can_delete_objs);
                         }
                         Ok(_) => {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
+                            stats.fail(format!(
                                 "revert part {} -> {}:{}/{} returned a stale, malformed, or truncated confirmation page",
                                 job.partition,
                                 node.replication_ip,
@@ -2709,8 +2719,7 @@ pub fn process_part_job(
                             return;
                         }
                         Err(e) => {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
+                            stats.fail(format!(
                                 "revert part {} -> {}:{}/{}: {e}",
                                 job.partition,
                                 node.replication_ip,
@@ -2741,13 +2750,11 @@ pub fn process_part_job(
                     job,
                     &confirmed_snapshots,
                 ) {
-                    stats.failures += 1;
-                    stats.last_error = Some(error);
+                    stats.fail(error);
                     return;
                 }
                 if confirmed_snapshots.len() != page.objects.len() {
-                    stats.failures += 1;
-                    stats.last_error = Some(format!(
+                    stats.fail(format!(
                         "revert part {} did not receive identical confirmation from every target for all {} offered objects",
                         job.partition,
                         page.objects.len()
@@ -4401,6 +4408,66 @@ mod suffix_sync_tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("reconstruct_fa") && e.contains("NotEnoughFragments")),
             "skip reason must reach the pass log: {stats:?}"
+        );
+        assert!(
+            stats
+                .log_lines
+                .iter()
+                .any(|line| line.contains("reconstruct_fa") && line.contains("NotEnoughFragments")),
+            "INFO log_lines must carry reconstruct_fa skip: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_process_part_job_logs_ssync_connect_507() {
+        struct FailPusher;
+        impl SsyncPusher for FailPusher {
+            fn push(
+                &self,
+                _sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                Err(SsyncSenderError::from(std::io::Error::other(
+                    "Expected status 200; got 507 body='Drive: sdb6'",
+                )))
+            }
+        }
+        let devices = tmp_root("recon-ssync-507");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16220, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16220, 2)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &FailPusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.rebuilt, 0, "{stats:?}");
+        assert!(
+            stats
+                .log_lines
+                .iter()
+                .any(|line| line.contains("got 507") && line.contains("Drive: sdb6")),
+            "SSYNC 507 must be INFO-logged: {stats:?}"
         );
         let _ = std::fs::remove_dir_all(&devices);
     }

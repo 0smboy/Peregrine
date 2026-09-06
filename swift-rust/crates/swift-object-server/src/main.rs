@@ -287,6 +287,22 @@ fn main() {
         ));
     }
 
+    if config.mount_check {
+        if let Ok(entries) = std::fs::read_dir(&config.devices) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && !swift_core::constraints::ismount(&path) {
+                    logger.warning(&format!(
+                        "mount_check=true but {} is not a mount point; \
+                         REPLICATE/SSYNC/PUT will 507 (unmounted). \
+                         Isolated SAIO dirs need mount_check=false or a .ismount stub.",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
     let mut server = ObjectServer::new(config)
         .with_fallocate_reserve(fallocate_reserve)
         .with_recon_cache_path(get("recon_cache_path", "/var/cache/swift").into());

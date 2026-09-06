@@ -374,6 +374,61 @@ fn read_crlf_line_before(
     }
 }
 
+/// Field 57b7456 logged `Expected status 200; got 507` with no body, so
+/// the empty `Drive:` HTML never reached syslog. Keep a short printable
+/// snippet so `Drive: sdb6` / `unmounted` is greppable.
+fn ssync_unexpected_status(status: u16, body: &str) -> SsyncSenderError {
+    let snippet: String = body
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == ' ')
+        .take(160)
+        .collect();
+    if snippet.is_empty() {
+        SsyncSenderError::new(format!("Expected status 200; got {status}"))
+    } else {
+        SsyncSenderError::new(format!(
+            "Expected status 200; got {status} body='{snippet}'"
+        ))
+    }
+}
+
+fn read_error_body_snippet(
+    read: &mut BufReader<TcpStream>,
+    content_length: Option<usize>,
+    idle_timeout: Duration,
+    deadline: Instant,
+) -> String {
+    const MAX: usize = 200;
+    let want = content_length.unwrap_or(MAX).min(MAX);
+    if want == 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; want];
+    let mut filled = 0usize;
+    while filled < want {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => left,
+            _ => break,
+        };
+        if read.buffer().is_empty() {
+            if read
+                .get_ref()
+                .set_read_timeout(Some(remaining.min(idle_timeout)))
+                .is_err()
+            {
+                break;
+            }
+        }
+        match read.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf[..filled]).into_owned()
+}
+
 impl TcpSsyncWire {
     /// `Sender.connect`: establish the connection, start the SSYNC request
     /// and read the response head (must be `200`).
@@ -446,6 +501,7 @@ impl TcpSsyncWire {
         let mut accept_no_commit = false;
         let mut transfer_encoding: Option<String> = None;
         let mut content_length_seen = false;
+        let mut content_length: Option<usize> = None;
         let mut response_head_bytes = status_line_bytes.len();
         loop {
             let line_bytes = read_crlf_line_before(
@@ -493,12 +549,17 @@ impl TcpSsyncWire {
                     return Err(SsyncSenderError::new("duplicate SSYNC Content-Length"));
                 }
                 content_length_seen = true;
+                content_length = value.trim().parse().ok();
             }
         }
         if status != 200 {
-            return Err(SsyncSenderError::new(format!(
-                "Expected status 200; got {status}"
-            )));
+            let snippet = read_error_body_snippet(
+                &mut read,
+                content_length,
+                node_timeout,
+                response_head_deadline,
+            );
+            return Err(ssync_unexpected_status(status, &snippet));
         }
         if content_length_seen
             || !transfer_encoding
@@ -1670,6 +1731,33 @@ mod tests {
         );
         peer.join().unwrap();
         result
+    }
+
+    #[test]
+    fn tcp_wire_connect_includes_507_body_drive_in_error() {
+        let html = "<html><h1>Insufficient Storage</h1>\
+                    <p>There was not enough space to save the resource. Drive: sdb6</p></html>";
+        let response = format!(
+            "HTTP/1.1 507 Insufficient Storage\r\nContent-Length: {}\r\n\r\n{html}",
+            html.len()
+        );
+        let err = match connect_with_test_head(response.as_bytes()) {
+            Err(err) => err,
+            Ok(_) => panic!("507 SSYNC connect must fail"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Expected status 200; got 507") && msg.contains("Drive: sdb6"),
+            "SSYNC 507 must carry the Drive: snippet, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn ssync_unexpected_status_keeps_bare_form_when_body_empty() {
+        assert_eq!(
+            ssync_unexpected_status(503, "").to_string(),
+            "Expected status 200; got 503"
+        );
     }
 
     #[test]

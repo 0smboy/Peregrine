@@ -17,7 +17,11 @@ PREFIX=a7e047fcefe014fbefad296bc6785c84
 SUFFIX=7a3cc73587dc333d113e93495a8ec4c4
 
 mkdir -p "$ETC" "$LOG"
-for d in 1 2 3 4; do mkdir -p "$DEV/sdb$d"; done
+for d in 1 2 3 4; do
+  mkdir -p "$DEV/sdb$d"
+  # Same-FS device dirs: official Swift honours this stub when mount_check=true.
+  : > "$DEV/sdb$d/.ismount"
+done
 
 cat > "$ETC/swift.conf" <<EOF
 [swift-hash]

@@ -46,4 +46,14 @@ start_one "proxy" "$SWIFT_DIR/proxy-server.conf" "$BIN/swift-proxy-server"
 
 sleep 1
 ss -lntp | grep -E '18080|16210|16220|16230|16240|16211|16221' || true
+# Isolated devices are dirs on a shared root FS. mount_check=true (Rust
+# default) 507s REPLICATE/SSYNC/PUT with Drive: <device> / unmounted.
+if grep -RqsE '^[[:space:]]*mount_check[[:space:]]*=[[:space:]]*true' \
+    "$SWIFT_DIR/object-server" 2>/dev/null; then
+  echo "WARN: g6-rust object-server mount_check=true — dir-backed devices 507 REPLICATE/SSYNC" >&2
+fi
+if ! grep -RqsE '^[[:space:]]*mount_check[[:space:]]*=[[:space:]]*false' \
+    "$SWIFT_DIR/object-server" 2>/dev/null; then
+  echo "WARN: g6-rust object-server confs do not set mount_check=false (SAIO default)" >&2
+fi
 echo "G6_RUST_START_OK"

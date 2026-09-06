@@ -287,6 +287,11 @@ fn main() {
             "object-reconstructor pass: suffix_syncs={} reverts={} rebuilt={} failures={}",
             total.suffix_syncs, total.reverts, total.rebuilt, total.failures
         ));
+        // Field 57b7456: reconstruct_fa / last_rebuild_error never appeared
+        // because only the last ERROR was logged. INFO every per-job line.
+        for line in &total.log_lines {
+            logger.info(&format!("object-reconstructor: {line}"));
+        }
         if let Some(err) = &total.last_error {
             // A pass that keeps failing is the one an operator has to act on,
             // so say what went wrong rather than only how often.

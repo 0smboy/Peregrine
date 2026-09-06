@@ -115,11 +115,15 @@ Replay the frozen official lists on `$CANDIDATE` only:
 Do not import W068/W069/W070 hashes from `17adf0b`.
 
 Field G6 on **`3d662b1` is 123/32/20/4**. Field on **`ca2081b` is
-124/30/21/4**. Overlay is firing; `suffix_syncs=1–3` but `rebuilt=0`.
-`test_reconstructor_rebuild` still 14 (Δ0).
-`test_rebuild_missing_frags` proxy_get 404 after reconstruct once×3
-(`failed=['127.0.0.2:16220/sdb6#2']` — ports already remapped). That
-is **FAIL**, not GREEN. Do not re-guess listen overlay.
+124/30/21/4**. Field on **`57b7456` is 123/32/20/4** (worse than
+ca2081b). Overlay is firing; `--features ec` verified. Theme
+`test_reconstructor_rebuild` still 14 (Δ0). `rebuilt>0 = 0`.
+`reconstruct_fa` strings never appeared in syslog. During the rebuild
+window Swift1 logged `got 503` and `got 507` Insufficient Storage with
+**empty `Drive:`** (REPLICATE `16220/sdb6/400`, revert `16210/sdb5`,
+`16220/sdb2`). `/srv/{1..4}/node` all on `/dev/sda4` — 40G, **3.5G
+free (92%)**. Isolated devices are dirs on that root FS. That is
+**FAIL**, not GREEN. Do not re-guess listen overlay or CSS.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:
@@ -143,7 +147,11 @@ strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|
 # bind_port vs EC ring port; servers_per_port
 awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
 # ca2081b: suffix_syncs>0 and rebuilt=0 is reconstruct_fa skip, not overlay
-grep -E 'suffix_syncs=|rebuilt=|reconstruct_fa|last failure' \
+# 57b7456: SSYNC/REPLICATE 507/503 before reconstruct_fa; INFO was blind
+awk '/mount_check|fallocate_reserve|devices|bind_port/' /etc/g6-rust/object-server/*.conf
+df -h /srv/1/node /dev/sda4
+find /srv/*/node -maxdepth 2 -name .ismount
+grep -E 'reconstruct_fa|got 507|got 503|Drive:|unmounted|object-reconstructor:' \
   /var/log/g6-rust/*/object-reconstructor*.log | tail
 ```
 

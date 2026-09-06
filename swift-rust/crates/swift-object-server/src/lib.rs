@@ -206,9 +206,11 @@ impl WriterLease {
                 self.writer = Some(writer);
                 Ok(())
             }
-            Ok(Err(DiskFileError::NoSpace)) => Err(swob_response(507)),
+            Ok(Err(DiskFileError::NoSpace)) => {
+                Err(swob_insufficient_storage(self.device.as_str(), "enospc"))
+            }
             Ok(Err(DiskFileError::Io(error))) if error.raw_os_error() == Some(28) => {
-                Err(swob_response(507))
+                Err(swob_insufficient_storage(self.device.as_str(), "enospc"))
             }
             Ok(Err(DiskFileError::Io(_))) => Err(plain_response(500, "disk I/O error")),
             Ok(Err(error)) => Err(plain_response(500, &error.to_string())),
@@ -1140,6 +1142,32 @@ fn swob_response(status: u16) -> Response {
     resp
 }
 
+/// Python `HTTPInsufficientStorage(drive=…)`: the field 507 body on
+/// `57b7456` had an empty `Drive:` because [`swob_response`] never filled
+/// the device name. Keep the swob HTML shape and name the drive.
+fn swob_insufficient_storage(drive: &str, reason: &str) -> Response {
+    let mut resp = Response::with_body(
+        507,
+        format!(
+            "<html><h1>Insufficient Storage</h1><p>There was not enough space to save the resource. Drive: {drive}</p></html>"
+        ),
+    );
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    resp.headers.set("X-Backend-No-Space-Reason", reason);
+    resp
+}
+
+fn drive_unavailable_response(drive: &str, detail: &str) -> Response {
+    let reason = if detail.contains("is not mounted") {
+        "unmounted"
+    } else if detail.contains("is not a directory") {
+        "not_a_directory"
+    } else {
+        "invalid_drive"
+    };
+    swob_insufficient_storage(drive, reason)
+}
+
 fn plain_response(status: u16, body: &str) -> Response {
     let mut resp = Response::with_body(status, body.as_bytes().to_vec());
     resp.headers.set("Content-Type", "text/plain");
@@ -1575,20 +1603,34 @@ fn acquire_ec_commit_guard(
     Ok(guard)
 }
 
-/// Python `fallocate()`'s FALLOCATE_RESERVE check, absolute-bytes mode: would
-/// writing `size` bytes leave the device's filesystem with `free` bytes
-/// available at or below the reserve? Zero-length writes never trip the
-/// reserve (Python skips the check when `size` is falsy) and a non-positive
-/// reserve disables it. Percent reserves compare against the device's TOTAL
-/// capacity, which the shared `fsutil` contract does not expose, so percent
-/// mode is not enforced here yet.
-fn fallocate_reserve_breached(free: u64, size: u64, reserve: &FallocateReserve) -> bool {
+/// Python `fallocate()`'s FALLOCATE_RESERVE check.
+///
+/// Bytes mode: `(free - size) <= reserve`. Percent mode: remaining free
+/// after the write, as a percent of `total`, is `<=` the configured
+/// percent (`swift.common.utils.fallocate`). Zero-length writes skip the
+/// check (Python treats a falsy `size` as no reservation). A non-positive
+/// reserve disables it. A zero `total` fails open — we cannot compute a
+/// percent without capacity.
+fn fallocate_reserve_breached(
+    free: u64,
+    total: u64,
+    size: u64,
+    reserve: &FallocateReserve,
+) -> bool {
     if size == 0 {
         return false;
     }
     match reserve {
         FallocateReserve::Bytes(reserve) if *reserve > 0 => {
             (free as i128) - (size as i128) <= (*reserve as i128)
+        }
+        FallocateReserve::Percent(percent) if *percent > 0.0 => {
+            if total == 0 {
+                return false;
+            }
+            let free_after = (free as i128) - (size as i128);
+            let remaining_pct = (free_after as f64) / (total as f64) * 100.0;
+            remaining_pct <= *percent
         }
         _ => false,
     }
@@ -1966,20 +2008,24 @@ impl ObjectServer {
             }
         }
         let device_path = self.config.devices.join(&drive);
-        let free = match self
+        let space = match self
             .storage()
             .run_finite(DeviceId::new(drive.clone()), traffic_class, move || {
-                swift_core::fsutil::free_bytes(&device_path)
+                swift_core::fsutil::fs_space(&device_path)
             })
             .await
         {
-            Ok(free) => free,
+            Ok(space) => space,
             Err(error) => return plain_response(500, &error.to_string()),
         };
-        if let Ok(free) = free {
-            if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
-            {
-                return swob_response(507);
+        if let Ok(space) = space {
+            if fallocate_reserve_breached(
+                space.free_bytes,
+                space.total_bytes,
+                declared_len.unwrap_or(0),
+                &self.fallocate_reserve,
+            ) {
+                return swob_insufficient_storage(&drive, "reserve");
             }
         }
         let device = DeviceId::new(drive.clone());
@@ -2044,7 +2090,7 @@ impl ObjectServer {
             .await
         {
             Ok(Ok(w)) => w,
-            Ok(Err(DiskFileError::NoSpace)) => return swob_response(507),
+            Ok(Err(DiskFileError::NoSpace)) => return swob_insufficient_storage(&drive, "enospc"),
             Ok(Err(e)) => return plain_response(500, &e.to_string()),
             Err(e) => return plain_response(500, &e.to_string()),
         };
@@ -2741,7 +2787,7 @@ impl ObjectServer {
             .run_finite(DeviceId::new(drive.clone()), traffic_class, move || {
                 swift_core::constraints::check_drive(&devices, &drive, mount_check)
                     .map(|_| ())
-                    .map_err(|_| swob_response(507))
+                    .map_err(|err| drive_unavailable_response(&drive, &err.0))
             })
             .await
             .map_err(|error| plain_response(500, &error.to_string()))?
@@ -2752,9 +2798,11 @@ impl ObjectServer {
         // container servers. In production, mount_check prevents a lost mount
         // from redirecting object I/O into the underlying root filesystem;
         // SAIO may explicitly disable it and use a plain device directory.
+        // Isolated G6 dirs on a shared root need mount_check=false or a
+        // `.ismount` stub; same-FS bind mounts are detected via mountinfo.
         swift_core::constraints::check_drive(&self.config.devices, drive, self.config.mount_check)
             .map(|_| ())
-            .map_err(|_| swob_response(507))
+            .map_err(|err| drive_unavailable_response(drive, &err.0))
     }
 
     #[allow(clippy::type_complexity)]
@@ -3287,10 +3335,14 @@ impl ObjectServer {
         // statvfs failure fails open; the write itself still ENOSPCs.
         // Chunked transfers declare no length, so (as in Python, which
         // fallocates only when a size is known) they cannot pre-reserve.
-        if let Ok(free) = swift_core::fsutil::free_bytes(&self.config.devices.join(&drive)) {
-            if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
-            {
-                return swob_response(507);
+        if let Ok(space) = swift_core::fsutil::fs_space(&self.config.devices.join(&drive)) {
+            if fallocate_reserve_breached(
+                space.free_bytes,
+                space.total_bytes,
+                declared_len.unwrap_or(0),
+                &self.fallocate_reserve,
+            ) {
+                return swob_insufficient_storage(&drive, "reserve");
             }
         }
 
@@ -3308,7 +3360,7 @@ impl ObjectServer {
 
         let mut writer = match df.create(".data") {
             Ok(w) => w,
-            Err(DiskFileError::NoSpace) => return swob_response(507),
+            Err(DiskFileError::NoSpace) => return swob_insufficient_storage(&drive, "enospc"),
             Err(e) => return plain_response(500, &e.to_string()),
         };
         // MIME mode: advertise the capabilities on the first 100 Continue
@@ -3527,7 +3579,8 @@ impl ObjectServer {
         if let Err(e) = writer.put(metadata) {
             writer.close();
             return match e {
-                DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
+                DiskFileError::NoSpace => swob_insufficient_storage(&drive, "enospc"),
+                DiskFileError::XattrNotSupported => swob_insufficient_storage(&drive, "xattr"),
                 other => plain_response(500, &other.to_string()),
             };
         }
@@ -3919,7 +3972,8 @@ impl ObjectServer {
         // present in the metadata, as decided above.
         if let Err(e) = df.write_metadata(&metadata) {
             return match e {
-                DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
+                DiskFileError::NoSpace => swob_insufficient_storage(&drive, "enospc"),
+                DiskFileError::XattrNotSupported => swob_insufficient_storage(&drive, "xattr"),
                 other => plain_response(500, &other.to_string()),
             };
         }
@@ -6181,30 +6235,62 @@ mod fallocate_reserve_tests {
     fn breach_math_matches_python_fallocate_reserve() {
         let reserve = FallocateReserve::Bytes(100);
         assert!(
-            fallocate_reserve_breached(150, 50, &reserve),
+            fallocate_reserve_breached(150, 0, 50, &reserve),
             "free-after-write equal to the reserve fails (Python: free <= reserve)"
         );
-        assert!(fallocate_reserve_breached(120, 50, &reserve));
+        assert!(fallocate_reserve_breached(120, 0, 50, &reserve));
         assert!(
-            fallocate_reserve_breached(10, 50, &reserve),
+            fallocate_reserve_breached(10, 0, 50, &reserve),
             "write larger than free"
         );
-        assert!(!fallocate_reserve_breached(151, 50, &reserve));
+        assert!(!fallocate_reserve_breached(151, 0, 50, &reserve));
         assert!(
-            !fallocate_reserve_breached(0, 0, &reserve),
+            !fallocate_reserve_breached(0, 0, 0, &reserve),
             "zero-length writes skip the check"
         );
         assert!(!fallocate_reserve_breached(
             0,
+            0,
             10,
             &FallocateReserve::Bytes(0)
         ));
-        // percent mode needs the device's total capacity; not enforced yet
-        assert!(!fallocate_reserve_breached(
-            1,
-            1,
-            &FallocateReserve::Percent(99.0)
-        ));
+        // Swift1 isolated lab: 40G disk, 3.5G free (~8.75%), default 1%.
+        // A reconstruct_fa fragment must not 507 on percent math.
+        assert!(
+            !fallocate_reserve_breached(
+                3_500_000_000,
+                40_000_000_000,
+                1_048_576,
+                &FallocateReserve::Percent(1.0)
+            ),
+            "8.75% free minus 1MiB is still above a 1% reserve"
+        );
+        assert!(
+            !fallocate_reserve_breached(
+                400_000_000,
+                40_000_000_000,
+                0,
+                &FallocateReserve::Percent(1.0)
+            ),
+            "zero-length writes skip percent reserve"
+        );
+        assert!(
+            fallocate_reserve_breached(
+                400_000_000,
+                40_000_000_000,
+                1,
+                &FallocateReserve::Percent(1.0)
+            ),
+            "remaining percent == reserve is a breach (Python: free <= reserve)"
+        );
+        assert!(
+            fallocate_reserve_breached(1, 100, 1, &FallocateReserve::Percent(99.0)),
+            "percent mode must use total capacity"
+        );
+        assert!(
+            !fallocate_reserve_breached(1, 0, 1, &FallocateReserve::Percent(99.0)),
+            "unknown total fails open"
+        );
     }
 
     fn tiny_server(devices: &Path, reserve: FallocateReserve) -> ObjectServer {
@@ -7020,6 +7106,66 @@ mod fallocate_reserve_tests {
         // a tiny reserve passes and the object lands
         let ok = tiny_server(&dir, FallocateReserve::Bytes(1));
         assert_eq!(ok.handle(put_request(b"body")).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_with_default_percent_reserve_lands_when_disk_is_not_at_the_floor() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-pct-reserve-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Percent(1.0));
+        assert_eq!(
+            server.handle(put_request(b"frag")).status,
+            201,
+            "1% reserve must not 507 a small PUT on a temp FS"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replicate_507_names_the_drive_when_mount_check_rejects_a_plain_dir() {
+        // Field 57b7456: REPLICATE /sdb6/400 returned
+        // "There was not enough space… Drive: " with no device. Isolated
+        // devices are dirs on the root FS; mount_check=true is a correct
+        // 507, but the body must name the drive.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-unmounted-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sdb6")).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: true,
+            hash_config: HashPathConfig::new(Vec::new(), b"unmounted-drive".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(0, PolicyKind::Replication)]),
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: ContainerUpdateMode::Sync,
+        });
+        let mut resp = server.handle(Request {
+            method: "REPLICATE".into(),
+            path: "/sdb6/400".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        });
+        assert_eq!(resp.status, 507, "{}", resp.reason);
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+        assert!(
+            body.contains("Drive: sdb6"),
+            "507 must name the device, got {body:?}"
+        );
+        assert_eq!(
+            resp.headers.get("X-Backend-No-Space-Reason"),
+            Some("unmounted")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

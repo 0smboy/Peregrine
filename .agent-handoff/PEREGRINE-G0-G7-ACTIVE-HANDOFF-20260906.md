@@ -37,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: 8 `listing_*_direct` (mode already Listing HTML). Field on **`b20f569`**: **565/31/54** — object `./` hrefs passed; leftover is **4× `listing_*_direct_with_css`**. Sample: expected `'<link rel="stylesheet" type="text/css" href="…" />'`, actual type-before-rel | In-repo now emits Python `rel` then `type` then `href`. Fail-then-pass: `test_listing_html_css_link_is_rel_then_type_then_href`. Listing `./` href work (`b20f569`) stays independent of this CSS-order follow-up | Do **not** call G4 GREEN. The 4 CSS identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Overlay fires (195× syslog; partner uses isolated `bind_port`). `suffix_syncs=1–3` but **`rebuilt=0` always**. Theme `test_reconstructor_rebuild` still **14 (Δ0)** | Listen overlay is **not** the leftover. `test_rebuild_missing_frags` proxy_get 404 after once×3: `failed=['127.0.0.2:16220/sdb6#2']` (ports already remapped). In-repo now seeds local fragment, merges timestamp forms, counts reconstruct_fa PUTs as `rebuilt`, and logs the skip. **Not** a field replay. Do **not** call G6 GREEN |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4** (worse than ca2081b). Overlay fires; `--features ec` reconstructor `1a0fa11b…`. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. `rebuilt>0 = 0`. `reconstruct_fa` / `last_rebuild_error` never in syslog | Field 507/503 during rebuild: REPLICATE/SSYNC `Expected status 200; got 507` body Insufficient Storage **empty `Drive:`**; 503 lock timeout. Swift1 `/srv/{1..4}/node` all on `/dev/sda4` 40G **3.5G free (92%)**. In-repo now names Drive, detects same-FS bind mounts, implements Python percent `fallocate_reserve`, INFO-logs every reconstruct_fa/SSYNC line. **Not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -250,6 +250,24 @@ as `rebuilt`, log `last_rebuild_error`. Fail-then-pass:
 **`--features ec` is still required.** This is not a field replay. Do
 **not** call G6 GREEN. Keep this independent of G4 listing/CSS work.
 
+Field on **`57b7456`**: seed/overlay/timestamp did **not** land fragments.
+`reconstruct_fa` strings never appeared because SSYNC/REPLICATE failed
+**before** updates (`got 503` / `got 507` with empty `Drive:`). Isolated
+devices are dirs on the 92% full root FS. Rust `check_drive` 507s when
+`mount_check=true` and the dir is not a mount (Python SAIO sets
+`mount_check=false`; `.ismount` or `/proc/self/mountinfo` bind-mounts
+also pass). Percent `fallocate_reserve=1%` was a **no-op** (no total
+capacity); 8.75% free would **not** 507 a small fragment under Python
+math. In-repo now: Drive: name + `X-Backend-No-Space-Reason`, bind-mount
+detection, Python percent reserve, SSYNC error body snippet, INFO
+`object-reconstructor:` for every skip/failure. Fail-then-pass:
+`test_mountinfo_parser_finds_same_fs_bind_mount`,
+`breach_math_matches_python_fallocate_reserve` (3.5G/40G/1%/1MiB),
+`replicate_507_names_the_drive_when_mount_check_rejects_a_plain_dir`,
+`tcp_wire_connect_includes_507_body_drive_in_error`,
+`test_process_part_job_logs_ssync_connect_507`.
+Do **not** re-fix listen overlay or CSS. Do **not** call G6 GREEN.
+
 ### Exact Swift2 / Swift1 checks (environmental — do not fake)
 
 **container_sync**
@@ -283,14 +301,23 @@ as `rebuilt`, log `last_rebuild_error`. Fail-then-pass:
    `servers_per_port`.
 3. Pass log: `suffix_syncs` / `rebuilt` / `failures`.
    Field on `ca2081b`: `suffix_syncs>0` and `rebuilt=0` — overlay
-   connected; reconstruct_fa skipped. After this SHA expect
-   `reconstruct_fa …:` on `last failure:` when a PUT is skipped, and
-   `rebuilt>=1` when a reconstruct_fa PUT lands.
+   connected; reconstruct_fa skipped. Field on `57b7456`: SSYNC/REPLICATE
+   507/503 **before** reconstruct_fa; INFO `reconstruct_fa` never printed.
+   After this SHA expect INFO `object-reconstructor: …` for every
+   reconstruct_fa skip **and** `got 507 body='…Drive: sdb6…'`.
+   `rebuilt>=1` only when a reconstruct_fa PUT lands.
 4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
    correctly empty; heal must be partner `reconstruct_fa`. Ports on
    `ca2081b` were already remapped (`16220/sdb6#2`).
 5. Manager binary same isolated rust bin, conf under
    `/etc/g6-rust/object-server/*.conf`.
+6. Swift1 disk: `df -h /srv/1/node /dev/sda4`. Confirm
+   `mount_check` / `fallocate_reserve` in
+   `/etc/g6-rust/object-server/*.conf`. Isolated dirs on a shared root
+   need `mount_check=false` (SAIO) or a `.ismount` stub — do **not**
+   set reserve to 0. After this SHA, `mount_check=true` without a mount
+   logs a startup warning and 507s with `Drive: <device>` /
+   `X-Backend-No-Space-Reason: unmounted`.
 
 ## How to run full G0–G7
 
