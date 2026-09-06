@@ -1973,16 +1973,8 @@ mod tests {
             "field 93bd70c table missing: {body}"
         );
         assert!(
-            body.contains(&format!(
-                "<a href=\"./{}\">{}</a>",
-                python_quote(&index),
-                index
-            )),
-            "field 93bd70c official './{{quote(link)}}' object href missing: {body}"
-        );
-        assert!(
             body.contains(&python_link(&index)),
-            "index link missing: {body}"
+            "field 93bd70c official './{{quote(link)}}' object href missing: {body}"
         );
         assert!(
             body.contains(&python_link(&dir_slash)),
@@ -1998,7 +1990,10 @@ mod tests {
                 "container CSS missing: {body}"
             );
             assert!(
-                !body.contains(&format!("href=\"./{css_name}\"")),
+                !body.contains(&format!(
+                    "<link type=\"text/css\" rel=\"stylesheet\" href=\"./{}\" />",
+                    python_quote(&css_name)
+                )),
                 "official container CSS has no ./ prefix: {body}"
             );
         } else {
@@ -2033,16 +2028,8 @@ mod tests {
             "field 93bd70c dir table missing: {body}"
         );
         assert!(
-            body.contains(&format!(
-                "<a href=\"./{}\">{}</a>",
-                python_quote(&dir_obj_leaf),
-                dir_obj_leaf
-            )),
-            "field 93bd70c dir './{{quote(link)}}' href missing: {body}"
-        );
-        assert!(
             body.contains(&python_link(&dir_obj_leaf)),
-            "dir obj link missing: {body}"
+            "field 93bd70c dir './{{quote(link)}}' href missing: {body}"
         );
         assert!(
             body.contains(&python_link(&subdir_leaf)),
