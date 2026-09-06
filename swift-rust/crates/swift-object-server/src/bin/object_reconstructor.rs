@@ -13,12 +13,13 @@
 // and limitations under the License.
 
 //! `swift-object-reconstructor <object-server.conf> [once]`: the EC
-//! reconstructor daemon (`swift/obj/reconstructor.py`), ssync-driven half.
+//! reconstructor daemon (`swift/obj/reconstructor.py`).
 //! For every EC policy it sweeps each local device's partitions, builds SYNC
 //! jobs (push this primary's fragment state to its ring partners) and REVERT
 //! jobs (push misplaced fragments to their proper primary, then purge them
-//! locally), and runs them over SSYNC. The fragment REBUILD path
-//! (liberasurecode) stays behind the `ec` cargo feature as a library API.
+//! locally), and runs them over SSYNC. When built with `--features ec` it
+//! also rebuilds a missing local primary fragment from peers after the
+//! ssync pass (`reconstructor::run_once`).
 
 use std::path::Path;
 
@@ -34,6 +35,8 @@ use swift_object_server::reconstructor::{
     build_part_jobs, process_part_job, EcScheme, EcSsyncStats, HttpSuffixHashFetcher,
     TcpSsyncPusher,
 };
+#[cfg(feature = "ec")]
+use swift_object_server::reconstructor::{run_once as reconstruct_missing, HttpFragmentFetcher};
 use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
@@ -271,8 +274,8 @@ fn main() {
             );
         }
         logger.info(&format!(
-            "object-reconstructor pass: suffix_syncs={} reverts={} failures={}",
-            total.suffix_syncs, total.reverts, total.failures
+            "object-reconstructor pass: suffix_syncs={} reverts={} rebuilt={} failures={}",
+            total.suffix_syncs, total.reverts, total.rebuilt, total.failures
         ));
         if let Some(err) = &total.last_error {
             // A pass that keeps failing is the one an operator has to act on,
@@ -281,6 +284,7 @@ fn main() {
         }
         statsd.update_stats("suffix_syncs", total.suffix_syncs as i64);
         statsd.update_stats("reverts", total.reverts as i64);
+        statsd.update_stats("rebuilt", total.rebuilt as i64);
         statsd.update_stats("failures", total.failures as i64);
         let update = serde_json::json!({
             "object_reconstruction_time": pass_start.elapsed().as_secs_f64() / 60.0,
@@ -444,6 +448,47 @@ fn sweep_policy(
                     total,
                 );
             }
+        }
+        // Partner SYNC + reconstruct_fa is the usual heal path. Also rebuild
+        // locally when this node still has the object hash dir (leftover
+        // fragment / metadata) but is missing its own primary index.
+        #[cfg(feature = "ec")]
+        if let (Some(dev), Some(spool_budget)) = (
+            policy
+                .ring
+                .devs()
+                .iter()
+                .flatten()
+                .find(|d| d.id == local_id),
+            spool,
+        ) {
+            let frag_fetcher = HttpFragmentFetcher {
+                policy_index: policy.index,
+                max_response_bytes:
+                    swift_object_server::reconstructor::fragment_archive_size_bound(
+                        policy.scheme,
+                        max_original_size,
+                    )
+                    .unwrap_or(0),
+                max_original_size,
+                scheme: Some(policy.scheme),
+                spool: Some(spool_budget.clone()),
+                ..Default::default()
+            };
+            let rebuilt = reconstruct_missing(
+                &device_path,
+                policy.index,
+                policy.scheme,
+                &policy.ring,
+                &dev.ip,
+                dev.port,
+                &dev.device,
+                hash_config,
+                diskfile_config,
+                &frag_fetcher,
+            );
+            total.rebuilt += rebuilt.rebuilt;
+            total.failures += rebuilt.failed;
         }
     }
 }

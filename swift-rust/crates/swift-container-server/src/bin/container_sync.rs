@@ -28,8 +28,8 @@
 use std::path::Path;
 
 use swift_container_server::sync::{
-    run_once, ContainerSyncConfig, ContainerSyncRealms, EmptyObjectSource, HttpSyncClient,
-    ObjectSource,
+    run_once, run_once_for_ring, ContainerSyncConfig, ContainerSyncLocality, ContainerSyncRealms,
+    EmptyObjectSource, HttpSyncClient, ObjectSource,
 };
 use swift_core::config::SwiftConfig;
 use swift_core::daemon;
@@ -550,14 +550,23 @@ fn main() {
     let stop = swift_http::install_sigterm_flag();
 
     // Local bind identity for primary-node ordinal (Python is_local_device).
-    let bind_ip = get("container-sync", "bind_ip", "0.0.0.0");
-    let bind_port: u16 = get("container-sync", "bind_port", "6201")
-        .parse()
-        .unwrap_or(6201);
-    let _ = (bind_ip, bind_port); // residual: full is_local_device scan
+    // Prefer the container-server listen identity; [container-sync] may override.
+    let bind_ip = get(
+        "container-sync",
+        "bind_ip",
+        &get("app:container-server", "bind_ip", "0.0.0.0"),
+    );
+    let bind_port: u32 = get(
+        "container-sync",
+        "bind_port",
+        &get("app:container-server", "bind_port", "6201"),
+    )
+    .parse()
+    .unwrap_or(6201);
+    let local_ips = swift_core::localdev::ips_for_ring_lookup(&bind_ip);
 
     logger.info(&format!(
-        "swift-container-sync: devices={} interval={}s container_time={} once={run_once_only} internal_url={internal_url}",
+        "swift-container-sync: devices={} bind={bind_ip}:{bind_port} interval={}s container_time={} once={run_once_only} internal_url={internal_url}",
         cfg.devices.display(),
         cfg.interval,
         cfg.container_time,
@@ -565,41 +574,50 @@ fn main() {
 
     loop {
         let sweep_start = std::time::Instant::now();
-        // Without a full local-IP scan, use ordinal 0 / replica_count 1 so a
-        // single-node (or SAIO) ships every new row; multi-node deployments
-        // still backfill via pass A (point2→point1).
-        let (ordinal, replica_count) = container_ring
-            .as_ref()
-            .map(|r| (0usize, r.replica_count().max(1.0) as usize))
-            .map(|(o, c)| {
-                // Prefer shipping every new row only when replica_count is
-                // treated as 1 (dev). Production multi-replica keeps
-                // replica_count and relies on pass-A backfill for missed
-                // hashes when ordinal is always 0 — honest residual.
-                let _ = o;
-                (0usize, if c <= 1 { 1 } else { c })
-            })
-            .unwrap_or((0, 1));
-
-        let stats = run_once(
-            &cfg.devices,
-            &client,
-            &realms,
-            &cfg.allowed_sync_hosts,
-            &hash_config,
-            ordinal,
-            // SAIO / single-node: force full ownership of new rows.
-            if ordinal == 0 && replica_count > 1 {
-                // Multi-replica with unknown local ordinal: only backfill
-                // (pass A). Pass B still runs but owns_object(0, N) only
-                // ships 1/N; other primaries need their own ordinal. Use
-                // replica_count=1 so this node is useful without IP scan.
-                1
+        let stats = if let Some(ring) = container_ring.as_ref() {
+            if local_ips.is_empty() {
+                logger.warning(
+                    "no local interface addresses for container-sync ordinal; \
+                     falling back to ordinal 0 / replica_count 1",
+                );
+                run_once(
+                    &cfg.devices,
+                    &client,
+                    &realms,
+                    &cfg.allowed_sync_hosts,
+                    &hash_config,
+                    0,
+                    1,
+                    cfg.container_time,
+                )
             } else {
-                replica_count
-            },
-            cfg.container_time,
-        );
+                let locality = ContainerSyncLocality {
+                    ring,
+                    local_ips: &local_ips,
+                    bind_port,
+                };
+                run_once_for_ring(
+                    &cfg.devices,
+                    &client,
+                    &realms,
+                    &cfg.allowed_sync_hosts,
+                    &hash_config,
+                    &locality,
+                    cfg.container_time,
+                )
+            }
+        } else {
+            run_once(
+                &cfg.devices,
+                &client,
+                &realms,
+                &cfg.allowed_sync_hosts,
+                &hash_config,
+                0,
+                1,
+                cfg.container_time,
+            )
+        };
         logger.info(&format!(
             "container-sync pass: syncs={} puts={} deletes={} skips={} failures={}",
             stats.syncs, stats.puts, stats.deletes, stats.skips, stats.failures

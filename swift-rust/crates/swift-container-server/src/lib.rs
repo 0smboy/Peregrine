@@ -59,10 +59,13 @@ pub use sharder::{
     TcpShardHttpTransport, CLEAVING_CONTEXT_KEY, CLEAVING_CONTEXT_KEY_PREFIX,
 };
 pub use sync::{
-    build_sync_headers, get_sig, owns_object, process_container_db, run_once as sync_run_once,
-    sync_auth_header, sync_rows, validate_sync_to, ContainerSyncConfig, ContainerSyncRealms,
-    ContainerSyncStore, EmptyObjectSource, HttpSyncClient, MapObjectSource, ObjectSource,
-    SyncAction, SyncClient, SyncContext, SyncRow, SyncStats, ValidatedSyncTo, SYNC_DATADIR,
+    build_sync_headers, container_sync_ordinal, destination_already_current,
+    destination_put_accepted, get_sig, owns_object, process_container_db,
+    run_once as sync_run_once, run_once_for_ring as sync_run_once_for_ring, sync_auth_header,
+    sync_rows, validate_sync_to, ContainerSyncConfig, ContainerSyncLocality, ContainerSyncRealms,
+    ContainerSyncStore, EmptyObjectSource, HttpCallResult, HttpSyncClient, MapObjectSource,
+    ObjectSource, SyncAction, SyncClient, SyncContext, SyncRow, SyncStats, ValidatedSyncTo,
+    SYNC_DATADIR,
 };
 pub use updater::{
     process_container, run_once as updater_run_once, AccountNodeClient, ContainerOutcome,

@@ -637,15 +637,18 @@ pub fn discover_jobs(
         if df.open(None).is_err() {
             continue;
         }
-        // The local fragment is present iff dest_index is in the newest durable
-        // fragment set.
-        let have_local = df
+        // Rebuild only when this hash dir still has a durable fragment set
+        // that does not include our primary index. Tombstone-only dirs have
+        // no data file (`open` fails). Empty fragment sets are not rebuild
+        // candidates — there is nothing to name or reconstruct from.
+        let Some((_, idxs)) = df
             .fragments()
             .ok()
             .and_then(|sets| sets.into_iter().max_by_key(|(ts, _)| *ts))
-            .map(|(_, idxs)| idxs.contains(&(dest_index as i64)))
-            .unwrap_or(false);
-        if have_local {
+        else {
+            continue;
+        };
+        if idxs.is_empty() || idxs.contains(&(dest_index as i64)) {
             continue;
         }
         let Some((account, container, object)) = df.get_metadata().ok().and_then(object_name)
@@ -2297,6 +2300,7 @@ fn intersect_revert_confirmations(
 pub struct EcSsyncStats {
     pub suffix_syncs: u64,
     pub reverts: u64,
+    pub rebuilt: u64,
     pub failures: u64,
     pub last_error: Option<String>,
 }
@@ -2304,14 +2308,14 @@ pub struct EcSsyncStats {
 /// `reconstructor.process_job`: run one partition job.
 ///
 /// SYNC (`reconstructor._sync`): ssync the job's suffixes to each partner.
-/// v1 scope notes — Python first narrows suffixes per partner with a
-/// REPLICATE hash comparison (`_get_suffixes_to_sync`); this version ssyncs
-/// the whole suffix list each pass (the missing-check keeps it cheap for
-/// in-sync objects). Python also rebuilds wanted data fragments on the fly at
-/// the partner's frag index (`sync_diskfile_builder`/`reconstruct_fa`); this
-/// version has no rebuilder, so the sender skips data PUTs whose local
-/// fragment does not match the partner's index (exactly what Python does when
-/// the rebuild fails) — tombstones and meta still propagate.
+/// Suffixes are first narrowed per partner with a REPLICATE hash comparison
+/// (`get_suffixes_to_sync`). When the `ec` feature is on, the daemon supplies
+/// [`EcSyncRebuilder`] so a local fragment at a different index is rebuilt
+/// at the partner's backend index (`reconstruct_fa`). Without a rebuilder —
+/// or when rebuild fails — the sender skips those data PUTs (tombstones and
+/// meta still propagate). The daemon also runs [`run_once`] after ssync so a
+/// node that still has the object hash dir but lost its own fragment can
+/// rebuild locally from peers.
 ///
 /// REVERT (`reconstructor._revert`): ssync everything (including non-durable
 /// fragments) to every proper primary; when all of them succeed, purge the
@@ -3874,6 +3878,151 @@ mod suffix_sync_tests {
             get_suffix_delta(&local, Some(1), &stale, Some(2)),
             Vec::<String>::new()
         );
+    }
+
+    fn named_ec_ring(ip: &str, port: u32, device: &str) -> Ring {
+        let dev = |id: u64, ip: &str, port: u32, device: &str| RingDevice {
+            id,
+            region: 1,
+            zone: id + 1,
+            ip: ip.to_string(),
+            port,
+            replication_ip: None,
+            replication_port: None,
+            device: device.to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        Ring::new(
+            swift_ring::RingData::from_parts(
+                vec![
+                    Some(dev(0, ip, port, device)),
+                    Some(dev(1, "10.0.0.2", port, "sdb")),
+                    Some(dev(2, "10.0.0.3", port, "sdc")),
+                ],
+                32,
+                vec![vec![0], vec![1], vec![2]],
+            ),
+            HashPathConfig::new("", "changeme").unwrap(),
+        )
+    }
+
+    fn write_named_ec_frag(
+        device: &Path,
+        account: &str,
+        container: &str,
+        object: &str,
+        frag_index: i64,
+    ) {
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::new(
+            device,
+            0,
+            account,
+            container,
+            object,
+            PolicyKind::Ec {
+                n_unique_fragments: Some(3),
+            },
+            POLICY_INDEX,
+            &hc,
+            cfg,
+        )
+        .unwrap()
+        .with_frag_index(Some(frag_index));
+        let ts: swift_core::timestamp::Timestamp = "1751500001.00000".parse().unwrap();
+        let mut writer = df.create(".data").unwrap();
+        writer.write(b"frag").unwrap();
+        writer
+            .put(vec![
+                (
+                    MetaValue::Str("name".into()),
+                    MetaValue::Str(format!("/{account}/{container}/{object}")),
+                ),
+                (
+                    MetaValue::Str("X-Timestamp".into()),
+                    MetaValue::Str(ts.internal()),
+                ),
+                (
+                    MetaValue::Str("Content-Type".into()),
+                    MetaValue::Str("application/octet-stream".into()),
+                ),
+                (
+                    MetaValue::Str("Content-Length".into()),
+                    MetaValue::Str("4".into()),
+                ),
+                (MetaValue::Str("ETag".into()), MetaValue::Str("x".into())),
+                (
+                    MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                    MetaValue::Int(frag_index),
+                ),
+            ])
+            .unwrap();
+        writer.commit(&ts).unwrap();
+        writer.close();
+    }
+
+    #[test]
+    fn test_discover_jobs_finds_missing_local_primary_fragment() {
+        let root = tmp_root("discover-missing");
+        let device = root.join("sda1");
+        std::fs::create_dir_all(&device).unwrap();
+        write_named_ec_frag(&device, "AUTH_test", "c", "o", 1);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let ring = named_ec_ring("127.0.0.1", 6200, "sda1");
+        let jobs = discover_jobs(
+            &device,
+            POLICY_INDEX,
+            EcScheme {
+                ndata: 2,
+                nparity: 1,
+                segment_size: 1024,
+            },
+            &ring,
+            "127.0.0.1",
+            6200,
+            "sda1",
+            &hc,
+            &cfg,
+        );
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].account, "AUTH_test");
+        assert_eq!(jobs[0].container, "c");
+        assert_eq!(jobs[0].object, "o");
+        assert_eq!(jobs[0].destination_index, 0);
+        assert_eq!(jobs[0].peers.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_discover_jobs_skips_when_local_fragment_is_present() {
+        let root = tmp_root("discover-present");
+        let device = root.join("sda1");
+        std::fs::create_dir_all(&device).unwrap();
+        write_named_ec_frag(&device, "AUTH_test", "c", "o", 0);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let ring = named_ec_ring("127.0.0.1", 6200, "sda1");
+        let jobs = discover_jobs(
+            &device,
+            POLICY_INDEX,
+            EcScheme {
+                ndata: 2,
+                nparity: 1,
+                segment_size: 1024,
+            },
+            &ring,
+            "127.0.0.1",
+            6200,
+            "sda1",
+            &hc,
+            &cfg,
+        );
+        assert!(jobs.is_empty(), "{jobs:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
