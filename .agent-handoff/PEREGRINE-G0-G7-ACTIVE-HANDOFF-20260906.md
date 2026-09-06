@@ -37,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. Field on `5434983` and again on `84751c9` (proxy sha `7c7da29b`): **556 pass / 40 fail / 54 skip**. Staticweb HTML theme 16→8 on `5434983` (index + `redirect_slash`); the 8 `listing_{anon,auth}_direct_{with,without}_css` × ascii+UTF-8 are **unchanged** after Host/token copy | TempURL Hyper path. Staticweb listing±CSS now has field-pipeline unit tests (`test_field_listing_*_through_listing_formats`) | Do **not** call G4 GREEN. The 8 listing identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114 PASS / 32 FAIL / 29 ERROR / 4 SKIP**. Field replay on `f84ac71`: **115 PASS / 31 FAIL / 29 ERROR / 4 SKIP**. Theme delta: `container_sync` still **13**, `reconstructor_rebuild` still **14**. Only +1 PASS (`test_delete_propagate`). Historical GREEN on `17adf0b` is **not** transferable | HEAD in-repo proxy-from-`SWIFT_DIR` + remapped-port identity are **not** a field replay. Do **not** call G6 GREEN |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. `f84ac71`: **115/31/29/4**. Field on `1e1c515`: **114/32/29/4** — **no improvement**. `container_sync` still **13**. Logs: `PROXY_BASE_URL=http://127.0.0.1:18080` was set; `source GET transport failure` ×24; **no** `internal_url=` in those files | `internal_url=` was syslog-only; transport `eprintln` swallowed URL/kind. In-repo now logs both on stderr and stops a stale conf URL from ignoring `PROXY_BASE_URL`. **Not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -143,6 +143,24 @@ it previously returned `None`, so a bind-only `[DEFAULT]` file could not
 feed this fallback. Do **not** hardcode a guessed `:18080` host
 (`127.0.0.1` vs `10.0.0.1` both exist in lab scripts).
 
+Field on `1e1c515` **had** `PROXY_BASE_URL=http://127.0.0.1:18080` and
+still logged `container-sync: source GET transport failure` ×24 with
+**no** `internal_url=` in the same files. That is not “env missing.”
+`http_exchange` returned `None` and swallowed the URL / error kind
+(connection refused, timeout, TLS/https, DNS, incomplete headers).
+`internal_url=` was `logger.info` (syslog) while the failure is
+`eprintln` (Manager file log). A copied `[container-sync]
+internal_client_url` also used to win over the env. Realms cluster
+URLs are dest-only (`X-Container-Sync-To`); they do not feed
+`ProxyObjectSource.get_object`.
+
+In-repo now (unit only): stderr
+`container-sync: proxy_base=… internal_url=… auth_url=…`; transport
+failures print `kind=… url=… detail=…`; env PROXY_BASE_URL overrides
+stale conf URL; `/v1` is not doubled; connect uses `connect_timeout`
+and retries `{SWIFT_DIR}` bind_ip when loopback refuses. **Do not**
+call G6 GREEN until Swift2 replays 179 on this SHA.
+
 ### reconstructor_rebuild still 14: local `run_once` is **not** the heal path
 
 Official suite: `test/probe/test_reconstructor_rebuild.py`
@@ -173,14 +191,21 @@ ring port (`6010`). In-repo now falls back to local IP + device name
    `/etc/swift`).
 2. Child env: `PROXY_BASE_URL`, `SWIFT_TEST_CONFIG_FILE`
    `[probe_test] proxy_base_url`, `SWIFT_DIR=/etc/g6-rust`.
-3. First log line `internal_url=...` — must be isolated `:18080`, not
-   production `:8080`.
-4. `G6_CONTAINER_SYNC_DEBUG=1` / `container-sync: source GET status=`
-   (401/404 vs dest PUT).
-5. Auth: `[container-sync] internal_client_auth_*` or `[func_test]`
-   user/key.
-6. Realms `current` cluster URL must be the isolated proxy.
-7. DELETE-only PASS + PUT FAIL ⇒ source GET / proxy base, not HEAD/409.
+3. Same file as the ×24 failures must now contain
+   `container-sync: proxy_base=` / `internal_url=` (stderr). Syslog
+   `internal_url=` alone is not enough — that is why `1e1c515` looked
+   like the URL was never chosen.
+4. `source GET transport failure kind=` must name
+   `connection refused` / `timeout` / `tls` / `dns` / `incomplete headers`
+   and the full URL. `G6_CONTAINER_SYNC_DEBUG=1` also prints
+   `source GET url=` before the request.
+5. `ss -lntp | grep 18080` vs URL host: if kind is connection refused
+   on `127.0.0.1:18080` but proxy binds `10.0.0.1` only, the fallback
+   retry log (`source GET fallback url=`) should fire.
+6. Auth: `[container-sync] internal_client_auth_*` or `[func_test]`
+   user/key. `auth transport failure kind=` is the same channel.
+7. Realms `current` cluster URL is **dest** Sync-To, not the source GET.
+8. DELETE-only PASS + PUT FAIL ⇒ source GET / proxy base, not HEAD/409.
 
 **reconstructor**
 
