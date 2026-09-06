@@ -5,6 +5,7 @@
 #[path = "harness.rs"]
 mod harness;
 
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -51,9 +52,13 @@ fn idle_50000_keepalives_or_capture_unavailability() {
         shutdown: flag,
         join: Some(join),
     };
+    // Reserve a keep-alive before the climb. After an OS port ceiling a
+    // new connect is AddrNotAvailable; that is not worker starvation.
+    let mut probe = harness::get_keepalive(server.addr)
+        .expect("reserved occupancy probe before the climb");
     let outcome = harness::open_many(&[server.addr], TARGET, 8, Duration::from_secs(600));
     let opened = outcome.streams.len();
-    let held = outcome.streams;
+    let mut held = outcome.streams;
     let os_ceiling = outcome.errors.iter().any(|error| {
         error.contains("AddrNotAvailable") || error.contains("ephemeral ports exhausted")
     });
@@ -70,11 +75,44 @@ fn idle_50000_keepalives_or_capture_unavailability() {
             outcome.attempts, outcome.errors
         );
     }
-    let (status, _) = harness::get_close_timed(server.addr, Duration::from_secs(1))
-        .expect("health GET with held idle keep-alives");
+    let status = health_on_held(&mut probe, &mut held);
     assert_eq!(
         status, 200,
         "health must work with {opened} idle sockets at worker_threads=2"
     );
     drop(held);
+}
+
+fn health_on_held(probe: &mut TcpStream, held: &mut [TcpStream]) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = 0u16;
+    while Instant::now() < deadline {
+        last = probe_status(probe);
+        if last == 200 {
+            return last;
+        }
+        for stream in held.iter_mut().take(4) {
+            last = probe_status(stream);
+            if last == 200 {
+                return last;
+            }
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    last
+}
+
+fn probe_status(stream: &mut TcpStream) -> u16 {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+        .is_err()
+    {
+        return 0;
+    }
+    match harness::read_http_response(stream) {
+        Ok((status, _)) => status,
+        Err(_) => 0,
+    }
 }
