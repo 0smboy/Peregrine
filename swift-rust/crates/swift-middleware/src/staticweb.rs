@@ -28,6 +28,13 @@
 //! carrying `type-<ct>` classes and human-readable sizes). Deferred: the CSS
 //! path building, tempurl query-string propagation, custom Web-Error docs,
 //! and directory-marker suppression.
+//!
+//! Follow-up (field G4, 16 HTML index/listing fails on isolated :18080):
+//! this filter only implements `handle()`. Production Hyper serve never
+//! calls `handle()` for ordinary GET/HEAD — it needs `intercepts_response`
+//! / `reassemble_async` (and likely `prepare` for the container HEAD) so
+//! index + listing run on the async path. Not the same hole as TempURL
+//! HMAC-in-`prepare`; do not treat a TempURL 401 fix as closing these.
 
 use swift_http::{split_path, Body, HeaderKeyDict, Request, Response, MAX_CONTROL_BODY};
 

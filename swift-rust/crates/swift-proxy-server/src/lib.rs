@@ -8620,6 +8620,93 @@ mod pipeline_async_tests {
             "catch_errors must stamp X-Trans-Id on the async path"
         );
     }
+
+    /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
+    /// because HMAC lived only in `handle()`, which Hyper never calls.
+    /// `prepare` must stamp `X-Backend-Authorize-Override` so
+    /// `authorize_async` does not treat a signed URL as anonymous.
+    #[tokio::test]
+    async fn tempurl_prepare_runs_on_hyper_path_so_signed_get_is_not_auth_401() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                // No live object nodes in this unit test; fail the backend
+                // connect quickly once authorize has accepted the TempURL.
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::CatchErrors::new("")),
+                Arc::new(swift_middleware::Gatekeeper::default()),
+                Arc::new(tu),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 401,
+            "valid TempURL on the Hyper path must not 401 (got {} {:?})",
+            resp.status, resp.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn tempurl_prepare_rejects_bad_sig_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec!["mykey".to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: "temp_url_sig=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&temp_url_expires=4102444800".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 401);
+        let mut resp = resp;
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Temp URL invalid"),
+            "bad HMAC on Hyper path must use TempURL 401 body, got {body:?}"
+        );
+    }
 }
 
 #[cfg(test)]
