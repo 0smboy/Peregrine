@@ -1587,7 +1587,10 @@ impl ProxyApp {
     }
 
     /// INFO (or ERROR when `error`) on the real proxy logger, plus any test sink.
+    /// Isolated lab harvests `G6_DIAG` from stderr (manager.log); syslog
+    /// `Logger` alone was silent on `2c64a89`.
     pub(crate) fn emit_proxy_log(&self, error: bool, msg: &str) {
+        eprintln!("G6_DIAG {msg}");
         if let Some(sink) = &self.log_sink {
             sink(msg);
         }
@@ -1633,6 +1636,23 @@ impl ProxyApp {
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect();
         self
+    }
+
+    /// EC scheme for a GET: exact policy index, else a configured scheme
+    /// whose `ndata + nparity` matches this object ring's replica count.
+    pub(crate) fn ec_params_for_object_ring(
+        &self,
+        policy_index: i64,
+        object_ring: &Ring,
+    ) -> Option<EcPolicyParams> {
+        if let Some(&ec) = self.ec_policies.get(&policy_index) {
+            return Some(ec);
+        }
+        let n = object_ring.replica_count().round() as usize;
+        self.ec_policies
+            .values()
+            .copied()
+            .find(|ec| ec.ndata + ec.nparity == n)
     }
 
     /// The object ring for a configured storage policy index (Python
@@ -3301,7 +3321,30 @@ impl ProxyApp {
             return match (req.method.as_str(), container.as_deref(), object.as_deref()) {
                 ("GET" | "HEAD", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
-                    self.object_get_head_async(&mut req, &account, &c, &o).await
+                    self.emit_proxy_log(
+                        false,
+                        &format!(
+                            "proxy-server: EC GET {}/{}/{} status=start \
+                             reason=handle_async method={}",
+                            percent_encode(&account),
+                            percent_encode(&c),
+                            percent_encode(&o),
+                            req.method
+                        ),
+                    );
+                    let resp = self.object_get_head_async(&mut req, &account, &c, &o).await;
+                    self.emit_proxy_log(
+                        resp.status >= 400,
+                        &format!(
+                            "proxy-server: EC GET {}/{}/{} status={} \
+                             reason=handle_async_done",
+                            percent_encode(&account),
+                            percent_encode(&c),
+                            percent_encode(&o),
+                            resp.status
+                        ),
+                    );
+                    resp
                 }
                 ("POST", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
@@ -5354,9 +5397,9 @@ impl ProxyApp {
         // and fans a distinct fragment archive to each node; GET/HEAD gather
         // `ndata` fragments and decode. POST (metadata) and DELETE (tombstone)
         // carry no object data, so they take the replication fan-out unchanged.
-        if let Some(&ec) = self.ec_policies.get(&policy_index) {
+        if let Some(ec) = self.ec_params_for_object_ring(policy_index, object_ring) {
             match req.method.as_str() {
-                "PUT" => {
+                "PUT" if self.ec_policies.contains_key(&policy_index) => {
                     return self.ec_put(
                         req,
                         account,
@@ -5369,7 +5412,23 @@ impl ProxyApp {
                     )
                 }
                 "GET" | "HEAD" => {
-                    return self.ec_get(req, &path, policy_index, object_ring, object_part, ec);
+                    self.emit_proxy_log(
+                        false,
+                        &format!(
+                            "proxy-server: EC GET {path} status=start reason=sync_ec_get \
+                             policy={policy_index} ndata={}",
+                            ec.ndata
+                        ),
+                    );
+                    let resp = self.ec_get(req, &path, policy_index, object_ring, object_part, ec);
+                    self.emit_proxy_log(
+                        resp.status >= 400,
+                        &format!(
+                            "proxy-server: EC GET {path} status={} reason=sync_ec_get_done",
+                            resp.status
+                        ),
+                    );
+                    return resp;
                 }
                 _ => {}
             }
@@ -5942,6 +6001,7 @@ impl ProxyApp {
                 Err(_) => self.error_limiter.increment(&node),
             }
         }
+        let n200 = goods.len();
         let mut sources: HashMap<i32, (Node, BackendHead)> = HashMap::new();
         let mut meta: Option<Vec<(String, String)>> = None;
         for (node, head) in goods {
@@ -5965,11 +6025,24 @@ impl ProxyApp {
         }
 
         if sources.len() < ec.ndata {
-            return if sources.is_empty() && saw_auth_404 {
-                swob_response(404)
+            let idxs: Vec<i32> = sources.keys().copied().collect();
+            let status = if sources.is_empty() && saw_auth_404 {
+                404
+            } else if saw_auth_404 {
+                404
             } else {
-                swob_response(503)
+                503
             };
+            self.emit_proxy_log(
+                true,
+                &format!(
+                    "proxy-server: EC GET {path} status={status} reason=sync_ec_gather \
+                     policy={policy_index} ndata={} 200s={} idxs={idxs:?}",
+                    ec.ndata,
+                    n200
+                ),
+            );
+            return swob_response(status);
         }
         let meta = meta.unwrap_or_default();
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")

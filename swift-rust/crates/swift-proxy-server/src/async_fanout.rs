@@ -1209,13 +1209,16 @@ impl ProxyApp {
             .headers
             .get("X-Backend-Storage-Policy-Index")
             .and_then(|v| v.parse().ok());
+        let container_policy = self
+            .container_info_async(account, container)
+            .await
+            .policy_index;
+        // InternalClient may send policy 0. Do not let that hide an EC
+        // container (field 2c64a89: Ec-Frag 200s exist, gather never ran).
         let policy_index: i64 = match header_policy {
+            Some(0) if self.ec_policies.contains_key(&container_policy) => container_policy,
             Some(p) => p,
-            None => {
-                self.container_info_async(account, container)
-                    .await
-                    .policy_index
-            }
+            None => container_policy,
         };
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return Response::with_body(
@@ -1251,23 +1254,46 @@ impl ProxyApp {
             }
         }
         self.forward_open_expired(req, &mut headers);
-        if self.ec_policies.contains_key(&policy_index) {
+        let ec_params = self.ec_params_for_object_ring(policy_index, object_ring);
+        self.emit_proxy_log(
+            false,
+            &format!(
+                "proxy-server: EC GET {path} status=route reason=object_get_head_async \
+                 header={header_policy:?} container_policy={container_policy} \
+                 policy={policy_index} ec={} ndata={} replica={}",
+                ec_params.is_some() as u8,
+                ec_params.map(|e| e.ndata).unwrap_or(0),
+                object_ring.replica_count()
+            ),
+        );
+        if ec_params.is_some() {
             return self
                 .ec_get_async(req, &path, policy_index, object_ring, object_part)
                 .await;
         }
         let nodes = self.iter_nodes(object_ring, object_part);
-        self.get_or_head_async(
-            "object",
-            nodes,
-            object_part,
-            &req.method,
-            &path,
-            &req.query_string,
-            &headers,
-        )
-        .await
-        .unwrap_or_else(|| swob_response(503))
+        let resp = self
+            .get_or_head_async(
+                "object",
+                nodes,
+                object_part,
+                &req.method,
+                &path,
+                &req.query_string,
+                &headers,
+            )
+            .await
+            .unwrap_or_else(|| swob_response(503));
+        if resp.status == 404 {
+            self.emit_proxy_log(
+                true,
+                &format!(
+                    "proxy-server: EC GET {path} status=404 reason=replica_get_or_head \
+                     policy={policy_index}"
+                ),
+            );
+        }
+        resp
     }
 
     pub(crate) async fn ec_get_async(
@@ -1278,7 +1304,7 @@ impl ProxyApp {
         object_ring: &swift_ring::Ring,
         object_part: u32,
     ) -> Response {
-        let Some(&ec) = self.ec_policies.get(&policy_index) else {
+        let Some(ec) = self.ec_params_for_object_ring(policy_index, object_ring) else {
             return swob_response(503);
         };
         #[cfg(not(feature = "ec"))]
