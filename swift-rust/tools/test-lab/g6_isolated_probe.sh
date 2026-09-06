@@ -14,6 +14,8 @@
 # Field `/workspace/rebuild-nondurable-176505e/` (2026-09-06): gatekeeper
 # on public :18080 strips X-Backend-* (X-Backend-No-Commit). IC no-commit
 # PUT and fragment-preferences GET used rust :18082 for that PASS.
+# Field `/workspace/g6-rebuild-176505e/` (2026-09-06): UTF8 names must be
+# percent-encoded before http.client (IRI → request-target).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"

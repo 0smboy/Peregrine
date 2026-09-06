@@ -163,6 +163,7 @@ on rust HTTP (do **not** reopen):
 - `test_rebuild_missing_frags` — PASS `988b81b` (`/workspace/rebuild-once-988b81b-httpget/`, 2026-09-06).
 - `test_rebuild_quarantines_lonely_frag` — PASS `3efec7d` + HEAD honesty (`/workspace/rebuild-lonely-3efec7d-headhttp/`, 2026-09-06).
 - `test_rebuild_with_non_durable_newer_data` — PASS `176505e` proxy `faaeed18…` (`/workspace/rebuild-nondurable-176505e/`, 2026-09-06). BrokenPipe gone; prefs GET etag v2≠v1.
+- `test_rebuild_reconciled_object_with_offset_timestamp` — ASCII PASS on the `176505e` theme replay (`/workspace/g6-rebuild-176505e/`, 2026-09-06). Do not reopen.
 
 `:18080` public pipeline includes **gatekeeper**, which strips every
 `X-Backend-*` (including `X-Backend-No-Commit`). Official IC
@@ -173,11 +174,30 @@ headers. Field PASS routed those IC PUTs and backend-header
 carry `X-Backend-*`. Do not “fix” gatekeeper by allowing client
 `X-Backend-*` on `:18080`.
 
-Wait for the **176505e full rebuild-theme ledger** before the next
-code tip. Prior 988b81b leftovers still in play until that replay:
-`test_rebuild_reconciled_object_with_offset_timestamp` (setup all
-direct GET 404), `test_sync_expired_object` (`proxy_get` 404), UTF-8
-class (meta encoding).
+Field `/workspace/g6-rebuild-176505e/` (2026-09-06) on tip `176505e`:
+rebuild theme **ok=9 / FAILED=3 / ERROR=5** of 17 (was 6/11 on
+`988b81b`+httpget). Newly green ASCII (do **not** reopen):
+`lonely_frag`, `non_durable_newer_data`,
+`test_rebuild_reconciled_object_with_offset_timestamp`, plus prior
+`missing_frags` / `non_durable` / `partner_down` / `combo` /
+`unexpired_meta`.
+
+This tip is IsolatedIdentity **IRI → percent-encoded request-target**,
+latin-1 `putheader` names (http.client requires ASCII names), and a
+latin-1 response-head parse (`email.parser` drops
+`X-Object-Meta-\xc3\xa8-…`, which is why UTF8 lonely HEAD only saw
+Content-Type). WSGI aliases (`è` → `Ã¨`) match InternalClient keys.
+Goal: UTF8 `missing_frags` / `non_durable_*` / lonely HEAD leave
+`UnicodeEncodeError`. ASCII twins already PASS — leftover UTF8 after
+this SHA is the next field replay, not reconstructor math. Do **not**
+claim those UTF8 identities PASS from unit tests.
+
+Remaining ASCII leftover (separate theme; not this adapter encode):
+`test_sync_expired_object` — official probe
+`AssertionError: Timed out waiting for … to expire after 2s`.
+Adapter already forwards `x-delete-after` (not hop-by-hop). Rust
+object GET already 404s `DiskFileExpired` when `X-Delete-At` is
+past and `allow_open_expired` is off. Do not call expire PASS.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080

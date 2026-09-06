@@ -132,6 +132,243 @@ class JoinAndGuard(unittest.TestCase):
         self.assertEqual(hdrs["X-Auth-Token"], "AUTH_tk")
 
 
+class Utf8PathAndHeaders(unittest.TestCase):
+    """Field /workspace/g6-rebuild-176505e/: IRI path + WSGI meta keys."""
+
+    def tearDown(self):
+        adapter.uninstall()
+        os.environ.pop("PROXY_BASE_URL", None)
+
+    def test_encode_swift_request_path_quotes_e_grave(self):
+        self.assertEqual(
+            adapter.encode_swift_request_path("/v1/a/cè/o"),
+            "/v1/a/c%C3%A8/o",
+        )
+        official = b"%s\xc3\xa8-%s" % (b"container", b"uuid")
+        path = "/v1/AUTH_ec/%s/%s" % (
+            official.decode("utf-8"),
+            (b"obj\xc3\xa8-uuid").decode("utf-8"),
+        )
+        self.assertEqual(
+            adapter.encode_swift_request_path(path),
+            "/v1/AUTH_ec/container%C3%A8-uuid/obj%C3%A8-uuid",
+        )
+
+    def test_encode_swift_request_path_does_not_double_quote(self):
+        self.assertEqual(
+            adapter.encode_swift_request_path("/v1/a/c%C3%A8/o"),
+            "/v1/a/c%C3%A8/o",
+        )
+
+    def test_join_proxy_url_percent_encodes_utf8_path(self):
+        self.assertEqual(
+            adapter.join_proxy_url("http://127.0.0.1:18080", "/v1/a/cè/oè"),
+            "http://127.0.0.1:18080/v1/a/c%C3%A8/o%C3%A8",
+        )
+        self.assertEqual(
+            adapter.join_proxy_url("http://127.0.0.1:18080", "/v1/a/c%C3%A8/o"),
+            "http://127.0.0.1:18080/v1/a/c%C3%A8/o",
+        )
+
+    def test_wsgi_header_token_e_grave_is_mojibake_not_double_encoded(self):
+        self.assertEqual(
+            adapter.wsgi_header_token("X-Object-Meta-è-color"),
+            "X-Object-Meta-Ã¨-color",
+        )
+        already = "X-Object-Meta-Ã¨-color"
+        self.assertEqual(adapter.wsgi_header_token(already), already)
+        self.assertEqual(adapter.wsgi_header_token("Content-Type"), "Content-Type")
+        self.assertEqual(
+            adapter.ascii_lower_http_token("X-Object-Meta-Ã¨-color"),
+            "x-object-meta-Ã¨-color",
+        )
+        self.assertNotEqual(
+            "X-Object-Meta-Ã¨-color".lower(),
+            "x-object-meta-Ã¨-color",
+        )
+
+    def test_outgoing_utf8_meta_is_wsgi_for_http_client(self):
+        filtered = adapter._filter_outgoing_headers(
+            {"X-Object-Meta-è-color": "red", "Transfer-Encoding": "chunked"}
+        )
+        self.assertEqual(filtered, [("X-Object-Meta-Ã¨-color", "red")])
+        name, value = filtered[0]
+        name.encode("latin-1")
+        value.encode("latin-1")
+
+    def test_parse_http_header_block_keeps_utf8_meta_name(self):
+        """email.parser drops X-Object-Meta-\\xc3\\xa8-…; we must not."""
+        status, hdrs = adapter.parse_http_header_block(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"X-Object-Meta-\xc3\xa8-color: blue\r\n"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("Content-Type"), "text/plain")
+        self.assertEqual(hdrs.get("x-object-meta-Ã¨-color"), "blue")
+
+    def test_response_headers_expose_lonely_frag_wsgi_meta_key(self):
+        from_wire_utf8 = adapter.wsgi_response_headers(
+            {"X-Object-Meta-Ã¨-color": "blue", "Content-Type": "text/plain"}
+        )
+        self.assertEqual(from_wire_utf8.get("X-Object-Meta-Ã¨-color"), "blue")
+        self.assertEqual(from_wire_utf8.get("x-object-meta-Ã¨-color"), "blue")
+        self.assertEqual(from_wire_utf8.get("X-Object-Meta-è-color"), "blue")
+        from_latin1_e = adapter.wsgi_response_headers({"X-Object-Meta-è-color": "blue"})
+        self.assertEqual(from_latin1_e.get("x-object-meta-Ã¨-color"), "blue")
+        self.assertEqual(from_latin1_e.get("X-Object-Meta-è-color"), "blue")
+
+    def test_http_get_opener_sees_ascii_percent_encoded_url(self):
+        class FakeResp:
+            status = 200
+            headers = {"X-Object-Meta-Ã¨-color": "blue"}
+
+            def read(self):
+                return b""
+
+            def getcode(self):
+                return 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            req.full_url.encode("ascii")
+            self.assertEqual(
+                req.full_url,
+                "http://127.0.0.1:18080/v1/AUTH_ec/c%C3%A8/o%C3%A8",
+            )
+            return FakeResp()
+
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        resp = adapter.rust_http_make_request(
+            "GET",
+            "/v1/AUTH_ec/cè/oè",
+            {"X-Object-Meta-è-color": "blue"},
+            (2,),
+            opener=opener,
+        )
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers.get("x-object-meta-Ã¨-color"), "blue")
+
+    def test_http_client_putrequest_accepts_utf8_object_path(self):
+        """Field UnicodeEncodeError was http.client._encode_request ascii."""
+        received = {}
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            received["port"] = sock.getsockname()[1]
+            received["ready"].set()
+            conn, _addr = sock.accept()
+            sock.close()
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                head, _rest = buf.split(b"\r\n\r\n", 1)
+                received["request_line"] = head.split(b"\r\n", 1)[0]
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+                    b"X-Object-Meta-\xc3\xa8-color: blue\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            finally:
+                conn.close()
+
+        received["ready"] = threading.Event()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(received["ready"].wait(2), "test server did not bind")
+        resp = adapter.rust_http_exchange(
+            "GET",
+            f"http://127.0.0.1:{received['port']}/v1/a/cè/oè-uuid",
+            {},
+            timeout=5.0,
+        )
+        thread.join(2)
+        self.assertEqual(resp.status_int, 200)
+        line = received["request_line"]
+        line.decode("ascii")
+        self.assertIn(b"/v1/a/c%C3%A8/o%C3%A8-uuid", line)
+        self.assertEqual(resp.headers.get("x-object-meta-Ã¨-color"), "blue")
+
+    def test_http_put_percent_encodes_path_and_wsgi_meta(self):
+        received = {}
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            received["port"] = sock.getsockname()[1]
+            received["ready"].set()
+            conn, _addr = sock.accept()
+            sock.close()
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                head, rest = buf.split(b"\r\n\r\n", 1)
+                lines = head.split(b"\r\n")
+                headers = {}
+                for line in lines[1:]:
+                    if b":" in line:
+                        name, value = line.split(b":", 1)
+                        headers[
+                            adapter.ascii_lower_http_token(name.decode("latin1"))
+                        ] = value.strip().decode("latin1")
+                received["request_line"] = lines[0]
+                received["raw_head"] = head
+                received["headers"] = headers
+                if headers.get("expect", "").lower() == "100-continue":
+                    conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                length = int(headers.get("content-length", "0"))
+                while len(rest) < length:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    rest += chunk
+                received["body"] = rest[:length]
+                conn.sendall(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            finally:
+                conn.close()
+
+        received["ready"] = threading.Event()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(received["ready"].wait(2), "test server did not bind")
+        resp = adapter.rust_http_exchange(
+            "PUT",
+            f"http://127.0.0.1:{received['port']}/v1/a/cè/oè",
+            {"X-Object-Meta-è-color": "red"},
+            timeout=5.0,
+            data=b"utf8-body",
+        )
+        thread.join(2)
+        self.assertEqual(resp.status_int, 201)
+        received["request_line"].decode("ascii")
+        self.assertIn(b"/v1/a/c%C3%A8/o%C3%A8", received["request_line"])
+        self.assertEqual(received["body"], b"utf8-body")
+        self.assertIn(b"X-Object-Meta-\xc3\xa8-color: red", received["raw_head"])
+        self.assertEqual(received["headers"].get("x-object-meta-\u00c3\u00a8-color"), "red")
+        self.assertNotIn("x-object-meta-\u00e8-color", received["headers"])
+
+
 class HttpAndPatch(unittest.TestCase):
     def tearDown(self):
         adapter.uninstall()

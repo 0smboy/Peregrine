@@ -35,6 +35,14 @@ pipeline includes gatekeeper, which strips ``X-Backend-*`` (including
 backend-header ``proxy_get`` via rust ``:18082``. Do not reopen
 lonely_frag, missing_frags, or non_durable_newer_data.
 
+Field ``/workspace/g6-rebuild-176505e/`` (2026-09-06): UTF8 class
+``UnicodeEncodeError`` ``'\\xe8'`` in ``http.client.putrequest`` when
+container/object names contain ``è``. Percent-encode the request-target
+(IRI → HTTP). ``putheader`` names are ASCII — send WSGI ``Ã¨`` as
+latin-1. ``email.parser`` drops ``X-Object-Meta-\\xc3\\xa8-…`` so
+response heads are read as latin-1 (lonely-frag HEAD meta). Expose
+InternalClient WSGI aliases (``x-object-meta-Ã¨-…``).
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
@@ -137,18 +145,107 @@ def uses_isolated_rust_proxy(environ: Optional[Mapping[str, str]] = None) -> boo
     return ISOLATED_RUST_PORT_TOKEN in proxy_base_url(environ)
 
 
+def quote_swift_path_segment(part: str) -> str:
+    """One PATH_INFO segment → ASCII percent-encoding (Swift ``quote``)."""
+    if isinstance(part, bytes):
+        part = part.decode("utf-8")
+    return urllib.parse.quote(part, safe="%-._~")
+
+
+def encode_swift_request_path(path: str) -> str:
+    """IRI / WSGI PATH_INFO → HTTP/1.1 request-target.
+
+    Official UTF8 rebuild names are ``b'…\\xc3\\xa8-…'`` decoded to ``è``.
+    ``http.client.putrequest`` requires ASCII; field
+    ``/workspace/g6-rebuild-176505e/`` UnicodeEncodeError ``\\xe8``.
+    Already-quoted ``%C3%A8`` is not double-encoded (``%`` stays safe).
+    """
+    raw = path or "/"
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    query = ""
+    if "?" in raw:
+        raw, query = raw.split("?", 1)
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    encoded = "/".join(quote_swift_path_segment(part) for part in raw.split("/"))
+    if query:
+        encoded += "?" + query
+    return encoded
+
+
+def wsgi_header_token(value: Any) -> str:
+    """Unicode header → PEP 3333 WSGI latin-1 (UTF-8 octets as ``Ã¨``).
+
+    ``è`` (U+00E8) becomes ``Ã¨``. Already-WSGI ``Ã¨`` (http.client latin-1
+    of UTF-8 on the wire) is left alone so lonely-frag HEAD can see
+    ``x-object-meta-Ã¨-…`` without a second encode.
+    """
+    if isinstance(value, bytes):
+        return value.decode("latin-1")
+    text = str(value)
+    try:
+        text.encode("ascii")
+        return text
+    except UnicodeEncodeError:
+        pass
+    try:
+        text.encode("latin-1").decode("utf-8")
+        return text
+    except UnicodeError:
+        return text.encode("utf-8").decode("latin-1")
+
+
+def ascii_lower_http_token(name: str) -> str:
+    """Case-fold only ASCII A–Z. ``str.lower()`` turns ``Ã`` into ``ã``."""
+    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in name)
+
+
+class _Latin1FieldName(str):
+    """``http.client.putheader`` does ``header.encode('ascii')``.
+
+    IsolatedIdentity must put WSGI ``X-Object-Meta-Ã¨-…`` on the wire as
+    latin-1 (UTF-8 octets), same as eventlet WSGI. A str subclass keeps
+    that encode path on latin-1 instead of raising UnicodeEncodeError.
+    """
+
+    def encode(self, encoding: str = "ascii", errors: str = "strict") -> bytes:
+        return str.encode(self, "latin-1", errors)
+
+
+def http_outgoing_header_name(name: Any) -> str:
+    return _Latin1FieldName(wsgi_header_token(name))
+
+
+def wsgi_response_headers(headers: Mapping[str, Any]) -> dict[str, str]:
+    """http.client latin-1 keys plus UTF-8 aliases for HeaderKeyDict tests."""
+    out: dict[str, str] = {}
+    for name, value in _header_items(headers):
+        wsgi_name = wsgi_header_token(name)
+        wsgi_value = wsgi_header_token(value)
+        aliases = {wsgi_name, ascii_lower_http_token(wsgi_name), name}
+        try:
+            utf8_name = wsgi_name.encode("latin-1").decode("utf-8")
+            aliases.add(utf8_name)
+            aliases.add(ascii_lower_http_token(utf8_name))
+        except UnicodeError:
+            pass
+        for key in aliases:
+            out[key] = wsgi_value
+    return out
+
+
 def join_proxy_url(
     base: str, path: str, params: Optional[Mapping[str, Any]] = None
 ) -> str:
     """Join IsolatedIdentity PROXY_BASE_URL with InternalClient.make_path.
 
     ``http://127.0.0.1:18080`` + ``/v1/a/c/o`` → ``http://127.0.0.1:18080/v1/a/c/o``.
-    A base that already ends in ``/v1`` is not doubled.
+    A base that already ends in ``/v1`` is not doubled. Non-ASCII path
+    segments are percent-encoded for ``http.client``.
     """
     base = (base or "").strip().rstrip("/")
-    path = path or "/"
-    if not path.startswith("/"):
-        path = "/" + path
+    path = encode_swift_request_path(path or "/")
     if base.endswith("/v1") and path.startswith("/v1"):
         url = base[: -len("/v1")] + path
     else:
@@ -391,7 +488,7 @@ def _filter_outgoing_headers(
     for name, value in _header_items(headers):
         if name.lower() in HOP_BY_HOP_REQUEST:
             continue
-        out.append((name, value))
+        out.append((http_outgoing_header_name(name), wsgi_header_token(value)))
     return out
 
 
@@ -403,6 +500,114 @@ def _eventlet_hub_yield() -> None:
         eventlet.sleep(0)
     except Exception:
         pass
+
+
+def parse_http_header_block(head: bytes) -> tuple[int, dict[str, str]]:
+    """Latin-1 HTTP head → status + WSGI header aliases.
+
+    ``http.client`` / ``email.parser`` drops ``X-Object-Meta-\\xc3\\xa8-…``
+    (field lonely-frag UTF8 HEAD saw only Content-Type). Keep every
+    field name as iso-8859-1, then add ``Ã¨`` / ``è`` aliases.
+    """
+    lines = head.split(b"\r\n")
+    if not lines:
+        raise RustProxyGetError("empty HTTP response head from rust :18080")
+    status_line = lines[0].decode("latin-1", "replace")
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise RustProxyGetError(f"bad HTTP status line {status_line!r}")
+    raw: dict[str, str] = {}
+    for line in lines[1:]:
+        if not line or b":" not in line:
+            continue
+        name, value = line.split(b":", 1)
+        raw[name.decode("latin-1").strip()] = value.decode("latin-1").strip()
+    return int(parts[1]), wsgi_response_headers(raw)
+
+
+def _header_lookup(headers: Mapping[str, str], name: str) -> Optional[str]:
+    want = ascii_lower_http_token(name)
+    for key, value in headers.items():
+        if ascii_lower_http_token(key) == want:
+            return value
+    return None
+
+
+def _read_chunked_body(sock: Any, initial: bytes) -> bytes:
+    buf = initial
+    chunks: list[bytes] = []
+    while True:
+        while b"\r\n" not in buf:
+            more = sock.recv(4096)
+            if not more:
+                break
+            buf += more
+        if b"\r\n" not in buf:
+            break
+        line, buf = buf.split(b"\r\n", 1)
+        size_s = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_s, 16)
+        except ValueError as err:
+            raise RustProxyGetError(f"bad chunk size {line!r}") from err
+        if size == 0:
+            break
+        while len(buf) < size + 2:
+            more = sock.recv(4096)
+            if not more:
+                break
+            buf += more
+        chunks.append(buf[:size])
+        buf = buf[size:]
+        if buf.startswith(b"\r\n"):
+            buf = buf[2:]
+    return b"".join(chunks)
+
+
+def _read_http_message(
+    sock: Any, timeout: float, *, expect_body: bool
+) -> _HttpResp:
+    """Read one final HTTP response, keeping non-ASCII header names."""
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > 64 * 1024:
+            raise RustProxyGetError("HTTP response head too large from rust :18080")
+    if b"\r\n\r\n" not in buf:
+        raise RustProxyGetError(
+            f"no HTTP response head from rust :18080 ({buf[:200]!r})"
+        )
+    head, leftover = buf.split(b"\r\n\r\n", 1)
+    status, headers = parse_http_header_block(head)
+    if not expect_body or status in {204, 304} or 100 <= status < 200:
+        return _HttpResp(status, headers, b"")
+    te = (_header_lookup(headers, "Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        return _HttpResp(status, headers, _read_chunked_body(sock, leftover))
+    length_s = _header_lookup(headers, "Content-Length")
+    if length_s is not None:
+        try:
+            length = int(length_s)
+        except ValueError as err:
+            raise RustProxyGetError(f"bad Content-Length {length_s!r}") from err
+        body = leftover
+        while len(body) < length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return _HttpResp(status, headers, body[:length])
+    body = leftover
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return _HttpResp(status, headers, body)
 
 
 def _read_http_head(sock: Any, timeout: float) -> tuple[int, bytes]:
@@ -453,7 +658,7 @@ def rust_http_send_body(
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    path = parsed.path or "/"
+    path = encode_swift_request_path(parsed.path or "/")
     if parsed.query:
         path = f"{path}?{parsed.query}"
     payload = data if data is not None else b""
@@ -476,10 +681,7 @@ def rust_http_send_body(
             for offset in range(0, len(payload), PUT_SEND_CHUNK):
                 conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
                 _eventlet_hub_yield()
-            resp = conn.getresponse()
-            body = resp.read()
-            hdrs = {k: v for k, v in resp.getheaders()}
-            return _HttpResp(int(resp.status), hdrs, body)
+            return _read_http_message(conn.sock, timeout, expect_body=True)
         if status == 417:
             conn.close()
             return _put_without_expect(
@@ -519,10 +721,46 @@ def _put_without_expect(
         for offset in range(0, len(payload), PUT_SEND_CHUNK):
             conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
             _eventlet_hub_yield()
-        resp = conn.getresponse()
-        body = resp.read()
-        hdrs = {k: v for k, v in resp.getheaders()}
-        return _HttpResp(int(resp.status), hdrs, body)
+        return _read_http_message(conn.sock, timeout, expect_body=True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def rust_http_no_body(
+    method: str,
+    url: str,
+    headers: Optional[Mapping[str, Any]],
+    timeout: float = 30.0,
+    connection_cls: Optional[type] = None,
+) -> _HttpResp:
+    """GET/HEAD/DELETE on rust :18080 with IRI path + WSGI header names.
+
+    urllib/http.client ``putrequest`` needs an ASCII request-target;
+    ``putheader`` names are ASCII unless wrapped in ``_Latin1FieldName``.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = encode_swift_request_path(parsed.path or "/")
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if connection_cls is None:
+        import http.client as http_client
+
+        connection_cls = http_client.HTTPConnection
+    conn = connection_cls(host, port, timeout=timeout)
+    try:
+        conn.putrequest(method.upper(), path, skip_accept_encoding=True)
+        for name, value in _filter_outgoing_headers(headers):
+            conn.putheader(name, value)
+        conn.putheader("Connection", "close")
+        conn.endheaders()
+        return _read_http_message(
+            conn.sock, timeout, expect_body=method.upper() != "HEAD"
+        )
     finally:
         try:
             conn.close()
@@ -550,6 +788,18 @@ def rust_http_exchange(
             timeout=timeout if timeout and timeout > 0 else PUT_TIMEOUT_SECS,
             connection_cls=connection_cls,
         )
+    if opener is None:
+        return rust_http_no_body(
+            method_u,
+            url,
+            headers,
+            timeout=timeout if timeout and timeout > 0 else 30.0,
+            connection_cls=connection_cls,
+        )
+    parsed = urllib.parse.urlparse(url)
+    encoded_path = encode_swift_request_path(parsed.path or "/")
+    if encoded_path != parsed.path:
+        url = urllib.parse.urlunparse(parsed._replace(path=encoded_path))
     req = urllib.request.Request(
         url, data=payload or None, method=method_u
     )
@@ -562,11 +812,11 @@ def rust_http_exchange(
         with open_url(req, timeout=timeout) as resp:
             body = resp.read()
             status = getattr(resp, "status", None) or resp.getcode()
-            return _HttpResp(int(status), dict(resp.headers), body)
+            return _HttpResp(int(status), wsgi_response_headers(dict(resp.headers)), body)
     except urllib.error.HTTPError as err:
         body = err.read() if err.fp is not None else b""
         hdrs = dict(err.headers) if err.headers is not None else {}
-        return _HttpResp(int(err.code), hdrs, body)
+        return _HttpResp(int(err.code), wsgi_response_headers(hdrs), body)
 
 
 def rust_http_make_request(
