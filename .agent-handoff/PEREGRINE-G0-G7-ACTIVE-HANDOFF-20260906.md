@@ -37,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: 8 `listing_*_direct` (mode already Listing HTML). Field on **`b20f569`**: **565/31/54** — object `./` hrefs passed; leftover is **4× `listing_*_direct_with_css`**. Sample: expected `'<link rel="stylesheet" type="text/css" href="…" />'`, actual type-before-rel | In-repo now emits Python `rel` then `type` then `href`. Fail-then-pass: `test_listing_html_css_link_is_rel_then_type_then_href`. Listing `./` href work (`b20f569`) stays independent of this CSS-order follow-up | Do **not** call G4 GREEN. The 4 CSS identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4**. Field on **`1682fdb`: 125/30/20/4**. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. Single-test `test_rebuild_missing_frags` still `proxy_get` 404 after once | Field **`4f7a82c`** harvest `proxy-gather-leftover.txt` (2026-09-06): PRE-once 404 while object-server already returned **5** Ec-Frag 200s `idxs=[0,2,3,4,5]` (ec42 ndata=4; missing only `#1`). POST-once still 404 after all 6 indexes 200. Dial ports isolated; proxy had **0** gather/etag lines. Leftover is **gather/decode** (etag/ts split or silent drop), not heal visibility. In-repo now: prefs-less round 0 joins unique indexes into **one** durable bucket; misses log `proxy-server: EC GET … reason= 200s= idxs=`. Fail-then-pass: `test_internal_client_get_after_post_and_single_frag_rmtree`. **Not** a field replay. Do **not** call G6 GREEN. Do not re-litigate mount_check / CSS / overlay / write-path durable PUT / object-server Ec-Frag-Index |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4**. Field on **`1682fdb`: 125/30/20/4**. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. Single-test `test_rebuild_missing_frags` still `proxy_get` 404 after once | Field **`f4051f4`** (2026-09-06): still **404×6** on isolated `:18080`. Join did not flip PRE-once. `eprintln!` gather lines had **0** hits in manager.log/syslog (string was in the binary). In-repo now: `Logger.info/error` (`proxy-server: EC GET … reason= 200s= idxs=`); round 0 strips leaked `X-Backend-Fragment-Preferences`; unique-index 200s merge across split buckets. Fail-then-pass: `test_internal_client_get_after_post_and_single_frag_rmtree` (Hyper `serve`/`handle_async`, no policy header, leaked prefs, logger sink). **Not** a field replay. Do **not** call G6 GREEN. Do not re-litigate DiskFile / dial / reconstruct_fa durable PUT |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -315,14 +315,18 @@ object-server already returned **5** Ec-Frag 200s
 `idxs=[0,2,3,4,5]` (missing only `#1`). POST-once still 404 after
 `reconstruct_fa` and waves that include `Ec-Frag-Index=1 status=200`.
 Dial ports are isolated. Proxy had **0** gather/etag lines (silent
-404). Leftover is **gather/decode**, not heal visibility. In-repo
-now: prefs-less round 0 joins every unique index into **one** durable
-bucket (POST/PUT ts and Ec-Etag must not split ndata successes) and
-`eprintln` `proxy-server: EC GET … reason= 200s= idxs=`. Fail-then-pass:
-`test_internal_client_get_after_post_and_single_frag_rmtree`.
-**Not** a field replay. Do **not** call G6 GREEN. Do not re-litigate
-mount_check / CSS / overlay / write-path durable PUT / object-server
-Ec-Frag-Index.
+404). Leftover is **gather/decode**, not heal visibility.
+
+Field on **`f4051f4`** (2026-09-06): same **404×6**; deployed proxy
+sha256 changed; object-server/reconstructor unchanged vs `4f7a82c`.
+`eprintln!` miss lines **0** hits in manager.log + syslog. In-repo
+now: `Logger` INFO/ERROR (`proxy-server: EC GET … reason=`); strip
+client Fragment-Preferences on round 0; merge unique-index 200s
+across split buckets when no single generation has ndata. Fail-then-pass:
+`test_internal_client_get_after_post_and_single_frag_rmtree` via
+Hyper `serve` → `handle_async` (the `:18080` path) with no policy
+header + leaked prefs + logger sink. **Not** a field replay. Do **not**
+call G6 GREEN. Do not re-litigate DiskFile / dial / reconstruct_fa.
 
 Do **not** call G6 GREEN.
 
@@ -369,11 +373,13 @@ Do **not** call G6 GREEN.
    After **`9a95747`** (a)/(b) matched live; leftover is (c). Grep
    `object-server: GET … Ec-Frag-Index=` on the victim after once.
    Field **`4f7a82c`**: those GET 200s landed; leftover is proxy
-   gather after ≥ndata 200s. After this SHA grep proxy stderr/manager
-   for `proxy-server: EC GET` / `reason=` / `200s=` / `idxs=` during
-   `test_rebuild_missing_frags`. PRE-once single-frag must be 200
-   (5 remaining). A leftover 404 must now name why (`empty_buckets` /
-   `no_complete_bucket` / `tombstone_trumps` + skip counts).
+   gather after ≥ndata 200s. Field **`f4051f4`**: still 404×6;
+   `eprintln!` did not reach manager.log. After this SHA grep
+   manager.log **and** syslog for `proxy-server: EC GET` / `reason=` /
+   `200s=` / `idxs=` (Logger INFO/ERROR, not stderr). PRE-once
+   single-frag must be 200 (5 remaining). A leftover 404 must name
+   why (`empty_buckets` / `no_complete_bucket` / `tombstone_trumps`
+   + skip counts). Start lines use `status=start reason=gather`.
    `rebuilt>=1` with `proxy_get` 404 is **not** GREEN.
 4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
    correctly empty; heal must be partner `reconstruct_fa`. Ports on

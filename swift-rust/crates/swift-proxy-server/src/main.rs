@@ -228,6 +228,7 @@ fn main() {
         logger.error(&format!("could not load rings: {e}"));
         std::process::exit(1);
     });
+    let app = app.with_logger(Arc::clone(&logger));
     // The handler reads the current app on every request; the reload thread
     // swaps in a rebuilt one when a ring file changes on disk. Cloned into
     // tempurl's KeyProvider so signed URLs resolve live Temp-URL-Key meta.
@@ -2412,6 +2413,7 @@ fn spawn_ring_reload_thread(
             }
             match builder.build() {
                 Ok(rebuilt) => {
+                    let rebuilt = rebuilt.with_logger(Arc::clone(&logger));
                     let mut slot = app.write().unwrap_or_else(|poisoned| poisoned.into_inner());
                     *slot = Arc::new(rebuilt);
                     drop(slot);

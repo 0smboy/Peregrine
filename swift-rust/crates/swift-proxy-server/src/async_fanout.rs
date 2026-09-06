@@ -1346,9 +1346,9 @@ impl ProxyApp {
     async fn ec_get_async_inner(
         self: &Arc<Self>,
         is_head: bool,
-        headers: HeaderKeyDict,
+        mut headers: HeaderKeyDict,
         path: &str,
-        _policy_index: i64,
+        policy_index: i64,
         object_ring: &swift_ring::Ring,
         object_part: u32,
         ec: super::EcPolicyParams,
@@ -1366,6 +1366,21 @@ impl ProxyApp {
 
         let nodes = self.iter_nodes(object_ring, object_part);
         let required = if is_head { 1 } else { ec.ndata };
+        // InternalClient / copy_backend_control_headers forwards every
+        // X-Backend-* header. A leaked Fragment-Preferences on the client
+        // GET would make rust DiskFile treat `[]` as newest-including-
+        // non-durable, or exclude the remaining durable indexes. Round 0
+        // must be prefs-less regardless of what the client sent.
+        headers.remove("X-Backend-Fragment-Preferences");
+        self.emit_proxy_log(
+            false,
+            &format!(
+                "proxy-server: EC GET {path} status=start reason=gather \
+                 policy={policy_index} ndata={} nodes={} prefs=omitted",
+                ec.ndata,
+                nodes.len()
+            ),
+        );
         let mut buckets: std::collections::HashMap<String, EcResponseBucket> =
             std::collections::HashMap::new();
         let mut saw_404 = false;
@@ -1447,9 +1462,7 @@ impl ProxyApp {
                                 explicit_data_timestamp.is_some(),
                             )
                         };
-                        let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                            .and_then(|value| value.parse::<i32>().ok())
-                            .or(node.backend_index);
+                        let fi = ec_frag_index(&head.headers).or(node.backend_index);
                         let Some(fi) = fi else {
                             skipped_no_fi += 1;
                             continue;
@@ -1561,11 +1574,42 @@ impl ProxyApp {
                         })
                         .collect::<Vec<_>>()
                         .join(",");
-                    if all_good_older_than_tombstone {
+                    // Field f4051f4: 5 unique-index 200s still 404'd when
+                    // they sat in split generation buckets. Merge every
+                    // unique index that is not older than a truthy tombstone
+                    // — that is the official probe contract (ndata of 6).
+                    let mut flat = std::collections::HashMap::new();
+                    for bucket in buckets.values_mut() {
+                        for (fi, head) in std::mem::take(&mut bucket.sources) {
+                            let src_ts = super::source_timestamp(&head.headers);
+                            if latest_404_timestamp.is_truthy() && src_ts < latest_404_timestamp {
+                                continue;
+                            }
+                            flat.entry(fi).or_insert(head);
+                        }
+                    }
+                    if flat.len() >= required {
+                        let flat_key = "flat".to_string();
+                        let merged = EcResponseBucket {
+                            etag: String::new(),
+                            meta: flat
+                                .values()
+                                .next()
+                                .map(|head| head.headers.clone())
+                                .unwrap_or_default(),
+                            sources: flat,
+                            durable: true,
+                        };
+                        buckets.insert(flat_key.clone(), merged);
+                        flat_key
+                    } else if all_good_older_than_tombstone {
                         log_ec_gather_miss(
+                            self,
                             path,
                             404,
                             "tombstone_trumps",
+                            policy_index,
+                            ec.ndata,
                             n200,
                             &seen_idxs,
                             skipped_no_ts,
@@ -1576,36 +1620,71 @@ impl ProxyApp {
                             saw_404,
                         );
                         return swob_response(404);
-                    }
-                    let status = ec_no_durable_status(
-                        has_reconstructable_nondurable_bucket,
-                        saw_404,
-                        buckets.is_empty(),
-                    );
-                    log_ec_gather_miss(
-                        path,
-                        status,
-                        if buckets.is_empty() {
-                            "empty_buckets"
+                    } else {
+                        // rmtree / missing-hash-dir 404 + fewer than ndata
+                        // live indexes is a known-missing object (probe 404),
+                        // not an availability 503.
+                        let status = if saw_404 && flat.len() < required {
+                            404
                         } else {
-                            "no_complete_bucket"
-                        },
-                        n200,
-                        &seen_idxs,
-                        skipped_no_ts,
-                        skipped_no_fi,
-                        skipped_etag,
-                        &bucket_summary,
-                        &latest_404_timestamp.internal(),
-                        saw_404,
-                    );
-                    return swob_response(status);
+                            ec_no_durable_status(
+                                has_reconstructable_nondurable_bucket,
+                                saw_404,
+                                buckets.is_empty() || flat.is_empty(),
+                            )
+                        };
+                        log_ec_gather_miss(
+                            self,
+                            path,
+                            status,
+                            if buckets.is_empty() {
+                                "empty_buckets"
+                            } else {
+                                "no_complete_bucket"
+                            },
+                            policy_index,
+                            ec.ndata,
+                            n200,
+                            &seen_idxs,
+                            skipped_no_ts,
+                            skipped_no_fi,
+                            skipped_etag,
+                            &bucket_summary,
+                            &latest_404_timestamp.internal(),
+                            saw_404,
+                        );
+                        return swob_response(status);
+                    }
                 }
             }
         };
         let chosen = buckets
             .remove(&chosen_timestamp)
             .expect("chosen EC response bucket must exist");
+        self.emit_proxy_log(
+            false,
+            &format_ec_gather_miss(
+                path,
+                200,
+                "ok",
+                policy_index,
+                ec.ndata,
+                n200,
+                &seen_idxs,
+                skipped_no_ts,
+                skipped_no_fi,
+                skipped_etag,
+                &format!(
+                    "{}:{}:{}:{}",
+                    chosen_timestamp,
+                    chosen.sources.len(),
+                    if chosen.durable { "d" } else { "n" },
+                    chosen.etag
+                ),
+                &latest_404_timestamp.internal(),
+                saw_404,
+            ),
+        );
         let sources = chosen.sources;
         let meta = chosen.meta;
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
@@ -3686,13 +3765,15 @@ fn ec_round0_bucket_key(existing: Option<&str>, data_timestamp: &str) -> String 
         .unwrap_or_else(|| version_timestamp_key(data_timestamp))
 }
 
-/// Field harvest greps proxy logs for `EC GET` / `reason=`. Object-server
-/// already logged the 200s; this line is why they did not become a client 200.
+/// Field harvest greps proxy manager.log / syslog for `EC GET` / `reason=`.
+/// Must go through `Logger` (`proxy-server:` INFO/ERROR), not `eprintln!`.
 #[cfg(feature = "ec")]
 fn format_ec_gather_miss(
     path: &str,
     status: u16,
     reason: &str,
+    policy_index: i64,
+    ndata: usize,
     n200: usize,
     idxs: &[i32],
     skipped_no_ts: usize,
@@ -3704,17 +3785,35 @@ fn format_ec_gather_miss(
 ) -> String {
     format!(
         "proxy-server: EC GET {path} status={status} reason={reason} \
-         200s={n200} idxs={idxs:?} skipped_no_ts={skipped_no_ts} \
-         skipped_no_fi={skipped_no_fi} skipped_etag={skipped_etag} \
-         buckets={buckets} tombstone={tombstone} saw_404={saw_404}"
+         policy={policy_index} ndata={ndata} 200s={n200} idxs={idxs:?} \
+         skipped_no_ts={skipped_no_ts} skipped_no_fi={skipped_no_fi} \
+         skipped_etag={skipped_etag} buckets={buckets} \
+         tombstone={tombstone} saw_404={saw_404}"
     )
 }
 
 #[cfg(feature = "ec")]
+fn ec_frag_index(headers: &[(String, String)]) -> Option<i32> {
+    for key in [
+        "X-Object-Sysmeta-Ec-Frag-Index",
+        "X-Backend-Ec-Frag-Index",
+        "Ec-Frag-Index",
+    ] {
+        if let Some(fi) = resp_header(headers, key).and_then(|value| value.parse::<i32>().ok()) {
+            return Some(fi);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "ec")]
 fn log_ec_gather_miss(
+    app: &ProxyApp,
     path: &str,
     status: u16,
     reason: &str,
+    policy_index: i64,
+    ndata: usize,
     n200: usize,
     idxs: &[i32],
     skipped_no_ts: usize,
@@ -3724,12 +3823,14 @@ fn log_ec_gather_miss(
     tombstone: &str,
     saw_404: bool,
 ) {
-    eprintln!(
-        "{}",
-        format_ec_gather_miss(
+    app.emit_proxy_log(
+        status >= 400,
+        &format_ec_gather_miss(
             path,
             status,
             reason,
+            policy_index,
+            ndata,
             n200,
             idxs,
             skipped_no_ts,
@@ -3738,7 +3839,7 @@ fn log_ec_gather_miss(
             buckets,
             tombstone,
             saw_404,
-        )
+        ),
     );
 }
 
@@ -4247,6 +4348,8 @@ mod tests {
             "/a/c/o",
             404,
             "no_complete_bucket",
+            2,
+            4,
             5,
             &[0, 2, 3, 4, 5],
             0,
@@ -4260,7 +4363,12 @@ mod tests {
             line.contains("proxy-server: EC GET /a/c/o status=404 reason=no_complete_bucket"),
             "{line}"
         );
-        assert!(line.contains("200s=5 idxs=[0, 2, 3, 4, 5]"), "{line}");
+        assert!(
+            line.contains("policy=2 ndata=4 200s=5 idxs=[0, 2, 3, 4, 5]"),
+            "{line}"
+        );
+        assert!(ec_frag_index(&[("X-Object-Sysmeta-Ec-Frag-Index".into(), "3".into())]) == Some(3));
+        assert!(ec_frag_index(&[("Ec-Frag-Index".into(), "5".into())]) == Some(5));
     }
 
     #[cfg(feature = "ec")]

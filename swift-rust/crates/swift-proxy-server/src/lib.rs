@@ -730,6 +730,11 @@ pub struct ProxyApp {
     /// Account/container info cache (L1 local + optional shared memcache L2).
     /// Rebuilt whenever the app is reconstructed (ring reload).
     info_cache: InfoCache,
+    /// Syslog logger used by the daemon (`log_name`, usually `proxy-server`).
+    /// Isolated lab manager.log / syslog harvest this path; `eprintln!` does not.
+    logger: Option<Arc<swift_core::obslog::Logger>>,
+    /// Test capture for the same lines the daemon sends to syslog.
+    log_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// A backend response.
@@ -1564,6 +1569,34 @@ impl ProxyApp {
             config,
             error_limiter,
             info_cache: InfoCache::new(),
+            logger: None,
+            log_sink: None,
+        }
+    }
+
+    /// Attach the daemon syslog logger. Ring reload must re-apply this.
+    pub fn with_logger(mut self, logger: Arc<swift_core::obslog::Logger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// Capture `proxy-server:` lines in tests (same strings as syslog).
+    pub fn with_log_sink(mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.log_sink = Some(sink);
+        self
+    }
+
+    /// INFO (or ERROR when `error`) on the real proxy logger, plus any test sink.
+    pub(crate) fn emit_proxy_log(&self, error: bool, msg: &str) {
+        if let Some(sink) = &self.log_sink {
+            sink(msg);
+        }
+        if let Some(logger) = &self.logger {
+            if error {
+                logger.error(msg);
+            } else {
+                logger.info(msg);
+            }
         }
     }
 

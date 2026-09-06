@@ -25,7 +25,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use swift_proxy_server::{EcPolicyParams, ProxyApp, ProxyConfig};
 use swift_ring::{Ring, RingData, RingDevice};
@@ -187,7 +187,28 @@ fn md5_hex(data: &[u8]) -> String {
 /// Policy 0 is replication (`objects/`). Policy 1 is EC (`objects-1/`).
 /// InternalClient GET omits `X-Backend-Storage-Policy-Index`; if the proxy
 /// falls through to policy 0 it 404s even when every fragment is on disk.
+///
+/// `serve()` is Hyper `handle_async` — the same path isolated `:18080` hits.
 fn boot_ec_cluster(tmp: &Path) -> (std::net::SocketAddr, Vec<PathBuf>) {
+    boot_ec_cluster_inner(tmp, None)
+}
+
+fn boot_ec_cluster_logged(
+    tmp: &Path,
+) -> (std::net::SocketAddr, Vec<PathBuf>, Arc<Mutex<Vec<String>>>) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink_lines = Arc::clone(&lines);
+    let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |msg: &str| {
+        sink_lines.lock().unwrap().push(msg.to_string());
+    });
+    let (addr, dirs) = boot_ec_cluster_inner(tmp, Some(sink));
+    (addr, dirs, lines)
+}
+
+fn boot_ec_cluster_inner(
+    tmp: &Path,
+    log_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+) -> (std::net::SocketAddr, Vec<PathBuf>) {
     let acct_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let acct_addr = acct_listener.local_addr().unwrap();
     std::fs::create_dir_all(tmp.join("acct/sda1")).unwrap();
@@ -271,6 +292,11 @@ fn boot_ec_cluster(tmp: &Path) -> (std::net::SocketAddr, Vec<PathBuf>) {
         },
     );
     app.policy_name_to_index.insert("policy-1".to_string(), 1);
+    let app = if let Some(sink) = log_sink {
+        app.with_log_sink(sink)
+    } else {
+        app
+    };
     let app = Arc::new(app);
     std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -691,7 +717,7 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let (proxy_addr, obj_dirs) = boot_ec_cluster(&tmp);
+    let (proxy_addr, obj_dirs, logs) = boot_ec_cluster_logged(&tmp);
 
     let (status, _, _) = http(
         proxy_addr,
@@ -741,7 +767,16 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
         .sum();
     assert_eq!(remaining, N - 1, "exactly one durable fragment removed");
 
-    let (status, headers, body) = http(proxy_addr, "GET", "/v1/AUTH_ec/probe/obj", &[], b"");
+    // Leaked client Fragment-Preferences must not hide remaining durables
+    // (`copy_backend_control_headers` forwards X-Backend-*).
+    let leaked_prefs = r#"[{"timestamp":"0","exclude":[0,1,2,3,4,5]}]"#;
+    let (status, headers, body) = http(
+        proxy_addr,
+        "GET",
+        "/v1/AUTH_ec/probe/obj",
+        &[("X-Backend-Fragment-Preferences", leaked_prefs)],
+        b"",
+    );
     assert_eq!(
         status,
         200,
@@ -755,6 +790,15 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
     assert_eq!(color, "red", "POST metadata must survive single-frag loss");
+    let captured = logs.lock().unwrap().clone();
+    assert!(
+        captured.iter().any(|line| {
+            line.contains("proxy-server: EC GET")
+                && line.contains("status=200")
+                && line.contains("reason=ok")
+        }),
+        "Hyper handle_async must log EC GET ok via the proxy logger sink: {captured:?}"
+    );
 
     // Adjacent second hole (official 0+5 / 0+4). Still ndata=4 of 6.
     let _ = rmtree_one_durable_hash_dir(&obj_dirs);
@@ -766,6 +810,23 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
         String::from_utf8_lossy(&body)
     );
     assert_eq!(body, payload);
+
+    // Below ndata: the miss line must use the same logger sink field greps.
+    let _ = rmtree_one_durable_hash_dir(&obj_dirs);
+    let _ = rmtree_one_durable_hash_dir(&obj_dirs);
+    logs.lock().unwrap().clear();
+    let (status, _, _) = http(proxy_addr, "GET", "/v1/AUTH_ec/probe/obj", &[], b"");
+    assert_eq!(status, 404, "GET with only 2/6 fragments must 404");
+    let captured = logs.lock().unwrap().clone();
+    assert!(
+        captured.iter().any(|line| {
+            line.contains("proxy-server: EC GET")
+                && line.contains("reason=")
+                && line.contains("200s=")
+                && line.contains("idxs=")
+        }),
+        "gather miss must log via the real proxy logger path: {captured:?}"
+    );
 
     std::fs::remove_dir_all(&tmp).unwrap();
 }
