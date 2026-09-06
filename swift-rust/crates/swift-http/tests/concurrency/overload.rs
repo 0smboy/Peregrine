@@ -68,11 +68,14 @@ fn extra_connection_is_503_when_max_connections_is_full() {
     let _ = extra.flush();
     let _ = extra.shutdown(Shutdown::Write);
     let (status, buf) = harness::read_http_response(&mut extra).expect("overflow response");
+    let text = String::from_utf8_lossy(&buf);
     assert_eq!(
-        status,
-        503,
-        "shipped Hyper must fail-closed at max_connections, got {status} {}",
-        String::from_utf8_lossy(&buf)
+        status, 503,
+        "shipped Hyper must fail-closed at max_connections, got {status} {text}"
+    );
+    assert!(
+        text.contains("admission"),
+        "overflow 503 must name admission, not a bare Service Unavailable: {text}"
     );
     drop(held);
 }

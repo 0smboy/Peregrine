@@ -251,19 +251,27 @@ pub async fn serve_http1_connection(
 }
 
 pub async fn reject_overloaded(mut stream: tokio::net::TcpStream) {
-    // Field `1682fdb` SSYNC `got 503` had no body token. Name admission so
-    // reconstructor syslog can tell this apart from a partition lock.
+    // Accept-overflow used to write 503 and shutdown before the client
+    // finished GET /health. CI then saw status 0 (`connection closed
+    // before message completed`) instead of fail-closed 503. Drain a
+    // bounded head first, then one write. Field `1682fdb` SSYNC `got 503`
+    // had no body token — name admission so syslog can tell this apart
+    // from a partition lock.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(250),
+        read_until_marker(&mut stream, b"\r\n\r\n", 8192, Duration::from_millis(250)),
+    )
+    .await;
     let body = b"Service Unavailable (admission)";
     let msg = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\
          X-Backend-Unavailable-Reason: admission\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        body.len()
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        std::str::from_utf8(body).unwrap_or("Service Unavailable")
     );
     let _ = stream.write_all(msg.as_bytes()).await;
-    let _ = stream.write_all(body).await;
     let _ = stream.flush().await;
-    let _ = stream.shutdown().await;
 }
 
 /// Bytes already read from `inner` are replayed before the live socket.
