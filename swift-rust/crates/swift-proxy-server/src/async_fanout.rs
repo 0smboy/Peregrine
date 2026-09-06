@@ -1674,18 +1674,21 @@ impl ProxyApp {
                             ),
                         );
                     } else {
-                        // rmtree / missing-hash-dir 404 + fewer than ndata
-                        // live indexes is a known-missing object (probe 404),
-                        // not an availability 503.
-                        let status = if saw_404 && flat.len() < required {
-                            404
-                        } else {
-                            ec_no_durable_status(
-                                has_reconstructable_nondurable_bucket,
-                                saw_404,
-                                buckets.is_empty() || flat.is_empty(),
-                            )
-                        };
+                        // Official test_rebuild_quarantines_lonely_frag:
+                        // some durable frags but fewer than ndata cannot
+                        // decode → 503 Service Unavailable. An empty
+                        // collection plus an explicit 404 (every hash dir
+                        // gone) is the known-missing 404. Do not treat
+                        // `saw_404 && flat.len() < ndata` as 404 — that
+                        // hid the lonely-frag pre-quarantine GET
+                        // (`fd53360` field `/workspace/rebuild-lonely-fd53360/`).
+                        // ≥ndata remaining still decodes above
+                        // (`test_rebuild_missing_frags`).
+                        let status = ec_no_durable_status(
+                            has_reconstructable_nondurable_bucket,
+                            saw_404,
+                            buckets.is_empty() || flat.is_empty(),
+                        );
                         let miss_reason = if buckets.is_empty() {
                             "empty_buckets"
                         } else {
@@ -4377,7 +4380,7 @@ mod tests {
         assert_eq!(
             ec_no_durable_status(false, true, false),
             503,
-            "an incomplete fragment bucket is still unavailable"
+            "incomplete durable set (lonely frag) + sibling 404s is 503, not 404"
         );
         assert_eq!(
             ec_no_durable_status(false, false, true),
@@ -4389,6 +4392,18 @@ mod tests {
             503,
             "an incomplete bucket without a 404 is unavailable"
         );
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn lonely_frag_below_ndata_is_503_not_404() {
+        // Official test_rebuild_quarantines_lonely_frag early client GET:
+        // 1 durable + 5 reclaimed 404s (no X-Backend-Timestamp). Python
+        // returns 503 so the probe can assert before quarantine once.
+        // Empty collection + 404 remains 404 (object gone).
+        assert_eq!(ec_no_durable_status(false, true, false), 503);
+        assert_eq!(ec_no_durable_status(false, true, true), 404);
+        assert_eq!(ec_no_durable_status(false, false, false), 503);
     }
 
     #[cfg(feature = "ec")]

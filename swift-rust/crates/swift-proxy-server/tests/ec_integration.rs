@@ -862,12 +862,17 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
     );
     assert_eq!(body, payload);
 
-    // Below ndata: the miss line must use the same logger sink field greps.
+    // Official test_rebuild_quarantines_lonely_frag early client GET:
+    // durable frags below ndata cannot decode → 503, not 404. All-gone
+    // empty gather is still 404 via ec_no_durable_status.
     let _ = rmtree_one_durable_hash_dir(&obj_dirs);
     let _ = rmtree_one_durable_hash_dir(&obj_dirs);
     logs.lock().unwrap().clear();
     let (status, _, _) = http(proxy_addr, "GET", "/v1/AUTH_ec/probe/obj", &[], b"");
-    assert_eq!(status, 404, "GET with only 2/6 fragments must 404");
+    assert_eq!(
+        status, 503,
+        "GET with only 2/6 fragments must 503 (cannot decode), not 404"
+    );
     let captured = logs.lock().unwrap().clone();
     assert!(
         captured.iter().any(|line| {

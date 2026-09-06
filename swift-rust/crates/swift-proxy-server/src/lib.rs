@@ -6066,9 +6066,9 @@ impl ProxyApp {
 
         if sources.len() < ec.ndata {
             let idxs: Vec<i32> = sources.keys().copied().collect();
+            // Match async gather / Python: empty + 404 → object gone;
+            // leftover durable frags below ndata → 503 (cannot decode).
             let status = if sources.is_empty() && saw_auth_404 {
-                404
-            } else if saw_auth_404 {
                 404
             } else {
                 503
