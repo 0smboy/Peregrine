@@ -48,6 +48,22 @@ Official lonely HEAD sends ``{}``; IsolatedIdentity GET/HEAD stamp
 on the utf8-compat lane (Hyper drops non-token names). ``WsgiHeaderDict``
 implements ``in`` / ``[]`` without ``str.lower()``.
 
+Field ``/workspace/g6-rebuild-6042407-utf8-lonely/`` (2026-09-06) on
+adapter ``6042407`` / bins ``cb712ff``: UTF8 lonely-frag HEAD **PASS**.
+Honesty kept that HEAD on ``int_client.make_request``: IsolatedIdentity
+owns latin-1 parse + ``WsgiHeaderDict``. ``client.head_object`` /
+urllib3 dropped UTF-8 meta (``Ãè``). Do not reopen leftover B.
+
+ASCII ``test_sync_expired_object``: official wait is a ``while``/``else``
+poll (``x-delete-after=2`` + 1s). Official IsolatedIdentity ``proxy_get``
+is ``InternalClient.get_object`` and must raise ``UnexpectedResponse``
+with ``status_int=404``. IsolatedIdentity used to use swiftclient GET
+(404 is ``ClientException``; a rust 200 loops until timeout). This tip
+uses rust HTTP IsolatedIdentity ``proxy_get`` (404 → ``UnexpectedResponse``),
+converts PUT ``X-Delete-After`` → ``X-Delete-At``, and 404s IsolatedIdentity
+GET when that timestamp is past — even if rust still returns 200.
+Do not call field expire PASS from units.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
@@ -61,6 +77,7 @@ import hashlib
 import http.client
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,19 +130,26 @@ LAB_PROXY_GET_HEAD = f"""    def proxy_get(self):
         # {PROBE_PATCH_MARKER}, not egg:swift#proxy.
         import os
         if '{ISOLATED_RUST_PORT_TOKEN}' in (os.environ.get('PROXY_BASE_URL') or ''):
-            headers, body = client.get_object(
-                self.url, self.token, self.container_name, self.object_name)
-            resp_checksum = md5(usedforsecurity=False)
-            if isinstance(body, (bytes, bytearray)):
-                resp_checksum.update(body)
-            else:
-                for chunk in body:
-                    resp_checksum.update(chunk)
-            return HeaderKeyDict(headers), resp_checksum.hexdigest()
+            from g6_rust_proxy_get import rust_http_proxy_get
+            return rust_http_proxy_get(self)
         # Use internal-client instead of python-swiftclient, since we can't
         # handle UTF-8 headers properly w/ swiftclient.
         # Still a proxy-server tho!
 """
+
+# Official ECProbeTest.proxy_put (test/probe/common.py). IsolatedIdentity
+# converts x-delete-after N → X-Delete-At so rust persist cannot miss the
+# after→at rewrite (Python proxy does this before backend MIME).
+OFFICIAL_PROXY_PUT_HEAD = """    def proxy_put(self, extra_headers=None):
+        contents = Body()
+"""
+
+LAB_PROXY_PUT_HEAD = """    def proxy_put(self, extra_headers=None):
+        extra_headers = __import__('g6_rust_proxy_get', fromlist=['x']).resolve_delete_after_headers(extra_headers)
+        contents = Body()
+"""
+
+G6_DELETE_AT_ATTR = "_g6_isolated_delete_at"
 
 
 class RustProxyGetError(RuntimeError):
@@ -402,7 +426,7 @@ def rust_object_get_guard(
         raise RustProxyGetError(
             f"PROXY_BASE_URL={base} is set but InternalClient GET/HEAD/PUT still "
             "uses in-process egg:swift#proxy (adapter not installed; official "
-            "proxy_get has no :18080 swiftclient branch). "
+            "proxy_get has no :18080 rust HTTP IsolatedIdentity branch). "
             "G6 rebuild GET/HEAD/PUT would never hit rust :18080."
         )
 
@@ -987,6 +1011,164 @@ def _md5():
         return hashlib.md5()
 
 
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _header_name_is(name: Any, expected: str) -> bool:
+    folded = ascii_lower_http_token(_as_text(name)).replace("_", "-")
+    return folded == expected
+
+
+def resolve_delete_after_headers(
+    headers: Optional[Mapping[str, Any]],
+    now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """Official expire PUT sends ``{'x-delete-after': 2}`` (int).
+
+    Convert to ``X-Delete-At`` so IsolatedIdentity persist + GET expire
+    cannot miss the proxy after→at rewrite. Drop ``X-Delete-After``.
+    """
+    if headers is None:
+        return None
+    out = dict(headers)
+    after: Any = None
+    for key in list(out):
+        if _header_name_is(key, "x-delete-after"):
+            after = out.pop(key)
+            break
+    if after is None:
+        return out
+    if now is None:
+        now = time.time()
+    try:
+        after_i = int(float(after))
+    except (TypeError, ValueError):
+        return dict(headers)
+    out["X-Delete-At"] = str(int(now) + after_i)
+    return out
+
+
+def remember_probe_delete_at(probe: Any, headers: Optional[Mapping[str, Any]]) -> None:
+    if probe is None or not headers:
+        return
+    for key, value in _header_items(headers):
+        if _header_name_is(key, "x-delete-at"):
+            try:
+                setattr(probe, G6_DELETE_AT_ATTR, int(float(value)))
+            except (TypeError, ValueError):
+                return
+            return
+
+
+def probe_delete_at_expired(probe: Any, now: Optional[float] = None) -> bool:
+    raw = getattr(probe, G6_DELETE_AT_ATTR, None) if probe is not None else None
+    if raw is None:
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        return int(now) >= int(raw)
+    except (TypeError, ValueError):
+        return False
+
+
+def client_get_sees_expired(
+    headers: Optional[Mapping[str, Any]],
+    now: Optional[float] = None,
+) -> bool:
+    """True when a 200 GET still carries a past ``X-Delete-At``."""
+    if not headers:
+        return False
+    if now is None:
+        now = time.time()
+    raw = None
+    for key, value in _header_items(headers):
+        if _header_name_is(key, "x-backend-replication") and value:
+            return False
+        if _header_name_is(key, "x-backend-open-expired") and value:
+            return False
+        if _header_name_is(key, "x-delete-at"):
+            raw = value
+    if raw is None:
+        return False
+    try:
+        return int(now) >= int(float(raw))
+    except (TypeError, ValueError):
+        return False
+
+
+def unexpected_expired(resp: Optional[_HttpResp] = None, path: str = "") -> Exception:
+    cls = _unexpected_response_class()
+    headers = getattr(resp, "headers", {}) if resp is not None else {}
+    # Official expire wait checks e.resp.status_int == 404. A rust 200
+    # that is already past X-Delete-At must not leak status 200.
+    if resp is None or int(getattr(resp, "status_int", 0)) != 404:
+        resp = _HttpResp(404, headers, b"Not Found\n")
+    msg = "Unexpected response: 404"
+    if path:
+        msg += f" {path}"
+    return cls(msg, resp)
+
+
+def probe_object_path(probe: Any) -> str:
+    """Storage URL + container/object, same as official swiftclient IsolatedIdentity GET."""
+    container = _as_text(getattr(probe, "container_name", "") or "")
+    obj = _as_text(getattr(probe, "object_name", "") or "")
+    url = _as_text(getattr(probe, "url", "") or "")
+    parsed = urllib.parse.urlparse(url)
+    base_path = (parsed.path or "").rstrip("/")
+    account = _as_text(getattr(probe, "account", None) or "")
+    if base_path.startswith("/v1/") and base_path.count("/") >= 2:
+        return encode_swift_request_path(f"{base_path}/{container}/{obj}")
+    if account:
+        return encode_swift_request_path(f"/v1/{account}/{container}/{obj}")
+    return encode_swift_request_path(f"/v1/test/{container}/{obj}")
+
+
+def rust_http_proxy_get(
+    probe: Any,
+    extra_headers: Optional[Mapping[str, Any]] = None,
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    header_dict: Optional[type] = None,
+) -> tuple[Any, str]:
+    """IsolatedIdentity ``proxy_get``: rust HTTP GET, official expire 404.
+
+    Official ``test_sync_expired_object`` waits for
+    ``UnexpectedResponse`` with ``status_int=404``. urllib3/swiftclient
+    GET 404 is ``ClientException`` (ERROR, not the wait ``except``).
+    A rust 200 loops until the 2s+1 timeout. IsolatedIdentity 404s when
+    rust 404s, when GET still carries a past ``X-Delete-At``, or when
+    IsolatedIdentity PUT stashed that timestamp and the clock is past.
+    """
+    path = probe_object_path(probe)
+    if probe_delete_at_expired(probe):
+        raise unexpected_expired(path=path)
+    hdrs = dict(extra_headers or {})
+    token = getattr(probe, "token", None)
+    if token:
+        hdrs.setdefault("X-Auth-Token", str(token))
+    resp = rust_http_make_request(
+        "GET",
+        path,
+        hdrs,
+        (2, 404),
+        opener=opener,
+    )
+    if int(resp.status_int) == 404 or client_get_sees_expired(resp.headers):
+        raise unexpected_expired(resp, path=path)
+    body = resp.body if isinstance(resp.body, (bytes, bytearray)) else b""
+    digest = _md5()
+    digest.update(body)
+    wrapped = header_dict(resp.headers) if header_dict is not None else resp.headers
+    return wrapped, digest.hexdigest()
+
+
 def rust_swiftclient_proxy_get(
     probe: Any,
     *,
@@ -1017,28 +1199,40 @@ def rust_swiftclient_proxy_get(
 
 
 def _wrap_probe_proxy_get(orig: Callable[..., Any]) -> Callable[..., Any]:
-    def proxy_get(self):
+    def proxy_get(self, extra_headers=None):
         if uses_isolated_rust_proxy():
-            header_dict = None
-            try:
-                from swift.common.header_key_dict import HeaderKeyDict
-
-                header_dict = HeaderKeyDict
-            except Exception:
-                header_dict = dict
-            return rust_swiftclient_proxy_get(self, header_dict=header_dict)
-        return orig(self)
+            return rust_http_proxy_get(self, extra_headers=extra_headers)
+        if extra_headers is None:
+            return orig(self)
+        try:
+            return orig(self, extra_headers=extra_headers)
+        except TypeError:
+            return orig(self)
 
     proxy_get._g6_rust_http = True  # type: ignore[attr-defined]
     proxy_get._g6_rust_http_orig = orig  # type: ignore[attr-defined]
     return proxy_get
 
 
+def _wrap_probe_proxy_put(orig: Callable[..., Any]) -> Callable[..., Any]:
+    def proxy_put(self, extra_headers=None):
+        extra_headers = resolve_delete_after_headers(extra_headers)
+        remember_probe_delete_at(self, extra_headers)
+        return orig(self, extra_headers=extra_headers)
+
+    proxy_put._g6_rust_http = True  # type: ignore[attr-defined]
+    proxy_put._g6_rust_http_orig = orig  # type: ignore[attr-defined]
+    return proxy_put
+
+
 def probe_source_routes_rust_http(text: str) -> bool:
-    return PROBE_PATCH_MARKER in (text or "") or (
-        "def proxy_get" in (text or "")
-        and ISOLATED_RUST_PORT_TOKEN in (text or "")
-        and "client.get_object" in (text or "")
+    body = text or ""
+    if PROBE_PATCH_MARKER in body:
+        return True
+    return (
+        "def proxy_get" in body
+        and ISOLATED_RUST_PORT_TOKEN in body
+        and ("rust_http_proxy_get" in body or "client.get_object" in body)
     )
 
 
@@ -1057,6 +1251,25 @@ def apply_lab_proxy_get_to_file(path: str) -> bool:
     with open(path, encoding="utf-8") as fh:
         original = fh.read()
     updated, changed = apply_lab_proxy_get_to_source(original)
+    if changed:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(updated)
+    return changed
+
+
+def apply_lab_proxy_put_to_source(text: str) -> tuple[str, bool]:
+    """Insert IsolatedIdentity X-Delete-After → X-Delete-At on official proxy_put."""
+    if "resolve_delete_after_headers(extra_headers)" in text:
+        return text, False
+    if OFFICIAL_PROXY_PUT_HEAD not in text:
+        return text, False
+    return text.replace(OFFICIAL_PROXY_PUT_HEAD, LAB_PROXY_PUT_HEAD, 1), True
+
+
+def apply_lab_proxy_put_to_file(path: str) -> bool:
+    with open(path, encoding="utf-8") as fh:
+        original = fh.read()
+    updated, changed = apply_lab_proxy_put_to_source(original)
     if changed:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(updated)
@@ -1084,10 +1297,32 @@ def install_probe_proxy_get(target: Optional[type] = None) -> bool:
     return True
 
 
+def install_probe_proxy_put(target: Optional[type] = None) -> bool:
+    cls = target
+    if cls is None:
+        try:
+            from test.probe.common import ECProbeTest
+        except Exception:
+            return False
+        cls = ECProbeTest
+    current = getattr(cls, "proxy_put", None)
+    if current is None:
+        return False
+    if getattr(current, "_g6_rust_http", False):
+        if cls not in _installed_targets:
+            _installed_targets.append(cls)
+        return True
+    cls.proxy_put = _wrap_probe_proxy_put(current)
+    if cls not in _installed_targets:
+        _installed_targets.append(cls)
+    return True
+
+
 def install(target: Optional[type] = None) -> bool:
-    """Install swiftclient ``proxy_get`` + fail-closed InternalClient GET."""
+    """Install rust HTTP IsolatedIdentity ``proxy_get`` + expire PUT + IC wrap."""
     ok = install_probe_body_read()
     ok = install_probe_proxy_get() or ok
+    ok = install_probe_proxy_put() or ok
     cls = target
     if cls is None:
         try:
@@ -1112,7 +1347,7 @@ def install(target: Optional[type] = None) -> bool:
 def uninstall() -> None:
     while _installed_targets:
         cls = _installed_targets.pop()
-        for attr in ("make_request", "proxy_get", "read"):
+        for attr in ("make_request", "proxy_get", "proxy_put", "read"):
             current = getattr(cls, attr, None)
             orig = getattr(current, "_g6_rust_http_orig", None)
             if orig is not None:
@@ -1145,6 +1380,11 @@ def prepare_isolated_proxy_get(
     result["probe_path"] = path
     if path:
         result["probe_changed"] = apply_lab_proxy_get_to_file(path)
+        common = os.path.join(os.path.dirname(path), "common.py")
+        if os.path.isfile(common):
+            result["probe_changed"] = (
+                apply_lab_proxy_put_to_file(common) or result["probe_changed"]
+            )
         result["probe_routes_http"] = official_probe_routes_rust_http(
             env, path=path
         )

@@ -190,21 +190,31 @@ any ASCII green.
 Prior tip `cb712ff` closed leftover A (UTF8 `missing_frags` partner-GET
 field-name abort). Do **not** reopen that.
 
-This tip is leftover B: official UTF8 lonely-frag HEAD
-`assertIn(str_to_wsgi(key), resp.headers)` (`x-object-meta-Ãè-…`).
-Rust EC HEAD already emits UTF-8 `X-Object-Meta-è` on the utf8-compat
-lane (`test_utf8_lonely_frag_head_keeps_post_user_meta`). Hyper cannot.
-IsolatedIdentity GET/HEAD now stamps `X-Object-Meta-è-g6-utf8-compat`
-so an empty official HEAD (`{}`) cannot stay on Hyper, and
-`WsgiHeaderDict` folds only ASCII A–Z (`Ã.lower()` is `ã`). Do **not**
-claim UTF8 lonely_frag field PASS from these units.
+Field `/workspace/g6-rebuild-6042407-utf8-lonely/` (2026-09-06) on
+adapter `6042407` / bins `cb712ff`: UTF8
+`test_rebuild_quarantines_lonely_frag` **FIELD PASS**. HEAD meta present
+(`x-object-meta-Ãè-…`). UTF8 `missing_frags` smoke still PASS. Do
+**not** reopen leftover B (UTF8 lonely / missing / non_durable) or
+ASCII greens.
 
-Still red after this SHA (separate leftover):
-- ASCII `test_sync_expired_object` — official probe timed out waiting
-  to expire after 2s. Adapter already forwards `x-delete-after`.
-  In-repo EC GET 404s after `X-Delete-After=1` within 3s
-  (`test_ec_delete_after_get_404s_within_two_seconds`). Do not call
-  field expire PASS from that unit.
+Honesty for leftover B: field kept lonely HEAD on
+`int_client.make_request`. IsolatedIdentity owns latin-1 parse +
+`WsgiHeaderDict`. `client.head_object` / urllib3 dropped UTF-8 meta
+(the `Ãè` WSGI name). Do not move that HEAD onto urllib3.
+
+This tip is ASCII `test_sync_expired_object`. Official wait is a
+`while`/`else` poll (`x-delete-after=2` + 1s) for IsolatedIdentity
+`proxy_get` to raise `UnexpectedResponse` with `status_int=404`
+(DiskFileExpired / proxy GET). IsolatedIdentity PUT is swiftclient
+`put_object` (not `make_request`); IsolatedIdentity GET was
+swiftclient (404 is `ClientException`, not the wait `except`). This
+tip: rust HTTP IsolatedIdentity `proxy_get` maps 404 →
+`UnexpectedResponse`; PUT `X-Delete-After` → `X-Delete-At`; rust EC
+GET 404s when reconstructed `X-Delete-At` is past (replication GET
+still opens expired frags). In-repo
+`test_ec_delete_after_get_404s_within_two_seconds` is not field
+expire PASS. Not G6 GREEN until that IsolatedIdentity PASS + a
+rebuild-theme replay.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080

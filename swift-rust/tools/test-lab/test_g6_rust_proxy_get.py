@@ -6,6 +6,7 @@ import io
 import os
 import socket
 import threading
+import time
 import unittest
 import urllib.error
 from email.message import EmailMessage
@@ -735,7 +736,7 @@ class HttpAndPatch(unittest.TestCase):
         self.assertEqual(headers.get("Etag"), "ignored")
         self.assertEqual(etag, "900150983cd24fb0d6963f7d28e17f72")
 
-    def test_probe_proxy_get_routes_to_swiftclient_on_18080(self):
+    def test_probe_proxy_get_routes_to_rust_http_on_18080(self):
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
 
         class Probe:
@@ -752,14 +753,14 @@ class HttpAndPatch(unittest.TestCase):
         self.assertTrue(adapter.install_probe_proxy_get(Probe))
         with mock.patch.object(
             adapter,
-            "rust_swiftclient_proxy_get",
+            "rust_http_proxy_get",
             return_value=({"Etag": "x"}, "deadbeef"),
         ) as routed:
             headers, etag = Probe().proxy_get()
         self.assertEqual(etag, "deadbeef")
         routed.assert_called_once()
 
-    def test_apply_lab_patch_inserts_18080_swiftclient_branch(self):
+    def test_apply_lab_patch_inserts_18080_rust_http_branch(self):
         official = (
             adapter.OFFICIAL_PROXY_GET_HEAD
             + "        status, headers, body = self.int_client.get_object(a, c, o)\n"
@@ -767,7 +768,7 @@ class HttpAndPatch(unittest.TestCase):
         updated, changed = adapter.apply_lab_proxy_get_to_source(official)
         self.assertTrue(changed)
         self.assertTrue(adapter.probe_source_routes_rust_http(updated))
-        self.assertIn("client.get_object", updated)
+        self.assertIn("rust_http_proxy_get", updated)
         self.assertIn(":18080", updated)
         again, changed_again = adapter.apply_lab_proxy_get_to_source(updated)
         self.assertFalse(changed_again)
@@ -828,6 +829,226 @@ class HttpAndPatch(unittest.TestCase):
         result = adapter.prepare_isolated_proxy_get(environ={})
         self.assertFalse(result["isolated"])
         self.assertFalse(result["probe_changed"])
+
+
+class ExpireWaitHonesty(unittest.TestCase):
+    """ASCII test_sync_expired_object: IsolatedIdentity GET must 404 in ~2s."""
+
+    def tearDown(self):
+        adapter.uninstall()
+        os.environ.pop("PROXY_BASE_URL", None)
+
+    def test_resolve_delete_after_becomes_delete_at(self):
+        now = 1_700_000_000.4
+        out = adapter.resolve_delete_after_headers({"x-delete-after": 2}, now=now)
+        self.assertEqual(out["X-Delete-At"], str(int(now) + 2))
+        self.assertNotIn("x-delete-after", out)
+        self.assertIsNone(adapter.resolve_delete_after_headers(None))
+        kept = adapter.resolve_delete_after_headers({"X-Object-Meta-Color": "red"})
+        self.assertEqual(kept["X-Object-Meta-Color"], "red")
+
+    def test_probe_delete_at_stash_expires(self):
+        class Probe:
+            pass
+
+        probe = Probe()
+        adapter.remember_probe_delete_at(probe, {"X-Delete-At": "100"})
+        self.assertTrue(adapter.probe_delete_at_expired(probe, now=100))
+        self.assertTrue(adapter.probe_delete_at_expired(probe, now=101))
+        self.assertFalse(adapter.probe_delete_at_expired(probe, now=99))
+
+    def test_client_get_sees_expired_from_headers(self):
+        self.assertTrue(
+            adapter.client_get_sees_expired({"X-Delete-At": "50"}, now=50)
+        )
+        self.assertFalse(
+            adapter.client_get_sees_expired({"X-Delete-At": "50"}, now=49)
+        )
+        self.assertFalse(
+            adapter.client_get_sees_expired(
+                {"X-Delete-At": "50", "X-Backend-Replication": "true"},
+                now=50,
+            )
+        )
+
+    def test_rust_http_proxy_get_200_returns_md5(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            token = "tk"
+            container_name = "c"
+            object_name = "live"
+
+        class FakeResp:
+            status = 200
+            headers = {"Etag": "ignored"}
+
+            def read(self):
+                return b"abc"
+
+            def getcode(self):
+                return 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        headers, etag = adapter.rust_http_proxy_get(Probe(), opener=lambda req, timeout=None: FakeResp())
+        self.assertEqual(etag, "900150983cd24fb0d6963f7d28e17f72")
+        self.assertEqual(headers.get("Etag"), "ignored")
+
+    def test_rust_http_proxy_get_404_is_unexpected_response(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            token = "tk"
+            container_name = "c"
+            object_name = "expired"
+
+        def opener(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 404, "Not Found", EmailMessage(), io.BytesIO(b"")
+            )
+
+        with self.assertRaises(Exception) as ctx:
+            adapter.rust_http_proxy_get(Probe(), opener=opener)
+        self.assertEqual(ctx.exception.resp.status_int, 404)
+
+    def test_rust_http_proxy_get_200_with_past_delete_at_is_404(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            token = "tk"
+            container_name = "c"
+            object_name = "stale"
+
+        class FakeResp:
+            status = 200
+            headers = {"X-Delete-At": "1"}
+
+            def read(self):
+                return b"still-here"
+
+            def getcode(self):
+                return 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            return FakeResp()
+
+        with self.assertRaises(Exception) as ctx:
+            adapter.rust_http_proxy_get(Probe(), opener=opener)
+        self.assertEqual(ctx.exception.resp.status_int, 404)
+
+    def test_stashed_delete_at_404s_without_http(self):
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            container_name = "c"
+            object_name = "o"
+            _g6_isolated_delete_at = 1
+
+        with self.assertRaises(Exception) as ctx:
+            adapter.rust_http_proxy_get(Probe())
+        self.assertEqual(ctx.exception.resp.status_int, 404)
+
+    def test_official_expire_wait_loop_breaks_on_404(self):
+        """Official while/else: UnexpectedResponse 404 breaks; 200 times out."""
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            token = "tk"
+            container_name = b"c"
+            object_name = b"o"
+            hits = 0
+
+        class FakeResp:
+            def __init__(self, status, headers, body):
+                self.status = status
+                self.headers = headers
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def getcode(self):
+                return self.status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            Probe.hits += 1
+            if Probe.hits < 2:
+                return FakeResp(200, {}, b"live")
+            raise urllib.error.HTTPError(
+                req.full_url, 404, "Not Found", EmailMessage(), io.BytesIO(b"")
+            )
+
+        timeout = time.time() + 2 + 1
+        broke = False
+        while time.time() < timeout:
+            try:
+                adapter.rust_http_proxy_get(Probe(), opener=opener)
+            except Exception as err:
+                resp = getattr(err, "resp", None)
+                if resp is not None and getattr(resp, "status_int", None) == 404:
+                    broke = True
+                    break
+                raise
+        else:
+            self.fail("Timed out waiting for c/o to expire after 2s")
+        self.assertTrue(broke)
+        self.assertEqual(Probe.hits, 2)
+
+    def test_proxy_put_wrap_converts_and_stashes_delete_at(self):
+        class Probe:
+            def proxy_put(self, extra_headers=None):
+                self.seen = extra_headers
+
+        self.assertTrue(adapter.install_probe_proxy_put(Probe))
+        now = 1_700_000_010
+        with mock.patch.object(adapter.time, "time", return_value=now):
+            inst = Probe()
+            inst.proxy_put(extra_headers={"x-delete-after": 2})
+        self.assertEqual(inst.seen["X-Delete-At"], str(now + 2))
+        self.assertEqual(inst._g6_isolated_delete_at, now + 2)
+
+    def test_apply_lab_put_patch_is_idempotent(self):
+        official = (
+            adapter.OFFICIAL_PROXY_PUT_HEAD
+            + "        headers = {}\n"
+        )
+        updated, changed = adapter.apply_lab_proxy_put_to_source(official)
+        self.assertTrue(changed)
+        self.assertIn("resolve_delete_after_headers", updated)
+        again, changed_again = adapter.apply_lab_proxy_put_to_source(updated)
+        self.assertFalse(changed_again)
+        self.assertEqual(again, updated)
+
+    def test_probe_object_path_uses_storage_url_account(self):
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            container_name = b"cont\xc3\xa8-x"
+            object_name = b"obj\xc3\xa8-y"
+
+        self.assertEqual(
+            adapter.probe_object_path(Probe()),
+            "/v1/AUTH_test/cont%C3%A8-x/obj%C3%A8-y",
+        )
 
 
 if __name__ == "__main__":

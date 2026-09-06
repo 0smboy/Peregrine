@@ -1757,6 +1757,24 @@ impl ProxyApp {
         );
         let sources = chosen.sources;
         let meta = chosen.meta;
+        // Official test_sync_expired_object: client GET (no
+        // X-Backend-Replication) must 404 once X-Delete-At is past.
+        // Object-server DiskFileExpired is the primary path; IsolatedIdentity
+        // GET still 200s if fragment meta lacked X-Delete-At or a 200
+        // slipped through. Re-check reconstructed metadata here.
+        if client_get_should_404_expired(&headers, &meta) {
+            return super::with_g6_diag(
+                swob_response(404),
+                g6_ec_diag(
+                    "expired",
+                    404,
+                    policy_index,
+                    ec.ndata,
+                    &seen_idxs,
+                    n200,
+                ),
+            );
+        }
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
             .unwrap_or_default()
             .to_string();
@@ -2037,6 +2055,9 @@ impl ProxyApp {
     ) -> Response {
         use md5::{Digest, Md5};
         use swift_ec::EcDriver;
+        if let Err(resp) = super::apply_check_delete_headers(req, Timestamp::now().as_secs_f64()) {
+            return resp;
+        }
         let Some(&ec) = self.ec_policies.get(&policy_index) else {
             return swob_response(503);
         };
@@ -3763,6 +3784,36 @@ fn ec_sources_sufficient(is_head: bool, available: usize, ndata: usize) -> bool 
     available >= if is_head { 1 } else { ndata }
 }
 
+/// Client EC GET/HEAD 404 when reconstructed metadata is past X-Delete-At.
+/// Replication / open-expired GETs must still see the fragments (official
+/// expire probe uses those after the client wait 404s).
+#[cfg(feature = "ec")]
+fn client_get_should_404_expired(headers: &HeaderKeyDict, meta: &[(String, String)]) -> bool {
+    if headers
+        .get("X-Backend-Replication")
+        .is_some_and(config_true_value)
+        || headers
+            .get("X-Backend-Open-Expired")
+            .is_some_and(config_true_value)
+        || headers
+            .get("X-Open-Expired")
+            .is_some_and(config_true_value)
+    {
+        return false;
+    }
+    let Some(raw) = resp_header(meta, "X-Delete-At") else {
+        return false;
+    };
+    let Ok(delete_at) = raw.trim().parse::<i64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now >= delete_at
+}
+
 /// Bucket key so `1751500123.45678` and `000001751500123.45678` join.
 #[cfg(feature = "ec")]
 fn version_timestamp_key(ts: &str) -> String {
@@ -4360,6 +4411,35 @@ mod tests {
         assert!(!ec_sources_sufficient(true, 0, 4));
         assert!(!ec_sources_sufficient(false, 1, 4));
         assert!(ec_sources_sufficient(false, 4, 4));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn client_get_404s_when_delete_at_is_past_unless_replication() {
+        let headers = HeaderKeyDict::new();
+        let past = vec![("X-Delete-At".into(), "1".into())];
+        assert!(
+            client_get_should_404_expired(&headers, &past),
+            "client GET must 404 once X-Delete-At is past"
+        );
+        let future = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 120)
+            .to_string();
+        let future_meta = vec![("X-Delete-At".into(), future)];
+        assert!(!client_get_should_404_expired(&headers, &future_meta));
+        assert!(!client_get_should_404_expired(
+            &headers,
+            &[("ETag".into(), "abc".into())]
+        ));
+        let mut replication = HeaderKeyDict::new();
+        replication.set("X-Backend-Replication", "true");
+        assert!(
+            !client_get_should_404_expired(&replication, &past),
+            "replication GET must still open expired fragments"
+        );
     }
 
     #[cfg(feature = "ec")]

@@ -3,7 +3,7 @@
 #
 # Field 988b81b (2026-09-06, /workspace/rebuild-once-988b81b-httpget/):
 # official proxy_get via egg:swift#proxy never hit rust :18080. After
-# forcing GET onto rust HTTP (swiftclient), test_rebuild_missing_frags
+# forcing GET onto rust HTTP, test_rebuild_missing_frags
 # PASSed (rc=0, 30× G6_DIAG proxy-server: EC GET status=200 reason=ok).
 #
 # This wrapper is the durable runner: apply that honesty, fail closed if
@@ -16,6 +16,9 @@
 # PUT and fragment-preferences GET used rust :18082 for that PASS.
 # Field `/workspace/g6-rebuild-176505e/` (2026-09-06): UTF8 names must be
 # percent-encoded before http.client (IRI → request-target).
+# Field `/workspace/g6-rebuild-6042407-utf8-lonely/`: leftover B PASS
+# via make_request HEAD (urllib3 dropped UTF-8 meta). ASCII expire
+# IsolatedIdentity proxy_get is rust HTTP (404 → UnexpectedResponse).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"
