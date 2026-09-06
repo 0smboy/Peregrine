@@ -1221,14 +1221,21 @@ impl ProxyApp {
             None => container_policy,
         };
         let Some(object_ring) = self.object_ring_for(policy_index) else {
-            return Response::with_body(
-                503,
-                format!("No object ring configured for storage policy {policy_index}").into_bytes(),
+            return super::with_g6_diag(
+                Response::with_body(
+                    503,
+                    format!("No object ring configured for storage policy {policy_index}")
+                        .into_bytes(),
+                ),
+                format!("reason=no_object_ring policy={policy_index} ec=0"),
             );
         };
         let Ok((object_part, _)) = object_ring.get_nodes(account, Some(container), Some(object))
         else {
-            return swob_response(503);
+            return super::with_g6_diag(
+                swob_response(503),
+                format!("reason=get_nodes_failed policy={policy_index} ec=0"),
+            );
         };
         let path = format!(
             "/{}/{}/{}",
@@ -1272,7 +1279,7 @@ impl ProxyApp {
                 .await;
         }
         let nodes = self.iter_nodes(object_ring, object_part);
-        let resp = self
+        let mut resp = self
             .get_or_head_async(
                 "object",
                 nodes,
@@ -1293,6 +1300,10 @@ impl ProxyApp {
                 ),
             );
         }
+        resp.set_g6_diag(format!(
+            "reason=replica_get_or_head policy={policy_index} ec=0 ndata=0 idxs=[] status={}",
+            resp.status
+        ));
         resp
     }
 
@@ -1305,14 +1316,20 @@ impl ProxyApp {
         object_part: u32,
     ) -> Response {
         let Some(ec) = self.ec_params_for_object_ring(policy_index, object_ring) else {
-            return swob_response(503);
+            return super::with_g6_diag(
+                swob_response(503),
+                format!("reason=ec_params_missing policy={policy_index} ec=0"),
+            );
         };
         #[cfg(not(feature = "ec"))]
         {
             let _ = (req, path, object_ring, object_part, ec);
-            return Response::with_body(
-                501,
-                b"erasure coding not built (compile with --features ec)".to_vec(),
+            return super::with_g6_diag(
+                Response::with_body(
+                    501,
+                    b"erasure coding not built (compile with --features ec)".to_vec(),
+                ),
+                format!("reason=ec_not_built policy={policy_index} ec=0"),
             );
         }
         #[cfg(feature = "ec")]
@@ -1645,7 +1662,17 @@ impl ProxyApp {
                             &latest_404_timestamp.internal(),
                             saw_404,
                         );
-                        return swob_response(404);
+                        return super::with_g6_diag(
+                            swob_response(404),
+                            g6_ec_diag(
+                                "tombstone_trumps",
+                                404,
+                                policy_index,
+                                ec.ndata,
+                                &seen_idxs,
+                                n200,
+                            ),
+                        );
                     } else {
                         // rmtree / missing-hash-dir 404 + fewer than ndata
                         // live indexes is a known-missing object (probe 404),
@@ -1659,15 +1686,16 @@ impl ProxyApp {
                                 buckets.is_empty() || flat.is_empty(),
                             )
                         };
+                        let miss_reason = if buckets.is_empty() {
+                            "empty_buckets"
+                        } else {
+                            "no_complete_bucket"
+                        };
                         log_ec_gather_miss(
                             self,
                             path,
                             status,
-                            if buckets.is_empty() {
-                                "empty_buckets"
-                            } else {
-                                "no_complete_bucket"
-                            },
+                            miss_reason,
                             policy_index,
                             ec.ndata,
                             n200,
@@ -1679,7 +1707,17 @@ impl ProxyApp {
                             &latest_404_timestamp.internal(),
                             saw_404,
                         );
-                        return swob_response(status);
+                        return super::with_g6_diag(
+                            swob_response(status),
+                            g6_ec_diag(
+                                miss_reason,
+                                status,
+                                policy_index,
+                                ec.ndata,
+                                &seen_idxs,
+                                n200,
+                            ),
+                        );
                     }
                 }
             }
@@ -1723,6 +1761,14 @@ impl ProxyApp {
             .unwrap_or("application/octet-stream")
             .to_string();
         let mut resp = Response::new(200);
+        resp.set_g6_diag(g6_ec_diag(
+            "ok",
+            200,
+            policy_index,
+            ec.ndata,
+            &seen_idxs,
+            n200,
+        ));
         for (k, v) in &meta {
             if super::keep_ec_client_metadata(&k.to_lowercase()) {
                 resp.headers.set(k, v);
@@ -3789,6 +3835,21 @@ fn ec_round0_bucket_key(existing: Option<&str>, data_timestamp: &str) -> String 
     existing
         .map(str::to_string)
         .unwrap_or_else(|| version_timestamp_key(data_timestamp))
+}
+
+/// Stamp piggybacked onto `G6_DIAG utf8-compat … service-complete`.
+#[cfg(feature = "ec")]
+fn g6_ec_diag(
+    reason: &str,
+    status: u16,
+    policy_index: i64,
+    ndata: usize,
+    idxs: &[i32],
+    n200: usize,
+) -> String {
+    format!(
+        "reason={reason} status={status} ndata={ndata} idxs={idxs:?} ec=1 policy={policy_index} 200s={n200}"
+    )
 }
 
 /// Field harvest greps proxy manager.log / syslog for `EC GET` / `reason=`.

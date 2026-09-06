@@ -745,6 +745,30 @@ struct BackendResponse {
     body: Vec<u8>,
 }
 
+pub(crate) fn with_g6_diag(mut resp: Response, reason: impl Into<String>) -> Response {
+    if resp.g6_diag.is_none() {
+        resp.set_g6_diag(reason);
+    }
+    resp
+}
+
+fn finalize_service_g6_diag(mut resp: Response, via: &str, method: &str, path: &str) -> Response {
+    match resp.g6_diag.as_mut() {
+        Some(inner) => {
+            if !inner.contains("via=") {
+                *inner = format!("via={via} {inner}");
+            }
+        }
+        None => {
+            resp.set_g6_diag(format!(
+                "reason=unstamped via={via} method={method} path={path} status={}",
+                resp.status
+            ));
+        }
+    }
+    resp
+}
+
 fn swob_response(status: u16) -> Response {
     let explanation = match status {
         404 => "The resource could not be found.",
@@ -3275,11 +3299,11 @@ impl ProxyApp {
                 body: swift_http::Body::empty(),
             };
             if let Some(resp) = utf8_or_null_rejected(&req) {
-                return resp;
+                return with_g6_diag(resp, "reason=utf8_or_null");
             }
             let account = segs[2].to_string();
             if segs.get(3) == Some(&"") {
-                return swob_response(404);
+                return with_g6_diag(swob_response(404), "reason=empty_container_seg");
             }
             let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
             let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
@@ -3295,7 +3319,11 @@ impl ProxyApp {
                 .authorize_async(&mut req, &account, container.as_deref(), object.as_deref())
                 .await
             {
-                return denied;
+                let status = denied.status;
+                return with_g6_diag(
+                    denied,
+                    format!("reason=authorize method={} status={status}", req.method),
+                );
             }
             if req
                 .headers
@@ -3332,7 +3360,7 @@ impl ProxyApp {
                             req.method
                         ),
                     );
-                    let resp = self.object_get_head_async(&mut req, &account, &c, &o).await;
+                    let mut resp = self.object_get_head_async(&mut req, &account, &c, &o).await;
                     self.emit_proxy_log(
                         resp.status >= 400,
                         &format!(
@@ -3344,6 +3372,12 @@ impl ProxyApp {
                             resp.status
                         ),
                     );
+                    if resp.g6_diag.is_none() {
+                        resp.set_g6_diag(format!(
+                            "reason=handle_async_done method={} status={}",
+                            req.method, resp.status
+                        ));
+                    }
                     resp
                 }
                 ("POST", Some(c), Some(o)) => {
@@ -3483,7 +3517,13 @@ impl ProxyApp {
             let allowed = self.allowed_methods(segs.get(3).is_some_and(|s| !s.is_empty()));
             return method_not_allowed(allowed);
         }
-        swob_response(404)
+        with_g6_diag(
+            swob_response(404),
+            format!(
+                "reason=handle_async_fallthrough method={} path={}",
+                areq.method, areq.path
+            ),
+        )
     }
 
     async fn options_response_async(
@@ -6038,11 +6078,17 @@ impl ProxyApp {
                 &format!(
                     "proxy-server: EC GET {path} status={status} reason=sync_ec_gather \
                      policy={policy_index} ndata={} 200s={} idxs={idxs:?}",
-                    ec.ndata,
-                    n200
+                    ec.ndata, n200
                 ),
             );
-            return swob_response(status);
+            return with_g6_diag(
+                swob_response(status),
+                format!(
+                    "reason=sync_ec_gather status={status} ndata={} idxs={idxs:?} \
+                     ec=1 policy={policy_index} 200s={n200}",
+                    ec.ndata
+                ),
+            );
         }
         let meta = meta.unwrap_or_default();
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
@@ -8424,133 +8470,148 @@ impl AsyncService for ProxyAsyncService {
         };
         let filters = self.filters.clone();
         Box::pin(async move {
-            let mut req = req;
-            if filters.is_empty() {
-                let head = Request {
+            let method = req.method.clone();
+            let path = req.path.clone();
+            let via = if filters.is_empty() {
+                "no_filters"
+            } else {
+                "filters"
+            };
+            let resp = async move {
+                let mut req = req;
+                if filters.is_empty() {
+                    let head = Request {
+                        method: req.method.clone(),
+                        path: req.path.clone(),
+                        query_string: req.query_string.clone(),
+                        headers: req.headers.clone(),
+                        body: swift_http::Body::empty(),
+                    };
+                    let mut resp = app.handle_async(req).await;
+                    app.apply_pipeline_cors(
+                        head.method.clone(),
+                        head.path.clone(),
+                        head.headers.get("Origin").map(str::to_string),
+                        &mut resp,
+                    )
+                    .await;
+                    return resp;
+                }
+                let mut head = Request {
                     method: req.method.clone(),
                     path: req.path.clone(),
                     query_string: req.query_string.clone(),
                     headers: req.headers.clone(),
                     body: swift_http::Body::empty(),
                 };
-                let mut resp = app.handle_async(req).await;
-                app.apply_pipeline_cors(
-                    head.method.clone(),
-                    head.path.clone(),
-                    head.headers.get("Origin").map(str::to_string),
-                    &mut resp,
-                )
-                .await;
-                return resp;
-            }
-            let mut head = Request {
-                method: req.method.clone(),
-                path: req.path.clone(),
-                query_string: req.query_string.clone(),
-                headers: req.headers.clone(),
-                body: swift_http::Body::empty(),
-            };
-            for filter in &filters {
-                match filter.prepare_async(&mut head).await {
-                    swift_middleware::MwPrep::Continue => {}
-                    swift_middleware::MwPrep::ShortCircuit(resp) => {
-                        let mut resp = resp;
-                        for g in filters.iter().rev() {
-                            resp = g.finish(&head, resp);
-                        }
-                        return resp;
-                    }
-                }
-            }
-            req.headers = head.headers.clone();
-            req.query_string = head.query_string.clone();
-            if filters.iter().any(|f| f.streams_request(&head)) {
-                let mut resp =
-                    dispatch_streaming_remaining(Arc::new(filters), 0, Arc::clone(&app), req).await;
-                app.apply_pipeline_cors(
-                    head.method.clone(),
-                    head.path.clone(),
-                    head.headers.get("Origin").map(str::to_string),
-                    &mut resp,
-                )
-                .await;
-                return resp;
-            }
-            if filters.iter().any(|f| f.intercepts_request(&head)) {
-                let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
-                    Ok(bytes) => swift_http::Body::Buffered(bytes),
-                    Err(e) if swift_http::body_too_large(&e) => {
-                        return Response::error(413, "Your request is too large.")
-                    }
-                    Err(_) => {
-                        // Python s3api PUT maps Swift 499 (short body /
-                        // client hangup) to RequestTimeout 400. The
-                        // intercept path never reaches s3api if Hyper
-                        // fails the body read (Content-Length mismatch).
-                        if head.method == "PUT" {
-                            let mut resp =
-                                swift_s3api::s3_error_response("RequestTimeout", None, &[]);
-                            resp.headers.set("Connection", "close");
+                for filter in &filters {
+                    match filter.prepare_async(&mut head).await {
+                        swift_middleware::MwPrep::Continue => {}
+                        swift_middleware::MwPrep::ShortCircuit(resp) => {
+                            let mut resp = resp;
+                            for g in filters.iter().rev() {
+                                resp = g.finish(&head, resp);
+                            }
                             return resp;
                         }
-                        return swob_response(499);
-                    }
-                };
-                let request = Request {
-                    method: req.method,
-                    path: req.path,
-                    query_string: req.query_string,
-                    headers: req.headers,
-                    body,
-                };
-                let filters_arc = Arc::new(filters.clone());
-                for (i, filter) in filters.iter().enumerate() {
-                    if filter.intercepts_request(&head) {
-                        let next =
-                            remaining_async_next(Arc::clone(&filters_arc), i + 1, Arc::clone(&app));
-                        let mut resp = filter.handle_request_async(request, next).await;
-                        buffer_manifest_channel(&mut resp).await;
-                        resp = apply_outbound_filters(
-                            Arc::clone(&filters_arc),
-                            0,
-                            i,
-                            Arc::clone(&app),
-                            head.clone_head(),
-                            resp,
-                        )
-                        .await;
-                        app.apply_pipeline_cors(
-                            head.method.clone(),
-                            head.path.clone(),
-                            head.headers.get("Origin").map(str::to_string),
-                            &mut resp,
-                        )
-                        .await;
-                        return resp;
                     }
                 }
-                return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
+                req.headers = head.headers.clone();
+                req.query_string = head.query_string.clone();
+                if filters.iter().any(|f| f.streams_request(&head)) {
+                    let mut resp =
+                        dispatch_streaming_remaining(Arc::new(filters), 0, Arc::clone(&app), req)
+                            .await;
+                    app.apply_pipeline_cors(
+                        head.method.clone(),
+                        head.path.clone(),
+                        head.headers.get("Origin").map(str::to_string),
+                        &mut resp,
+                    )
+                    .await;
+                    return resp;
+                }
+                if filters.iter().any(|f| f.intercepts_request(&head)) {
+                    let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
+                        Ok(bytes) => swift_http::Body::Buffered(bytes),
+                        Err(e) if swift_http::body_too_large(&e) => {
+                            return Response::error(413, "Your request is too large.")
+                        }
+                        Err(_) => {
+                            // Python s3api PUT maps Swift 499 (short body /
+                            // client hangup) to RequestTimeout 400. The
+                            // intercept path never reaches s3api if Hyper
+                            // fails the body read (Content-Length mismatch).
+                            if head.method == "PUT" {
+                                let mut resp =
+                                    swift_s3api::s3_error_response("RequestTimeout", None, &[]);
+                                resp.headers.set("Connection", "close");
+                                return resp;
+                            }
+                            return swob_response(499);
+                        }
+                    };
+                    let request = Request {
+                        method: req.method,
+                        path: req.path,
+                        query_string: req.query_string,
+                        headers: req.headers,
+                        body,
+                    };
+                    let filters_arc = Arc::new(filters.clone());
+                    for (i, filter) in filters.iter().enumerate() {
+                        if filter.intercepts_request(&head) {
+                            let next = remaining_async_next(
+                                Arc::clone(&filters_arc),
+                                i + 1,
+                                Arc::clone(&app),
+                            );
+                            let mut resp = filter.handle_request_async(request, next).await;
+                            buffer_manifest_channel(&mut resp).await;
+                            resp = apply_outbound_filters(
+                                Arc::clone(&filters_arc),
+                                0,
+                                i,
+                                Arc::clone(&app),
+                                head.clone_head(),
+                                resp,
+                            )
+                            .await;
+                            app.apply_pipeline_cors(
+                                head.method.clone(),
+                                head.path.clone(),
+                                head.headers.get("Origin").map(str::to_string),
+                                &mut resp,
+                            )
+                            .await;
+                            return resp;
+                        }
+                    }
+                    return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
+                }
+                let mut resp = app.handle_async(req).await;
+                buffer_manifest_channel(&mut resp).await;
+                let filters_arc = Arc::new(filters);
+                resp = apply_outbound_filters(
+                    Arc::clone(&filters_arc),
+                    0,
+                    filters_arc.len(),
+                    Arc::clone(&app),
+                    head.clone_head(),
+                    resp,
+                )
+                .await;
+                app.apply_pipeline_cors(
+                    head.method.clone(),
+                    head.path.clone(),
+                    head.headers.get("Origin").map(str::to_string),
+                    &mut resp,
+                )
+                .await;
+                resp
             }
-            let mut resp = app.handle_async(req).await;
-            buffer_manifest_channel(&mut resp).await;
-            let filters_arc = Arc::new(filters);
-            resp = apply_outbound_filters(
-                Arc::clone(&filters_arc),
-                0,
-                filters_arc.len(),
-                Arc::clone(&app),
-                head.clone_head(),
-                resp,
-            )
             .await;
-            app.apply_pipeline_cors(
-                head.method.clone(),
-                head.path.clone(),
-                head.headers.get("Origin").map(str::to_string),
-                &mut resp,
-            )
-            .await;
-            resp
+            finalize_service_g6_diag(resp, via, &method, &path)
         })
     }
 }

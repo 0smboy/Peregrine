@@ -1214,9 +1214,14 @@ async fn serve_swift_utf8_handoff(
     }
     let head_request = method == "HEAD";
     let diagnostic_method = method.clone();
+    let diagnostic_path = path.clone();
+    let diagnostic_qs = query_string.clone();
     let diagnostic_started = std::time::Instant::now();
-    eprintln!("G6_DIAG utf8-compat method={diagnostic_method} stage=service-start");
-    let response = service
+    eprintln!(
+        "G6_DIAG utf8-compat method={diagnostic_method} stage=service-start path={}",
+        sanitize_g6_token(&diagnostic_path)
+    );
+    let mut response = service
         .call(AsyncRequest {
             method,
             path,
@@ -1225,12 +1230,17 @@ async fn serve_swift_utf8_handoff(
             body,
         })
         .await;
-    eprintln!(
-        "G6_DIAG utf8-compat method={} stage=service-complete status={} elapsed_ms={}",
-        diagnostic_method,
+    let g6 = response.take_g6_diag();
+    let complete = format_utf8_compat_service_complete(
+        &diagnostic_method,
         response.status,
-        diagnostic_started.elapsed().as_millis()
+        diagnostic_started.elapsed().as_millis(),
+        &diagnostic_path,
+        &diagnostic_qs,
+        g6.as_deref(),
     );
+    eprintln!("{complete}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
     let write_result = write_swift_compat_response(&mut write_half, response, head_request).await;
     if let Err(error) = &write_result {
         eprintln!(
@@ -1542,11 +1552,38 @@ async fn pump_length(
     }
 }
 
+/// Field harvests `G6_DIAG utf8-compat method=GET stage=service-complete`.
+/// Keep that prefix and append why the service returned (ndata/idxs/ec/policy).
+fn sanitize_g6_token(value: &str) -> String {
+    value.replace(['\r', '\n'], "_")
+}
+
+fn format_utf8_compat_service_complete(
+    method: &str,
+    status: u16,
+    elapsed_ms: u128,
+    path: &str,
+    query_string: &str,
+    g6: Option<&str>,
+) -> String {
+    let g6 = g6
+        .filter(|value| !value.is_empty())
+        .unwrap_or("reason=unstamped");
+    format!(
+        "G6_DIAG utf8-compat method={method} stage=service-complete status={status} \
+         elapsed_ms={elapsed_ms} path={} qs={} {}",
+        sanitize_g6_token(path),
+        sanitize_g6_token(query_string),
+        sanitize_g6_token(g6)
+    )
+}
+
 async fn write_swift_compat_response(
     write: &mut tokio::net::tcp::OwnedWriteHalf,
     mut response: Response,
     head_request: bool,
 ) -> std::io::Result<()> {
+    response.g6_diag = None;
     let reason = if response.reason.contains(['\r', '\n']) || response.reason.is_empty() {
         reason_phrase(response.status).to_string()
     } else {
@@ -2087,6 +2124,29 @@ mod tests {
         assert_eq!(ct.as_bytes(), "text/Ω".as_bytes());
         assert!(hyper.headers().get("Date").is_some());
         assert!(hyper.headers().get("Connection").is_none());
+    }
+
+    #[test]
+    fn utf8_compat_service_complete_line_keeps_harvest_prefix_and_names_ec_404() {
+        let line = format_utf8_compat_service_complete(
+            "GET",
+            404,
+            12,
+            "/v1/AUTH_ec/probe/obj",
+            "",
+            Some("reason=gather ndata=4 idxs=[0,2,3,4,5] ec=1 policy=1"),
+        );
+        assert!(
+            line.starts_with("G6_DIAG utf8-compat method=GET stage=service-complete status=404"),
+            "{line}"
+        );
+        assert!(line.contains("ndata=4"), "{line}");
+        assert!(line.contains("idxs=[0,2,3,4,5]"), "{line}");
+        assert!(line.contains("ec=1"), "{line}");
+        assert!(line.contains("policy=1"), "{line}");
+        assert!(line.contains("path=/v1/AUTH_ec/probe/obj"), "{line}");
+        let unstamped = format_utf8_compat_service_complete("GET", 404, 1, "/v1/a/c/o", "", None);
+        assert!(unstamped.contains("reason=unstamped"), "{unstamped}");
     }
 
     #[test]

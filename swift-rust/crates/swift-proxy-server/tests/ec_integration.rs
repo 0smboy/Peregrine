@@ -120,6 +120,57 @@ fn http(
     (status, hdrs, out_body)
 }
 
+/// Drive the utf8-compat Hyper lane field already harvests
+/// (`G6_DIAG utf8-compat method=GET stage=service-complete`).
+/// Official `proxy_get` uses InternalClient after PUT/POST with UTF-8
+/// object-meta names / `_make_name` paths; those requests never take the
+/// ASCII keep-alive parser the other tests use.
+fn http_utf8_compat(
+    addr: std::net::SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let mut req = Vec::new();
+    req.extend_from_slice(format!("{method} {target} HTTP/1.1\r\nHost: t\r\n").as_bytes());
+    for (k, v) in headers {
+        req.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+    }
+    req.extend_from_slice(b"X-Object-Meta-");
+    req.extend_from_slice("色".as_bytes());
+    req.extend_from_slice(b": probe\r\n");
+    req.extend_from_slice(
+        format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    conn.write_all(&req).unwrap();
+    conn.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let out_body = raw[split + 4..].to_vec();
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hdrs = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    (status, hdrs, out_body)
+}
+
 /// Recursively collect files under `dir` whose name matches `pred`.
 fn find_files(dir: &Path, pred: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -826,6 +877,108 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
                 && line.contains("idxs=")
         }),
         "gather miss must log via the real proxy logger path: {captured:?}"
+    );
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// Field `988b81b`: harvestable 404 is
+/// `G6_DIAG utf8-compat method=GET stage=service-complete status=404`,
+/// not `G6_DIAG proxy-server: EC GET`. Single-frag loss on that lane
+/// must 200, and the completion reason must be stamped on the Response
+/// (piggybacked onto the utf8-compat line; never leaked as a client header).
+#[test]
+fn test_utf8_compat_get_after_post_and_single_frag_rmtree() {
+    let _ec = EC_CLUSTER_LOCK.lock().unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "swift-ec-utf8-compat-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (proxy_addr, obj_dirs, logs) = boot_ec_cluster_logged(&tmp);
+
+    let object = "/v1/AUTH_ec/probe/obj-%C3%A9";
+    let (status, _, _) = http_utf8_compat(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/probe",
+        &[("X-Storage-Policy", "Policy-1")],
+        b"",
+    );
+    assert_eq!(status, 201, "container PUT via utf8-compat");
+
+    let payload: Vec<u8> = (0..1800u32).map(|i| (i % 251) as u8).collect();
+    let (status, _, _) = http_utf8_compat(
+        proxy_addr,
+        "PUT",
+        object,
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        &payload,
+    );
+    assert_eq!(status, 201, "EC PUT via utf8-compat");
+    let (status, _, _) = http_utf8_compat(
+        proxy_addr,
+        "POST",
+        object,
+        &[
+            ("X-Object-Meta-Color", "red"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 202, "POST-after-PUT via utf8-compat");
+
+    let leaked_prefs = r#"[{"timestamp":"0","exclude":[0,1,2,3,4,5]}]"#;
+    let deleted = rmtree_one_durable_hash_dir(&obj_dirs);
+    assert!(
+        !deleted.exists(),
+        "break_nodes-shaped rmtree must remove the hash dir: {deleted:?}"
+    );
+
+    logs.lock().unwrap().clear();
+    let (status, headers, body) = http_utf8_compat(
+        proxy_addr,
+        "GET",
+        object,
+        &[
+            ("X-Backend-Allow-Reserved-Names", "true"),
+            ("X-Backend-Storage-Policy-Index", "0"),
+            ("X-Backend-Fragment-Preferences", leaked_prefs),
+        ],
+        b"",
+    );
+    assert_eq!(
+        status,
+        200,
+        "utf8-compat InternalClient GET after single-frag rmtree must 200: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(body, payload);
+    assert!(
+        headers
+            .iter()
+            .all(|(k, _)| !k.eq_ignore_ascii_case("X-Backend-Peregrine-G6-Diag")),
+        "g6_diag must not leak to the client: {headers:?}"
+    );
+    let captured = logs.lock().unwrap().clone();
+    assert!(
+        captured.iter().any(|line| {
+            line.contains("proxy-server: EC GET")
+                && line.contains("status=200")
+                && line.contains("reason=ok")
+        }),
+        "utf8-compat GET must reach handle_async gather ok: {captured:?}"
+    );
+    assert!(
+        captured
+            .iter()
+            .any(|line| line.contains("ndata=4") && line.contains("idxs=")),
+        "gather ok must name ndata/idxs for the utf8-compat piggyback: {captured:?}"
     );
 
     std::fs::remove_dir_all(&tmp).unwrap();
