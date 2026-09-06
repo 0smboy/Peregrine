@@ -127,10 +127,11 @@ now match `failed=` victims; still **404×6**. Leftover is GET
 visibility (`X-Object-Sysmeta-Ec-Frag-Index` + DiskFile open) and
 proxy async gather after POST-after-PUT. That is **FAIL**, not GREEN.
 Field on **`4f7a82c`**: object-server GET 200 + Ec-Frag-Index for
-0–5 and victim `#N#d.data` after once; proxy GET still **404×6**
-including single-frag loss. In-repo follow-up: gather round 0 omits
-`X-Backend-Fragment-Preferences`; InternalClient-shaped GET after
-POST + rmtree 1–2 hash dirs. Still **FAIL**, not GREEN.
+0–5 and victim `#N#d.data` after once; proxy GET still **404×6**.
+Sharper leftover: PRE-once 404 with **5** Ec-Frag 200s
+`idxs=[0,2,3,4,5]` (ndata=4). In-repo: round 0 joins those 200s
+into one durable bucket; `proxy-server: EC GET … reason=` on miss.
+Still **FAIL**, not GREEN.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:

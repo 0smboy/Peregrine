@@ -1370,6 +1370,11 @@ impl ProxyApp {
             std::collections::HashMap::new();
         let mut saw_404 = false;
         let mut latest_404_timestamp = Timestamp::zero();
+        let mut n200 = 0usize;
+        let mut seen_idxs: Vec<i32> = Vec::new();
+        let mut skipped_no_ts = 0usize;
+        let mut skipped_no_fi = 0usize;
+        let mut skipped_etag = 0usize;
         // Two rounds, Python ECFragGetter-shaped. Round 0 must *omit*
         // X-Backend-Fragment-Preferences: rust DiskFile treats `[]` as
         // "newest, including non-durable". Official
@@ -1412,14 +1417,23 @@ impl ProxyApp {
                 .await
                 {
                     Ok(head) if head.status == 200 => {
+                        n200 += 1;
                         let explicit_data_timestamp =
                             resp_header(&head.headers, "X-Backend-Data-Timestamp");
                         let data_timestamp = explicit_data_timestamp
                             .or_else(|| resp_header(&head.headers, "X-Backend-Timestamp"))
                             .or_else(|| resp_header(&head.headers, "X-Timestamp"))
                             .map(str::to_string);
-                        let Some(data_timestamp) = data_timestamp else {
-                            continue;
+                        // Field 4f7a82c: five Ec-Frag 200s (idxs 0,2,3,4,5)
+                        // still 404'd. A prefs-less 200 is the durable
+                        // generation — do not drop it for a missing ts.
+                        let data_timestamp = match data_timestamp {
+                            Some(ts) => ts,
+                            None if round == 0 => "0".to_string(),
+                            None => {
+                                skipped_no_ts += 1;
+                                continue;
+                            }
                         };
                         let durable = if round == 0 {
                             // Prefs-less object-server GET only opens the
@@ -1436,29 +1450,40 @@ impl ProxyApp {
                         let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
                             .and_then(|value| value.parse::<i32>().ok())
                             .or(node.backend_index);
-                        if let Some(fi) = fi {
-                            let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
-                                .unwrap_or_default()
-                                .to_string();
-                            let data_key = version_timestamp_key(&data_timestamp);
-                            let bucket =
-                                buckets.entry(data_key).or_insert_with(|| EcResponseBucket {
-                                    etag: etag.clone(),
-                                    meta: head.headers.clone(),
-                                    sources: std::collections::HashMap::new(),
-                                    durable,
-                                });
-                            bucket.durable |= durable;
-                            // Empty Ec-Etag (healed first) must not poison
-                            // remaining fragments that carry the whole-object
-                            // etag. Only reject two non-empty mismatches.
-                            if bucket.etag.is_empty() && !etag.is_empty() {
-                                bucket.etag = etag.clone();
-                                bucket.meta = head.headers.clone();
-                            }
-                            if ec_etag_compatible(&bucket.etag, &etag) {
-                                bucket.sources.entry(fi).or_insert(head);
-                            }
+                        let Some(fi) = fi else {
+                            skipped_no_fi += 1;
+                            continue;
+                        };
+                        seen_idxs.push(fi);
+                        let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
+                            .unwrap_or_default()
+                            .to_string();
+                        // Round 0 is one durable generation. Join every
+                        // unique index even when POST/PUT timestamps or
+                        // fragment ETags disagree (field: 5×200 → 404).
+                        let data_key = if round == 0 {
+                            ec_round0_bucket_key(
+                                buckets.keys().next().map(String::as_str),
+                                &data_timestamp,
+                            )
+                        } else {
+                            version_timestamp_key(&data_timestamp)
+                        };
+                        let bucket = buckets.entry(data_key).or_insert_with(|| EcResponseBucket {
+                            etag: etag.clone(),
+                            meta: head.headers.clone(),
+                            sources: std::collections::HashMap::new(),
+                            durable,
+                        });
+                        bucket.durable |= durable;
+                        if bucket.etag.is_empty() && !etag.is_empty() {
+                            bucket.etag = etag.clone();
+                            bucket.meta = head.headers.clone();
+                        }
+                        if round == 0 || ec_etag_compatible(&bucket.etag, &etag) {
+                            bucket.sources.entry(fi).or_insert(head);
+                        } else {
+                            skipped_etag += 1;
                         }
                     }
                     Ok(head) if head.status == 404 => {
@@ -1523,14 +1548,58 @@ impl ProxyApp {
                         });
                     let all_good_older_than_tombstone = latest_404_timestamp.is_truthy()
                         && buckets.keys().all(|timestamp| tombstone_trumps(timestamp));
+                    let bucket_summary = buckets
+                        .iter()
+                        .map(|(key, bucket)| {
+                            format!(
+                                "{}:{}:{}:{}",
+                                key,
+                                bucket.sources.len(),
+                                if bucket.durable { "d" } else { "n" },
+                                bucket.etag
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
                     if all_good_older_than_tombstone {
+                        log_ec_gather_miss(
+                            path,
+                            404,
+                            "tombstone_trumps",
+                            n200,
+                            &seen_idxs,
+                            skipped_no_ts,
+                            skipped_no_fi,
+                            skipped_etag,
+                            &bucket_summary,
+                            &latest_404_timestamp.internal(),
+                            saw_404,
+                        );
                         return swob_response(404);
                     }
-                    return swob_response(ec_no_durable_status(
+                    let status = ec_no_durable_status(
                         has_reconstructable_nondurable_bucket,
                         saw_404,
                         buckets.is_empty(),
-                    ));
+                    );
+                    log_ec_gather_miss(
+                        path,
+                        status,
+                        if buckets.is_empty() {
+                            "empty_buckets"
+                        } else {
+                            "no_complete_bucket"
+                        },
+                        n200,
+                        &seen_idxs,
+                        skipped_no_ts,
+                        skipped_no_fi,
+                        skipped_etag,
+                        &bucket_summary,
+                        &latest_404_timestamp.internal(),
+                        saw_404,
+                    );
+                    return swob_response(status);
                 }
             }
         };
@@ -3608,6 +3677,71 @@ fn send_ec_fragment_preferences(round: u32) -> bool {
     round > 0
 }
 
+/// Prefs-less round 0 is one durable generation. Reuse the first bucket
+/// key so POST-after-PUT timestamp noise cannot split ndata successes.
+#[cfg(feature = "ec")]
+fn ec_round0_bucket_key(existing: Option<&str>, data_timestamp: &str) -> String {
+    existing
+        .map(str::to_string)
+        .unwrap_or_else(|| version_timestamp_key(data_timestamp))
+}
+
+/// Field harvest greps proxy logs for `EC GET` / `reason=`. Object-server
+/// already logged the 200s; this line is why they did not become a client 200.
+#[cfg(feature = "ec")]
+fn format_ec_gather_miss(
+    path: &str,
+    status: u16,
+    reason: &str,
+    n200: usize,
+    idxs: &[i32],
+    skipped_no_ts: usize,
+    skipped_no_fi: usize,
+    skipped_etag: usize,
+    buckets: &str,
+    tombstone: &str,
+    saw_404: bool,
+) -> String {
+    format!(
+        "proxy-server: EC GET {path} status={status} reason={reason} \
+         200s={n200} idxs={idxs:?} skipped_no_ts={skipped_no_ts} \
+         skipped_no_fi={skipped_no_fi} skipped_etag={skipped_etag} \
+         buckets={buckets} tombstone={tombstone} saw_404={saw_404}"
+    )
+}
+
+#[cfg(feature = "ec")]
+fn log_ec_gather_miss(
+    path: &str,
+    status: u16,
+    reason: &str,
+    n200: usize,
+    idxs: &[i32],
+    skipped_no_ts: usize,
+    skipped_no_fi: usize,
+    skipped_etag: usize,
+    buckets: &str,
+    tombstone: &str,
+    saw_404: bool,
+) {
+    eprintln!(
+        "{}",
+        format_ec_gather_miss(
+            path,
+            status,
+            reason,
+            n200,
+            idxs,
+            skipped_no_ts,
+            skipped_no_fi,
+            skipped_etag,
+            buckets,
+            tombstone,
+            saw_404,
+        )
+    );
+}
+
 /// Encode Python `ECGetResponseCollection._get_frag_prefs`. Each later
 /// request names the data generations already observed and excludes fragment
 /// indexes already held for that generation. An empty collection deliberately
@@ -4100,6 +4234,33 @@ mod tests {
         assert!(ec_etag_compatible("deadbeef", ""));
         assert!(ec_etag_compatible("deadbeef", "deadbeef"));
         assert!(!ec_etag_compatible("deadbeef", "cafebabe"));
+        // Field 4f7a82c: idxs=[0,2,3,4,5] 200s with POST X-Timestamp and
+        // PUT data_ts must stay one generation on prefs-less gather.
+        let put = version_timestamp_key("1788720311.82508");
+        assert_eq!(ec_round0_bucket_key(None, "1788720311.82508"), put);
+        assert_eq!(
+            ec_round0_bucket_key(Some(&put), "000001788720312.00000"),
+            put,
+            "later POST timestamp must not open a second round-0 bucket"
+        );
+        let line = format_ec_gather_miss(
+            "/a/c/o",
+            404,
+            "no_complete_bucket",
+            5,
+            &[0, 2, 3, 4, 5],
+            0,
+            0,
+            0,
+            "1788720311:5:d:abc",
+            "0",
+            true,
+        );
+        assert!(
+            line.contains("proxy-server: EC GET /a/c/o status=404 reason=no_complete_bucket"),
+            "{line}"
+        );
+        assert!(line.contains("200s=5 idxs=[0, 2, 3, 4, 5]"), "{line}");
     }
 
     #[cfg(feature = "ec")]
