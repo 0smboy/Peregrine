@@ -420,6 +420,21 @@ impl WebConfig {
     fn enabled(&self) -> bool {
         self.index.is_some() || self.listings
     }
+
+    /// Python `_get_container_info` is a container HEAD. The captured
+    /// first `next()` may already be the index *object* (`index contents`)
+    /// with no web-* headers — `from_headers(first)` then makes
+    /// `enabled()` false and Hyper `return first` leaks those bytes.
+    /// Prefer HEAD when it enables web mode; fall back to captured meta
+    /// only if HEAD carried none (HEAD 401 / empty).
+    fn from_captured_or_head(first: &HeaderKeyDict, head: &HeaderKeyDict) -> Self {
+        let from_head = Self::from_headers(head);
+        if from_head.enabled() {
+            from_head
+        } else {
+            Self::from_headers(first)
+        }
+    }
 }
 
 struct Scope {
@@ -737,6 +752,13 @@ impl StaticWeb {
         if !req.path.ends_with('/') {
             return redirect_with_slash(&req);
         }
+        // Official listing_*_direct: listings on, web-index removed.
+        // Python `if not self._index: return _listing`. When leftover
+        // web-index is still present *with* listings (index tests ran
+        // first), listing style must not serve the index object body.
+        if cfg.listings {
+            return self.serve_listing(&req, &scope, &cfg, "", next);
+        }
         if let Some(index) = &cfg.index {
             let index_resp = next(index_subrequest(&req, &scope, "", index));
             if is_success(index_resp.status) || is_redirect(index_resp.status) {
@@ -830,11 +852,11 @@ impl Middleware for StaticWeb {
             // First next() is the captured original app response.
             let first = next(req.clone_head()).await;
             if scope.obj.is_empty() {
-                let cfg = if is_success(first.status) {
-                    WebConfig::from_headers(&first.headers)
-                } else {
-                    WebConfig::from_headers(&next(head_req).await.headers)
-                };
+                // Always HEAD. A successful first body can be the leftover
+                // index object (`index contents`) from `_test_index`; its
+                // 200 must not skip config or leak as the listing page.
+                let cfg =
+                    WebConfig::from_captured_or_head(&first.headers, &next(head_req).await.headers);
                 if !cfg.enabled() {
                     if web_mode {
                         return Response::error(404, "Not Found");
@@ -844,13 +866,15 @@ impl Middleware for StaticWeb {
                 if !path_has_slash {
                     return redirect_with_slash(&head);
                 }
-                if let Some(index) = &cfg.index {
-                    let index_resp = next(index_subrequest(&head, &scope, "", index)).await;
-                    if is_success(index_resp.status) || is_redirect(index_resp.status) {
-                        return index_resp;
-                    }
-                }
+                // listing_*_direct style: listings wins over a leftover
+                // web-index (field G4 on 668b948 returned "index contents").
                 if !cfg.listings {
+                    if let Some(index) = &cfg.index {
+                        let index_resp = next(index_subrequest(&head, &scope, "", index)).await;
+                        if is_success(index_resp.status) || is_redirect(index_resp.status) {
+                            return index_resp;
+                        }
+                    }
                     return Response::error(404, "Not Found");
                 }
                 let mut listing = next(listing_subrequest(&head, &scope, "")).await;
@@ -1981,7 +2005,8 @@ mod tests {
                     }
                     if r.method == "GET" && r.path == env.storage_path() {
                         let mut resp = Response::with_body(200, text.into_bytes());
-                        resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+                        resp.headers
+                            .set("Content-Type", "text/plain; charset=utf-8");
                         return resp;
                     }
                     Response::new(404)
@@ -2064,6 +2089,229 @@ mod tests {
         assert!(
             body.contains(&python_link(&format!("{}/", env.dir))),
             "{body}"
+        );
+    }
+
+    /// Official `('%s contents' % item)` for item `'index'` — the field
+    /// body on `668b948` (`AssertionError: 'Listing of …' not found in
+    /// 'index contents'`).
+    const INDEX_OBJECT_BYTES: &str = "index contents";
+
+    fn leftover_index_listing_env() -> DirectListingEnv {
+        // Official `Utils.create_name()` uuid; body is still
+        // `('%s contents' % 'index')` → `index contents`.
+        DirectListingEnv::field_ascii()
+    }
+
+    /// Captured first `next()` is already the index object, not a
+    /// container listing. Official listing tests still HEAD listings-on
+    /// / web-index removed (`_set_staticweb_headers(listings=True)`).
+    fn index_object_captured(
+        env: &DirectListingEnv,
+        leftover_web_index: bool,
+        leftover_listings: bool,
+    ) -> Response {
+        let mut resp = Response::with_body(200, INDEX_OBJECT_BYTES.as_bytes().to_vec());
+        resp.headers.set("Content-Type", "text/plain");
+        if leftover_web_index {
+            resp.headers.set("X-Container-Meta-Web-Index", &env.index);
+        }
+        if leftover_listings {
+            resp.headers.set("X-Container-Meta-Web-Listings", "true");
+        }
+        resp
+    }
+
+    fn listing_head_next(env: DirectListingEnv) -> crate::AsyncNextFn {
+        let rest = hyper_listing_next(env.clone(), false);
+        let index_path = format!("{}/{}", env.storage_path(), env.index);
+        Arc::new(move |r: Request| {
+            let rest = Arc::clone(&rest);
+            let index_path = index_path.clone();
+            Box::pin(async move {
+                if r.method == "GET" && r.path == index_path {
+                    return Response::with_body(200, INDEX_OBJECT_BYTES.as_bytes().to_vec());
+                }
+                rest(r).await
+            })
+        })
+    }
+
+    fn official_listing_of_asserts(body: &str, container_path: &str, index: &str) {
+        assert!(
+            body.contains(&format!("Listing of {container_path}")),
+            "official _test_listing expects Listing of {container_path} in body, got {body:?}"
+        );
+        assert_ne!(
+            body.trim(),
+            INDEX_OBJECT_BYTES,
+            "body must be listing HTML, not the index object bytes (field 668b948)"
+        );
+        assert_ne!(
+            body, INDEX_OBJECT_BYTES,
+            "body must not equal the index object content"
+        );
+        assert!(
+            body.contains(&python_link(index)),
+            "listing should quote-link the index object, not serve it: {body}"
+        );
+    }
+
+    /// Field sample: captured GET is `index contents` (no web-* meta).
+    /// HEAD has listings. Must not `return first`.
+    #[tokio::test]
+    async fn test_reassemble_listing_direct_ignores_index_bytes_without_web_headers() {
+        let env = leftover_index_listing_env();
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let index = env.index.clone();
+        let req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        let next = hyper_next(
+            index_object_captured(&env, false, false),
+            listing_head_next(env),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "got {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        official_listing_of_asserts(&body, &container_path, &index);
+    }
+
+    /// Leftover `X-Container-Meta-Web-Index` from `_test_index` on the
+    /// captured GET, plus listings (official listing tests XOR-remove
+    /// web-index). Body must still be Listing-of HTML, not `index contents`.
+    #[tokio::test]
+    async fn test_reassemble_listing_direct_not_index_object_body() {
+        let env = leftover_index_listing_env();
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let index = env.index.clone();
+        let req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        let next = hyper_next(
+            index_object_captured(&env, true, true),
+            listing_head_next(env.clone()),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "got {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        official_listing_of_asserts(&body, &container_path, &index);
+        assert!(
+            body.contains(&python_link(&format!("{}/", env.dir))),
+            "sibling dir link missing: {body}"
+        );
+    }
+
+    /// Leftover web-index only on captured GET; HEAD is listings-only
+    /// (official remove). Must HEAD and list, not serve the index object.
+    #[tokio::test]
+    async fn test_reassemble_listing_direct_head_listings_beats_leftover_web_index() {
+        let env = leftover_index_listing_env();
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let index = env.index.clone();
+        let req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        let next = hyper_next(
+            index_object_captured(&env, true, false),
+            listing_head_next(env),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "got {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        official_listing_of_asserts(&body, &container_path, &index);
+    }
+
+    /// Sync `handle_container`: listings on + leftover web-index must not
+    /// GET/return the index object (`index contents`).
+    #[test]
+    fn test_handle_container_listings_not_index_object_when_both_set() {
+        let env = leftover_index_listing_env();
+        let listing = env.delimited_listing_json("");
+        let index_name = env.index.clone();
+        let index_for_assert = index_name.clone();
+        let container_path = env.container_url();
+        let storage = env.storage_path();
+        let app: crate::NextFn = Arc::new(move |r: Request| {
+            if r.method == "HEAD" && r.path == storage {
+                let mut resp = Response::new(204);
+                resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                resp.headers.set("X-Container-Meta-Web-Index", &index_name);
+                return resp;
+            }
+            if r.path.ends_with(&format!("/{index_name}")) {
+                return Response::with_body(200, INDEX_OBJECT_BYTES.as_bytes().to_vec());
+            }
+            if r.method == "GET" && r.path == storage {
+                return Response::with_body(200, listing.clone());
+            }
+            Response::new(404)
+        });
+        let sw = StaticWeb::new();
+        let req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        let mut resp = sw.handle(req, &app);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        official_listing_of_asserts(&body, &container_path, &index_for_assert);
+    }
+
+    /// Index-style (`listings=false`, web-index set) still serves the
+    /// index object — do not invert `_test_index`.
+    #[tokio::test]
+    async fn test_reassemble_index_style_still_serves_index_not_listing() {
+        let next: crate::AsyncNextFn = Arc::new(|r: Request| {
+            Box::pin(async move {
+                if r.method == "HEAD" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Meta-Web-Index", "index.html");
+                    return resp;
+                }
+                if r.path.ends_with("/index.html") {
+                    return Response::with_body(200, b"<h1>home</h1>".to_vec());
+                }
+                Response::with_body(200, INDEX_OBJECT_BYTES.as_bytes().to_vec())
+            })
+        });
+        let sw = StaticWeb::new();
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/web/".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let first = Response::with_body(200, INDEX_OBJECT_BYTES.as_bytes().to_vec());
+        let mut resp = sw.reassemble_async(req, hyper_next(first, next)).await;
+        let body = resp.body.materialize(u64::MAX).unwrap().to_vec();
+        assert_eq!(&body, b"<h1>home</h1>");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Listing of"),
+            "index-style must not emit a listing page"
         );
     }
 }

@@ -97,12 +97,13 @@ Collect `/recon/concurrency` **deltas** with
 Replay the frozen official lists on `$CANDIDATE` only:
 
 - G4: Swift `test/functional` identity list, exact-name diff vs Python.
-  Field on `5434983` and `84751c9` (proxy sha `7c7da29b`) is **556/40/54**.
-  The 8 `listing_*_direct` identities are still open; Host copy on
-  `84751c9` did not move them. After this SHA, if they stay red, check
-  whether isolated `:18080` listing follow-ups are `text/plain`
-  (`X-Backend-Listing-Out-Content-Type` on the staticweb subrequest)
-  rather than JSON. Do **not** call G4 GREEN from unit tests.
+  Field on `5434983`, `84751c9`, and **`668b948` is still 556/40/54**.
+  All 8 `listing_*_direct` fail with body `index contents` (the index
+  object), not a missing `Listing of` title on an empty/text listing.
+  `listing_formats` text/plain was the wrong primary hypothesis. After
+  this SHA, confirm the container GET body contains `Listing of` and
+  quoted links and is **not** equal to `index contents`. Do **not**
+  call G4 GREEN from unit tests.
 - G5: Swift `test/s3api` + pinned Ceph `s3-tests`
 - G6: 147 replication + 32 EC identities, merge **once** into the 179
   ledger. Score with `python3 swift-rust/tools/test-lab/g6_ledger.py LEDGER.json`.
