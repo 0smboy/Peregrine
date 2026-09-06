@@ -248,6 +248,15 @@ fn main() {
     let reclaim_age: f64 = get("object-reconstructor", "reclaim_age", "604800")
         .parse()
         .unwrap_or(604800.0);
+    let quarantine_age = get(
+        "object-reconstructor",
+        "quarantine_age",
+        &reclaim_age.to_string(),
+    );
+    let quarantine_policy = swift_object_server::reconstructor::QuarantinePolicy::from_conf(
+        &get("object-reconstructor", "quarantine_threshold", "0"),
+        &quarantine_age,
+    );
     let commit_window: f64 = get("object-reconstructor", "commit_window", "60")
         .parse()
         .unwrap_or(60.0);
@@ -317,6 +326,7 @@ fn main() {
                 &listen_overlay,
                 &logger,
                 &mut total,
+                quarantine_policy,
             );
         }
         logger.info(&format!(
@@ -392,9 +402,10 @@ fn sweep_policy(
     listen_overlay: &swift_object_server::localdev::ObjectListenOverlay,
     logger: &Logger,
     total: &mut EcSsyncStats,
+    quarantine_policy: swift_object_server::reconstructor::QuarantinePolicy,
 ) {
     #[cfg(not(feature = "ec"))]
-    let _ = (max_original_size, spool);
+    let _ = (max_original_size, spool, quarantine_policy);
     let Ok(entries) = std::fs::read_dir(devices_path) else {
         return;
     };
@@ -511,6 +522,7 @@ fn sweep_policy(
                     partition,
                     peers: peers.clone(),
                     fetcher: &overlay_fetcher,
+                    quarantine: quarantine_policy,
                 };
                 #[cfg(feature = "ec")]
                 let diskfile_builder: Option<

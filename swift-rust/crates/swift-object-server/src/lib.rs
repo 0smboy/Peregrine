@@ -7231,6 +7231,56 @@ mod fallocate_reserve_tests {
     }
 
     #[test]
+    fn get_after_lonely_frag_quarantine_is_404_not_503() {
+        // Official test_rebuild_quarantines_lonely_frag: after reconstruct_fa
+        // quarantines the solitary fragment, direct GET must be 404, not 503.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-lonely-quar-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        assert_eq!(server.handle(put_named("lonely", "1", b"frag")).status, 201);
+        assert_eq!(server.handle(get_named("lonely")).status, 200);
+
+        let hc = HashPathConfig::new(Vec::new(), b"reserve-tests".to_vec()).unwrap();
+        let df = DiskFile::new(
+            &dir.join("sda1"),
+            0,
+            "AUTH_test",
+            "c",
+            "lonely",
+            PolicyKind::Replication,
+            0,
+            &hc,
+            DiskFileConfig::default(),
+        )
+        .unwrap();
+        let err = df.quarantine_object("Solitary fragment #0");
+        assert!(
+            matches!(err, DiskFileError::Quarantined(_)),
+            "quarantine_object must report Quarantined, got {err:?}"
+        );
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Storage-Policy-Index", "0");
+        let get = server.handle(Request {
+            method: "GET".into(),
+            path: "/sda1/0/AUTH_test/c/lonely".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        });
+        assert_eq!(
+            get.status, 404,
+            "quarantined lonely frag must GET 404, not {}: {}",
+            get.status, get.reason
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn replicate_accepts_plain_dir_when_mount_check_is_false() {
         let dir = std::env::temp_dir().join(format!(
             "swift-obj-mc-false-{}-{}",

@@ -156,6 +156,20 @@ swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
 #   python3 swift-rust/tools/test-lab/g6_rust_proxy_get.py --check
 ```
 
+Field `/workspace/g6-rebuild-988b81b-httpget/` (2026-09-06): rebuild
+theme **6 green / 11 red** of 17 after rust HTTP `proxy_get`. Do not
+reopen `test_rebuild_missing_frags` gather. Next leftover:
+`test_rebuild_quarantines_lonely_frag` (`AssertionError: 503 != 404`).
+After reconstructor once with `quarantine_threshold=1` `quarantine_age=0`,
+the solitary fragment must be moved to `quarantined/` so **direct GET
+is 404**, not 503.
+
+```bash
+export PROXY_BASE_URL=http://127.0.0.1:18080
+swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
+  test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_quarantines_lonely_frag -vv
+```
+
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:
 

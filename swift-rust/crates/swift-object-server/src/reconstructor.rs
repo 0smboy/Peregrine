@@ -239,6 +239,65 @@ pub enum ReconstructError {
     BadTimestamp(String),
 }
 
+/// Python `[object-reconstructor] quarantine_threshold` / `quarantine_age`.
+/// Threshold 0 (default) never quarantines. Official
+/// `test_rebuild_quarantines_lonely_frag` sets threshold=1 and age=0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuarantinePolicy {
+    pub threshold: u64,
+    pub age_secs: f64,
+}
+
+impl Default for QuarantinePolicy {
+    fn default() -> Self {
+        Self {
+            threshold: 0,
+            age_secs: 604800.0,
+        }
+    }
+}
+
+impl QuarantinePolicy {
+    pub fn from_conf(threshold: &str, age: &str) -> Self {
+        Self {
+            threshold: threshold.parse().unwrap_or(0),
+            age_secs: age.parse().unwrap_or(604800.0),
+        }
+    }
+}
+
+/// Python `_is_quarantine_candidate` (obj.py). A solitary local fragment
+/// whose peers only 404, and that is older than `quarantine_age`, is
+/// moved off the primary path so a later direct GET is 404 not 503.
+pub fn is_solitary_quarantine_candidate(
+    policy: QuarantinePolicy,
+    ndata: usize,
+    useful_at_local: usize,
+    local_index_present: bool,
+    only_404_errors: bool,
+    only_local_timestamp: bool,
+    local_timestamp_secs: f64,
+    now_secs: f64,
+) -> bool {
+    if policy.threshold == 0 || !only_404_errors || !only_local_timestamp || !local_index_present {
+        return false;
+    }
+    if now_secs - local_timestamp_secs <= policy.age_secs {
+        return false;
+    }
+    useful_at_local > 0 && useful_at_local <= policy.threshold as usize && useful_at_local < ndata
+}
+
+/// Prefix `ssync_sender` recognizes to move the local hash dir.
+pub const QUARANTINE_REBUILD_PREFIX: &str = "QUARANTINE ";
+
+#[cfg(feature = "ec")]
+#[derive(Debug, Default, Clone)]
+struct GatherTally {
+    useful_indexes: std::collections::BTreeSet<i32>,
+    timestamps: std::collections::BTreeSet<String>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconstructorStats {
     pub rebuilt: u64,
@@ -303,6 +362,7 @@ fn gather_coherent_archives(
     fetcher: &dyn FragmentFetcher,
     preferred_timestamp: Option<&str>,
     seed: Option<FetchedFragment>,
+    mut tally: Option<&mut GatherTally>,
 ) -> Result<(FetchedFragment, Vec<ArchiveBody>), ReconstructError> {
     type VersionKey = (String, String, usize);
     let mut versions: BTreeMap<VersionKey, BTreeMap<i32, FetchedFragment>> = BTreeMap::new();
@@ -312,6 +372,12 @@ fn gather_coherent_archives(
                 .is_none_or(|expected| same_data_timestamp(&frag.timestamp, expected))
     };
     if let Some(frag) = seed.filter(|frag| accept(frag)) {
+        if let Some(tally) = tally.as_mut() {
+            tally.useful_indexes.insert(frag.frag_index);
+            tally
+                .timestamps
+                .insert(version_timestamp_key(&frag.timestamp));
+        }
         let key = (
             version_timestamp_key(&frag.timestamp),
             frag.ec_etag.clone(),
@@ -339,6 +405,12 @@ fn gather_coherent_archives(
         };
         if !accept(&frag) {
             continue;
+        }
+        if let Some(tally) = tally.as_mut() {
+            tally.useful_indexes.insert(frag.frag_index);
+            tally
+                .timestamps
+                .insert(version_timestamp_key(&frag.timestamp));
         }
         let key = (
             version_timestamp_key(&frag.timestamp),
@@ -475,6 +547,8 @@ pub struct EcSyncRebuilder<'a> {
     /// `_make_fragment_requests`).
     pub peers: Vec<(i64, RingDevice)>,
     pub fetcher: &'a dyn FragmentFetcher,
+    /// Official lonely-frag probe: `quarantine_threshold=1` `quarantine_age=0`.
+    pub quarantine: QuarantinePolicy,
 }
 
 #[cfg(feature = "ec")]
@@ -525,7 +599,15 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             .filter(|(index, _)| *index != target_frag_index)
             .map(|(_, device)| device.clone())
             .collect();
-        let (chosen, archives) = gather_coherent_archives(
+        let local_frag_index: Option<i32> = get("X-Object-Sysmeta-Ec-Frag-Index")
+            .and_then(|s| s.parse().ok())
+            .or_else(|| local.as_ref().map(|f| f.frag_index));
+        let local_ts_secs = local_ts
+            .parse::<swift_core::timestamp::Timestamp>()
+            .map(|t| t.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut tally = GatherTally::default();
+        let (chosen, archives) = match gather_coherent_archives(
             &sources,
             self.partition,
             account,
@@ -535,8 +617,36 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             self.fetcher,
             Some(&local_ts),
             local,
-        )
-        .map_err(|e| format!("{e:?}"))?;
+            Some(&mut tally),
+        ) {
+            Ok(got) => got,
+            Err(ReconstructError::NotEnoughFragments) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let useful = tally.useful_indexes.len();
+                let local_present =
+                    local_frag_index.is_some_and(|idx| tally.useful_indexes.contains(&idx));
+                if is_solitary_quarantine_candidate(
+                    self.quarantine,
+                    self.scheme.ndata,
+                    useful,
+                    local_present,
+                    true,
+                    tally.timestamps.len() <= 1,
+                    local_ts_secs,
+                    now,
+                ) {
+                    return Err(format!(
+                        "{QUARANTINE_REBUILD_PREFIX}solitary fragment #{}",
+                        local_frag_index.unwrap_or(-1)
+                    ));
+                }
+                return Err("NotEnoughFragments".into());
+            }
+            Err(e) => return Err(format!("{e:?}")),
+        };
         // The rebuilt bytes must belong to the SAME version the sender is
         // offering: peers serving a different timestamp would be labelled
         // with this datafile's metadata and corrupt the receiver's view.
@@ -600,6 +710,7 @@ pub fn rebuild_job(
         &job.object,
         scheme.ndata,
         fetcher,
+        None,
         None,
         None,
     )?;
@@ -2706,13 +2817,17 @@ pub fn process_part_job(
                             ));
                         }
                         if let Some(error) = report.last_rebuild_error {
-                            stats.note(format!(
-                                "reconstruct_fa part {} -> {}:{}/{}: {error}",
-                                job.partition,
-                                node.replication_ip,
-                                node.replication_port,
-                                node.device
-                            ));
+                            if error.starts_with("Quarantined object") {
+                                stats.log_lines.push(error);
+                            } else {
+                                stats.note(format!(
+                                    "reconstruct_fa part {} -> {}:{}/{}: {error}",
+                                    job.partition,
+                                    node.replication_ip,
+                                    node.replication_port,
+                                    node.device
+                                ));
+                            }
                         }
                         if report.offered_count > page_limit
                             || (report.offered_count > 0 && report.last_offered.is_none())
@@ -5412,7 +5527,7 @@ mod tests {
         };
         let peers = vec![dev(0), dev(1), dev(2)];
         let (chosen, archives) =
-            gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None, None)
+            gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None, None, None)
                 .expect("later coherent quorum");
         assert_eq!(chosen.timestamp, "1751500001.00000");
         assert_eq!(
@@ -5428,7 +5543,18 @@ mod tests {
             ]),
         };
         assert!(matches!(
-            gather_coherent_archives(&peers, 0, "a", "c", "o", 3, &duplicate_fetcher, None, None),
+            gather_coherent_archives(
+                &peers,
+                0,
+                "a",
+                "c",
+                "o",
+                3,
+                &duplicate_fetcher,
+                None,
+                None,
+                None,
+            ),
             Err(ReconstructError::NotEnoughFragments)
         ));
     }
@@ -5454,6 +5580,7 @@ mod tests {
             &fetcher,
             Some("1751500123.45678"),
             Some(seed),
+            None,
         )
         .expect("same instant must form one quorum");
         assert!(same_data_timestamp(&chosen.timestamp, "1751500123.45678"));
@@ -5690,6 +5817,7 @@ mod tests {
             partition: 7,
             peers: vec![(0, dev(0)), (1, dev(1)), (2, dev(2))],
             fetcher: &fetcher,
+            quarantine: QuarantinePolicy::default(),
         };
         let metadata: Metadata = vec![
             (
@@ -5745,6 +5873,7 @@ mod tests {
             rebuilder.fetcher,
             Some(ts),
             Some(seed),
+            None,
         )
         .expect("local seed + one peer is ndata");
         assert_eq!(gathered.len(), 2);
@@ -5755,5 +5884,139 @@ mod tests {
             fetcher.seen.borrow()
         );
         let _ = (rebuilder, metadata, archives);
+    }
+
+    #[test]
+    fn test_reconstruct_fa_quarantines_solitary_frag_when_threshold_is_one() {
+        use crate::ssync_sender::SyncDiskfileBuilder;
+        struct MissFetcher {
+            spool: SpoolBudget,
+        }
+        impl FragmentFetcher for MissFetcher {
+            fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+                Some(self.spool.clone())
+            }
+            fn fetch(
+                &self,
+                _node: &RingDevice,
+                _p: u64,
+                _a: &str,
+                _c: &str,
+                _o: &str,
+            ) -> Option<FetchedFragment> {
+                None
+            }
+        }
+        let spool = TestSpool::new(1024 * 1024);
+        let fetcher = MissFetcher {
+            spool: spool.budget.clone(),
+        };
+        let old_ts = "1000000000.00000";
+        let seed = FetchedFragment {
+            frag_index: 0,
+            archive: vec![1, 2, 3].into(),
+            ec_etag: "e".into(),
+            ec_content_length: 3,
+            timestamp: old_ts.into(),
+            content_type: "application/octet-stream".into(),
+        };
+        let metadata: Metadata = vec![
+            (
+                MetaValue::Str("name".into()),
+                MetaValue::Str("/AUTH_test/c/o".into()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".into()),
+                MetaValue::Str(old_ts.into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                MetaValue::Int(0),
+            ),
+        ];
+        let with_threshold = EcSyncRebuilder {
+            scheme: EcScheme {
+                ndata: 4,
+                nparity: 2,
+                segment_size: 1000,
+            },
+            partition: 3,
+            peers: vec![(1, dev(1)), (2, dev(2))],
+            fetcher: &fetcher,
+            quarantine: QuarantinePolicy {
+                threshold: 1,
+                age_secs: 0.0,
+            },
+        };
+        let err = with_threshold
+            .rebuild_with_local("hash", &metadata, 1, Some(seed.clone()))
+            .expect_err("lonely frag must quarantine");
+        assert!(
+            err.starts_with(QUARANTINE_REBUILD_PREFIX),
+            "expected QUARANTINE prefix, got {err}"
+        );
+
+        let no_threshold = EcSyncRebuilder {
+            quarantine: QuarantinePolicy::default(),
+            ..with_threshold
+        };
+        let skip = no_threshold
+            .rebuild_with_local("hash", &metadata, 1, Some(seed))
+            .expect_err("threshold 0 must not quarantine");
+        assert_eq!(skip, "NotEnoughFragments");
+    }
+}
+
+#[cfg(test)]
+mod quarantine_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn test_solitary_quarantine_candidate_matches_python() {
+        let policy = QuarantinePolicy {
+            threshold: 1,
+            age_secs: 0.0,
+        };
+        assert!(
+            is_solitary_quarantine_candidate(policy, 4, 1, true, true, true, 1.0, 10.0),
+            "lonely frag older than age=0 is a candidate"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(
+                QuarantinePolicy::default(),
+                4,
+                1,
+                true,
+                true,
+                true,
+                1.0,
+                10.0
+            ),
+            "threshold 0 never quarantines"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(policy, 4, 2, true, true, true, 1.0, 10.0),
+            "two useful responses exceed threshold 1"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(policy, 4, 1, true, false, true, 1.0, 10.0),
+            "a non-404 peer response blocks quarantine"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(
+                QuarantinePolicy {
+                    threshold: 1,
+                    age_secs: 10000.0,
+                },
+                4,
+                1,
+                true,
+                true,
+                true,
+                9.0,
+                10.0
+            ),
+            "younger than quarantine_age stays"
+        );
     }
 }

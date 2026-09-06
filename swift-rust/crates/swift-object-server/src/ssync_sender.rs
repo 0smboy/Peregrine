@@ -31,8 +31,8 @@ use swift_core::config::config_true_value;
 use swift_core::hashing::HashPathConfig;
 use swift_core::timestamp::Timestamp;
 use swift_diskfile::{
-    get_data_dir, get_ondisk_files, storage_directory, DiskFile, DiskFileConfig, DiskFileError,
-    FragPref, MetaValue, Metadata, PolicyKind,
+    get_data_dir, get_ondisk_files, quarantine_renamer, storage_directory, DiskFile,
+    DiskFileConfig, DiskFileError, FragPref, MetaValue, Metadata, PolicyKind,
 };
 
 use crate::percent_encode;
@@ -791,6 +791,8 @@ pub struct SenderReport {
     /// `{ts}#N#d.data`). Field `proxy_get` 404 after once is (a) if this
     /// is false for a durable local source.
     pub last_rebuild_durable: Option<bool>,
+    /// Lonely-fragment hash dirs moved to `quarantined/` this session.
+    pub quarantined: u64,
 }
 
 /// `ssync_sender.Sender` for one node+job.
@@ -1297,6 +1299,23 @@ impl Sender<'_> {
                                     )));
                                 }
                                 Err(error) => {
+                                    if let Some(detail) = error.strip_prefix(
+                                        crate::reconstructor::QUARANTINE_REBUILD_PREFIX,
+                                    ) {
+                                        let marker = df.datadir().join("made-up-filename");
+                                        match quarantine_renamer(&device_path, &marker) {
+                                            Ok(_) => {
+                                                report.quarantined += 1;
+                                                report.last_rebuild_error =
+                                                    Some(format!("Quarantined object {detail}"));
+                                            }
+                                            Err(e) => {
+                                                report.last_rebuild_error =
+                                                    Some(format!("quarantine failed: {e}"));
+                                            }
+                                        }
+                                        continue 'objects;
+                                    }
                                     report.last_rebuild_error = Some(error);
                                     continue 'objects;
                                 }

@@ -252,6 +252,22 @@ impl DiskFile {
         &self.datadir
     }
 
+    pub fn device_path(&self) -> &Path {
+        &self.device_path
+    }
+
+    /// Python `DiskFile._quarantine`: move the hash dir under
+    /// `<device>/quarantined/objects[-N]/`. A later object-server GET must
+    /// be `DiskFileNotExist` → 404, not 503.
+    pub fn quarantine_object(&self, msg: &str) -> DiskFileError {
+        let marker = self
+            .state
+            .as_ref()
+            .map(|s| s.data_file.clone())
+            .unwrap_or_else(|| self.datadir.join("made-up-filename"));
+        self.quarantine(&marker, msg)
+    }
+
     /// Acquire the cross-process mutation stripe for this object.
     ///
     /// The lock lives below the policy-specific tmp directory rather than the
