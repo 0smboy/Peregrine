@@ -1370,24 +1370,34 @@ impl ProxyApp {
             std::collections::HashMap::new();
         let mut saw_404 = false;
         let mut latest_404_timestamp = Timestamp::zero();
-        // Python may issue up to twice the replica count. The second pass is
-        // essential when every primary has a newer non-durable generation:
-        // pass one discovers and excludes those fragment indexes, then pass
-        // two asks the same nodes for the older durable generation.
-        'request_rounds: for _round in 0..2 {
+        // Two rounds, Python ECFragGetter-shaped. Round 0 must *omit*
+        // X-Backend-Fragment-Preferences: rust DiskFile treats `[]` as
+        // "newest, including non-durable". Official
+        // `test_rebuild_missing_frags` POSTs after PUT then deletes 1–2
+        // hash dirs. A first-node `[]` 200 that we fail to mark durable
+        // (or that is a different generation) then excludes that index on
+        // every later primary; with ndata=4 a single-frag hole still 404s
+        // even though five `#d.data` archives remain. Prefs-less GET is
+        // the durable-only contract, so remaining primaries return the
+        // same PUT generation. Round 1 still sends prefs so a newer
+        // no-commit generation can be skipped in favor of the older
+        // durable set.
+        'request_rounds: for round in 0..2 {
             for node in &nodes {
-                let preferences = encode_ec_fragment_preferences(
-                    buckets.iter().map(|(timestamp, bucket)| {
-                        (
-                            timestamp.as_str(),
-                            bucket.durable,
-                            bucket.sources.keys().copied().collect(),
-                        )
-                    }),
-                    required,
-                );
                 let mut request_headers = headers.clone();
-                request_headers.set("X-Backend-Fragment-Preferences", preferences);
+                if send_ec_fragment_preferences(round) {
+                    let preferences = encode_ec_fragment_preferences(
+                        buckets.iter().map(|(timestamp, bucket)| {
+                            (
+                                timestamp.as_str(),
+                                bucket.durable,
+                                bucket.sources.keys().copied().collect(),
+                            )
+                        }),
+                        required,
+                    );
+                    request_headers.set("X-Backend-Fragment-Preferences", preferences);
+                }
                 match backend_request_head_async(
                     node,
                     object_part,
@@ -1411,11 +1421,18 @@ impl ProxyApp {
                         let Some(data_timestamp) = data_timestamp else {
                             continue;
                         };
-                        let durable = ec_source_is_durable(
-                            &data_timestamp,
-                            resp_header(&head.headers, "X-Backend-Durable-Timestamp"),
-                            explicit_data_timestamp.is_some(),
-                        );
+                        let durable = if round == 0 {
+                            // Prefs-less object-server GET only opens the
+                            // durable set. Count it even when POST moved
+                            // X-Timestamp / durable_ts off the data file.
+                            true
+                        } else {
+                            ec_source_is_durable(
+                                &data_timestamp,
+                                resp_header(&head.headers, "X-Backend-Durable-Timestamp"),
+                                explicit_data_timestamp.is_some(),
+                            )
+                        };
                         let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
                             .and_then(|value| value.parse::<i32>().ok())
                             .or(node.backend_index);
@@ -1481,21 +1498,41 @@ impl ProxyApp {
             .map(|(timestamp, _)| timestamp)
             .max()
             .cloned();
-        let Some(chosen_timestamp) = chosen_timestamp else {
-            let has_reconstructable_nondurable_bucket =
-                buckets.iter().any(|(timestamp, bucket)| {
-                    !tombstone_trumps(timestamp) && bucket.sources.len() >= required
-                });
-            let all_good_older_than_tombstone = latest_404_timestamp.is_truthy()
-                && buckets.keys().all(|timestamp| tombstone_trumps(timestamp));
-            if all_good_older_than_tombstone {
-                return swob_response(404);
+        let chosen_timestamp = match chosen_timestamp {
+            Some(ts) => ts,
+            None => {
+                // Field `4f7a82c` single-frag 404: ndata remaining 200s
+                // were collected then classified non-durable, so
+                // ec_no_durable_status pretended they were 404. If a
+                // complete generation survived tombstones, serve it —
+                // that is the official probe's "remaining ndata must
+                // decode" case, including after once.
+                if let Some(ts) = buckets
+                    .iter()
+                    .filter(|(timestamp, bucket)| {
+                        !tombstone_trumps(timestamp) && bucket.sources.len() >= required
+                    })
+                    .map(|(timestamp, _)| timestamp.clone())
+                    .max()
+                {
+                    ts
+                } else {
+                    let has_reconstructable_nondurable_bucket =
+                        buckets.iter().any(|(timestamp, bucket)| {
+                            !tombstone_trumps(timestamp) && bucket.sources.len() >= required
+                        });
+                    let all_good_older_than_tombstone = latest_404_timestamp.is_truthy()
+                        && buckets.keys().all(|timestamp| tombstone_trumps(timestamp));
+                    if all_good_older_than_tombstone {
+                        return swob_response(404);
+                    }
+                    return swob_response(ec_no_durable_status(
+                        has_reconstructable_nondurable_bucket,
+                        saw_404,
+                        buckets.is_empty(),
+                    ));
+                }
             }
-            return swob_response(ec_no_durable_status(
-                has_reconstructable_nondurable_bucket,
-                saw_404,
-                buckets.is_empty(),
-            ));
         };
         let chosen = buckets
             .remove(&chosen_timestamp)
@@ -3563,6 +3600,14 @@ fn ec_no_durable_status(
     }
 }
 
+/// Round 0 of proxy EC GET omits the header (durable-only DiskFile open).
+/// Later rounds send prefs, including `[]`, so a no-commit generation can
+/// be skipped in favor of the older durable set.
+#[cfg(feature = "ec")]
+fn send_ec_fragment_preferences(round: u32) -> bool {
+    round > 0
+}
+
 /// Encode Python `ECGetResponseCollection._get_frag_prefs`. Each later
 /// request names the data generations already observed and excludes fragment
 /// indexes already held for that generation. An empty collection deliberately
@@ -4060,10 +4105,18 @@ mod tests {
     #[cfg(feature = "ec")]
     #[test]
     fn ec_fragment_preferences_expose_non_durable_then_prioritize_durable_bucket() {
+        assert!(
+            !send_ec_fragment_preferences(0),
+            "round 0 must omit prefs so rust DiskFile opens the durable set"
+        );
+        assert!(
+            send_ec_fragment_preferences(1),
+            "round 1 may send [] to expose a non-durable generation"
+        );
         assert_eq!(
             encode_ec_fragment_preferences(std::iter::empty(), 4),
             "[]",
-            "the first EC request must make non-durable fragments eligible"
+            "an empty collection still serializes as [] for a later pass"
         );
         let encoded = encode_ec_fragment_preferences(
             [

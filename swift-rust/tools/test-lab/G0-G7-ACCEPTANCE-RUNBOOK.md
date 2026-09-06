@@ -126,6 +126,11 @@ mount_check, or 503-connect. Field on **`9a95747`**: durable PUTs
 now match `failed=` victims; still **404×6**. Leftover is GET
 visibility (`X-Object-Sysmeta-Ec-Frag-Index` + DiskFile open) and
 proxy async gather after POST-after-PUT. That is **FAIL**, not GREEN.
+Field on **`4f7a82c`**: object-server GET 200 + Ec-Frag-Index for
+0–5 and victim `#N#d.data` after once; proxy GET still **404×6**
+including single-frag loss. In-repo follow-up: gather round 0 omits
+`X-Backend-Fragment-Preferences`; InternalClient-shaped GET after
+POST + rmtree 1–2 hash dirs. Still **FAIL**, not GREEN.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:

@@ -180,13 +180,10 @@ fn md5_hex(data: &[u8]) -> String {
     format!("{:x}", Md5::digest(data))
 }
 
-#[test]
-fn test_ec_object_put_get_round_trip_and_fragment_loss() {
-    let tmp = std::env::temp_dir().join(format!("swift-ec-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    // account server
+/// Policy 0 is replication (`objects/`). Policy 1 is EC (`objects-1/`).
+/// InternalClient GET omits `X-Backend-Storage-Policy-Index`; if the proxy
+/// falls through to policy 0 it 404s even when every fragment is on disk.
+fn boot_ec_cluster(tmp: &Path) -> (std::net::SocketAddr, Vec<PathBuf>) {
     let acct_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let acct_addr = acct_listener.local_addr().unwrap();
     std::fs::create_dir_all(tmp.join("acct/sda1")).unwrap();
@@ -199,7 +196,6 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     };
     std::thread::spawn(move || swift_account_server::serve(acct_listener, acct_config));
 
-    // container server
     let cont_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let cont_addr = cont_listener.local_addr().unwrap();
     std::fs::create_dir_all(tmp.join("cont/sda1")).unwrap();
@@ -214,8 +210,6 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
 
-    // k + m object servers, each with its own device tree; all know policy 1
-    // is EC (ndata + nparity fragments).
     let mut obj_ports = Vec::new();
     let mut obj_dirs = Vec::new();
     for i in 0..N {
@@ -246,7 +240,6 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         std::thread::spawn(move || swift_object_server::serve(listener, config));
     }
 
-    // proxy: EC ring for policy 1, EC scheme for policy 1
     let ec_ring = multi_device_ring(&obj_ports);
     let mut object_rings = std::collections::HashMap::new();
     object_rings.insert(EC_POLICY, ec_ring.clone());
@@ -277,6 +270,28 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     let app = Arc::new(app);
     std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
     std::thread::sleep(std::time::Duration::from_millis(300));
+    (proxy_addr, obj_dirs)
+}
+
+fn rmtree_one_durable_hash_dir(obj_dirs: &[PathBuf]) -> PathBuf {
+    let victim = obj_dirs
+        .iter()
+        .find_map(|d| {
+            let frags = find_files(d, &|n| n.ends_with("#d.data"));
+            frags.into_iter().next()
+        })
+        .expect("a durable fragment to delete");
+    let hash_dir = victim.parent().expect("hash dir").to_path_buf();
+    std::fs::remove_dir_all(&hash_dir).unwrap();
+    hash_dir
+}
+
+#[test]
+fn test_ec_object_put_get_round_trip_and_fragment_loss() {
+    let tmp = std::env::temp_dir().join(format!("swift-ec-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (proxy_addr, obj_dirs) = boot_ec_cluster(&tmp);
 
     // create the container ON THE EC POLICY (autocreates the account) —
     // updates for policy-1 objects are filtered out of a policy-0
@@ -429,6 +444,13 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         body, payload,
         "POST must not split the durable EC generation"
     );
+    // Official proxy_get is InternalClient: no policy index header.
+    let (status, _, body) = http(proxy_addr, "GET", "/v1/AUTH_ec/ecbox/big.bin", &[], b"");
+    assert_eq!(
+        status, 200,
+        "InternalClient-shaped GET after POST must use the container EC policy"
+    );
+    assert_eq!(body, payload);
 
     // EC redundancy: destroy nparity fragments and confirm the object still
     // decodes from the surviving ndata.
@@ -646,6 +668,98 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         b"some bytes",
     );
     assert_eq!(status, 422, "client etag mismatch");
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// Field `4f7a82c` `test_rebuild_missing_frags`: official probe is
+/// PUT + POST, `break_nodes` rmtree of 1–2 primaries, then InternalClient
+/// GET (no `X-Backend-Storage-Policy-Index`). Single-frag loss must 200
+/// because ndata=4 and five archives remain — including before once.
+#[test]
+fn test_internal_client_get_after_post_and_single_frag_rmtree() {
+    let tmp = std::env::temp_dir().join(format!(
+        "swift-ec-rebuild-once-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (proxy_addr, obj_dirs) = boot_ec_cluster(&tmp);
+
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/probe",
+        &[("X-Storage-Policy", "Policy-1")],
+        b"",
+    );
+    assert_eq!(status, 201, "container PUT");
+
+    let payload: Vec<u8> = (0..1800u32).map(|i| (i % 251) as u8).collect();
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/probe/obj",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        &payload,
+    );
+    assert_eq!(status, 201, "EC PUT");
+    let (status, _, _) = http(
+        proxy_addr,
+        "POST",
+        "/v1/AUTH_ec/probe/obj",
+        &[
+            ("X-Object-Meta-Color", "red"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 202, "POST-after-PUT");
+
+    let (status, _, body) = http(proxy_addr, "GET", "/v1/AUTH_ec/probe/obj", &[], b"");
+    assert_eq!(status, 200, "InternalClient GET after POST");
+    assert_eq!(body, payload);
+
+    let deleted = rmtree_one_durable_hash_dir(&obj_dirs);
+    assert!(
+        !deleted.exists(),
+        "break_nodes-shaped rmtree must remove the hash dir: {deleted:?}"
+    );
+    let remaining: usize = obj_dirs
+        .iter()
+        .map(|d| find_files(d, &|n| n.ends_with("#d.data")).len())
+        .sum();
+    assert_eq!(remaining, N - 1, "exactly one durable fragment removed");
+
+    let (status, headers, body) = http(proxy_addr, "GET", "/v1/AUTH_ec/probe/obj", &[], b"");
+    assert_eq!(
+        status,
+        200,
+        "InternalClient GET after single-frag rmtree must decode remaining ndata: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(body, payload);
+    let color = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Object-Meta-Color"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(color, "red", "POST metadata must survive single-frag loss");
+
+    // Adjacent second hole (official 0+5 / 0+4). Still ndata=4 of 6.
+    let _ = rmtree_one_durable_hash_dir(&obj_dirs);
+    let (status, _, body) = http(proxy_addr, "GET", "/v1/AUTH_ec/probe/obj", &[], b"");
+    assert_eq!(
+        status,
+        200,
+        "InternalClient GET after two-frag rmtree must still decode: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(body, payload);
 
     std::fs::remove_dir_all(&tmp).unwrap();
 }

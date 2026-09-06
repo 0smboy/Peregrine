@@ -37,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: 8 `listing_*_direct` (mode already Listing HTML). Field on **`b20f569`**: **565/31/54** — object `./` hrefs passed; leftover is **4× `listing_*_direct_with_css`**. Sample: expected `'<link rel="stylesheet" type="text/css" href="…" />'`, actual type-before-rel | In-repo now emits Python `rel` then `type` then `href`. Fail-then-pass: `test_listing_html_css_link_is_rel_then_type_then_href`. Listing `./` href work (`b20f569`) stays independent of this CSS-order follow-up | Do **not** call G4 GREEN. The 4 CSS identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4**. Field on **`1682fdb`: 125/30/20/4**. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. Single-test `test_rebuild_missing_frags` still `proxy_get` 404 after once | Field **`9a95747`**: still **404×6**, but durable reconstruct_fa PUTs now match `failed=` victims (`sdb7#2` → `backend_index=2 durable=true`, etc.). Write path is **closed**. One `503 replication lock timeout` on sdb6 (retry 1/8) is **secondary**. Leftover is **READ**: object-server GET / proxy gather. In-repo now: GET always emits `X-Object-Sysmeta-Ec-Frag-Index` from the opened filename and logs `object-server: GET … Ec-Frag-Index=`; `#d.data` stays openable if a newer orphan `.durable` exists; async EC gather treats POST-after-PUT `durable_ts >= data_ts` as one generation, joins empty/non-empty Ec-Etag, falls back to ring `backend_index`. Fail-then-pass: Hyper GET after once (`reconstruct_fa_after_once_leaves_deleted_index_durable_and_gettable`), `post_after_put_durable_header_still_counts_the_data_generation`, ec_integration POST-after-PUT + parity-loss GET. **Not** a field replay. Do **not** call G6 GREEN. Do not re-litigate mount_check / CSS / overlay / connect-503-as-primary |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4**. Field on **`1682fdb`: 125/30/20/4**. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. Single-test `test_rebuild_missing_frags` still `proxy_get` 404 after once | Field **`4f7a82c`**: still **404×6** after write + object-server GET closed (Ec-Frag-Index 200s for 0–5; `#N#d.data` on disk; durable_ts==data_ts). Leftover is **proxy InternalClient GET** after POST+`break_nodes` (single-frag still 404s). In-repo now: EC gather round 0 omits fragment-preferences; prefs-less 200s are the durable generation; complete remaining-ndata is not pretend-404. Fail-then-pass: `test_internal_client_get_after_post_and_single_frag_rmtree`. **Not** a field replay. Do **not** call G6 GREEN. Do not re-litigate mount_check / CSS / overlay / write-path durable PUT / object-server Ec-Frag-Index |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -309,6 +309,22 @@ forces the header from the opened filename, logs it, opens `#d`
 despite an orphan newer `.durable`, and treats POST-after-PUT
 `durable_ts >= data_ts` as durable. **Not GREEN.**
 
+Field on **`4f7a82c`**: write path + object-server GET **closed**.
+g6 logs emit `GET … Ec-Frag-Index=N durable_ts=… data_ts=… status=200`
+for indexes 0–5 (in field `durable_ts == data_ts`). Victim `#N#d.data`
+exists after once. Proxy InternalClient GET still **404×6**, including
+single-frag `failed=['127.0.0.1:16210/sdb5#1']` (ec42 ndata=4). That
+is **not** healed-frag invisibility. In-repo now: Hyper EC gather
+round 0 **omits** `X-Backend-Fragment-Preferences` (rust DiskFile
+`[]` means newest, including non-durable) and counts those 200s as
+the durable generation; a complete remaining-ndata bucket is served
+instead of pretend-404. Fail-then-pass:
+`test_internal_client_get_after_post_and_single_frag_rmtree`
+(POST-after-PUT, rmtree 1 then 2 hash dirs, GET with **no** policy
+header). **Not** a field replay. Do **not** call G6 GREEN. Do not
+re-litigate mount_check / CSS / overlay / write-path durable PUT /
+object-server Ec-Frag-Index.
+
 Do **not** call G6 GREEN.
 
 ### Exact Swift2 / Swift1 checks (environmental — do not fake)
@@ -353,7 +369,13 @@ Do **not** call G6 GREEN.
    `#0#d.data` + GET still 404 is (c) / proxy fragment discovery.
    After **`9a95747`** (a)/(b) matched live; leftover is (c). Grep
    `object-server: GET … Ec-Frag-Index=` on the victim after once.
-   `rebuilt>=1` with `proxy_get` 404 is **not** GREEN.
+   Field **`4f7a82c`**: those GET 200s landed; leftover is proxy
+   InternalClient GET (no policy header) after POST+rmtree. After this
+   SHA, during `test_rebuild_missing_frags` confirm the isolated proxy
+   used the EC path (container HEAD `X-Backend-Storage-Policy-Index`
+   = ec42) and that backend GETs in the first gather round omit
+   `X-Backend-Fragment-Preferences`. `rebuilt>=1` with `proxy_get` 404
+   is **not** GREEN.
 4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
    correctly empty; heal must be partner `reconstruct_fa`. Ports on
    `ca2081b` were already remapped (`16220/sdb6#2`).
