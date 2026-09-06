@@ -56,9 +56,27 @@ class JoinAndGuard(unittest.TestCase):
             adapter.conf_uses_egg_swift_proxy("[app:proxy-server]\nuse = egg:other#proxy\n")
         )
 
+    def test_isolated_rust_port_is_18080_not_any_proxy_base(self):
+        self.assertTrue(
+            adapter.uses_isolated_rust_proxy(
+                {"PROXY_BASE_URL": "http://127.0.0.1:18080"}
+            )
+        )
+        self.assertFalse(
+            adapter.uses_isolated_rust_proxy(
+                {"PROXY_BASE_URL": "http://127.0.0.1:8080"}
+            )
+        )
+        self.assertFalse(adapter.uses_isolated_rust_proxy({}))
+
     def test_guard_silent_without_proxy_base(self):
         adapter.rust_object_get_guard(
             environ={},
+            conf_text=EGG_CONF,
+            adapter_installed=False,
+        )
+        adapter.rust_object_get_guard(
+            environ={"PROXY_BASE_URL": "http://127.0.0.1:8080"},
             conf_text=EGG_CONF,
             adapter_installed=False,
         )
@@ -162,36 +180,14 @@ class HttpAndPatch(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.resp.status_int, 404)
 
-    def test_patched_get_never_calls_wsgi(self):
-        class FakeResp:
-            status = 200
-            headers = {}
-
-            def read(self):
-                return b"ok"
-
-            def getcode(self):
-                return 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        def opener(req, timeout=None):
-            return FakeResp()
-
+    def test_internal_client_get_is_forbidden_on_18080(self):
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
         self.assertTrue(adapter.install(DummyInternalClient))
         client = DummyInternalClient()
-        with mock.patch.object(adapter, "rust_http_exchange", side_effect=lambda *a, **k: adapter._HttpResp(200, {}, b"from-rust")):
-            status_headers_body = client.make_request(
-                "GET", "/v1/AUTH_ec/probe/obj", {}, (2,)
-            )
+        with self.assertRaises(adapter.RustProxyGetError) as ctx:
+            client.make_request("GET", "/v1/AUTH_ec/probe/obj", {}, (2,))
+        self.assertIn("swiftclient HTTP", str(ctx.exception))
         self.assertEqual(client.wsgi_calls, [])
-        self.assertEqual(status_headers_body.status_int, 200)
-        self.assertEqual(b"".join(status_headers_body.app_iter), b"from-rust")
 
     def test_patched_put_still_uses_original(self):
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
@@ -202,28 +198,63 @@ class HttpAndPatch(unittest.TestCase):
         self.assertIn("WSGI", str(ctx.exception))
         self.assertEqual(client.wsgi_calls[0][0], "PUT")
 
-    def test_get_object_shape_matches_official_proxy_get(self):
-        """Official proxy_get unpacks (status, headers, body_iter)."""
+    def test_swiftclient_proxy_get_matches_official_return(self):
+        """Official proxy_get returns (headers, md5_hex). Lab used swiftclient."""
+
+        class Probe:
+            url = "http://127.0.0.1:18080/auth/v1.0"
+            token = "AUTH_tk"
+            container_name = b"c"
+            object_name = b"o"
+
+        def get_object(url, token, container, obj):
+            self.assertEqual(url, Probe.url)
+            self.assertEqual(token, Probe.token)
+            return {"Etag": "ignored"}, b"abc"
+
+        headers, etag = adapter.rust_swiftclient_proxy_get(
+            Probe(), get_object=get_object
+        )
+        self.assertEqual(headers.get("Etag"), "ignored")
+        self.assertEqual(etag, "900150983cd24fb0d6963f7d28e17f72")
+
+    def test_probe_proxy_get_routes_to_swiftclient_on_18080(self):
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
-        adapter.install(DummyInternalClient)
 
-        class ProbeClient(DummyInternalClient):
-            def get_object(self, account, container, obj, headers=None, acceptable_statuses=(2,), params=None):
-                path = f"/v1/{account}/{container}/{obj}"
-                resp = self.make_request("GET", path, headers or {}, acceptable_statuses, params=params)
-                return (resp.status_int, resp.headers, resp.app_iter)
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH"
+            token = "tk"
+            container_name = "c"
+            object_name = "o"
+            int_hits = 0
 
-        client = ProbeClient()
+            def proxy_get(self):
+                self.int_hits += 1
+                raise AssertionError("InternalClient proxy_get used")
+
+        self.assertTrue(adapter.install_probe_proxy_get(Probe))
         with mock.patch.object(
             adapter,
-            "rust_http_exchange",
-            return_value=adapter._HttpResp(200, {"Etag": "deadbeef"}, b"abc"),
-        ):
-            status, headers, body = client.get_object("AUTH_ec", "probe", "obj")
-        self.assertEqual(status, 200)
-        self.assertEqual(headers.get("Etag"), "deadbeef")
-        self.assertEqual(b"".join(body), b"abc")
-        self.assertEqual(client.wsgi_calls, [])
+            "rust_swiftclient_proxy_get",
+            return_value=({"Etag": "x"}, "deadbeef"),
+        ) as routed:
+            headers, etag = Probe().proxy_get()
+        self.assertEqual(etag, "deadbeef")
+        routed.assert_called_once()
+
+    def test_apply_lab_patch_inserts_18080_swiftclient_branch(self):
+        official = (
+            adapter.OFFICIAL_PROXY_GET_HEAD
+            + "        status, headers, body = self.int_client.get_object(a, c, o)\n"
+        )
+        updated, changed = adapter.apply_lab_proxy_get_to_source(official)
+        self.assertTrue(changed)
+        self.assertTrue(adapter.probe_source_routes_rust_http(updated))
+        self.assertIn("client.get_object", updated)
+        self.assertIn(":18080", updated)
+        again, changed_again = adapter.apply_lab_proxy_get_to_source(updated)
+        self.assertFalse(changed_again)
+        self.assertEqual(again, updated)
 
 
 if __name__ == "__main__":

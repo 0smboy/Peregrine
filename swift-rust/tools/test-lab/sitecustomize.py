@@ -1,5 +1,5 @@
 # IsolatedIdentity adds this directory to PYTHONPATH. When PROXY_BASE_URL
-# is set, InternalClient GET/HEAD must HTTP to rust :18080.
+# contains :18080, rebuild proxy_get must use swiftclient HTTP to rust.
 try:
     import g6_rust_proxy_get
 except Exception:

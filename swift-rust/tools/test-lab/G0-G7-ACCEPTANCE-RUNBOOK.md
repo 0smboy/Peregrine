@@ -133,21 +133,22 @@ Sharper leftover: PRE-once 404 with **5** Ec-Frag 200s
 In-repo: `G6_DIAG proxy-server: EC GET` on every object GET
 (`handle_async` + route + gather/404). Still **FAIL**, not GREEN.
 
-Field **`988b81b` locked**: official `proxy_get` is Python
-`InternalClient.get_object` (`egg:swift#proxy` in
-`/etc/g6-rust/internal-client.conf`). It does **not** HTTP to rust
-`:18080`. Access 404s were `swift[python-pid]` while rust stayed idle.
-Do **not** keep joining EC gather buckets for this leftover until a
-re-probe shows rust `G6_DIAG proxy-server: EC GET` during the GET.
+Field **`988b81b` locked then flipped on rust HTTP**: official
+`proxy_get` is Python `InternalClient` / `egg:swift#proxy`. After the
+lab forced GET onto rust `:18080` via **swiftclient** (same `self.url` /
+token as PUT/POST), `test_rebuild_missing_frags` **PASSED** (rc=0, ~10s,
+30× `G6_DIAG proxy-server: EC GET status=200 reason=ok`). Do **not**
+reopen gather-bucket chasing for this single-test.
 
 ```bash
-# IsolatedIdentity child env — required for rust GET asserts
 export PROXY_BASE_URL=http://127.0.0.1:18080
 export PYTHONPATH=/path/to/Peregrine/swift-rust/tools/test-lab:$PYTHONPATH
-# sitecustomize auto-installs; or:
+# Durable lab file patch (same honesty as bak.httpget-988b81b):
+python3 swift-rust/tools/test-lab/g6_rust_proxy_get.py --apply-probe \
+  /root/work/swift-master/test/probe/test_reconstructor_rebuild.py
+# Runtime wrap + fail-closed if InternalClient GET still runs:
 #   pytest -p g6_rust_proxy_get ...
 #   python3 swift-rust/tools/test-lab/g6_rust_proxy_get.py --check
-# Fail-closed if PROXY_BASE_URL is set but GET still uses egg:swift#proxy.
 ```
 
 If those two themes stay red after rebuilding **this SHA**, check
