@@ -8,7 +8,12 @@
 #
 # This wrapper is the durable runner: apply that honesty, fail closed if
 # GET would still use InternalClient, then exec the probe command.
-# Do not reopen gather-bucket chasing for this single-test.
+# Do not reopen gather-bucket chasing, lonely_frag, missing_frags, or
+# non_durable_newer_data.
+#
+# Field `/workspace/rebuild-nondurable-176505e/` (2026-09-06): gatekeeper
+# on public :18080 strips X-Backend-* (X-Backend-No-Commit). IC no-commit
+# PUT and fragment-preferences GET used rust :18082 for that PASS.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"

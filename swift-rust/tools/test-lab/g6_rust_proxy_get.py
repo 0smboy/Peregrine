@@ -27,8 +27,15 @@ the eventlet green socket (server closed mid-send). Drain with sized
 reads, make ``Body.read`` file-like, and PUT with ``Content-Length``
 plus chunked socket writes. No ``Expect`` / no unframed chunked TE.
 
+Field ``/workspace/rebuild-nondurable-176505e/`` (2026-09-06) on
+``176505e`` (proxy ``faaeed18…``): ``test_rebuild_with_non_durable_newer_data``
+**PASSED** (BrokenPipe gone; prefs GET etag v2≠v1). Public ``:18080``
+pipeline includes gatekeeper, which strips ``X-Backend-*`` (including
+``X-Backend-No-Commit``). Field routed those IC PUTs and
+backend-header ``proxy_get`` via rust ``:18082``. Do not reopen
+lonely_frag, missing_frags, or non_durable_newer_data.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
-Do not reopen gather-bucket chasing, lonely_frag, or missing_frags.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
     # IsolatedIdentity must go through this wrapper (or --prepare):

@@ -157,27 +157,37 @@ swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
 ```
 
 Field `/workspace/g6-rebuild-988b81b-httpget/` (2026-09-06): rebuild
-theme **6 green / 11 red** of 17 after rust HTTP `proxy_get`. Do not
-reopen `test_rebuild_missing_frags` gather. Next leftover:
-`test_rebuild_quarantines_lonely_frag` field PASS on `3efec7d` + lab
-HEAD honesty (`/workspace/rebuild-lonely-3efec7d-headhttp/`,
-2026-09-06). Do not reopen it. Next leftover:
-`test_rebuild_with_non_durable_newer_data` still FAIL on `4e284ae`
-(`/workspace/rebuild-nondurable-4e284ae/`, 2026-09-06): ProbeBody
-TypeError gone; 3735552-byte IC PUT still **BrokenPipe** on eventlet
-to rust `:18080`. Rust peek/Hyper `max_buf` treated coalesced
-header+body as a 72KiB head and reset. Expect `100-continue` then
-64KiB writes; Hyper buffer floor for leftover body. Do **not** claim
-this identity PASS until IsolatedIdentity re-runs the official probe.
-Do not reopen `test_rebuild_quarantines_lonely_frag`.
+theme **6 green / 11 red** of 17 after rust HTTP `proxy_get`. Closed
+on rust HTTP (do **not** reopen):
+
+- `test_rebuild_missing_frags` — PASS `988b81b` (`/workspace/rebuild-once-988b81b-httpget/`, 2026-09-06).
+- `test_rebuild_quarantines_lonely_frag` — PASS `3efec7d` + HEAD honesty (`/workspace/rebuild-lonely-3efec7d-headhttp/`, 2026-09-06).
+- `test_rebuild_with_non_durable_newer_data` — PASS `176505e` proxy `faaeed18…` (`/workspace/rebuild-nondurable-176505e/`, 2026-09-06). BrokenPipe gone; prefs GET etag v2≠v1.
+
+`:18080` public pipeline includes **gatekeeper**, which strips every
+`X-Backend-*` (including `X-Backend-No-Commit`). Official IC
+`upload_object` / `direct_get(..., require_durable=False)` need those
+headers. Field PASS routed those IC PUTs and backend-header
+`proxy_get` to rust **`:18082`** (no gatekeeper). Client
+`proxy_get` / lonely-frag HEAD stay on `:18080` when they do not
+carry `X-Backend-*`. Do not “fix” gatekeeper by allowing client
+`X-Backend-*` on `:18080`.
+
+Wait for the **176505e full rebuild-theme ledger** before the next
+code tip. Prior 988b81b leftovers still in play until that replay:
+`test_rebuild_reconciled_object_with_offset_timestamp` (setup all
+direct GET 404), `test_sync_expired_object` (`proxy_get` 404), UTF-8
+class (meta encoding).
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080
+# IC no-commit / fragment-preferences (gatekeeper-free):
+# export PROXY_BASE_URL=http://127.0.0.1:18082
 swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
   test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_with_non_durable_newer_data -vv
 ```
 
-If those two themes stay red after rebuilding **this SHA**, check
+If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 
 ```bash
