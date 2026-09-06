@@ -171,8 +171,8 @@ class HttpAndPatch(unittest.TestCase):
         )
         self.assertEqual(resp.status_int, 201)
 
-    def test_put_sends_content_length_in_chunks_no_expect(self):
-        """Multi-MiB IsolatedIdentity PUT: CL + chunked send, no Expect/TE."""
+    def test_put_sends_content_length_in_chunks_after_100_continue(self):
+        """Official-size IsolatedIdentity PUT: Expect 100, then CL chunks."""
         received = {}
 
         def serve():
@@ -206,6 +206,8 @@ class HttpAndPatch(unittest.TestCase):
                     conn.close()
                     received["closed_on_te"] = True
                     return
+                if headers.get("expect", "").lower() == "100-continue":
+                    conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
                 length = int(headers.get("content-length", "0"))
                 while len(rest) < length:
                     chunk = conn.recv(65536)
@@ -244,7 +246,7 @@ class HttpAndPatch(unittest.TestCase):
         headers = received["headers"]
         self.assertEqual(headers.get("content-length"), str(len(payload)))
         self.assertNotIn("transfer-encoding", headers)
-        self.assertNotIn("expect", headers)
+        self.assertEqual(headers.get("expect"), "100-continue")
         self.assertEqual(headers.get("x-backend-no-commit"), "True")
         self.assertEqual(headers.get("connection"), "close")
 

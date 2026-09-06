@@ -71,6 +71,7 @@ BODY_READ_CHUNK = 64 * 1024
 HOP_BY_HOP_REQUEST = frozenset(
     {"content-length", "transfer-encoding", "host", "expect", "connection"}
 )
+CONTINUE_WAIT_SECS = 30.0
 PROBE_PATCH_MARKER = "Peregrine G6: IsolatedIdentity rust :18080 must HTTP"
 DEFAULT_OFFICIAL_PROBE = (
     "/root/work/swift-master/test/probe/test_reconstructor_rebuild.py"
@@ -387,6 +388,44 @@ def _filter_outgoing_headers(
     return out
 
 
+def _eventlet_hub_yield() -> None:
+    """Let eventlet flush the green socket between PUT chunks."""
+    try:
+        import eventlet
+
+        eventlet.sleep(0)
+    except Exception:
+        pass
+
+
+def _read_http_head(sock: Any, timeout: float) -> tuple[int, bytes]:
+    """Read one HTTP response head from a raw (possibly greened) socket."""
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > 64 * 1024:
+            raise RustProxyGetError("HTTP response head too large from rust :18080")
+    if b"\r\n\r\n" not in buf:
+        raise RustProxyGetError(
+            f"no HTTP response head from rust :18080 ({buf[:200]!r})"
+        )
+    head, leftover = buf.split(b"\r\n\r\n", 1)
+    if leftover:
+        raise RustProxyGetError(
+            "unexpected bytes after informational response head "
+            f"({len(leftover)} leftover)"
+        )
+    status_line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise RustProxyGetError(f"bad HTTP status line {status_line!r}")
+    return int(parts[1]), head
+
+
 def rust_http_send_body(
     method: str,
     url: str,
@@ -397,10 +436,12 @@ def rust_http_send_body(
 ) -> _HttpResp:
     """PUT/POST to rust :18080 with Content-Length and chunked writes.
 
-    Eventlet green sockets BrokenPipe when urllib/http.client dumps
-    ~3.5MiB in one send while Hyper closes on unframed chunked TE.
-    Content-Length, no Expect, 64KiB sends. Look up HTTPConnection at
-    call time so eventlet.monkey_patch is visible.
+    Field ``/workspace/rebuild-nondurable-4e284ae/`` (2026-09-06):
+    blasting the 3735552-byte body right after headers BrokenPipe on
+    eventlet — rust Hyper peek/max_buf reset mid-send. Send
+    ``Expect: 100-continue``, wait for 100, then 64KiB ``bytes`` writes
+    with an eventlet yield. Look up HTTPConnection at call time so
+    ``eventlet.monkey_patch`` is visible.
     """
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or "127.0.0.1"
@@ -419,19 +460,62 @@ def rust_http_send_body(
         for name, value in _filter_outgoing_headers(headers):
             conn.putheader(name, value)
         conn.putheader("Content-Length", str(len(payload)))
+        conn.putheader("Expect", "100-continue")
         conn.putheader("Connection", "close")
         conn.endheaders()
-        view = memoryview(payload)
+        wait = min(float(timeout), CONTINUE_WAIT_SECS) if timeout else CONTINUE_WAIT_SECS
+        status, _head = _read_http_head(conn.sock, wait)
+        if status == 100:
+            for offset in range(0, len(payload), PUT_SEND_CHUNK):
+                conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
+                _eventlet_hub_yield()
+            resp = conn.getresponse()
+            body = resp.read()
+            hdrs = {k: v for k, v in resp.getheaders()}
+            return _HttpResp(int(resp.status), hdrs, body)
+        if status == 417:
+            conn.close()
+            return _put_without_expect(
+                connection_cls, host, port, path, method, headers, payload, timeout
+            )
+        # Final response before the body (error). Do not send payload.
+        return _HttpResp(status, {}, b"")
+    except (BrokenPipeError, ConnectionResetError) as err:
+        raise RustProxyGetError(
+            f"BrokenPipe PUT {url} ({len(payload)} bytes) to rust :18080: {err}"
+        ) from err
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _put_without_expect(
+    connection_cls: type,
+    host: str,
+    port: int,
+    path: str,
+    method: str,
+    headers: Optional[Mapping[str, Any]],
+    payload: bytes,
+    timeout: float,
+) -> _HttpResp:
+    conn = connection_cls(host, port, timeout=timeout)
+    try:
+        conn.putrequest(method.upper(), path, skip_accept_encoding=True)
+        for name, value in _filter_outgoing_headers(headers):
+            conn.putheader(name, value)
+        conn.putheader("Content-Length", str(len(payload)))
+        conn.putheader("Connection", "close")
+        conn.endheaders()
         for offset in range(0, len(payload), PUT_SEND_CHUNK):
-            conn.send(view[offset : offset + PUT_SEND_CHUNK])
+            conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
+            _eventlet_hub_yield()
         resp = conn.getresponse()
         body = resp.read()
         hdrs = {k: v for k, v in resp.getheaders()}
         return _HttpResp(int(resp.status), hdrs, body)
-    except BrokenPipeError as err:
-        raise RustProxyGetError(
-            f"BrokenPipe PUT {url} ({len(payload)} bytes) to rust :18080: {err}"
-        ) from err
     finally:
         try:
             conn.close()

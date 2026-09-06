@@ -49,6 +49,10 @@ use crate::server::{
     AsyncInterimCommand, AsyncRequest, AsyncService, IncomingBody, IncomingBodySender, ServerConfig,
 };
 
+/// Extra Hyper HTTP/1 buffer beyond the peek cap so leftover body does
+/// not saturate `max_buf_size`. Hyper's own default is ~400KiB.
+const HTTP1_BODY_BUF_FLOOR: usize = 400 * 1024;
+
 /// Decode a Hyper header value the way WSGI/Swift does: UTF-8 when the
 /// octets are valid UTF-8 (Python `str_to_wsgi` puts UTF-8 on the wire),
 /// otherwise latin-1 so a non-ASCII header is not dropped. `HeaderValue::to_str`
@@ -175,10 +179,13 @@ pub async fn serve_http1_connection(
     // waits for the first byte without a timer (new-conn idle occupancy);
     // HeaderDeadline still bounds a dripping request line after that byte.
     builder.header_read_timeout(None);
-    let max_buf = config
-        .max_header_bytes
-        .saturating_add(config.max_request_line_bytes)
-        .max(8192);
+    // Peek can replay leftover PUT body via PrefixedIo. A header-only
+    // max_buf (~72KiB) fills on the first IsolatedIdentity 64KiB chunk
+    // and Hyper resets the socket: field BrokenPipe 3735552-byte PUT
+    // to :18080 (`/workspace/rebuild-nondurable-4e284ae/`, 2026-09-06).
+    // Floor at Hyper's default (~400KiB) so Content-Length body can
+    // arrive while the service starts polling Incoming.
+    let max_buf = max_head.saturating_add(HTTP1_BODY_BUF_FLOOR);
     builder.max_buf_size(max_buf);
 
     let conn = builder.serve_connection(io, svc).with_upgrades();
@@ -645,6 +652,15 @@ async fn read_until_marker(
     read_until_marker_with_prefix(stream, Vec::new(), marker, max, deadline).await
 }
 
+fn peek_head_exceeds_limit(buf: &[u8], marker: &[u8], max: usize) -> bool {
+    // A coalesced header+body read must not count leftover PUT bytes
+    // toward the head cap. Limit the span *through* the marker only.
+    match buf.windows(marker.len()).position(|w| w == marker) {
+        Some(pos) => pos.saturating_add(marker.len()) > max,
+        None => buf.len() > max,
+    }
+}
+
 async fn read_until_marker_with_prefix(
     stream: &mut tokio::net::TcpStream,
     mut buf: Vec<u8>,
@@ -652,7 +668,7 @@ async fn read_until_marker_with_prefix(
     max: usize,
     deadline: Duration,
 ) -> std::io::Result<Vec<u8>> {
-    if buf.len() > max {
+    if peek_head_exceeds_limit(&buf, marker, max) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "HTTP head too large",
@@ -671,7 +687,7 @@ async fn read_until_marker_with_prefix(
         return Ok(buf);
     }
     buf.extend_from_slice(&tmp[..n]);
-    if buf.len() > max {
+    if peek_head_exceeds_limit(&buf, marker, max) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "HTTP head too large",
@@ -687,7 +703,7 @@ async fn read_until_marker_with_prefix(
                 return Ok(());
             }
             buf.extend_from_slice(&tmp[..n]);
-            if buf.len() > max {
+            if peek_head_exceeds_limit(&buf, marker, max) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "HTTP head too large",
@@ -2103,6 +2119,17 @@ impl http_body::Body for SwiftHttpBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_head_limit_ignores_coalesced_put_body() {
+        let mut buf = b"PUT /v1/a/c/o HTTP/1.1\r\nContent-Length: 80\r\n\r\n".to_vec();
+        buf.extend(std::iter::repeat(b'x').take(80 * 1024));
+        assert!(
+            !peek_head_exceeds_limit(&buf, b"\r\n\r\n", 72 * 1024),
+            "leftover body after CRLFCRLF must not trip HTTP head too large"
+        );
+        assert!(peek_head_exceeds_limit(&buf[..20], b"\r\n\r\n", 16));
+    }
 
     #[test]
     fn header_value_to_string_keeps_utf8_and_latin1() {

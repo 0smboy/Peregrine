@@ -162,14 +162,14 @@ reopen `test_rebuild_missing_frags` gather. Next leftover:
 `test_rebuild_quarantines_lonely_frag` field PASS on `3efec7d` + lab
 HEAD honesty (`/workspace/rebuild-lonely-3efec7d-headhttp/`,
 2026-09-06). Do not reopen it. Next leftover:
-`test_rebuild_with_non_durable_newer_data` still FAIL on `2d774ae`
-(`/workspace/rebuild-nondurable-2d774ae/`, 2026-09-06):
-`ProbeBody.read(amount)` TypeError, then lab drain + http.client PUT
-**BrokenPipe** (~3.5MiB, eventlet; rust closed mid-send). Drain with
-sized reads, file-like `Body.read`, PUT with Content-Length + 64KiB
-sends (no Expect / no unframed chunked TE). Do **not** claim this
-identity PASS until IsolatedIdentity re-runs the official probe. Do
-not reopen `test_rebuild_quarantines_lonely_frag`.
+`test_rebuild_with_non_durable_newer_data` still FAIL on `4e284ae`
+(`/workspace/rebuild-nondurable-4e284ae/`, 2026-09-06): ProbeBody
+TypeError gone; 3735552-byte IC PUT still **BrokenPipe** on eventlet
+to rust `:18080`. Rust peek/Hyper `max_buf` treated coalesced
+header+body as a 72KiB head and reset. Expect `100-continue` then
+64KiB writes; Hyper buffer floor for leftover body. Do **not** claim
+this identity PASS until IsolatedIdentity re-runs the official probe.
+Do not reopen `test_rebuild_quarantines_lonely_frag`.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080

@@ -3516,6 +3516,69 @@ mod tests {
     }
 
     #[test]
+    fn isolated_identity_sized_put_without_expect_completes() {
+        // Field `/workspace/rebuild-nondurable-4e284ae/` (2026-09-06):
+        // IsolatedIdentity rust_http_send_body Content-Length + 64KiB
+        // writes of 3735552 bytes got BrokenPipe. Production serve peeks
+        // the head then hands leftover body to Hyper; header-sized
+        // max_buf reset the socket. This is that PUT on the Hyper path.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            ..ServerConfig::default()
+        };
+        let payload_len = 3_735_552usize;
+        let seen = Arc::new(Mutex::new(0usize));
+        let seen_c = Arc::clone(&seen);
+        let handler: Handler = Arc::new(move |mut request: Request| {
+            match request.body.materialize(u64::MAX) {
+                Ok(body) => {
+                    *seen_c.lock().unwrap() = body.len();
+                    Response::new(201)
+                }
+                Err(error) => Response::error(500, &error.to_string()),
+            }
+        });
+        let server =
+            std::thread::spawn(move || serve_forever_with_config(listener, handler, config));
+        let mut client = TcpStream::connect(address).unwrap();
+        let _ = client.set_nodelay(true);
+        client
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "PUT /v1/AUTH_ec/c/o HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: {payload_len}\r\nX-Backend-No-Commit: True\r\n\
+             Connection: close\r\n\r\n"
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut left = payload_len;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            client.write_all(&chunk[..n]).unwrap();
+            left -= n;
+        }
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        assert_eq!(
+            status(&response),
+            201,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(*seen.lock().unwrap(), payload_len);
+    }
+
+    #[test]
     fn shutdown_flag_stops_the_accept_loop_after_draining() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
