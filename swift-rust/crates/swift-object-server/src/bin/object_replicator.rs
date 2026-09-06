@@ -570,7 +570,7 @@ fn checked_device_path(root: &Path, device: &str, mount_check: bool) -> Result<P
         .map_err(|error| error.to_string())
 }
 
-/// The ring device id for the local device dir, matched by (port, device name).
+/// The ring device id for the local device dir.
 fn ring_device_id(
     ring: &Ring,
     bind_port: u32,
@@ -579,12 +579,14 @@ fn ring_device_id(
 ) -> Option<u64> {
     // Delegated: matching on (port, device) alone makes every node but the
     // first adopt another node's ring identity, because every node calls its
-    // first disk d1. See `localdev`.
-    if servers_per_port > 0 {
-        swift_object_server::localdev::ring_device_id_local_name(ring, dev_name)
-    } else {
-        swift_object_server::localdev::ring_device_id(ring, bind_port, dev_name)
-    }
+    // first disk d1. Isolated remaps also keep ring ports while conf
+    // bind_port differs — fall back to local IP + name. See `localdev`.
+    swift_object_server::localdev::resolve_ring_device_id(
+        ring,
+        bind_port,
+        servers_per_port,
+        dev_name,
+    )
 }
 
 #[cfg(test)]
@@ -696,7 +698,30 @@ mod tests {
         let data = RingData::from_parts(devs, 32, vec![vec![7u32]]);
         let ring = Ring::new(data, HashPathConfig::new("", "changeme").unwrap());
         assert_eq!(ring_device_id(&ring, 6210, 1, "sda1"), Some(7));
+        // spp=0 + remapped bind_port used to return None and skip the device.
+        assert_eq!(ring_device_id(&ring, 6210, 0, "sda1"), Some(7));
+    }
+
+    #[test]
+    fn remapped_bind_port_does_not_claim_a_remote_device() {
+        let mut devs = vec![None; 8];
+        devs[7] = Some(RingDevice {
+            id: 7,
+            region: 1,
+            zone: 1,
+            ip: "192.0.2.1".to_string(),
+            port: 6217,
+            replication_ip: None,
+            replication_port: None,
+            device: "sda1".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        });
+        let data = RingData::from_parts(devs, 32, vec![vec![7u32]]);
+        let ring = Ring::new(data, HashPathConfig::new("", "changeme").unwrap());
         assert_eq!(ring_device_id(&ring, 6210, 0, "sda1"), None);
+        assert_eq!(ring_device_id(&ring, 6210, 1, "sda1"), None);
     }
 
     #[test]

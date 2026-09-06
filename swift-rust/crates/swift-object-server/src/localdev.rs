@@ -169,9 +169,60 @@ pub fn ring_device_id_local_name(ring: &Ring, dev_name: &str) -> Option<u64> {
     Some(local[0].id)
 }
 
+/// Ring device id for a local `devices/` directory.
+///
+/// Isolated G6 remaps object-server listen ports (`16210` …) while EC rings
+/// often still list `6010` / `6200`. With `servers_per_port=0` a strict
+/// `(bind_port, name)` match returns `None` and the reconstructor skips every
+/// device (`suffix_syncs=0`) — partner SYNC and the post-ssync local rebuild
+/// never run. Fall back to local IP + device name. Still requires a local
+/// interface address so a multi-node `d1` cannot be stolen.
+pub fn resolve_ring_device_id(
+    ring: &Ring,
+    bind_port: u32,
+    servers_per_port: u32,
+    dev_name: &str,
+) -> Option<u64> {
+    if servers_per_port > 0 {
+        return ring_device_id_local_name(ring, dev_name);
+    }
+    ring_device_id(ring, bind_port, dev_name).or_else(|| ring_device_id_local_name(ring, dev_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swift_core::hashing::HashPathConfig;
+    use swift_ring::{RingData, RingDevice};
+
+    fn test_dev(id: u64, ip: &str, port: u32, device: &str) -> RingDevice {
+        RingDevice {
+            id,
+            region: 1,
+            zone: 1,
+            ip: ip.to_string(),
+            port,
+            replication_ip: None,
+            replication_port: None,
+            device: device.to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        }
+    }
+
+    fn test_ring(devs: Vec<Option<RingDevice>>) -> Ring {
+        let assigned: Vec<u32> = devs.iter().flatten().map(|d| d.id as u32).collect();
+        let parts = if assigned.is_empty() {
+            vec![0]
+        } else {
+            assigned
+        };
+        Ring::new(
+            RingData::from_parts(devs, 32, vec![parts]),
+            HashPathConfig::new("", "changeme").unwrap(),
+        )
+    }
 
     #[test]
     fn loopback_is_local_and_a_documentation_address_is_not() {
@@ -218,6 +269,34 @@ mod tests {
         assert!(wild.contains(&"127.0.0.1".to_string()) || !wild.is_empty());
     }
 
-    // ring_device_id_local_name needs a real Ring fixture; covered by Contabo
-    // heal re-proof after deploy (spp>0 + conf bind_port ≠ ring port).
+    #[test]
+    fn remapped_bind_port_falls_back_to_local_name() {
+        // Failed first: spp=0 + bind_port 16210 vs ring port 6010 returned
+        // None, so reconstructor skipped the only local device.
+        let ring = test_ring(vec![Some(test_dev(3, "127.0.0.1", 6010, "d1"))]);
+        assert_eq!(
+            resolve_ring_device_id(&ring, 16210, 0, "d1"),
+            Some(3),
+            "isolated remapped listen port must still find the local device"
+        );
+        assert_eq!(resolve_ring_device_id(&ring, 6010, 0, "d1"), Some(3));
+    }
+
+    #[test]
+    fn remapped_bind_port_does_not_steal_a_remote_d1() {
+        let ring = test_ring(vec![Some(test_dev(3, "192.0.2.1", 6010, "d1"))]);
+        assert_eq!(
+            resolve_ring_device_id(&ring, 16210, 0, "d1"),
+            None,
+            "TEST-NET-1 is never a local interface"
+        );
+        assert_eq!(resolve_ring_device_id(&ring, 6010, 0, "d1"), Some(3));
+    }
+
+    #[test]
+    fn servers_per_port_still_matches_local_name() {
+        let ring = test_ring(vec![Some(test_dev(7, "127.0.0.1", 6217, "sda1"))]);
+        assert_eq!(resolve_ring_device_id(&ring, 6210, 1, "sda1"), Some(7));
+        assert_eq!(resolve_ring_device_id(&ring, 6210, 0, "sda1"), Some(7));
+    }
 }

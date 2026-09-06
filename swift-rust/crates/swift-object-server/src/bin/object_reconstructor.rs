@@ -270,6 +270,7 @@ fn main() {
                 spool.as_ref(),
                 &pusher,
                 &hash_fetcher,
+                &logger,
                 &mut total,
             );
         }
@@ -332,6 +333,7 @@ fn sweep_policy(
     spool: Option<&SpoolBudget>,
     pusher: &TcpSsyncPusher,
     hash_fetcher: &HttpSuffixHashFetcher,
+    logger: &Logger,
     total: &mut EcSsyncStats,
 ) {
     #[cfg(not(feature = "ec"))]
@@ -347,18 +349,22 @@ fn sweep_policy(
         let Some(dev_name) = device_path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Identify self: the ring device on this port owning this dir.
-        // Address-aware: (port, device) alone is ambiguous across nodes and
-        // made every node but the first act as swift1. See `localdev`.
-        // With servers_per_port>0 conf bind_port is only a base (e.g. 6210)
-        // while ring ports are 6211/6212 — match by local IP + device name.
-        let local_id = if servers_per_port > 0 {
-            swift_object_server::localdev::ring_device_id_local_name(&policy.ring, dev_name)
-        } else {
-            swift_object_server::localdev::ring_device_id(&policy.ring, bind_port, dev_name)
-        };
+        // Identify self. Isolated remaps often keep ring ports at 6010
+        // while the object server listens on 16210 with servers_per_port=0;
+        // a strict (bind_port, name) miss used to skip every device.
+        // See `localdev::resolve_ring_device_id`.
+        let local_id = swift_object_server::localdev::resolve_ring_device_id(
+            &policy.ring,
+            bind_port,
+            servers_per_port,
+            dev_name,
+        );
         let Some(local_id) = local_id else {
-            continue; // device not in this policy's ring
+            logger.warning(&format!(
+                "skipping device {dev_name}: no ring identity \
+                 (bind_port={bind_port} servers_per_port={servers_per_port})"
+            ));
+            continue;
         };
         let part_root = device_path.join(get_data_dir(policy.index));
         let Ok(parts) = std::fs::read_dir(&part_root) else {

@@ -21,9 +21,11 @@
 //! when `//realm/cluster/...` is configured, else the legacy sync-key header.
 //!
 //! PUT bodies require a local object source. This binary uses a proxy HTTP
-//! GET via `internal_client_url` (default `http://127.0.0.1:8080`) — the
-//! same role Python's InternalClient fills. Without a reachable proxy,
-//! DELETE still works; PUT rows fail and are retried next pass.
+//! GET via `internal_client_url`. The default base is `PROXY_BASE_URL`, then
+//! `[probe_test] proxy_base_url`, then `{SWIFT_DIR}/proxy-server.conf`
+//! `bind_ip`/`bind_port` (isolated `/etc/g6-rust` → `:18080`), else Python's
+//! historic `http://127.0.0.1:8080`. Without a reachable proxy, DELETE still
+//! works; PUT rows fail and are retried next pass.
 
 use std::path::Path;
 
@@ -39,8 +41,19 @@ use swift_core::statsd::StatsdClient;
 use swift_ring::{Ring, RingData};
 
 /// Probe/G6: prefer `PROXY_BASE_URL`, then `[probe_test] proxy_base_url`
-/// from `SWIFT_TEST_CONFIG_FILE`, else Python's historic `:8080`.
-fn resolve_proxy_base(env_proxy: Option<&str>, test_conf: Option<&SwiftConfig>) -> String {
+/// from `SWIFT_TEST_CONFIG_FILE`, then `{SWIFT_DIR}/proxy-server.conf`
+/// listen address, else Python's historic `:8080`.
+///
+/// `Manager.once()` children often inherit `SWIFT_DIR=/etc/g6-rust` but not
+/// the Python-module `PROXY_BASE_URL`. Hardcoding `:8080` then GETs
+/// production objects; dest PUTs never leave the node. DELETE rows do not
+/// need a source GET — that is why `test_delete_propagate` can PASS while
+/// the rest of `container_sync` stays FAIL.
+fn resolve_proxy_base(
+    env_proxy: Option<&str>,
+    test_conf: Option<&SwiftConfig>,
+    proxy_server_conf: Option<&SwiftConfig>,
+) -> String {
     if let Some(u) = env_proxy.map(str::trim).filter(|s| !s.is_empty()) {
         return u.trim_end_matches('/').to_string();
     }
@@ -52,7 +65,47 @@ fn resolve_proxy_base(env_proxy: Option<&str>, test_conf: Option<&SwiftConfig>) 
             }
         }
     }
+    if let Some(conf) = proxy_server_conf {
+        if let Some(base) = proxy_base_from_proxy_server_conf(conf) {
+            return base;
+        }
+    }
     "http://127.0.0.1:8080".to_string()
+}
+
+/// Listen URL from proxy-server.conf (`[DEFAULT]` or `[app:proxy-server]`).
+///
+/// Wildcard `0.0.0.0` / `::` become `127.0.0.1` so a Manager child on the
+/// isolated stack talks to the local proxy, not a VIP guess.
+fn proxy_base_from_proxy_server_conf(conf: &SwiftConfig) -> Option<String> {
+    let bind_port = conf
+        .get("DEFAULT", "bind_port")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("app:proxy-server", "bind_port").ok().flatten())?;
+    let bind_port = bind_port.trim();
+    if bind_port.is_empty() {
+        return None;
+    }
+    let bind_ip = conf
+        .get("DEFAULT", "bind_ip")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("app:proxy-server", "bind_ip").ok().flatten())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    Some(format!(
+        "http://{}:{bind_port}",
+        listen_host_for_proxy_base(&bind_ip)
+    ))
+}
+
+fn listen_host_for_proxy_base(bind_ip: &str) -> String {
+    match bind_ip.trim() {
+        "" | "0.0.0.0" | "*" | "::" | "[::]" => "127.0.0.1".to_string(),
+        ip if ip.starts_with('[') => ip.to_string(),
+        ip if ip.contains(':') => format!("[{ip}]"),
+        ip => ip.to_string(),
+    }
 }
 
 /// Copied SAIO samples hardcode `:8080`; a probe base on another port wins.
@@ -458,12 +511,21 @@ fn main() {
     // SWIFT_TEST_CONFIG_FILE [probe_test] proxy_base_url is the same source
     // Python test.probe uses; honor it when the env var is missing (Manager
     // children do not always inherit a Python module global).
+    // When both are absent, `{SWIFT_DIR}/proxy-server.conf` bind is the
+    // isolated stack's listen address — not a guessed :18080 host.
     let test_conf_for_base = std::env::var("SWIFT_TEST_CONFIG_FILE")
         .ok()
         .map(|p| parse_conf_file(&p));
+    let proxy_server_conf = {
+        let path = format!("{swift_dir}/proxy-server.conf");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| SwiftConfig::parse_lenient(&content, &[], false).ok())
+    };
     let proxy_base = resolve_proxy_base(
         std::env::var("PROXY_BASE_URL").ok().as_deref(),
         test_conf_for_base.as_ref(),
+        proxy_server_conf.as_ref(),
     );
     let default_internal = format!("{proxy_base}/v1");
     let default_auth = format!("{proxy_base}/auth/v1.0");
@@ -661,7 +723,10 @@ fn main() {
 
 #[cfg(test)]
 mod proxy_base_tests {
-    use super::{object_source_url, resolve_proxy_base, rewrite_loopback_8080};
+    use super::{
+        listen_host_for_proxy_base, object_source_url, proxy_base_from_proxy_server_conf,
+        resolve_proxy_base, rewrite_loopback_8080,
+    };
     use swift_core::config::SwiftConfig;
 
     #[test]
@@ -672,8 +737,10 @@ mod proxy_base_tests {
             false,
         )
         .unwrap();
+        let proxy =
+            SwiftConfig::parse_lenient("[DEFAULT]\nbind_port = 18080\n", &[], false).unwrap();
         assert_eq!(
-            resolve_proxy_base(Some("http://127.0.0.1:19999/"), Some(&conf)),
+            resolve_proxy_base(Some("http://127.0.0.1:19999/"), Some(&conf), Some(&proxy)),
             "http://127.0.0.1:19999"
         );
     }
@@ -686,19 +753,75 @@ mod proxy_base_tests {
             false,
         )
         .unwrap();
+        let proxy =
+            SwiftConfig::parse_lenient("[DEFAULT]\nbind_port = 19999\n", &[], false).unwrap();
         assert_eq!(
-            resolve_proxy_base(None, Some(&conf)),
+            resolve_proxy_base(None, Some(&conf), Some(&proxy)),
             "http://127.0.0.1:18080"
         );
         assert_eq!(
-            resolve_proxy_base(Some("  "), Some(&conf)),
+            resolve_proxy_base(Some("  "), Some(&conf), Some(&proxy)),
             "http://127.0.0.1:18080"
         );
     }
 
     #[test]
+    fn isolated_swift_dir_proxy_bind_used_when_env_and_probe_url_missing() {
+        // Failed first: resolve_proxy_base ignored SWIFT_DIR/proxy-server.conf
+        // and returned historic :8080, so Manager children on IsolatedIdentity
+        // GETs production while dest PUTs never fire.
+        let proxy = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nbind_ip = 0.0.0.0\nbind_port = 18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, None, Some(&proxy)),
+            "http://127.0.0.1:18080"
+        );
+        let named = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nbind_ip = 10.0.0.1\nbind_port = 18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, None, Some(&named)),
+            "http://10.0.0.1:18080"
+        );
+        let app_section = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nbind_ip = 0.0.0.0\nbind_port = 18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            proxy_base_from_proxy_server_conf(&app_section).as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+    }
+
+    #[test]
     fn default_is_python_historic_8080() {
-        assert_eq!(resolve_proxy_base(None, None), "http://127.0.0.1:8080");
+        assert_eq!(
+            resolve_proxy_base(None, None, None),
+            "http://127.0.0.1:8080"
+        );
+        let empty_proxy =
+            SwiftConfig::parse_lenient("[DEFAULT]\nlog_name = proxy\n", &[], false).unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, None, Some(&empty_proxy)),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn listen_host_maps_wildcards_to_loopback() {
+        assert_eq!(listen_host_for_proxy_base("0.0.0.0"), "127.0.0.1");
+        assert_eq!(listen_host_for_proxy_base("::"), "127.0.0.1");
+        assert_eq!(listen_host_for_proxy_base("10.0.0.1"), "10.0.0.1");
+        assert_eq!(listen_host_for_proxy_base("2001:db8::1"), "[2001:db8::1]");
     }
 
     #[test]

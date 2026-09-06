@@ -16,7 +16,8 @@ swiftfuse were **not** touched. Do not deploy this candidate.
 | Parent checkpoint | `885b57c38dcc60c2e263f23a109668718ebce785` (`codex/g0-g7-safety-20260905`) |
 | Parent tag | `g0-g7-checkpoint-20260905` (prerelease, **unaccepted**) |
 | This continuation | `aa2643dc8796c8ff28cd71e55011eb0c1394ca53` |
-| Formal G0–G7 field replay | **NOT RUN** — **blocked on Swift2 SSH** from this cloud VM |
+| Latest in-repo SHA | see `git rev-parse HEAD` after push |
+| Formal G0–G7 field replay | **NOT RUN** on HEAD — **blocked on Swift2 SSH** from this cloud VM |
 
 Freeze `candidate_commit` in
 `swift-rust/tools/test-lab/g7/acceptance.yaml` and
@@ -36,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. Field replay on `5434983`: **556 pass / 40 fail / 54 skip** (staticweb HTML theme 16→8; index + `redirect_slash` closed). Not replayed after the listing±CSS Hyper follow-up | TempURL Hyper path. Staticweb `reassemble_async` index/301 + listing±CSS unit tests (`test_reassemble_listing_*_direct_*`) | Do **not** call G4 GREEN. Remaining field 40 includes the 8 listing±CSS identities until Swift2 replays `.functests` on the SHA that copies `make_env` headers onto listing GETs |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **NOT RUN** | Historical W068/W069/W070 GREEN was on `17adf0b`, **not** transferable | Must replay 179 identities once, no retry-to-PASS |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114 PASS / 32 FAIL / 29 ERROR / 4 SKIP**. Field replay on `f84ac71`: **115 PASS / 31 FAIL / 29 ERROR / 4 SKIP**. Theme delta: `container_sync` still **13**, `reconstructor_rebuild` still **14**. Only +1 PASS (`test_delete_propagate`). Historical GREEN on `17adf0b` is **not** transferable | HEAD in-repo proxy-from-`SWIFT_DIR` + remapped-port identity are **not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -86,6 +87,92 @@ runner retry/timeout issues. Replay exactly 179 identities.
    (ascii + UTF-8), including dir-marker `GET` and `some sub%dir/` hrefs.
    Those 8 are **not** field-closed. Deferred vs Python: custom web-error
    documents, domain_remap Host listing titles.
+6. **G6 container-sync / reconstructor follow-up (unit only, not GREEN).**
+   Field on `f84ac71` did **not** reduce the 13 `container_sync` or 14
+   `reconstructor_rebuild` violations. HEAD/409 and post-ssync local
+   `discover_jobs` were the wrong layers for those probes. See
+   “G6 live themes (`f84ac71`)” below.
+
+## G6 live themes (`f84ac71`) — do not upgrade by prose
+
+This cloud VM cannot read `/var/log/g6-rust/f84ac71/w1-honest179/` on
+Swift1. `gh` PR #10 comments and CI artifacts have no probe failure
+strings. Reasoning is from official probe names + in-repo daemons.
+
+### container_sync still 13: HttpSyncClient **is** the path
+
+Official suite: OpenStack `test/probe/test_container_sync.py`.
+`Manager(['container-sync']).once()` starts `swift-container-sync`.
+The Rust binary always builds `HttpSyncClient` (HTTP PUT/DELETE to
+`X-Container-Sync-To`). It is **not** rsync.
+
+HEAD-before-PUT / PUT-409-as-success help **already-present dest**
+objects (`test_sync_newer_remote`). First-time PUT needs
+`ProxyObjectSource.get_object()` (public proxy GET + TempAuth) then dest
+PUT. DELETE does **not** need a source GET — that is why only
+`test_delete_propagate` moved PASS on `f84ac71`.
+
+`Manager.once()` children often inherit `SWIFT_DIR` but **not** the
+Python-module `PROXY_BASE_URL`. Historic default `http://127.0.0.1:8080`
+then GETs production. In-repo now: `PROXY_BASE_URL` →
+`[probe_test] proxy_base_url` → `{SWIFT_DIR}/proxy-server.conf`
+`bind_ip`/`bind_port` (wildcard → `127.0.0.1`) → historic `:8080`.
+Do **not** hardcode a guessed `:18080` host (`127.0.0.1` vs `10.0.0.1`
+both exist in lab scripts).
+
+### reconstructor_rebuild still 14: local `run_once` is **not** the heal path
+
+Official suite: `test/probe/test_reconstructor_rebuild.py`
+(`TestReconstructorRebuild`). `break_nodes(...)` **deletes** fragments
+on failed primaries. Python heals via a **partner** SYNC job
+(`reconstruct_fa` + ssync **to** the broken node).
+
+Rust partner path is `EcSyncRebuilder` + `process_part_job`, **only**
+with `--features ec`. The `f84ac71` post-ssync `discover_jobs` /
+`reconstruct_missing` path also needs `ec`, and requires a remaining
+hash dir with a non-empty durable fragment set that does **not** include
+this node’s primary index. After `break_nodes` the victim hash dir is
+gone or empty → `discover_jobs` correctly returns **no jobs**. Empty
+fragment filtering is right for tombstones; do not “fix” it so those
+dirs become rebuild jobs.
+
+Field jobs therefore need partner SYNC. That sweep used to skip every
+device when `servers_per_port=0` and conf `bind_port` (`16210` …) ≠
+ring port (`6010`). In-repo now falls back to local IP + device name
+(`resolve_ring_device_id`). Still requires a local interface address.
+
+### Exact Swift2 / Swift1 checks (environmental — do not fake)
+
+**container_sync**
+
+1. `Manager.once()` PATH: `/root/work/g6-rust-bin/swift-container-sync`
+   vs `/usr/local/bin` (production systemd install is `:8080` /
+   `/etc/swift`).
+2. Child env: `PROXY_BASE_URL`, `SWIFT_TEST_CONFIG_FILE`
+   `[probe_test] proxy_base_url`, `SWIFT_DIR=/etc/g6-rust`.
+3. First log line `internal_url=...` — must be isolated `:18080`, not
+   production `:8080`.
+4. `G6_CONTAINER_SYNC_DEBUG=1` / `container-sync: source GET status=`
+   (401/404 vs dest PUT).
+5. Auth: `[container-sync] internal_client_auth_*` or `[func_test]`
+   user/key.
+6. Realms `current` cluster URL must be the isolated proxy.
+7. DELETE-only PASS + PUT FAIL ⇒ source GET / proxy base, not HEAD/409.
+
+**reconstructor**
+
+1. `sha256sum` of live `swift-object-reconstructor`; confirm
+   `--features ec` (`strings` / `nm` / log `rebuilt=`).
+2. Conf `devices` + `bind_port` vs **EC ring** `ip/port/device`;
+   `servers_per_port`.
+3. Pass log: `suffix_syncs` / `rebuilt` / `failures`.
+   `suffix_syncs=0` ⇒ identity skip. After this SHA a remapped-port
+   skip should log
+   `skipping device …: no ring identity`.
+4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
+   correctly empty; heal must be partner `reconstruct_fa`.
+5. Manager binary same isolated rust bin, conf under
+   `/etc/g6-rust/object-server/*.conf`.
 
 ## How to run full G0–G7
 

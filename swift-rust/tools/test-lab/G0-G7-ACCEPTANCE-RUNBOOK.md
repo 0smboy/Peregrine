@@ -105,6 +105,38 @@ Replay the frozen official lists on `$CANDIDATE` only:
 
 Do not import W068/W069/W070 hashes from `17adf0b`.
 
+Field G6 on `f84ac71` was **115 PASS / 31 FAIL / 29 ERROR / 4 SKIP**
+versus `1f7c401` **114 / 32 / 29 / 4**. Themes still open:
+`container_sync` 13, `reconstructor_rebuild` 14. Only
+`test_delete_propagate` moved PASS. That is **FAIL**, not GREEN.
+
+If those two themes stay red after rebuilding **this SHA**, check
+environment before another code guess:
+
+```bash
+# container-sync: which binary + which proxy
+type -a swift-container-sync
+# expect /root/work/g6-rust-bin/swift-container-sync, not /usr/local/bin
+tr '\0' '\n' < /proc/$(pgrep -n swift-container-sync)/environ \
+  | egrep '^(PROXY_BASE_URL|SWIFT_DIR|SWIFT_TEST_CONFIG_FILE)='
+# log line must be isolated :18080, not production :8080
+grep -E 'internal_url=' /var/log/g6-rust/*/container-sync*.log | tail
+# IsolatedIdentity /etc/g6-rust/proxy-server.conf bind_port
+awk '/bind_(ip|port)/' /etc/g6-rust/proxy-server.conf
+
+# reconstructor: features ec + ring identity
+strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|reconstruct'
+# bind_port vs EC ring port; servers_per_port
+awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
+# suffix_syncs=0 means every device was skipped
+grep -E 'suffix_syncs=|skipping device|no ring identity' \
+  /var/log/g6-rust/*/object-reconstructor*.log | tail
+```
+
+Do not treat empty-fragment `discover_jobs` skips as a bug: probe
+`break_nodes` deletes the victim hash dir; heal is partner SYNC +
+`reconstruct_fa`, which requires `--features ec`.
+
 ## 7. G7 physical matrix
 
 ```bash
