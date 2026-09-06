@@ -31,7 +31,6 @@ FORBIDDEN_WRITE_PREFIXES = (
     "/usr",
     "/var/run",
     "/var/log",
-    "/root/work",
 )
 PENDING = "PENDING_FREEZE"
 
@@ -58,7 +57,7 @@ def assert_in_repo_write(path: Path, repo: Path) -> None:
     text = str(resolved)
     for prefix in FORBIDDEN_WRITE_PREFIXES:
         if text == prefix or text.startswith(prefix + "/"):
-            die(f"refusing production/lab write path {resolved}")
+            die(f"refusing production write path {resolved}")
 
 
 def git_head(repo: Path) -> str:

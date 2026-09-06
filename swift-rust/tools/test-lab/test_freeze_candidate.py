@@ -71,8 +71,32 @@ class FreezeCandidate(unittest.TestCase):
             self.assertEqual(freeze_mod.read_candidate(repo / freeze_mod.YAML_REL), "PENDING_FREEZE")
 
     def test_refuses_production_write_path(self):
+        self.assertEqual(
+            freeze_mod.FORBIDDEN_WRITE_PREFIXES,
+            ("/etc", "/srv", "/usr", "/var/run", "/var/log"),
+        )
         with self.assertRaises(SystemExit):
             freeze_mod.assert_in_repo_write(Path("/etc/g6-rust/acceptance.yaml"), Path("/tmp/x"))
+        # repo=/ would otherwise allow these; prefixes must still refuse.
+        for path in (
+            "/etc/g6-rust/acceptance.yaml",
+            "/srv/node/d1",
+            "/usr/local/bin/swift-proxy-server",
+        ):
+            with self.assertRaises(SystemExit):
+                freeze_mod.assert_in_repo_write(Path(path), Path("/"))
+
+    def test_lab_checkout_under_root_work_is_not_forbidden(self):
+        self.assertNotIn("/root/work", freeze_mod.FORBIDDEN_WRITE_PREFIXES)
+        lab = Path(
+            "/root/work/pa-v2-cfinal/swift-rust/tools/test-lab/g7/acceptance.yaml"
+        )
+        text = str(lab)
+        self.assertFalse(
+            any(text == prefix or text.startswith(prefix + "/")
+                for prefix in freeze_mod.FORBIDDEN_WRITE_PREFIXES),
+            freeze_mod.FORBIDDEN_WRITE_PREFIXES,
+        )
 
     def test_checklist_names_g0_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
