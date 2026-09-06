@@ -120,6 +120,64 @@ fn http(
     (status, hdrs, out_body)
 }
 
+/// Same socket helper as `http`, plus the raw response head so leftover B
+/// can assert UTF-8 `X-Object-Meta-è` octets on the wire (IsolatedIdentity
+/// latin-1 → WSGI `x-object-meta-Ãè-…`).
+fn http_wire(
+    addr: std::net::SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>, Vec<u8>) {
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let mut req = Vec::new();
+    req.extend_from_slice(format!("{method} {target} HTTP/1.1\r\nHost: t\r\n").as_bytes());
+    for (k, v) in headers {
+        req.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+    }
+    req.extend_from_slice(
+        format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    conn.write_all(&req).unwrap();
+    conn.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = raw[..split].to_vec();
+    let out_body = raw[split + 4..].to_vec();
+    let head_text = String::from_utf8_lossy(&head).into_owned();
+    let mut lines = head_text.lines();
+    let status: u16 = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hdrs = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    (status, hdrs, out_body, head)
+}
+
+fn header_utf8_object_meta<'a>(headers: &'a [(String, String)]) -> Option<(&'a str, &'a str)> {
+    headers.iter().find_map(|(k, v)| {
+        let kl = k.to_lowercase();
+        if kl.starts_with("x-object-meta-") && (k.contains('è') || k.contains('Ã')) {
+            Some((k.as_str(), v.as_str()))
+        } else {
+            None
+        }
+    })
+}
+
 /// Drive the utf8-compat Hyper lane field already harvests
 /// (`G6_DIAG utf8-compat method=GET stage=service-complete`).
 /// Official `proxy_get` uses InternalClient after PUT/POST with UTF-8
@@ -1016,6 +1074,193 @@ fn test_utf8_compat_get_after_post_and_single_frag_rmtree() {
             .iter()
             .any(|line| line.contains("ndata=4") && line.contains("idxs=")),
         "gather ok must name ndata/idxs for the utf8-compat piggyback: {captured:?}"
+    );
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// Official UTF8 `test_rebuild_quarantines_lonely_frag` leftover B:
+/// IsolatedIdentity HEAD (`{}` extra headers, `%C3%A8` path) must keep
+/// POST `X-Object-Meta-è-…` on the 2xx wire before quarantine. ASCII
+/// lonely HEAD already PASSes with `X-Object-Meta-Color`.
+#[test]
+fn test_utf8_lonely_frag_head_keeps_post_user_meta() {
+    let _ec = EC_CLUSTER_LOCK.lock().unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "swift-ec-utf8-lonely-head-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (proxy_addr, obj_dirs) = boot_ec_cluster(&tmp);
+
+    let object = "/v1/AUTH_ec/probe-%C3%A8/obj-%C3%A8";
+    let meta_name = "X-Object-Meta-è-probe";
+    let meta_value = "meta-bar-è";
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/probe-%C3%A8",
+        &[("X-Storage-Policy", "Policy-1")],
+        b"",
+    );
+    assert_eq!(status, 201, "container PUT");
+
+    let payload: Vec<u8> = (0..1800u32).map(|i| (i % 251) as u8).collect();
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        object,
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        &payload,
+    );
+    assert_eq!(status, 201, "EC PUT");
+    let (status, _, _) = http(
+        proxy_addr,
+        "POST",
+        object,
+        &[
+            (meta_name, meta_value),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 202, "POST-after-PUT with UTF-8 object-meta name");
+
+    let (status, headers, body, get_head) = http_wire(proxy_addr, "GET", object, &[], b"");
+    assert_eq!(
+        status, 200,
+        "GET before rmtree: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(body, payload);
+    assert!(
+        header_utf8_object_meta(&headers).is_some_and(|(_, v)| v == meta_value)
+            || get_head
+                .windows(b"X-Object-Meta-\xc3\xa8".len())
+                .any(|w| w == b"X-Object-Meta-\xc3\xa8"),
+        "full GET must echo POST UTF-8 user meta: {headers:?} head={}",
+        String::from_utf8_lossy(&get_head)
+    );
+
+    let (status, headers, _, head_full) = http_wire(proxy_addr, "HEAD", object, &[], b"");
+    assert!(
+        (200..300).contains(&status),
+        "full HEAD must be 2xx, not {status}"
+    );
+    assert!(
+        header_utf8_object_meta(&headers).is_some_and(|(_, v)| v == meta_value)
+            || head_full
+                .windows(b"X-Object-Meta-\xc3\xa8".len())
+                .any(|w| w == b"X-Object-Meta-\xc3\xa8"),
+        "full HEAD must echo POST UTF-8 user meta (leftover B starts here if not): {headers:?} head={}",
+        String::from_utf8_lossy(&head_full)
+    );
+
+    for _ in 0..4 {
+        let _ = rmtree_one_durable_hash_dir(&obj_dirs);
+    }
+    let remaining: usize = obj_dirs
+        .iter()
+        .map(|d| find_files(d, &|n| n.ends_with("#d.data")).len())
+        .sum();
+    assert_eq!(remaining, 2, "lonely: 2/6 durable fragments");
+
+    let (status, _, _) = http(proxy_addr, "GET", object, &[], b"");
+    assert_eq!(
+        status, 503,
+        "GET with only 2/6 fragments must 503 (cannot decode), not {status}"
+    );
+
+    let (head_status, head_headers, _, head_raw) = http_wire(proxy_addr, "HEAD", object, &[], b"");
+    assert!(
+        (200..300).contains(&head_status),
+        "lonely-frag HEAD must be 2xx (metadata), not {head_status}"
+    );
+    let on_wire = head_raw
+        .windows(b"X-Object-Meta-\xc3\xa8".len())
+        .any(|w| w == b"X-Object-Meta-\xc3\xa8");
+    let parsed = header_utf8_object_meta(&head_headers);
+    assert!(
+        on_wire || parsed.is_some_and(|(_, v)| v == meta_value),
+        "lonely-frag HEAD must carry UTF-8 X-Object-Meta-è (WSGI Ãè) before quarantine: {head_headers:?} head={}",
+        String::from_utf8_lossy(&head_raw)
+    );
+    if let Some((_, value)) = parsed {
+        assert_eq!(value, meta_value, "lonely-frag HEAD user-meta value");
+    }
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// Official `test_sync_expired_object` waits `x-delete-after + 1` (2s + 1)
+/// for proxy GET to 404. Do not call field expire PASS from this unit.
+#[test]
+fn test_ec_delete_after_get_404s_within_two_seconds() {
+    let _ec = EC_CLUSTER_LOCK.lock().unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "swift-ec-delete-after-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (proxy_addr, _obj_dirs) = boot_ec_cluster(&tmp);
+
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/probe",
+        &[("X-Storage-Policy", "Policy-1")],
+        b"",
+    );
+    assert_eq!(status, 201, "container PUT");
+    let payload = b"expire-me";
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_ec/probe/obj-expire",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+            ("X-Delete-After", "1"),
+        ],
+        payload,
+    );
+    assert_eq!(status, 201, "EC PUT with X-Delete-After=1: {status}");
+    let (status, headers, body) = http(
+        proxy_addr,
+        "GET",
+        "/v1/AUTH_ec/probe/obj-expire",
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200, "GET before expiry must 200: {headers:?}");
+    assert_eq!(body, payload);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = 200u16;
+    while std::time::Instant::now() < deadline {
+        let (status, _, _) = http(
+            proxy_addr,
+            "GET",
+            "/v1/AUTH_ec/probe/obj-expire",
+            &[],
+            b"",
+        );
+        last = status;
+        if status == 404 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        last, 404,
+        "official probe waits 2s+1 for expired GET 404, last={last}"
     );
 
     std::fs::remove_dir_all(&tmp).unwrap();

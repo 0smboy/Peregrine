@@ -187,21 +187,24 @@ Field `/workspace/g6-rebuild-e650f12-utf8/` (2026-09-06) on adapter
 `test_rebuild_non_durable_frags` **PASS**. Do not reopen that, or
 any ASCII green.
 
-This tip is reconstructor partner-GET HTTP: `read_internal_http_head`
-used a token-only field-name check, so UTF8 `X-Object-Meta-è-…` on
-the fragment response aborted the whole GET. `reconstruct_fa` then
-gathered 0 archives and UTF8 `test_rebuild_missing_frags`
-`_assert_all_nodes_have_frag` 404'd on the percent-encoded path.
-Accept the same UTF-8 object-meta prefixes Python echoes. Do **not**
-claim UTF8 missing_frags PASS from this unit test.
+Prior tip `cb712ff` closed leftover A (UTF8 `missing_frags` partner-GET
+field-name abort). Do **not** reopen that.
 
-Still red after this SHA (separate leftovers):
-- UTF8 `test_rebuild_quarantines_lonely_frag` — HEAD missing
-  `x-object-meta-Ãè-…` (only Content-Type). Not this gather parser.
+This tip is leftover B: official UTF8 lonely-frag HEAD
+`assertIn(str_to_wsgi(key), resp.headers)` (`x-object-meta-Ãè-…`).
+Rust EC HEAD already emits UTF-8 `X-Object-Meta-è` on the utf8-compat
+lane (`test_utf8_lonely_frag_head_keeps_post_user_meta`). Hyper cannot.
+IsolatedIdentity GET/HEAD now stamps `X-Object-Meta-è-g6-utf8-compat`
+so an empty official HEAD (`{}`) cannot stay on Hyper, and
+`WsgiHeaderDict` folds only ASCII A–Z (`Ã.lower()` is `ã`). Do **not**
+claim UTF8 lonely_frag field PASS from these units.
+
+Still red after this SHA (separate leftover):
 - ASCII `test_sync_expired_object` — official probe timed out waiting
   to expire after 2s. Adapter already forwards `x-delete-after`.
-  Rust object GET 404s `DiskFileExpired` when `X-Delete-At` is past
-  and `allow_open_expired` is off. Queued; do not call expire PASS.
+  In-repo EC GET 404s after `X-Delete-After=1` within 3s
+  (`test_ec_delete_after_get_404s_within_two_seconds`). Do not call
+  field expire PASS from that unit.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080

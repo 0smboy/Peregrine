@@ -12185,6 +12185,10 @@ mod account_update_headers_tests {
         assert!(keep_ec_client_metadata("x-object-manifest"));
         assert!(keep_ec_client_metadata("x-object-sysmeta-slo-etag"));
         assert!(keep_ec_client_metadata("x-object-meta-color"));
+        assert!(keep_ec_client_metadata("x-object-meta-è-probe"));
+        assert!(keep_ec_client_metadata(
+            &"X-Object-Meta-è-probe".to_lowercase()
+        ));
         assert!(keep_ec_client_metadata("x-backend-data-timestamp"));
         assert!(keep_ec_client_metadata("x-backend-durable-timestamp"));
         assert!(!keep_ec_client_metadata("content-length"));

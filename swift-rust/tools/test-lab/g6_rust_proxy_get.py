@@ -43,6 +43,11 @@ latin-1. ``email.parser`` drops ``X-Object-Meta-\\xc3\\xa8-…`` so
 response heads are read as latin-1 (lonely-frag HEAD meta). Expose
 InternalClient WSGI aliases (``x-object-meta-Ã¨-…``).
 
+Official lonely HEAD sends ``{}``; IsolatedIdentity GET/HEAD stamp
+``X-Object-Meta-è-g6-utf8-compat`` so rust writes UTF-8 object-meta
+on the utf8-compat lane (Hyper drops non-token names). ``WsgiHeaderDict``
+implements ``in`` / ``[]`` without ``str.lower()``.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
@@ -63,6 +68,10 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 EGG_PROXY_RE = re.compile(r"(?im)^\s*use\s*=\s*egg:swift#proxy\s*$")
 OBJECT_GET_METHODS = frozenset({"GET", "HEAD"})
+# Official UTF8 lonely HEAD sends ``{}``. Rust Hyper then drops
+# ``X-Object-Meta-è`` (token names only). One UTF-8 object-meta request
+# name forces the utf8-compat write lane. GET/HEAD only — never PUT/POST.
+UTF8_HANDOFF_HEADER = "X-Object-Meta-è-g6-utf8-compat"
 # Official test_rebuild_with_non_durable_newer_data PUTs v2 via
 # InternalClient.upload_object (make_request PUT + body). GET/HEAD-only
 # wrapping dropped that body (body_file=None) so rust never saw v2.
@@ -123,6 +132,36 @@ class RustProxyGetError(RuntimeError):
     """PROXY_BASE_URL points at rust :18080 but GET would still miss rust HTTP."""
 
 
+class WsgiHeaderDict(dict):
+    """Plain dict plus official ``assertIn(str_to_wsgi(key), headers)``.
+
+    Swift ``HeaderKeyDict`` titles with ``str.capitalize`` / ``str.lower``,
+    which turns ``Ã`` into ``ã`` and ``è`` into ``È``. Official UTF8 lonely
+    HEAD looks up WSGI ``x-object-meta-Ãè-…`` — fold only ASCII A–Z.
+    """
+
+    def __contains__(self, key: object) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        if key is None:
+            return False
+        return _header_lookup(self, str(key)) is not None
+
+    def __getitem__(self, key: object) -> str:
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        found = _header_lookup(self, str(key))
+        if found is not None:
+            return found
+        raise KeyError(key)
+
+    def get(self, key: object, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 class _HttpResp:
     """swob-shaped object for ``InternalClient.get_object`` / ``make_request``."""
 
@@ -130,7 +169,9 @@ class _HttpResp:
         self.status_int = int(status)
         phrase = http.client.responses.get(self.status_int, "Unknown")
         self.status = f"{self.status_int} {phrase}"
-        self.headers = dict(headers)
+        self.headers = (
+            headers if isinstance(headers, WsgiHeaderDict) else WsgiHeaderDict(headers)
+        )
         self.body = body
         self.app_iter: Iterable[bytes] = [body] if body else []
 
@@ -232,7 +273,7 @@ def wsgi_response_headers(headers: Mapping[str, Any]) -> dict[str, str]:
             pass
         for key in aliases:
             out[key] = wsgi_value
-    return out
+    return WsgiHeaderDict(out)
 
 
 def join_proxy_url(
@@ -492,6 +533,22 @@ def _filter_outgoing_headers(
     return out
 
 
+def force_utf8_compat_request_headers(
+    headers: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Keep GET/HEAD on rust utf8-compat so UTF-8 object-meta is written.
+
+    Official lonely-frag HEAD uses ``make_request('HEAD', path, {}, …)``.
+    An ASCII-only request stays on Hyper, which cannot emit
+    ``X-Object-Meta-è``. IsolatedIdentity GET/HEAD always stamp one
+    UTF-8 object-meta name so leftover B cannot regress to Content-Type
+    only. Not used on PUT/POST (would persist).
+    """
+    out = dict(_header_items(headers)) if headers else {}
+    out.setdefault(UTF8_HANDOFF_HEADER, "1")
+    return out
+
+
 def _eventlet_hub_yield() -> None:
     """Let eventlet flush the green socket between PUT chunks."""
     try:
@@ -747,19 +804,22 @@ def rust_http_no_body(
     path = encode_swift_request_path(parsed.path or "/")
     if parsed.query:
         path = f"{path}?{parsed.query}"
+    method_u = method.upper()
+    if method_u in OBJECT_GET_METHODS:
+        headers = force_utf8_compat_request_headers(headers)
     if connection_cls is None:
         import http.client as http_client
 
         connection_cls = http_client.HTTPConnection
     conn = connection_cls(host, port, timeout=timeout)
     try:
-        conn.putrequest(method.upper(), path, skip_accept_encoding=True)
+        conn.putrequest(method_u, path, skip_accept_encoding=True)
         for name, value in _filter_outgoing_headers(headers):
             conn.putheader(name, value)
         conn.putheader("Connection", "close")
         conn.endheaders()
         return _read_http_message(
-            conn.sock, timeout, expect_body=method.upper() != "HEAD"
+            conn.sock, timeout, expect_body=method_u != "HEAD"
         )
     finally:
         try:
@@ -840,6 +900,8 @@ def rust_http_make_request(
     for name, value in g6_auth_headers(environ).items():
         merged.setdefault(name, value)
     merged.setdefault("X-Backend-Allow-Reserved-Names", "true")
+    if method.upper() in OBJECT_GET_METHODS:
+        merged = force_utf8_compat_request_headers(merged)
     url = join_proxy_url(base, path, params)
     timeout = PUT_TIMEOUT_SECS if body or method.upper() in {"PUT", "POST"} else 30.0
     resp = rust_http_exchange(

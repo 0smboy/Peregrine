@@ -218,6 +218,40 @@ class Utf8PathAndHeaders(unittest.TestCase):
         self.assertEqual(from_latin1_e.get("x-object-meta-Ã¨-color"), "blue")
         self.assertEqual(from_latin1_e.get("X-Object-Meta-è-color"), "blue")
 
+    def test_lonely_head_headers_assertin_wsgi_key_without_unicode_lower(self):
+        """Official lonely HEAD: assertIn(str_to_wsgi(key), resp.headers)."""
+        status, hdrs = adapter.parse_http_header_block(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/octet-stream\r\n"
+            b"X-Object-Meta-\xc3\xa8-uuid: meta-bar-\xc3\xa8\r\n"
+        )
+        self.assertEqual(status, 200)
+        # str_to_wsgi(è) is UTF-8 C3 A8 as latin-1: Ã + U+00A8 (not è).
+        wsgi_key = "x-object-meta-\u00c3\u00a8-uuid"
+        self.assertIn(wsgi_key, hdrs)
+        self.assertEqual(hdrs[wsgi_key], "meta-bar-\u00c3\u00a8")
+        resp = adapter._HttpResp(200, hdrs, b"")
+        self.assertIn(wsgi_key, resp.headers)
+        self.assertEqual(resp.headers[wsgi_key], "meta-bar-\u00c3\u00a8")
+        titled = adapter.wsgi_response_headers(
+            {"X-Object-Meta-\u00e8-Uuid": "meta-bar-\u00e8"}
+        )
+        self.assertIn(wsgi_key, titled)
+        self.assertNotEqual(wsgi_key.lower(), "x-object-meta-\u00c3\u00a8-uuid")
+
+    def test_head_forces_utf8_compat_handoff_header(self):
+        filtered = adapter._filter_outgoing_headers(
+            adapter.force_utf8_compat_request_headers({})
+        )
+        names = [name for name, _ in filtered]
+        self.assertTrue(
+            any("g6-utf8-compat" in name for name in names),
+            names,
+        )
+        name, value = next((n, v) for n, v in filtered if "g6-utf8-compat" in n)
+        name.encode("latin-1")
+        self.assertEqual(value, "1")
+
     def test_http_get_opener_sees_ascii_percent_encoded_url(self):
         class FakeResp:
             status = 200
