@@ -14,11 +14,10 @@ This module is that honesty for the IsolatedIdentity runner:
    when ``PROXY_BASE_URL`` contains ``:18080`` (same as lab
    ``bak.httpget-988b81b``).
 2. Runtime-wrap ``TestReconstructorRebuild.proxy_get`` the same way.
-3. Fail closed if ``:18080`` is set and GET/HEAD would still use
-   ``InternalClient`` / ``egg:swift#proxy`` (no silent ``swift[python-pid]``
-   assert GETs). Official lonely-frag HEAD is ``int_client.make_request``;
-   that is rewritten to rust HTTP. A source file already carrying the
-   ``:18080`` swiftclient branch is honest.
+3. Fail closed if ``:18080`` is set and GET/HEAD/PUT would still use
+   ``InternalClient`` / ``egg:swift#proxy``. Official lonely-frag HEAD
+   and non-durable v2 ``upload_object`` are ``make_request``; both
+   rewrite to rust HTTP **with the body**. Do not drop ``body_file``.
 
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 Do not reopen gather-bucket chasing for this single-test.
@@ -41,6 +40,10 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 EGG_PROXY_RE = re.compile(r"(?im)^\s*use\s*=\s*egg:swift#proxy\s*$")
 OBJECT_GET_METHODS = frozenset({"GET", "HEAD"})
+# Official test_rebuild_with_non_durable_newer_data PUTs v2 via
+# InternalClient.upload_object (make_request PUT + body). GET/HEAD-only
+# wrapping dropped that body (body_file=None) so rust never saw v2.
+OBJECT_HTTP_METHODS = frozenset({"GET", "HEAD", "PUT", "POST", "DELETE"})
 
 INTERNAL_CLIENT_CONF_CANDIDATES = (
     "SWIFT_INTERNAL_CLIENT_CONF",
@@ -237,10 +240,10 @@ def rust_object_get_guard(
             text = ""
     if conf_uses_egg_swift_proxy(text) or text == "":
         raise RustProxyGetError(
-            f"PROXY_BASE_URL={base} is set but InternalClient GET/HEAD still "
+            f"PROXY_BASE_URL={base} is set but InternalClient GET/HEAD/PUT still "
             "uses in-process egg:swift#proxy (adapter not installed; official "
             "proxy_get has no :18080 swiftclient branch). "
-            "G6 rebuild GET/HEAD would never hit rust :18080."
+            "G6 rebuild GET/HEAD/PUT would never hit rust :18080."
         )
 
 
@@ -272,14 +275,29 @@ def _header_items(headers: Optional[Mapping[str, Any]]) -> list[tuple[str, str]]
     return out
 
 
+def read_request_body(body_file: Any) -> bytes:
+    """InternalClient.upload_object passes a file-like ProbeBody."""
+    if body_file is None:
+        return b""
+    if isinstance(body_file, (bytes, bytearray)):
+        return bytes(body_file)
+    read = getattr(body_file, "read", None)
+    if callable(read):
+        data = read()
+        return data if isinstance(data, (bytes, bytearray)) else b""
+    return b""
+
+
 def rust_http_exchange(
     method: str,
     url: str,
     headers: Optional[Mapping[str, Any]] = None,
     timeout: float = 30.0,
     opener: Optional[Callable[..., Any]] = None,
+    data: Optional[bytes] = None,
 ) -> _HttpResp:
-    req = urllib.request.Request(url, method=method.upper())
+    payload = data if data else None
+    req = urllib.request.Request(url, data=payload, method=method.upper())
     for name, value in _header_items(headers):
         if name.lower() in {"content-length", "transfer-encoding", "host"}:
             continue
@@ -305,11 +323,12 @@ def rust_http_make_request(
     environ: Optional[Mapping[str, str]] = None,
     opener: Optional[Callable[..., Any]] = None,
     unexpected_cls: Optional[type] = None,
+    body: Optional[bytes] = None,
 ) -> _HttpResp:
     if not uses_isolated_rust_proxy(environ):
         raise RustProxyGetError(
             "PROXY_BASE_URL does not point at isolated rust :18080; "
-            "refusing to rewrite GET"
+            "refusing to rewrite InternalClient HTTP"
         )
     base = proxy_base_url(environ)
     merged = dict(_header_items(headers))
@@ -317,7 +336,7 @@ def rust_http_make_request(
         merged.setdefault(name, value)
     merged.setdefault("X-Backend-Allow-Reserved-Names", "true")
     url = join_proxy_url(base, path, params)
-    resp = rust_http_exchange(method, url, merged, opener=opener)
+    resp = rust_http_exchange(method, url, merged, opener=opener, data=body)
     acceptable = tuple(acceptable_statuses)
     status = resp.status_int
     ok = status in acceptable or (status // 100) in acceptable
@@ -362,19 +381,19 @@ def _wrap_make_request(orig: Callable[..., Any]) -> Callable[..., Any]:
         body_file=None,
         params=None,
     ):
-        del body_file
         method_u = str(method or "").upper()
-        if uses_isolated_rust_proxy() and method_u in OBJECT_GET_METHODS:
-            # Official test_rebuild_quarantines_lonely_frag HEADs via
-            # InternalClient.make_request, not proxy_get. Field 3efec7d:
-            # GET on rust was 503; this HEAD still hit egg:swift#proxy
-            # and 404'd (`/workspace/rebuild-lonely-3efec7d/`).
+        if uses_isolated_rust_proxy() and method_u in OBJECT_HTTP_METHODS:
+            # Official test_rebuild_with_non_durable_newer_data PUTs v2
+            # via upload_object. Dropping body_file made rust see an
+            # empty PUT; durable v1 etag then equalled prefs GET.
+            # Field `/workspace/g6-rebuild-988b81b-httpget/` (2026-09-06).
             return rust_http_make_request(
                 method_u,
                 path,
                 headers,
                 acceptable_statuses,
                 params=params,
+                body=read_request_body(body_file),
             )
         return orig(
             self,
@@ -382,7 +401,7 @@ def _wrap_make_request(orig: Callable[..., Any]) -> Callable[..., Any]:
             path,
             headers,
             acceptable_statuses,
-            body_file=None,
+            body_file=body_file,
             params=params,
         )
 

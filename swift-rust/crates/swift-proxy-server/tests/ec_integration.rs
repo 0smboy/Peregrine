@@ -463,6 +463,22 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         nondurable, N,
         "all {N} staged fragments must remain non-durable"
     );
+    // Official test_rebuild_with_non_durable_newer_data: default GET is
+    // durable v1; require_durable=False is v2. Fragment archive bytes
+    // (what direct_get md5s) must differ.
+    for d in &obj_dirs {
+        let durable_files = find_files(d, &|n| n.ends_with("#d.data"));
+        let staged_files = find_files(d, &|n| n.ends_with(".data") && !n.ends_with("#d.data"));
+        assert_eq!(durable_files.len(), 1, "one durable v1 on {d:?}");
+        assert_eq!(staged_files.len(), 1, "one non-durable v2 on {d:?}");
+        let v1 = std::fs::read(&durable_files[0]).unwrap();
+        let v2 = std::fs::read(&staged_files[0]).unwrap();
+        assert_ne!(
+            md5_hex(&v1),
+            md5_hex(&v2),
+            "non-durable v2 frag etag must differ from durable v1 on {d:?}"
+        );
+    }
 
     // EC GET through the proxy: gather ndata fragments and decode
     let (status, headers, body) = http(

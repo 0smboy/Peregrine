@@ -29,7 +29,9 @@ class DummyInternalClient:
     def make_request(
         self, method, path, headers, acceptable_statuses, body_file=None, params=None
     ):
-        self.wsgi_calls.append((method, path, headers, acceptable_statuses, params))
+        self.wsgi_calls.append(
+            (method, path, headers, acceptable_statuses, params, body_file)
+        )
         raise AssertionError(f"WSGI egg:swift#proxy used for {method} {path}")
 
 
@@ -120,6 +122,45 @@ class HttpAndPatch(unittest.TestCase):
         adapter.uninstall()
         os.environ.pop("PROXY_BASE_URL", None)
 
+    def test_http_put_sends_body_and_no_commit_header(self):
+        class FakeResp:
+            status = 201
+            headers = {}
+
+            def read(self):
+                return b""
+
+            def getcode(self):
+                return 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            self.assertEqual(req.get_method(), "PUT")
+            self.assertEqual(req.data, b"v2-probe-body")
+            self.assertEqual(req.get_header("X-backend-no-commit"), "True")
+            return FakeResp()
+
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        resp = adapter.rust_http_make_request(
+            "PUT",
+            "/v1/AUTH_ec/c/o",
+            {"x-backend-no-commit": "True"},
+            (2,),
+            opener=opener,
+            body=b"v2-probe-body",
+        )
+        self.assertEqual(resp.status_int, 201)
+
+    def test_read_request_body_from_fileobj(self):
+        self.assertEqual(adapter.read_request_body(None), b"")
+        self.assertEqual(adapter.read_request_body(b"abc"), b"abc")
+        self.assertEqual(adapter.read_request_body(io.BytesIO(b"probe")), b"probe")
+
     def test_http_get_200_returns_status_headers_app_iter(self):
         class FakeResp:
             status = 200
@@ -206,14 +247,54 @@ class HttpAndPatch(unittest.TestCase):
         )
         self.assertEqual(client.wsgi_calls, [])
 
-    def test_patched_put_still_uses_original(self):
+    def test_internal_client_put_forwards_body_to_rust_http_on_18080(self):
+        """Official non_durable_newer_data v2 is upload_object + no-commit."""
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        self.assertTrue(adapter.install(DummyInternalClient))
+        client = DummyInternalClient()
+        seen = []
+
+        def fake_http(method, path, headers, acceptable, **kwargs):
+            seen.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "headers": dict(headers or {}),
+                    "acceptable": tuple(acceptable),
+                    "body": kwargs.get("body"),
+                }
+            )
+            return adapter._HttpResp(201, {}, b"")
+
+        with mock.patch.object(adapter, "rust_http_make_request", fake_http):
+            resp = client.make_request(
+                "PUT",
+                "/v1/AUTH_ec/probe/obj",
+                {"x-backend-no-commit": "True"},
+                (2,),
+                body_file=io.BytesIO(b"v2-probe-body"),
+            )
+        self.assertEqual(resp.status_int, 201)
+        self.assertEqual(seen[0]["method"], "PUT")
+        self.assertEqual(seen[0]["body"], b"v2-probe-body")
+        self.assertEqual(seen[0]["headers"].get("x-backend-no-commit"), "True")
+        self.assertEqual(client.wsgi_calls, [])
+
+    def test_non_isolated_put_keeps_original_body_file(self):
         adapter.install(DummyInternalClient)
         client = DummyInternalClient()
+        body = io.BytesIO(b"keep-me")
         with self.assertRaises(AssertionError) as ctx:
-            client.make_request("PUT", "/v1/AUTH_ec/probe/obj", {}, (2,))
+            client.make_request(
+                "PUT",
+                "/v1/AUTH_ec/probe/obj",
+                {},
+                (2,),
+                body_file=body,
+            )
         self.assertIn("WSGI", str(ctx.exception))
         self.assertEqual(client.wsgi_calls[0][0], "PUT")
+        self.assertIs(client.wsgi_calls[0][5], body)
 
     def test_swiftclient_proxy_get_matches_official_return(self):
         """Official proxy_get returns (headers, md5_hex). Lab used swiftclient."""

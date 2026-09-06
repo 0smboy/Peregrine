@@ -159,22 +159,21 @@ swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
 Field `/workspace/g6-rebuild-988b81b-httpget/` (2026-09-06): rebuild
 theme **6 green / 11 red** of 17 after rust HTTP `proxy_get`. Do not
 reopen `test_rebuild_missing_frags` gather. Next leftover:
-`test_rebuild_quarantines_lonely_frag`. Field
-`/workspace/rebuild-lonely-3efec7d/` (2026-09-06) on `3efec7d`: early
-client GET is now rust **503** (line 438). Leftover is client **HEAD**
-via InternalClient (`UnexpectedResponse: 404`) at line 445 — official
-expects 2xx metadata before quarantine once. Route IsolatedIdentity
-HEAD to rust `:18080` and return **2xx** from one durable frag; GET
-below ndata stays **503**. Do **not** claim this identity PASS until
-IsolatedIdentity re-runs the official probe on the new SHA. After
-reconstructor once with `quarantine_threshold=1` `quarantine_age=0`,
-the solitary fragment must be moved to `quarantined/` so **direct GET
-is 404**, not 503.
+`test_rebuild_quarantines_lonely_frag` field PASS on `3efec7d` + lab
+HEAD honesty (`/workspace/rebuild-lonely-3efec7d-headhttp/`,
+2026-09-06). Do not reopen it. Next leftover:
+`test_rebuild_with_non_durable_newer_data` — after IC
+`upload_object` v2 with `x-backend-no-commit`, durable v1 frag etag
+equaled prefs GET (expected differ). IsolatedIdentity
+`make_request` dropped `body_file`, so v2 never landed on rust.
+Route IC PUT/POST/DELETE (with body) to rust `:18080`. Do **not**
+claim this identity PASS until IsolatedIdentity re-runs the official
+probe on the new SHA.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080
 swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
-  test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_quarantines_lonely_frag -vv
+  test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_with_non_durable_newer_data -vv
 ```
 
 If those two themes stay red after rebuilding **this SHA**, check
