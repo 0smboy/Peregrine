@@ -180,13 +180,30 @@ class HttpAndPatch(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.resp.status_int, 404)
 
-    def test_internal_client_get_is_forbidden_on_18080(self):
+    def test_internal_client_get_and_head_route_to_rust_http_on_18080(self):
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
         self.assertTrue(adapter.install(DummyInternalClient))
         client = DummyInternalClient()
-        with self.assertRaises(adapter.RustProxyGetError) as ctx:
-            client.make_request("GET", "/v1/AUTH_ec/probe/obj", {}, (2,))
-        self.assertIn("swiftclient HTTP", str(ctx.exception))
+        seen = []
+
+        def fake_http(method, path, headers, acceptable, **kwargs):
+            del headers, kwargs
+            seen.append((method, path, tuple(acceptable)))
+            return adapter._HttpResp(200, {"X-Object-Meta-Color": "red"}, b"")
+
+        with mock.patch.object(adapter, "rust_http_make_request", fake_http):
+            get_resp = client.make_request("GET", "/v1/AUTH_ec/probe/obj", {}, (2,))
+            head_resp = client.make_request("HEAD", "/v1/AUTH_ec/probe/obj", {}, (2,))
+        self.assertEqual(get_resp.status_int, 200)
+        self.assertEqual(head_resp.status_int, 200)
+        self.assertEqual(head_resp.headers.get("X-Object-Meta-Color"), "red")
+        self.assertEqual(
+            seen,
+            [
+                ("GET", "/v1/AUTH_ec/probe/obj", (2,)),
+                ("HEAD", "/v1/AUTH_ec/probe/obj", (2,)),
+            ],
+        )
         self.assertEqual(client.wsgi_calls, [])
 
     def test_patched_put_still_uses_original(self):

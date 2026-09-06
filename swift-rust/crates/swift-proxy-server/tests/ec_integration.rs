@@ -873,6 +873,22 @@ fn test_internal_client_get_after_post_and_single_frag_rmtree() {
         status, 503,
         "GET with only 2/6 fragments must 503 (cannot decode), not 404"
     );
+    // Official line 445: client HEAD succeeds (metadata) while GET is 503.
+    let (head_status, head_headers, _) =
+        http(proxy_addr, "HEAD", "/v1/AUTH_ec/probe/obj", &[], b"");
+    assert!(
+        (200..300).contains(&head_status),
+        "lonely-frag HEAD must be 2xx (metadata), not {head_status}"
+    );
+    let color = head_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Object-Meta-Color"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        color, "red",
+        "lonely-frag HEAD must still carry POST metadata"
+    );
     let captured = logs.lock().unwrap().clone();
     assert!(
         captured.iter().any(|line| {

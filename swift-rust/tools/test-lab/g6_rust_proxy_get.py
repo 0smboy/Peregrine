@@ -14,10 +14,11 @@ This module is that honesty for the IsolatedIdentity runner:
    when ``PROXY_BASE_URL`` contains ``:18080`` (same as lab
    ``bak.httpget-988b81b``).
 2. Runtime-wrap ``TestReconstructorRebuild.proxy_get`` the same way.
-3. Fail closed if ``:18080`` is set and GET would still use
+3. Fail closed if ``:18080`` is set and GET/HEAD would still use
    ``InternalClient`` / ``egg:swift#proxy`` (no silent ``swift[python-pid]``
-   assert GETs). A source file already carrying the ``:18080``
-   swiftclient branch is honest.
+   assert GETs). Official lonely-frag HEAD is ``int_client.make_request``;
+   that is rewritten to rust HTTP. A source file already carrying the
+   ``:18080`` swiftclient branch is honest.
 
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 Do not reopen gather-bucket chasing for this single-test.
@@ -236,10 +237,10 @@ def rust_object_get_guard(
             text = ""
     if conf_uses_egg_swift_proxy(text) or text == "":
         raise RustProxyGetError(
-            f"PROXY_BASE_URL={base} is set but InternalClient GET still uses "
-            "in-process egg:swift#proxy (adapter not installed; official "
+            f"PROXY_BASE_URL={base} is set but InternalClient GET/HEAD still "
+            "uses in-process egg:swift#proxy (adapter not installed; official "
             "proxy_get has no :18080 swiftclient branch). "
-            "G6 rebuild proxy_get would never hit rust :18080."
+            "G6 rebuild GET/HEAD would never hit rust :18080."
         )
 
 
@@ -364,10 +365,16 @@ def _wrap_make_request(orig: Callable[..., Any]) -> Callable[..., Any]:
         del body_file
         method_u = str(method or "").upper()
         if uses_isolated_rust_proxy() and method_u in OBJECT_GET_METHODS:
-            raise RustProxyGetError(
-                f"InternalClient.{method_u} {path} forbidden while "
-                f"PROXY_BASE_URL={proxy_base_url()!r} points at rust :18080; "
-                "rebuild proxy_get must use swiftclient HTTP"
+            # Official test_rebuild_quarantines_lonely_frag HEADs via
+            # InternalClient.make_request, not proxy_get. Field 3efec7d:
+            # GET on rust was 503; this HEAD still hit egg:swift#proxy
+            # and 404'd (`/workspace/rebuild-lonely-3efec7d/`).
+            return rust_http_make_request(
+                method_u,
+                path,
+                headers,
+                acceptable_statuses,
+                params=params,
             )
         return orig(
             self,
@@ -579,8 +586,8 @@ def pytest_sessionstart(session):  # noqa: ARG001
     if not uses_isolated_rust_proxy():
         return
     print(
-        f"G6 rust proxy GET: PROXY_BASE_URL={base} adapter="
-        f"{'installed' if is_installed() else 'MISSING'} route=swiftclient",
+        f"G6 rust proxy GET/HEAD: PROXY_BASE_URL={base} adapter="
+        f"{'installed' if is_installed() else 'MISSING'} route=rust-http",
         flush=True,
     )
     rust_object_get_guard(adapter_installed=is_installed())

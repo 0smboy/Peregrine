@@ -6064,10 +6064,12 @@ impl ProxyApp {
             }
         }
 
-        if sources.len() < ec.ndata {
+        let required = if is_head { 1 } else { ec.ndata };
+        if sources.len() < required {
             let idxs: Vec<i32> = sources.keys().copied().collect();
-            // Match async gather / Python: empty + 404 → object gone;
-            // leftover durable frags below ndata → 503 (cannot decode).
+            // GET: empty + 404 → gone; leftover durables below ndata → 503.
+            // HEAD: one fragment's metadata is enough (official lonely-frag
+            // client HEAD is 2xx). Zero sources still follow GET's miss map.
             let status = if sources.is_empty() && saw_auth_404 {
                 404
             } else {

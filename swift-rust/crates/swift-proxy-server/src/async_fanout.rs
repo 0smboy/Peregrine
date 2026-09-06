@@ -1408,6 +1408,9 @@ impl ProxyApp {
         }
 
         let nodes = self.iter_nodes(object_ring, object_part);
+        // Official test_rebuild_quarantines_lonely_frag: GET with <ndata
+        // durable frags is 503 (cannot decode); HEAD needs only one
+        // fragment's metadata and must be 2xx before quarantine once.
         let required = if is_head { 1 } else { ec.ndata };
         // InternalClient / copy_backend_control_headers forwards every
         // X-Backend-* header. A leaked Fragment-Preferences on the client
@@ -4392,6 +4395,16 @@ mod tests {
             503,
             "an incomplete bucket without a 404 is unavailable"
         );
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn lonely_frag_head_is_ok_when_get_cannot_decode() {
+        // Official: GET 503 below ndata; HEAD 2xx from one durable frag.
+        assert!(ec_sources_sufficient(true, 1, 4));
+        assert!(!ec_sources_sufficient(false, 1, 4));
+        assert!(ec_sources_sufficient(false, 4, 4));
+        assert!(!ec_sources_sufficient(true, 0, 4));
     }
 
     #[cfg(feature = "ec")]
