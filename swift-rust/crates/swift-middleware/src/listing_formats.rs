@@ -77,6 +77,13 @@ impl Default for ListingFormats {
 
 impl Middleware for ListingFormats {
     fn prepare(&self, req: &mut Request) -> MwPrep {
+        if req
+            .headers
+            .get("X-Backend-Source")
+            .is_some_and(|s| s.eq_ignore_ascii_case("staticweb"))
+        {
+            return MwPrep::Continue;
+        }
         let parts = match split_path(&req.path, 2, 3, false) {
             Ok(p) => p,
             Err(_) => return MwPrep::Continue,
@@ -150,7 +157,14 @@ impl Middleware for ListingFormats {
             || !params.iter().any(|(k, _)| k == "format");
         // Python object_versioning._list_versions sets
         // `swift.format_listing = False` so `?versions` stays JSON.
-        let skip_format_listing = cont.is_some() && params.iter().any(|(k, _)| k == "versions");
+        // Staticweb listing subrequests set `swift.source = SW` and expect
+        // JSON (`json.loads`). Hyper prepare may have stamped a client
+        // text/plain out-type on the original GET; do not convert those.
+        let skip_format_listing = (cont.is_some() && params.iter().any(|(k, _)| k == "versions"))
+            || req
+                .headers
+                .get("X-Backend-Source")
+                .is_some_and(|s| s.eq_ignore_ascii_case("staticweb"));
         let allow_reserved = req
             .headers
             .get("X-Backend-Allow-Reserved-Names")
@@ -193,7 +207,10 @@ impl Middleware for ListingFormats {
         }
 
         // Only reformat a JSON body; otherwise (staticweb, etc.) pass through.
-        if resp_content_type != "application/json" {
+        // Isolated container GETs sometimes omit Content-Type after a
+        // clone_head() hop. An empty type still converts when the body is a
+        // JSON array (`parse_listing` fails closed and returns the original).
+        if resp_content_type != "application/json" && !resp_content_type.is_empty() {
             return resp;
         }
 
@@ -1029,6 +1046,44 @@ mod tests {
             Some("text/plain; charset=utf-8")
         );
         assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn empty_content_type_json_listing_still_converts() {
+        let body = br#"[{"name": "a"}, {"subdir": "b/"}]"#;
+        let resp = call(req("GET", "/v1/a/c", ""), move |_| {
+            Response::with_body(200, body.to_vec())
+        });
+        assert_eq!(body_bytes(&resp), b"a\nb/\n");
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn staticweb_source_listing_stays_json() {
+        let body = br#"[{"name":"idx.html","bytes":4,"content_type":"text/html","last_modified":"2026-07-16T00:00:00.0"}]"#;
+        let mut request = req("GET", "/v1/a/c", "delimiter=/&format=json");
+        request.headers.set("X-Backend-Source", "staticweb");
+        request
+            .headers
+            .set("X-Backend-Listing-Out-Content-Type", "text/plain");
+        request.headers.set("Accept", "application/json");
+        let resp = call(request, move |_| json_backend(body));
+        assert_eq!(
+            body_bytes(&resp),
+            body,
+            "staticweb listing subrequests must not be rewritten to text/plain"
+        );
+        assert!(
+            resp.headers
+                .get("Content-Type")
+                .unwrap_or("")
+                .contains("application/json"),
+            "{:?}",
+            resp.headers.get("Content-Type")
+        );
     }
 
     #[test]

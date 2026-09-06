@@ -35,7 +35,7 @@ Package/unit green is not field acceptance.
 | **G1** environment | **NOT RUN** | Preflight unit tests exist | No Swift1–4 census from this VM |
 | **G2** build / pipeline | **NOT RUN** | Offline build not executed here | No locked Linux artifact hashes for this commit |
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
-| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. Field replay on `5434983`: **556 pass / 40 fail / 54 skip** (staticweb HTML theme 16→8; index + `redirect_slash` closed). Not replayed after the listing±CSS Hyper follow-up | TempURL Hyper path. Staticweb `reassemble_async` index/301 + listing±CSS unit tests (`test_reassemble_listing_*_direct_*`) | Do **not** call G4 GREEN. Remaining field 40 includes the 8 listing±CSS identities until Swift2 replays `.functests` on the SHA that copies `make_env` headers onto listing GETs |
+| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. Field on `5434983` and again on `84751c9` (proxy sha `7c7da29b`): **556 pass / 40 fail / 54 skip**. Staticweb HTML theme 16→8 on `5434983` (index + `redirect_slash`); the 8 `listing_{anon,auth}_direct_{with,without}_css` × ascii+UTF-8 are **unchanged** after Host/token copy | TempURL Hyper path. Staticweb listing±CSS now has field-pipeline unit tests (`test_field_listing_*_through_listing_formats`) | Do **not** call G4 GREEN. The 8 listing identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
 | **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114 PASS / 32 FAIL / 29 ERROR / 4 SKIP**. Field replay on `f84ac71`: **115 PASS / 31 FAIL / 29 ERROR / 4 SKIP**. Theme delta: `container_sync` still **13**, `reconstructor_rebuild` still **14**. Only +1 PASS (`test_delete_propagate`). Historical GREEN on `17adf0b` is **not** transferable | HEAD in-repo proxy-from-`SWIFT_DIR` + remapped-port identity are **not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
@@ -80,13 +80,34 @@ runner retry/timeout issues. Replay exactly 179 identities.
    `reassemble_async` serve index, delimiter-`/` HTML listing, 301 slash
    redirect, CSS link, dir-prefix listing, TempURL query on listing hrefs,
    and Python `X-Web-Mode` / `.wsgi.tempurl` gating. `handle()` matches.
-   Listing subrequests now copy Host / token / `X-Backend-Remote-User`
-   (Python `make_env`), force `Accept: application/json`, and apply
-   `delimiter=/` grouping to flat captured listings. Unit tests cover the
-   8 remaining `listing_{anon,auth}_direct_{with,without}_css` identities
-   (ascii + UTF-8), including dir-marker `GET` and `some sub%dir/` hrefs.
-   Those 8 are **not** field-closed. Deferred vs Python: custom web-error
-   documents, domain_remap Host listing titles.
+   Listing subrequests copy Host / token / `X-Backend-Remote-User`
+   (Python `make_env`) and force `Accept: application/json`. Field G4 on
+   `84751c9` proved Host copy was **not** the remaining hole (score
+   identical to `5434983`). The listing follow-up now also drops
+   `X-Backend-Listing-Out-Content-Type` / `X-Backend-Listing-Can-Vary`,
+   sets `X-Backend-Source: staticweb` (Python `swift.source = SW`), and
+   `listing_formats` skips reformatting that source. `parse_listing`
+   accepts `listing_formats` `text/plain` (`name\\n` / `subdir/\\n`) as
+   well as JSON. Field-shaped tests: official container-always-anonymous
+   + dir auth flag, uuid-hex names, `listing_formats.prepare` stash →
+   inner convert to text/plain, remaining `listing_formats` wrap, CSS
+   `quote(css)` / `../{css}`. Those 8 are **not** field-closed. Deferred
+   vs Python: custom web-error documents, domain_remap Host listing titles.
+
+### G4 listing±CSS hypotheses (`84751c9` vs official `TestStaticWeb`)
+
+Labelled as hypotheses. Official suite:
+`test/functional/test_staticweb.py` `_test_listing_direct`.
+
+| Hypothesis | Verdict |
+|---|---|
+| Field GETs skip `reassemble_async` / `intercepts_response` | **Unlikely.** Index + `redirect_slash` closed on `5434983` via the same Hyper path. |
+| Listing shape XML vs JSON / Accept | **Likely the hole.** `listing_formats.prepare` on a client GET with no Accept stashes `X-Backend-Listing-Out-Content-Type: text/plain` and forces `format=json`. If that stash rides a staticweb listing subrequest (`clone_head`), or `listing_formats` is inner / in remaining, `handle` rewrites JSON to `name\\n`. Old `parse_listing` then returned empty items → title without links (container) or 404 (dir prefix). |
+| Auth/Host copy incomplete for TempAuth | **Not the field hole.** Client already sends Host; `clone_head()` already copied it. `84751c9` score identical to `5434983`. |
+| CSS href vs unit fixtures | **Unlikely for ascii.** Official CSS/object names are `uuid4().hex` (no dots). Unit `%` / `.css` names were fixture invention. Official test uses `quote(link)` / `quote(css)` without Python's `%2E` href rewrite; rust `quote` matches that contract. |
+| staticweb not in isolated pipeline | **Unlikely.** Index/301 would also fail. Generated test-lab confs omit staticweb; live isolated G4 must have had it for those 8 to close. |
+
+P1b rust pipeline keeps `listing_formats` **outer** of `staticweb` (should still be JSON for the follow-up). Isolated `/etc/g6-rust/proxy-server.conf` was not readable here. Treat inner-or-stashed-header as the hole unit fixtures never exercised. In-repo now covers that path; **do not** call the 8 identities closed until `.functests` on the new SHA.
 6. **G6 container-sync / reconstructor follow-up (unit only, not GREEN).**
    Field on `f84ac71` did **not** reduce the 13 `container_sync` or 14
    `reconstructor_rebuild` violations. HEAD/409 and post-ssync local

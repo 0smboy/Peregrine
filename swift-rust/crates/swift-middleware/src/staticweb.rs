@@ -27,7 +27,10 @@
 //! Name/Size/Date columns, a `../` parent row, `subdir` rows, then object rows
 //! carrying `type-<ct>` classes and human-readable sizes). Listing subrequests
 //! copy the original request's auth/Host context (Python `make_env`) and force
-//! JSON. Delimiter grouping is applied even when the backend returns a flat
+//! JSON. Listing subrequests drop `X-Backend-Listing-Out-Content-Type` and set
+//! `X-Backend-Source: staticweb` so Hyper `listing_formats` cannot rewrite the
+//! follow-up to `text/plain`. `parse_listing` also accepts that text shape.
+//! Delimiter grouping is applied even when the backend returns a flat
 //! listing. Deferred: custom Web-Error docs and domain_remap Host listing titles.
 //!
 //! Production Hyper serve never calls `handle()` for ordinary GET/HEAD.
@@ -235,38 +238,72 @@ fn build_listing_html_full(
     body
 }
 
-fn parse_listing(json: &[u8]) -> Vec<ListingItem> {
-    let value: serde_json::Value = match serde_json::from_slice(json) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+fn parse_listing(body: &[u8]) -> Vec<ListingItem> {
+    if let Some(items) = parse_json_listing(body) {
+        return items;
+    }
+    parse_text_listing(body)
+}
+
+fn parse_json_listing(json: &[u8]) -> Option<Vec<ListingItem>> {
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let arr = value.as_array()?;
     let mut items = Vec::new();
-    if let Some(arr) = value.as_array() {
-        for it in arr {
-            if let Some(subdir) = it.get("subdir").and_then(|v| v.as_str()) {
-                items.push(ListingItem::Subdir(subdir.to_string()));
-            } else if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
-                items.push(ListingItem::Object {
-                    name: name.to_string(),
-                    content_type: it
-                        .get("content_type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("application/octet-stream")
-                        .to_string(),
-                    bytes: it
-                        .get("bytes")
-                        .and_then(|v| {
-                            v.as_u64()
-                                .or_else(|| v.as_i64().and_then(|n| n.try_into().ok()))
-                        })
-                        .unwrap_or(0),
-                    last_modified: it
-                        .get("last_modified")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                });
-            }
+    for it in arr {
+        if let Some(subdir) = it.get("subdir").and_then(|v| v.as_str()) {
+            items.push(ListingItem::Subdir(subdir.to_string()));
+        } else if let Some(name) = it.get("name").and_then(|v| v.as_str()) {
+            items.push(ListingItem::Object {
+                name: name.to_string(),
+                content_type: it
+                    .get("content_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                bytes: it
+                    .get("bytes")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_i64().and_then(|n| n.try_into().ok()))
+                    })
+                    .unwrap_or(0),
+                last_modified: it
+                    .get("last_modified")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    Some(items)
+}
+
+/// `listing_formats` text/plain body: one object name or `subdir/` per line.
+/// Hyper prepare stamps `X-Backend-Listing-Out-Content-Type: text/plain` on
+/// the client GET; if that header rides a staticweb listing subrequest,
+/// the follow-up is this shape instead of JSON.
+fn parse_text_listing(body: &[u8]) -> Vec<ListingItem> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    if text.contains('<') {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    for line in text.lines() {
+        let name = line.trim_end_matches('\r');
+        if name.is_empty() {
+            continue;
+        }
+        if name.ends_with('/') {
+            items.push(ListingItem::Subdir(name.to_string()));
+        } else {
+            items.push(ListingItem::Object {
+                name: name.to_string(),
+                content_type: "application/octet-stream".to_string(),
+                bytes: 0,
+                last_modified: String::new(),
+            });
         }
     }
     items
@@ -568,6 +605,13 @@ fn staticweb_subrequest(
     sub.headers.remove("If-None-Match");
     sub.headers.remove("If-Modified-Since");
     sub.headers.remove("If-Unmodified-Since");
+    // listing_formats.prepare on the client GET stashes the negotiated
+    // client type (default text/plain). clone_head would make the listing
+    // subrequest come back as text/plain, which Python never does: its
+    // make_env listing is JSON from the inner app. Drop the stash and
+    // mark the source so listing_formats leaves JSON alone.
+    sub.headers.remove("X-Backend-Listing-Out-Content-Type");
+    sub.headers.remove("X-Backend-Listing-Can-Vary");
     sub.headers.set("X-Backend-Source", "staticweb");
     sub
 }
@@ -913,6 +957,73 @@ mod tests {
     #[test]
     fn test_html_escape() {
         assert_eq!(html_escape("a<b>&\"'"), "a&lt;b&gt;&amp;&quot;&#x27;");
+    }
+
+    #[test]
+    fn test_parse_text_listing_from_listing_formats() {
+        let items = parse_listing(b"idx.html\nfolder/\nnested/obj\n");
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, ListingItem::Object { name, .. } if name == "idx.html")),
+            "{items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, ListingItem::Subdir(s) if s == "folder/")),
+            "{items:?}"
+        );
+        let grouped = apply_web_delimiter(items, "");
+        assert!(
+            grouped
+                .iter()
+                .any(|i| matches!(i, ListingItem::Subdir(s) if s == "folder/")),
+            "text listing must still group nested names: {grouped:?}"
+        );
+        assert!(
+            !grouped
+                .iter()
+                .any(|i| matches!(i, ListingItem::Object { name, .. } if name == "nested/obj")),
+            "{grouped:?}"
+        );
+        assert!(parse_listing(b"<html>Listing of /v1</html>").is_empty());
+    }
+
+    #[test]
+    fn listing_subrequest_drops_listing_formats_negotiation() {
+        // Failed first: clone_head kept X-Backend-Listing-Out-Content-Type
+        // from listing_formats.prepare, so the follow-up was text/plain.
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "swift.example:18080");
+        headers.set("X-Backend-Listing-Out-Content-Type", "text/plain");
+        headers.set("X-Backend-Listing-Can-Vary", "1");
+        headers.set("X-Auth-Token", "AUTH_tk123");
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c/".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let scope = Scope::parse(&req).unwrap();
+        let sub = listing_subrequest(&req, &scope, "");
+        assert_eq!(sub.headers.get("X-Backend-Listing-Out-Content-Type"), None);
+        assert_eq!(sub.headers.get("X-Backend-Listing-Can-Vary"), None);
+        assert_eq!(sub.headers.get("X-Backend-Source"), Some("staticweb"));
+        assert_eq!(sub.headers.get("Accept"), Some("application/json"));
+        assert_eq!(sub.headers.get("Host"), Some("swift.example:18080"));
+        assert_eq!(sub.headers.get("X-Auth-Token"), Some("AUTH_tk123"));
+        assert!(
+            sub.query_string.contains("delimiter=/"),
+            "{}",
+            sub.query_string
+        );
+        assert!(
+            sub.query_string.contains("format=json"),
+            "{}",
+            sub.query_string
+        );
     }
 
     #[test]
@@ -1355,6 +1466,22 @@ mod tests {
             }
         }
 
+        /// Official `Utils.create_name()` / `uuid4().hex` — no dots, no `%`.
+        /// Virtual keys like `dir/some sub%dir/` are setup-only in
+        /// `test_staticweb.py`; stored names are random.
+        fn field_ascii() -> Self {
+            Self {
+                account: "AUTH_test",
+                container: "c7a1e2b3c4d5e6f7a8b9c0d1e2f30415".into(),
+                index: "aa11bb22cc33dd44ee55ff6677889900".into(),
+                css: "0123456789abcdef0123456789abcdef".into(),
+                dir: "d00dfeedfacebaba0000111122223333".into(),
+                dir_obj: "0b1ec7ab1e0000001111222233334444".into(),
+                subdir: "5e7e0000111122223333444455556666".into(),
+                nested: "9e57ed00001111222233334444555566".into(),
+            }
+        }
+
         fn storage_path(&self) -> String {
             format!("/v1/{}/{}", self.account, self.container)
         }
@@ -1635,5 +1762,308 @@ mod tests {
     #[tokio::test]
     async fn test_reassemble_listing_auth_direct_with_css_utf8() {
         assert_listing_direct(DirectListingEnv::utf8(), false, true).await;
+    }
+
+    fn listing_formats_then(rest: crate::AsyncNextFn) -> crate::AsyncNextFn {
+        Arc::new(move |r: Request| {
+            let rest = Arc::clone(&rest);
+            Box::pin(async move { crate::ListingFormats.reassemble_async(r, rest).await })
+        })
+    }
+
+    fn listing_formats_convert(req: &Request, mut resp: Response) -> Response {
+        if resp.headers.get("Content-Type").unwrap_or("").is_empty() {
+            resp.headers.set("Content-Type", "application/json");
+        }
+        let status = resp.status;
+        let headers = resp.headers.clone();
+        let body = resp.body.materialize(u64::MAX).unwrap().to_vec();
+        let app: crate::NextFn = Arc::new(move |_| {
+            let mut out = Response::with_body(status, body.clone());
+            out.headers = headers.clone();
+            out
+        });
+        crate::ListingFormats.handle(req.clone_head(), &app)
+    }
+
+    /// Official `_test_listing_direct`: container GET is always anonymous
+    /// (`X-Web-Mode: False`, no token) even in auth tests; dir GET uses the
+    /// real anonymous flag.
+    fn listing_direct_headers(anonymous: bool) -> HeaderKeyDict {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", "swift.example:18080");
+        if anonymous {
+            headers.set("X-Web-Mode", "False");
+        } else {
+            headers.set("X-Web-Mode", "True");
+            headers.set("X-Backend-Remote-User", "AUTH_test,AUTH_test:tester");
+            headers.set("X-Auth-Token", "AUTH_tk123");
+        }
+        headers
+    }
+
+    /// Field G4 on `84751c9` still failed the 8 listing_*_direct identities.
+    /// Isolated Hyper runs listing_formats.prepare on the client GET (default
+    /// Accept → text/plain out-type) before staticweb.reassemble. When
+    /// listing_formats is also in remaining (or converts the captured GET
+    /// first), the listing body is text/plain — the old unit fixtures never
+    /// did that and stayed green.
+    ///
+    /// Mirrors OpenStack `test_staticweb.py` `_test_listing` assertions:
+    /// `Listing of {unquote(path)}`, `<a href="{quote(link)}">{link}</a>`,
+    /// CSS `<link type="text/css" rel="stylesheet" href="{quote(css)}" />`.
+    async fn assert_listing_direct_field_pipeline(
+        env: DirectListingEnv,
+        anonymous: bool,
+        listings_css: bool,
+    ) {
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let dir_path = env.dir_url();
+        let index = env.index.clone();
+        let dir_slash = format!("{}/", env.dir);
+        let dir_obj_leaf = env.dir_obj.clone();
+        let subdir_leaf = format!("{}/", env.subdir);
+        let nested_full = env.nested_name();
+        let css_name = env.css.clone();
+        let dir_obj_full = env.dir_obj_name();
+
+        // Official: container listing is always anonymous=True.
+        let mut req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        assert!(
+            matches!(
+                crate::ListingFormats.prepare(&mut req),
+                crate::MwPrep::Continue
+            ),
+            "container GET must not 406 without Accept"
+        );
+        assert_eq!(
+            req.headers.get("X-Backend-Listing-Out-Content-Type"),
+            Some("text/plain"),
+            "no Accept → listing_formats negotiates text/plain"
+        );
+        let captured = listing_formats_convert(&req, env.captured_container(listings_css));
+        assert!(
+            captured
+                .headers
+                .get("Content-Type")
+                .unwrap_or("")
+                .contains("text/plain"),
+            "inner listing_formats must rewrite captured JSON to text/plain, ct={:?}",
+            captured.headers.get("Content-Type")
+        );
+        let next = hyper_next(
+            captured,
+            listing_formats_then(hyper_listing_next(env.clone(), listings_css)),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "container listing status {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        assert!(
+            body.contains(&format!("Listing of {container_path}")),
+            "title missing in {body}"
+        );
+        assert!(
+            body.contains(&python_link(&index)),
+            "index link missing: {body}"
+        );
+        assert!(
+            body.contains(&python_link(&dir_slash)),
+            "dir link missing: {body}"
+        );
+        assert!(
+            !body.contains(&dir_obj_full),
+            "nested dir/obj must not appear: {body}"
+        );
+        if listings_css {
+            assert!(
+                body.contains(&python_css_link(&css_name)),
+                "container CSS missing: {body}"
+            );
+        } else {
+            assert!(
+                !body.contains("<link type=\"text/css\""),
+                "unexpected CSS link: {body}"
+            );
+        }
+
+        let mut req = Request {
+            method: "GET".into(),
+            path: dir_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(anonymous),
+            body: Body::empty(),
+        };
+        let _ = crate::ListingFormats.prepare(&mut req);
+        let next = hyper_next(
+            env.captured_dir_marker(),
+            listing_formats_then(hyper_listing_next(env, listings_css)),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "dir listing status {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 dir listing");
+        assert!(
+            body.contains(&format!("Listing of {dir_path}")),
+            "dir title missing in {body}"
+        );
+        assert!(
+            body.contains(&python_link(&dir_obj_leaf)),
+            "dir obj link missing: {body}"
+        );
+        assert!(
+            body.contains(&python_link(&subdir_leaf)),
+            "subdir link missing: {body}"
+        );
+        assert!(
+            !body.contains(&index),
+            "index must not appear in dir: {body}"
+        );
+        assert!(
+            !body.contains(&nested_full),
+            "nested subdir/obj must not appear: {body}"
+        );
+        if listings_css {
+            let href = format!("../{css_name}");
+            assert!(
+                body.contains(&python_css_link(&href)),
+                "dir CSS missing: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_field_listing_anon_direct_without_css_through_listing_formats() {
+        assert_listing_direct_field_pipeline(DirectListingEnv::field_ascii(), true, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_field_listing_auth_direct_with_css_through_listing_formats() {
+        assert_listing_direct_field_pipeline(DirectListingEnv::field_ascii(), false, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_field_listing_anon_direct_with_css_utf8_through_listing_formats() {
+        assert_listing_direct_field_pipeline(DirectListingEnv::utf8(), true, true).await;
+    }
+
+    /// Defense in depth: remaining listing_formats still rewrote the follow-up
+    /// to text/plain (stash kept / source stripped). HTML must still grow
+    /// official `quote(link)` hrefs from that name-per-line body.
+    #[tokio::test]
+    async fn test_field_listing_text_plain_followup_parses_like_json() {
+        let env = DirectListingEnv::field_ascii();
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let index = env.index.clone();
+        let dir_slash = format!("{}/", env.dir);
+        let text = format!(
+            "{}\nerror.html\n{}\n{}\n{}/\n",
+            env.index, env.css, env.dir, env.dir
+        );
+        let rest: crate::AsyncNextFn = {
+            let env = env.clone();
+            Arc::new(move |r: Request| {
+                let env = env.clone();
+                let text = text.clone();
+                Box::pin(async move {
+                    if r.method == "HEAD" {
+                        let mut resp = Response::new(204);
+                        resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                        return resp;
+                    }
+                    if r.method == "GET" && r.path == env.storage_path() {
+                        let mut resp = Response::with_body(200, text.into_bytes());
+                        resp.headers.set("Content-Type", "text/plain; charset=utf-8");
+                        return resp;
+                    }
+                    Response::new(404)
+                })
+            })
+        };
+        let mut req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        let _ = crate::ListingFormats.prepare(&mut req);
+        let next = hyper_next(env.captured_container(false), rest);
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "got {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        assert!(
+            body.contains(&format!("Listing of {container_path}")),
+            "{body}"
+        );
+        assert!(body.contains(&python_link(&index)), "{body}");
+        assert!(body.contains(&python_link(&dir_slash)), "{body}");
+        assert!(
+            !body.contains(&env.dir_obj_name()),
+            "nested name leaked: {body}"
+        );
+    }
+
+    /// P1b pipeline (`listing_formats` outer of `staticweb`): captured GET
+    /// stays JSON; listing_formats.handle must pass the HTML through.
+    #[tokio::test]
+    async fn test_field_listing_formats_outer_passthrough_html() {
+        let env = DirectListingEnv::field_ascii();
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let mut req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        assert!(matches!(
+            crate::ListingFormats.prepare(&mut req),
+            crate::MwPrep::Continue
+        ));
+        let next = hyper_next(
+            env.captured_container(false),
+            hyper_listing_next(env.clone(), false),
+        );
+        let mut html = sw.reassemble_async(req.clone_head(), next).await;
+        assert_eq!(html.status, 200);
+        assert!(html
+            .headers
+            .get("Content-Type")
+            .unwrap_or("")
+            .contains("text/html"));
+        let app: crate::NextFn = {
+            let status = html.status;
+            let headers = html.headers.clone();
+            let body = html.body.materialize(u64::MAX).unwrap().to_vec();
+            Arc::new(move |_| {
+                let mut out = Response::with_body(status, body.clone());
+                out.headers = headers.clone();
+                out
+            })
+        };
+        let mut resp = crate::ListingFormats.handle(req, &app);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        assert!(
+            body.contains(&format!("Listing of {container_path}")),
+            "{body}"
+        );
+        assert!(body.contains(&python_link(&env.index)), "{body}");
+        assert!(
+            body.contains(&python_link(&format!("{}/", env.dir))),
+            "{body}"
+        );
     }
 }
