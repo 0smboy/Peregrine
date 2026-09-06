@@ -25,9 +25,10 @@
 //!
 //! The listing HTML structure mirrors Python's (`Listing of …`, a table with
 //! Name/Size/Date columns, a `../` parent row, `subdir` rows, then object rows
-//! carrying `type-<ct>` classes and human-readable sizes). Deferred: the CSS
-//! path building, tempurl query-string propagation, custom Web-Error docs,
-//! and directory-marker suppression.
+//! carrying `type-<ct>` classes and human-readable sizes). Listing subrequests
+//! copy the original request's auth/Host context (Python `make_env`) and force
+//! JSON. Delimiter grouping is applied even when the backend returns a flat
+//! listing. Deferred: custom Web-Error docs and domain_remap Host listing titles.
 //!
 //! Production Hyper serve never calls `handle()` for ordinary GET/HEAD.
 //! Index + HTML listing run in [`Middleware::reassemble_async`]: the first
@@ -252,7 +253,13 @@ fn parse_listing(json: &[u8]) -> Vec<ListingItem> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("application/octet-stream")
                         .to_string(),
-                    bytes: it.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                    bytes: it
+                        .get("bytes")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_i64().and_then(|n| n.try_into().ok()))
+                        })
+                        .unwrap_or(0),
                     last_modified: it
                         .get("last_modified")
                         .and_then(|v| v.as_str())
@@ -263,6 +270,83 @@ fn parse_listing(json: &[u8]) -> Vec<ListingItem> {
         }
     }
     items
+}
+
+/// Python container GET `delimiter=/` grouping. Applied even when the
+/// listing body is a flat name list (Hyper captured GET has no delimiter).
+fn apply_web_delimiter(items: Vec<ListingItem>, prefix: &str) -> Vec<ListingItem> {
+    let prefix = listing_prefix(prefix);
+    let mut subdirs = Vec::new();
+    let mut seen_subdirs = std::collections::HashSet::new();
+    let mut objects = Vec::new();
+    for item in items {
+        match item {
+            ListingItem::Subdir(subdir) => {
+                let Some(rest) = subdir.strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                let seg = rest.split('/').next().unwrap_or(rest);
+                if seg.is_empty() {
+                    continue;
+                }
+                let key = format!("{prefix}{seg}/");
+                if seen_subdirs.insert(key.clone()) {
+                    subdirs.push(ListingItem::Subdir(key));
+                }
+            }
+            ListingItem::Object {
+                name,
+                content_type,
+                bytes,
+                last_modified,
+            } => {
+                let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                if let Some((seg, after)) = rest.split_once('/') {
+                    if seg.is_empty() {
+                        continue;
+                    }
+                    if !after.is_empty() || name.ends_with('/') {
+                        let key = format!("{prefix}{seg}/");
+                        if seen_subdirs.insert(key.clone()) {
+                            subdirs.push(ListingItem::Subdir(key));
+                        }
+                        continue;
+                    }
+                }
+                objects.push(ListingItem::Object {
+                    name,
+                    content_type,
+                    bytes,
+                    last_modified,
+                });
+            }
+        }
+    }
+    subdirs.extend(objects);
+    subdirs
+}
+
+fn listing_body_is_json_array(resp: &mut Response) -> bool {
+    if !is_success(resp.status) {
+        return false;
+    }
+    if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
+        return false;
+    }
+    matches!(
+        serde_json::from_slice::<serde_json::Value>(
+            resp.body.materialize(MAX_CONTROL_BODY).expect("buffered")
+        ),
+        Ok(serde_json::Value::Array(_))
+    )
 }
 
 #[derive(Debug, Default, Clone)]
@@ -466,30 +550,55 @@ fn tempurl_listing_bits(req: &Request) -> (String, String) {
     (format!("?{}", parts.join("&amp;")), prefix)
 }
 
-fn listing_subrequest(scope: &Scope, prefix: &str) -> Request {
-    let mut list_req = Request {
-        method: "GET".to_string(),
-        path: scope.container_path(),
-        query_string: if prefix.is_empty() {
-            "delimiter=/&format=json".to_string()
-        } else {
-            format!("delimiter=/&format=json&prefix={}", quote(prefix))
-        },
-        headers: HeaderKeyDict::new(),
-        body: Body::empty(),
+/// Python `make_env`: keep Host / REMOTE_USER / token / authorize-equivalent
+/// headers, retarget method/path/query, drop range/conditionals.
+fn staticweb_subrequest(
+    orig: &Request,
+    method: &str,
+    path: String,
+    query_string: String,
+) -> Request {
+    let mut sub = orig.clone_head();
+    sub.method = method.to_string();
+    sub.path = path;
+    sub.query_string = query_string;
+    sub.headers.remove("Range");
+    sub.headers.remove("Content-Length");
+    sub.headers.remove("If-Match");
+    sub.headers.remove("If-None-Match");
+    sub.headers.remove("If-Modified-Since");
+    sub.headers.remove("If-Unmodified-Since");
+    sub.headers.set("X-Backend-Source", "staticweb");
+    sub
+}
+
+fn listing_prefix(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+fn listing_subrequest(orig: &Request, scope: &Scope, prefix: &str) -> Request {
+    let prefix = listing_prefix(prefix);
+    let query = if prefix.is_empty() {
+        "delimiter=/&format=json".to_string()
+    } else {
+        format!("delimiter=/&format=json&prefix={}", quote(&prefix))
     };
-    list_req.headers.set("X-Backend-Source", "staticweb");
+    let mut list_req = staticweb_subrequest(orig, "GET", scope.container_path(), query);
+    list_req.headers.set("Accept", "application/json");
     list_req
 }
 
-fn index_subrequest(scope: &Scope, prefix: &str, index: &str) -> Request {
-    Request {
-        method: "GET".to_string(),
-        path: format!("{}/{prefix}{index}", scope.container_path()),
-        query_string: String::new(),
-        headers: HeaderKeyDict::new(),
-        body: Body::empty(),
-    }
+fn index_subrequest(orig: &Request, scope: &Scope, prefix: &str, index: &str) -> Request {
+    staticweb_subrequest(
+        orig,
+        "GET",
+        format!("{}/{prefix}{index}", scope.container_path()),
+        String::new(),
+    )
 }
 
 fn container_head_request(req: &Request, scope: &Scope) -> Request {
@@ -540,8 +649,11 @@ fn listing_from_response(
     if resp.body.materialize(MAX_CONTROL_BODY).is_err() {
         return resp;
     }
-    let items = parse_listing(resp.body.materialize(MAX_CONTROL_BODY).expect("buffered"));
-    html_listing_response(req, scope, cfg, prefix, &items)
+    let items = apply_web_delimiter(
+        parse_listing(resp.body.materialize(MAX_CONTROL_BODY).expect("buffered")),
+        prefix,
+    );
+    html_listing_response(req, scope, cfg, &listing_prefix(prefix), &items)
 }
 
 impl StaticWeb {
@@ -561,7 +673,7 @@ impl StaticWeb {
             scope,
             cfg,
             prefix,
-            next(listing_subrequest(scope, prefix)),
+            next(listing_subrequest(req, scope, prefix)),
         )
     }
 
@@ -582,7 +694,7 @@ impl StaticWeb {
             return redirect_with_slash(&req);
         }
         if let Some(index) = &cfg.index {
-            let index_resp = next(index_subrequest(&scope, "", index));
+            let index_resp = next(index_subrequest(&req, &scope, "", index));
             if is_success(index_resp.status) || is_redirect(index_resp.status) {
                 return index_resp;
             }
@@ -614,7 +726,7 @@ impl StaticWeb {
             format!("{}/", scope.obj)
         };
         if let Some(index) = &cfg.index {
-            let index_resp = next(index_subrequest(&scope, &prefix, index));
+            let index_resp = next(index_subrequest(&req, &scope, &prefix, index));
             if is_success(index_resp.status) || is_redirect(index_resp.status) {
                 if !req.path.ends_with('/') {
                     return redirect_with_slash(&req);
@@ -623,7 +735,7 @@ impl StaticWeb {
             }
         }
         if !req.path.ends_with('/') {
-            let mut probe = listing_subrequest(&scope, &prefix);
+            let mut probe = listing_subrequest(&req, &scope, &prefix);
             probe.query_string =
                 format!("limit=1&delimiter=/&format=json&prefix={}", quote(&prefix));
             let mut probe_resp = next(probe);
@@ -632,18 +744,21 @@ impl StaticWeb {
             {
                 return first;
             }
-            let items = parse_listing(
-                probe_resp
-                    .body
-                    .materialize(MAX_CONTROL_BODY)
-                    .expect("buffered"),
+            let items = apply_web_delimiter(
+                parse_listing(
+                    probe_resp
+                        .body
+                        .materialize(MAX_CONTROL_BODY)
+                        .expect("buffered"),
+                ),
+                &prefix,
             );
             if items.is_empty() {
                 return first;
             }
             return redirect_with_slash(&req);
         }
-        self.serve_listing(&req, &scope, &cfg, &scope.obj, next)
+        self.serve_listing(&req, &scope, &cfg, &prefix, next)
     }
 }
 
@@ -686,7 +801,7 @@ impl Middleware for StaticWeb {
                     return redirect_with_slash(&head);
                 }
                 if let Some(index) = &cfg.index {
-                    let index_resp = next(index_subrequest(&scope, "", index)).await;
+                    let index_resp = next(index_subrequest(&head, &scope, "", index)).await;
                     if is_success(index_resp.status) || is_redirect(index_resp.status) {
                         return index_resp;
                     }
@@ -694,7 +809,13 @@ impl Middleware for StaticWeb {
                 if !cfg.listings {
                     return Response::error(404, "Not Found");
                 }
-                let listing = next(listing_subrequest(&scope, "")).await;
+                let mut listing = next(listing_subrequest(&head, &scope, "")).await;
+                if !listing_body_is_json_array(&mut listing) {
+                    let mut captured = first;
+                    if listing_body_is_json_array(&mut captured) {
+                        listing = captured;
+                    }
+                }
                 return listing_from_response(&head, &scope, &cfg, "", listing);
             }
 
@@ -716,7 +837,7 @@ impl Middleware for StaticWeb {
                 format!("{}/", scope.obj)
             };
             if let Some(index) = &cfg.index {
-                let index_resp = next(index_subrequest(&scope, &prefix, index)).await;
+                let index_resp = next(index_subrequest(&head, &scope, &prefix, index)).await;
                 if is_success(index_resp.status) || is_redirect(index_resp.status) {
                     if !path_has_slash {
                         return redirect_with_slash(&head);
@@ -725,7 +846,7 @@ impl Middleware for StaticWeb {
                 }
             }
             if !path_has_slash {
-                let mut probe = listing_subrequest(&scope, &prefix);
+                let mut probe = listing_subrequest(&head, &scope, &prefix);
                 probe.query_string =
                     format!("limit=1&delimiter=/&format=json&prefix={}", quote(&prefix));
                 let mut probe_resp = next(probe).await;
@@ -734,11 +855,14 @@ impl Middleware for StaticWeb {
                 {
                     return first;
                 }
-                let items = parse_listing(
-                    probe_resp
-                        .body
-                        .materialize(MAX_CONTROL_BODY)
-                        .expect("buffered"),
+                let items = apply_web_delimiter(
+                    parse_listing(
+                        probe_resp
+                            .body
+                            .materialize(MAX_CONTROL_BODY)
+                            .expect("buffered"),
+                    ),
+                    &prefix,
                 );
                 if items.is_empty() {
                     return first;
@@ -748,8 +872,8 @@ impl Middleware for StaticWeb {
             if !cfg.listings {
                 return Response::error(404, "Not Found");
             }
-            let listing = next(listing_subrequest(&scope, &scope.obj)).await;
-            listing_from_response(&head, &scope, &cfg, &scope.obj, listing)
+            let listing = next(listing_subrequest(&head, &scope, &prefix)).await;
+            listing_from_response(&head, &scope, &cfg, &prefix, listing)
         })
     }
 
@@ -789,6 +913,23 @@ mod tests {
     #[test]
     fn test_html_escape() {
         assert_eq!(html_escape("a<b>&\"'"), "a&lt;b&gt;&amp;&quot;&#x27;");
+    }
+
+    #[test]
+    fn test_apply_web_delimiter_hides_nested_names() {
+        let items = parse_listing(
+            br#"[{"name":"idx.html","content_type":"text/html","bytes":1,"last_modified":"2026-07-16T00:00:00.0"},{"name":"folder/nested","content_type":"text/plain","bytes":1,"last_modified":"2026-07-16T00:00:00.0"}]"#,
+        );
+        let grouped = apply_web_delimiter(items, "");
+        assert!(grouped
+            .iter()
+            .any(|i| matches!(i, ListingItem::Object { name, .. } if name == "idx.html")));
+        assert!(grouped
+            .iter()
+            .any(|i| matches!(i, ListingItem::Subdir(s) if s == "folder/")));
+        assert!(!grouped
+            .iter()
+            .any(|i| matches!(i, ListingItem::Object { name, .. } if name.contains("nested"))));
     }
 
     #[test]
@@ -1171,5 +1312,328 @@ mod tests {
         let mut resp = sw.handle(req, &app);
         assert_eq!(resp.status, 200);
         assert!(resp.body.materialize(u64::MAX).unwrap().starts_with(b"["));
+    }
+
+    /// Field G4 leftovers on `5434983`: `listing_{anon,auth}_direct_{with,without}_css`
+    /// × ascii + UTF-8. Mirrors OpenStack `test_staticweb.py` `_test_listing_direct`.
+    #[derive(Clone)]
+    struct DirectListingEnv {
+        account: &'static str,
+        container: String,
+        index: String,
+        css: String,
+        dir: String,
+        dir_obj: String,
+        subdir: String,
+        nested: String,
+    }
+
+    impl DirectListingEnv {
+        fn ascii() -> Self {
+            Self {
+                account: "AUTH_test",
+                container: "webc".into(),
+                index: "idx.html".into(),
+                css: "listings.css".into(),
+                dir: "folder".into(),
+                dir_obj: "nested".into(),
+                subdir: "some sub%dir".into(),
+                nested: "deep".into(),
+            }
+        }
+
+        fn utf8() -> Self {
+            Self {
+                account: "AUTH_test",
+                container: "站点".into(),
+                index: "首页.html".into(),
+                css: "样式.css".into(),
+                dir: "目录".into(),
+                dir_obj: "物件".into(),
+                subdir: "子 目录%名".into(),
+                nested: "深层".into(),
+            }
+        }
+
+        fn storage_path(&self) -> String {
+            format!("/v1/{}/{}", self.account, self.container)
+        }
+
+        fn container_url(&self) -> String {
+            format!("{}/", self.storage_path())
+        }
+
+        fn dir_url(&self) -> String {
+            format!("{}/{}/", self.storage_path(), self.dir)
+        }
+
+        fn dir_obj_name(&self) -> String {
+            format!("{}/{}", self.dir, self.dir_obj)
+        }
+
+        fn subdir_name(&self) -> String {
+            format!("{}/{}/", self.dir, self.subdir)
+        }
+
+        fn nested_name(&self) -> String {
+            format!("{}/{}/{}", self.dir, self.subdir, self.nested)
+        }
+
+        fn flat_listing_json(&self) -> Vec<u8> {
+            let rows = serde_json::json!([
+                {"name": self.index, "content_type": "text/html", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                {"name": "error.html", "content_type": "text/html", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                {"name": self.css, "content_type": "text/css", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                {"name": self.dir, "content_type": "application/directory", "bytes": 0, "last_modified": "2026-07-16T00:00:00.0"},
+                {"name": self.dir_obj_name(), "content_type": "text/plain", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                {"name": format!("{}/{}", self.dir, self.subdir), "content_type": "application/directory", "bytes": 0, "last_modified": "2026-07-16T00:00:00.0"},
+                {"name": self.nested_name(), "content_type": "text/plain", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+            ]);
+            serde_json::to_vec(&rows).unwrap()
+        }
+
+        fn delimited_listing_json(&self, prefix: &str) -> Vec<u8> {
+            if prefix.is_empty() {
+                let rows = serde_json::json!([
+                    {"name": self.index, "content_type": "text/html", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                    {"name": "error.html", "content_type": "text/html", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                    {"name": self.css, "content_type": "text/css", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                    {"name": self.dir, "content_type": "application/directory", "bytes": 0, "last_modified": "2026-07-16T00:00:00.0"},
+                    {"subdir": format!("{}/", self.dir)},
+                ]);
+                return serde_json::to_vec(&rows).unwrap();
+            }
+            let rows = serde_json::json!([
+                {"name": self.dir_obj_name(), "content_type": "text/plain", "bytes": 4, "last_modified": "2026-07-16T00:00:00.0"},
+                {"subdir": self.subdir_name()},
+            ]);
+            serde_json::to_vec(&rows).unwrap()
+        }
+
+        fn captured_container(&self, css: bool) -> Response {
+            let mut resp = Response::with_body(200, self.flat_listing_json());
+            resp.headers.set("X-Container-Meta-Web-Listings", "true");
+            if css {
+                resp.headers
+                    .set("X-Container-Meta-Web-Listings-Css", &self.css);
+            }
+            resp
+        }
+
+        fn captured_dir_marker(&self) -> Response {
+            let mut resp = Response::with_body(200, Vec::new());
+            resp.headers.set("Content-Type", "application/directory");
+            resp.headers.set("Content-Length", "0");
+            resp
+        }
+    }
+
+    fn python_quote(s: &str) -> String {
+        quote(s)
+    }
+
+    fn python_link(name: &str) -> String {
+        format!("<a href=\"{}\">{}</a>", python_quote(name), name)
+    }
+
+    fn python_css_link(href: &str) -> String {
+        format!(
+            "<link type=\"text/css\" rel=\"stylesheet\" href=\"{}\" />",
+            python_quote(href)
+        )
+    }
+
+    /// Python `make_env` copies Host / REMOTE_USER / authorize. A listing GET
+    /// that drops them is 401 here (field Hyper hole). `Accept: text/html`
+    /// without `format=json` is 406 like listing_formats. Missing `delimiter=/`
+    /// returns the flat listing (nested names) so HTML must still group.
+    fn hyper_listing_next(env: DirectListingEnv, css: bool) -> crate::AsyncNextFn {
+        let rest: crate::AsyncNextFn = Arc::new(move |r: Request| {
+            let env = env.clone();
+            Box::pin(async move {
+                if r.method == "HEAD" && r.path == env.storage_path() {
+                    if r.headers.get("Host").unwrap_or("").is_empty() {
+                        return Response::error(401, "Unauthorized");
+                    }
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                    if css {
+                        resp.headers
+                            .set("X-Container-Meta-Web-Listings-Css", &env.css);
+                    }
+                    return resp;
+                }
+                if r.method == "GET" && r.path == env.storage_path() {
+                    // Python make_env copies HTTP_HOST and REMOTE_USER.
+                    if r.headers.get("Host").unwrap_or("").is_empty() {
+                        return Response::error(401, "Unauthorized");
+                    }
+                    let accept = r.headers.get("Accept").unwrap_or("");
+                    if !r.query_string.contains("format=json")
+                        && accept.contains("text/html")
+                        && !accept.contains("application/json")
+                    {
+                        return Response::error(406, "Not Acceptable");
+                    }
+                    let prefix = r.param("prefix").unwrap_or_default();
+                    if r.query_string.contains("delimiter=") {
+                        return Response::with_body(200, env.delimited_listing_json(&prefix));
+                    }
+                    return Response::with_body(200, env.flat_listing_json());
+                }
+                Response::new(404)
+            })
+        });
+        rest
+    }
+
+    async fn assert_listing_direct(env: DirectListingEnv, anonymous: bool, listings_css: bool) {
+        let sw = StaticWeb::new();
+        let host = "swift.example:18080";
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Host", host);
+        if anonymous {
+            headers.set("X-Web-Mode", "False");
+        } else {
+            headers.set("X-Web-Mode", "True");
+            headers.set("X-Backend-Remote-User", "AUTH_test,AUTH_test:tester");
+            headers.set("X-Auth-Token", "AUTH_tk123");
+        }
+
+        let container_path = env.container_url();
+        let dir_path = env.dir_url();
+        let index = env.index.clone();
+        let dir_slash = format!("{}/", env.dir);
+        let dir_obj_leaf = env.dir_obj.clone();
+        let subdir_leaf = format!("{}/", env.subdir);
+        let nested_full = env.nested_name();
+        let css_name = env.css.clone();
+        let dir_obj_full = env.dir_obj_name();
+
+        let req = Request {
+            method: "GET".into(),
+            path: container_path.clone(),
+            query_string: String::new(),
+            headers: headers.clone(),
+            body: Body::empty(),
+        };
+        let next = hyper_next(
+            env.captured_container(listings_css),
+            hyper_listing_next(env.clone(), listings_css),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "container listing status {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 listing");
+        assert!(
+            body.contains(&format!("Listing of {container_path}")),
+            "title missing in {body}"
+        );
+        assert!(
+            body.contains(&python_link(&index)),
+            "index link missing: {body}"
+        );
+        assert!(
+            body.contains(&python_link(&dir_slash)),
+            "dir link missing: {body}"
+        );
+        assert!(
+            !body.contains(&dir_obj_full),
+            "nested dir/obj must not appear: {body}"
+        );
+        if listings_css {
+            assert!(
+                body.contains(&python_css_link(&css_name)),
+                "container CSS missing: {body}"
+            );
+        } else {
+            assert!(
+                !body.contains("<link type=\"text/css\""),
+                "unexpected CSS link: {body}"
+            );
+        }
+
+        let req = Request {
+            method: "GET".into(),
+            path: dir_path.clone(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let next = hyper_next(
+            env.captured_dir_marker(),
+            hyper_listing_next(env, listings_css),
+        );
+        let mut resp = sw.reassemble_async(req, next).await;
+        assert_eq!(resp.status, 200, "dir listing status {}", resp.status);
+        let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
+            .expect("utf8 dir listing");
+        assert!(
+            body.contains(&format!("Listing of {dir_path}")),
+            "dir title missing in {body}"
+        );
+        assert!(
+            body.contains(&python_link(&dir_obj_leaf)),
+            "dir obj link missing: {body}"
+        );
+        assert!(
+            body.contains(&python_link(&subdir_leaf)),
+            "percent-subdir link missing: {body}"
+        );
+        assert!(
+            !body.contains(&index),
+            "index must not appear in dir: {body}"
+        );
+        assert!(
+            !body.contains(&nested_full),
+            "nested subdir/obj must not appear: {body}"
+        );
+        if listings_css {
+            let href = format!("../{css_name}");
+            assert!(
+                body.contains(&python_css_link(&href)),
+                "dir CSS missing: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_anon_direct_without_css() {
+        assert_listing_direct(DirectListingEnv::ascii(), true, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_anon_direct_with_css() {
+        assert_listing_direct(DirectListingEnv::ascii(), true, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_auth_direct_without_css() {
+        assert_listing_direct(DirectListingEnv::ascii(), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_auth_direct_with_css() {
+        assert_listing_direct(DirectListingEnv::ascii(), false, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_anon_direct_without_css_utf8() {
+        assert_listing_direct(DirectListingEnv::utf8(), true, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_anon_direct_with_css_utf8() {
+        assert_listing_direct(DirectListingEnv::utf8(), true, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_auth_direct_without_css_utf8() {
+        assert_listing_direct(DirectListingEnv::utf8(), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_reassemble_listing_auth_direct_with_css_utf8() {
+        assert_listing_direct(DirectListingEnv::utf8(), false, true).await;
     }
 }

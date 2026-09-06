@@ -34,7 +34,7 @@ Package/unit green is not field acceptance.
 | **G1** environment | **NOT RUN** | Preflight unit tests exist | No Swift1–4 census from this VM |
 | **G2** build / pipeline | **NOT RUN** | Offline build not executed here | No locked Linux artifact hashes for this commit |
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
-| **G4** Swift functional | **RED** — `1f7c401` vs isolated `:18080`: **549 pass / 47 fail / 54 skip / 0 error**. Not replayed on later SHAs | TempURL `prepare`/`finish` (field 79→1). Staticweb `intercepts_response`/`reassemble_async` is unit-proven only | Do **not** call G4 GREEN. Replay `.functests` on the SHA that includes the staticweb Hyper-path fix |
+| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. Field replay on `5434983`: **556 pass / 40 fail / 54 skip** (staticweb HTML theme 16→8; index + `redirect_slash` closed). Not replayed after the listing±CSS Hyper follow-up | TempURL Hyper path. Staticweb `reassemble_async` index/301 + listing±CSS unit tests (`test_reassemble_listing_*_direct_*`) | Do **not** call G4 GREEN. Remaining field 40 includes the 8 listing±CSS identities until Swift2 replays `.functests` on the SHA that copies `make_env` headers onto listing GETs |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
 | **G6** probe / 179 ledger | **NOT RUN** | Historical W068/W069/W070 GREEN was on `17adf0b`, **not** transferable | Must replay 179 identities once, no retry-to-PASS |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
@@ -79,8 +79,12 @@ runner retry/timeout issues. Replay exactly 179 identities.
    `reassemble_async` serve index, delimiter-`/` HTML listing, 301 slash
    redirect, CSS link, dir-prefix listing, TempURL query on listing hrefs,
    and Python `X-Web-Mode` / `.wsgi.tempurl` gating. `handle()` matches.
-   Field 16 HTML index/listing fails are **not** closed until Swift2
-   replays `.functests` on this SHA. Deferred vs Python: custom web-error
+   Listing subrequests now copy Host / token / `X-Backend-Remote-User`
+   (Python `make_env`), force `Accept: application/json`, and apply
+   `delimiter=/` grouping to flat captured listings. Unit tests cover the
+   8 remaining `listing_{anon,auth}_direct_{with,without}_css` identities
+   (ascii + UTF-8), including dir-marker `GET` and `some sub%dir/` hrefs.
+   Those 8 are **not** field-closed. Deferred vs Python: custom web-error
    documents, domain_remap Host listing titles.
 
 ## How to run full G0–G7
