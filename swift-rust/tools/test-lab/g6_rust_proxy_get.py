@@ -19,8 +19,16 @@ This module is that honesty for the IsolatedIdentity runner:
    and non-durable v2 ``upload_object`` are ``make_request``; both
    rewrite to rust HTTP **with the body**. Do not drop ``body_file``.
 
+Field ``/workspace/rebuild-nondurable-2d774ae/`` (2026-09-06):
+``ProbeBody.read(amount)`` requires a size (``read()`` TypeError), and
+``upload_object`` sets ``Transfer-Encoding: chunked`` without framing.
+A one-shot urllib/http.client send of ~3.5MiB then **BrokenPipe** on
+the eventlet green socket (server closed mid-send). Drain with sized
+reads, make ``Body.read`` file-like, and PUT with ``Content-Length``
+plus chunked socket writes. No ``Expect`` / no unframed chunked TE.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
-Do not reopen gather-bucket chasing for this single-test.
+Do not reopen gather-bucket chasing, lonely_frag, or missing_frags.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
     # IsolatedIdentity must go through this wrapper (or --prepare):
@@ -57,6 +65,12 @@ DEFAULT_CONF_PATHS = (
 
 
 ISOLATED_RUST_PORT_TOKEN = ":18080"
+PUT_SEND_CHUNK = 64 * 1024
+PUT_TIMEOUT_SECS = 120.0
+BODY_READ_CHUNK = 64 * 1024
+HOP_BY_HOP_REQUEST = frozenset(
+    {"content-length", "transfer-encoding", "host", "expect", "connection"}
+)
 PROBE_PATCH_MARKER = "Peregrine G6: IsolatedIdentity rust :18080 must HTTP"
 DEFAULT_OFFICIAL_PROBE = (
     "/root/work/swift-master/test/probe/test_reconstructor_rebuild.py"
@@ -275,17 +289,154 @@ def _header_items(headers: Optional[Mapping[str, Any]]) -> list[tuple[str, str]]
     return out
 
 
-def read_request_body(body_file: Any) -> bytes:
-    """InternalClient.upload_object passes a file-like ProbeBody."""
+def read_request_body(body_file: Any, chunk_size: int = BODY_READ_CHUNK) -> bytes:
+    """Drain InternalClient.upload_object's ProbeBody.
+
+    Official ``test.probe.common.Body.read(amount)`` requires a size.
+    ``read()`` / ``read(-1)`` TypeError (field ``2d774ae``). Do not call
+    ``read(-1)`` on the unpatched class: ``buff[:-1]`` drops a byte.
+    """
     if body_file is None:
         return b""
     if isinstance(body_file, (bytes, bytearray)):
         return bytes(body_file)
     read = getattr(body_file, "read", None)
-    if callable(read):
+    if not callable(read):
+        return b""
+    try:
         data = read()
-        return data if isinstance(data, (bytes, bytearray)) else b""
-    return b""
+    except TypeError:
+        data = None
+    else:
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return b""
+    chunks: list[bytes] = []
+    while True:
+        try:
+            piece = read(chunk_size)
+        except TypeError:
+            try:
+                piece = read(size=chunk_size)
+            except TypeError:
+                break
+        if not piece:
+            break
+        if not isinstance(piece, (bytes, bytearray)):
+            break
+        chunks.append(bytes(piece))
+    return b"".join(chunks)
+
+
+def _wrap_probe_body_read(orig: Callable[..., Any]) -> Callable[..., Any]:
+    """Official ProbeBody.read(amount) → file-like read(size=-1)."""
+
+    def read(self, amount=None, size=None):
+        n = amount if amount is not None else size
+        if n is None or (isinstance(n, int) and n < 0):
+            chunks: list[bytes] = []
+            while True:
+                piece = orig(self, BODY_READ_CHUNK)
+                if not piece:
+                    break
+                chunks.append(piece)
+            return b"".join(chunks)
+        return orig(self, int(n))
+
+    read._g6_filelike_read = True  # type: ignore[attr-defined]
+    read._g6_rust_http_orig = orig  # type: ignore[attr-defined]
+    return read
+
+
+def install_probe_body_read(target: Optional[type] = None) -> bool:
+    """Patch official ProbeBody so read() and read(int) both work."""
+    cls = target
+    if cls is None:
+        try:
+            from test.probe.common import Body as ProbeBody
+        except Exception:
+            return False
+        cls = ProbeBody
+    current = getattr(cls, "read", None)
+    if current is None:
+        return False
+    if getattr(current, "_g6_filelike_read", False):
+        if cls not in _installed_targets:
+            _installed_targets.append(cls)
+        return True
+    cls.read = _wrap_probe_body_read(current)
+    if cls not in _installed_targets:
+        _installed_targets.append(cls)
+    return True
+
+
+def _filter_outgoing_headers(
+    headers: Optional[Mapping[str, Any]],
+) -> list[tuple[str, str]]:
+    """Drop hop-by-hop / framing headers IsolatedIdentity must not forward.
+
+    ``upload_object`` sets ``Transfer-Encoding: chunked`` without chunk
+    framing. Forwarding that with a raw body makes rust Hyper close
+    mid-send (field BrokenPipe on ``:18080``).
+    """
+    out: list[tuple[str, str]] = []
+    for name, value in _header_items(headers):
+        if name.lower() in HOP_BY_HOP_REQUEST:
+            continue
+        out.append((name, value))
+    return out
+
+
+def rust_http_send_body(
+    method: str,
+    url: str,
+    headers: Optional[Mapping[str, Any]],
+    data: bytes,
+    timeout: float = PUT_TIMEOUT_SECS,
+    connection_cls: Optional[type] = None,
+) -> _HttpResp:
+    """PUT/POST to rust :18080 with Content-Length and chunked writes.
+
+    Eventlet green sockets BrokenPipe when urllib/http.client dumps
+    ~3.5MiB in one send while Hyper closes on unframed chunked TE.
+    Content-Length, no Expect, 64KiB sends. Look up HTTPConnection at
+    call time so eventlet.monkey_patch is visible.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    payload = data if data is not None else b""
+    if connection_cls is None:
+        import http.client as http_client
+
+        connection_cls = http_client.HTTPConnection
+    conn = connection_cls(host, port, timeout=timeout)
+    try:
+        conn.putrequest(method.upper(), path, skip_accept_encoding=True)
+        for name, value in _filter_outgoing_headers(headers):
+            conn.putheader(name, value)
+        conn.putheader("Content-Length", str(len(payload)))
+        conn.putheader("Connection", "close")
+        conn.endheaders()
+        view = memoryview(payload)
+        for offset in range(0, len(payload), PUT_SEND_CHUNK):
+            conn.send(view[offset : offset + PUT_SEND_CHUNK])
+        resp = conn.getresponse()
+        body = resp.read()
+        hdrs = {k: v for k, v in resp.getheaders()}
+        return _HttpResp(int(resp.status), hdrs, body)
+    except BrokenPipeError as err:
+        raise RustProxyGetError(
+            f"BrokenPipe PUT {url} ({len(payload)} bytes) to rust :18080: {err}"
+        ) from err
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def rust_http_exchange(
@@ -295,13 +446,26 @@ def rust_http_exchange(
     timeout: float = 30.0,
     opener: Optional[Callable[..., Any]] = None,
     data: Optional[bytes] = None,
+    connection_cls: Optional[type] = None,
 ) -> _HttpResp:
-    payload = data if data else None
-    req = urllib.request.Request(url, data=payload, method=method.upper())
-    for name, value in _header_items(headers):
-        if name.lower() in {"content-length", "transfer-encoding", "host"}:
-            continue
+    method_u = method.upper()
+    payload = data if data else b""
+    if opener is None and (payload or method_u in {"PUT", "POST"}):
+        return rust_http_send_body(
+            method_u,
+            url,
+            headers,
+            payload,
+            timeout=timeout if timeout and timeout > 0 else PUT_TIMEOUT_SECS,
+            connection_cls=connection_cls,
+        )
+    req = urllib.request.Request(
+        url, data=payload or None, method=method_u
+    )
+    for name, value in _filter_outgoing_headers(headers):
         req.add_header(name, value)
+    if payload:
+        req.add_header("Content-Length", str(len(payload)))
     open_url = opener or urllib.request.urlopen
     try:
         with open_url(req, timeout=timeout) as resp:
@@ -336,7 +500,10 @@ def rust_http_make_request(
         merged.setdefault(name, value)
     merged.setdefault("X-Backend-Allow-Reserved-Names", "true")
     url = join_proxy_url(base, path, params)
-    resp = rust_http_exchange(method, url, merged, opener=opener, data=body)
+    timeout = PUT_TIMEOUT_SECS if body or method.upper() in {"PUT", "POST"} else 30.0
+    resp = rust_http_exchange(
+        method, url, merged, timeout=timeout, opener=opener, data=body
+    )
     acceptable = tuple(acceptable_statuses)
     status = resp.status_int
     ok = status in acceptable or (status // 100) in acceptable
@@ -516,7 +683,8 @@ def install_probe_proxy_get(target: Optional[type] = None) -> bool:
 
 def install(target: Optional[type] = None) -> bool:
     """Install swiftclient ``proxy_get`` + fail-closed InternalClient GET."""
-    ok = install_probe_proxy_get()
+    ok = install_probe_body_read()
+    ok = install_probe_proxy_get() or ok
     cls = target
     if cls is None:
         try:
@@ -541,7 +709,7 @@ def install(target: Optional[type] = None) -> bool:
 def uninstall() -> None:
     while _installed_targets:
         cls = _installed_targets.pop()
-        for attr in ("make_request", "proxy_get"):
+        for attr in ("make_request", "proxy_get", "read"):
             current = getattr(cls, attr, None)
             orig = getattr(current, "_g6_rust_http_orig", None)
             if orig is not None:

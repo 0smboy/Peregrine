@@ -4,12 +4,27 @@ from __future__ import annotations
 
 import io
 import os
+import socket
+import threading
 import unittest
 import urllib.error
 from email.message import EmailMessage
 from unittest import mock
 
 import g6_rust_proxy_get as adapter
+
+
+class OfficialProbeBody:
+    """Official test.probe.common.Body.read(amount) — size is required."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+
+    def read(self, amount):
+        chunk = self._data[self._pos : self._pos + amount]
+        self._pos += len(chunk)
+        return chunk
 
 
 EGG_CONF = """
@@ -156,10 +171,119 @@ class HttpAndPatch(unittest.TestCase):
         )
         self.assertEqual(resp.status_int, 201)
 
+    def test_put_sends_content_length_in_chunks_no_expect(self):
+        """Multi-MiB IsolatedIdentity PUT: CL + chunked send, no Expect/TE."""
+        received = {}
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            received["port"] = sock.getsockname()[1]
+            received["ready"].set()
+            conn, _addr = sock.accept()
+            sock.close()
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                head, rest = buf.split(b"\r\n\r\n", 1)
+                lines = head.split(b"\r\n")
+                headers = {}
+                for line in lines[1:]:
+                    if b":" in line:
+                        name, value = line.split(b":", 1)
+                        headers[name.decode("latin1").lower()] = value.strip().decode(
+                            "latin1"
+                        )
+                received["request_line"] = lines[0].decode("latin1")
+                received["headers"] = headers
+                if "transfer-encoding" in headers:
+                    conn.close()
+                    received["closed_on_te"] = True
+                    return
+                length = int(headers.get("content-length", "0"))
+                while len(rest) < length:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    rest += chunk
+                received["body"] = rest[:length]
+                conn.sendall(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            finally:
+                conn.close()
+
+        received["ready"] = threading.Event()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(received["ready"].wait(2), "test server did not bind")
+        payload = os.urandom(int(3.5 * 2**20))
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        resp = adapter.rust_http_exchange(
+            "PUT",
+            f"http://127.0.0.1:{received['port']}/v1/AUTH_ec/c/o",
+            {
+                "Transfer-Encoding": "chunked",
+                "Expect": "100-continue",
+                "x-backend-no-commit": "True",
+            },
+            timeout=30.0,
+            data=payload,
+        )
+        thread.join(2)
+        self.assertEqual(resp.status_int, 201)
+        self.assertNotIn("closed_on_te", received)
+        self.assertEqual(received["body"], payload)
+        headers = received["headers"]
+        self.assertEqual(headers.get("content-length"), str(len(payload)))
+        self.assertNotIn("transfer-encoding", headers)
+        self.assertNotIn("expect", headers)
+        self.assertEqual(headers.get("x-backend-no-commit"), "True")
+        self.assertEqual(headers.get("connection"), "close")
+
     def test_read_request_body_from_fileobj(self):
         self.assertEqual(adapter.read_request_body(None), b"")
         self.assertEqual(adapter.read_request_body(b"abc"), b"abc")
         self.assertEqual(adapter.read_request_body(io.BytesIO(b"probe")), b"probe")
+
+    def test_read_request_body_official_probabody_requires_amount(self):
+        body = OfficialProbeBody(b"v2-non-durable")
+        with self.assertRaises(TypeError):
+            body.read()
+        self.assertEqual(adapter.read_request_body(body), b"v2-non-durable")
+
+    def test_probe_body_read_accepts_int_size_and_optional(self):
+        """Field 2d774ae: ProbeBody.read(amount) TypeError; file-like read(size)."""
+        src = OfficialProbeBody(b"abcdefghij")
+        wrapped = adapter._wrap_probe_body_read(OfficialProbeBody.read)
+        src.read = wrapped.__get__(src, OfficialProbeBody)
+        self.assertEqual(src.read(4), b"abcd")
+        self.assertEqual(src.read(size=2), b"ef")
+        self.assertEqual(src.read(), b"ghij")
+        self.assertEqual(src.read(8), b"")
+
+    def test_install_probe_body_read_patches_class(self):
+        class Body:
+            def __init__(self, data):
+                self._data = data
+                self._pos = 0
+
+            def read(self, amount):
+                chunk = self._data[self._pos : self._pos + amount]
+                self._pos += len(chunk)
+                return chunk
+
+        self.assertTrue(adapter.install_probe_body_read(Body))
+        probe = Body(b"xyz")
+        self.assertEqual(probe.read(2), b"xy")
+        self.assertEqual(probe.read(), b"z")
 
     def test_http_get_200_returns_status_headers_app_iter(self):
         class FakeResp:
@@ -279,6 +403,28 @@ class HttpAndPatch(unittest.TestCase):
         self.assertEqual(seen[0]["body"], b"v2-probe-body")
         self.assertEqual(seen[0]["headers"].get("x-backend-no-commit"), "True")
         self.assertEqual(client.wsgi_calls, [])
+
+    def test_internal_client_put_drains_official_probabody(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        self.assertTrue(adapter.install(DummyInternalClient))
+        client = DummyInternalClient()
+        seen = []
+
+        def fake_http(method, path, headers, acceptable, **kwargs):
+            del path, headers, acceptable
+            seen.append((method, kwargs.get("body")))
+            return adapter._HttpResp(201, {}, b"")
+
+        with mock.patch.object(adapter, "rust_http_make_request", fake_http):
+            resp = client.make_request(
+                "PUT",
+                "/v1/AUTH_ec/probe/obj",
+                {"Transfer-Encoding": "chunked", "x-backend-no-commit": "True"},
+                (2,),
+                body_file=OfficialProbeBody(b"v2-from-probabody"),
+            )
+        self.assertEqual(resp.status_int, 201)
+        self.assertEqual(seen, [("PUT", b"v2-from-probabody")])
 
     def test_non_isolated_put_keeps_original_body_file(self):
         adapter.install(DummyInternalClient)

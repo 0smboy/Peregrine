@@ -162,13 +162,14 @@ reopen `test_rebuild_missing_frags` gather. Next leftover:
 `test_rebuild_quarantines_lonely_frag` field PASS on `3efec7d` + lab
 HEAD honesty (`/workspace/rebuild-lonely-3efec7d-headhttp/`,
 2026-09-06). Do not reopen it. Next leftover:
-`test_rebuild_with_non_durable_newer_data` — after IC
-`upload_object` v2 with `x-backend-no-commit`, durable v1 frag etag
-equaled prefs GET (expected differ). IsolatedIdentity
-`make_request` dropped `body_file`, so v2 never landed on rust.
-Route IC PUT/POST/DELETE (with body) to rust `:18080`. Do **not**
-claim this identity PASS until IsolatedIdentity re-runs the official
-probe on the new SHA.
+`test_rebuild_with_non_durable_newer_data` still FAIL on `2d774ae`
+(`/workspace/rebuild-nondurable-2d774ae/`, 2026-09-06):
+`ProbeBody.read(amount)` TypeError, then lab drain + http.client PUT
+**BrokenPipe** (~3.5MiB, eventlet; rust closed mid-send). Drain with
+sized reads, file-like `Body.read`, PUT with Content-Length + 64KiB
+sends (no Expect / no unframed chunked TE). Do **not** claim this
+identity PASS until IsolatedIdentity re-runs the official probe. Do
+not reopen `test_rebuild_quarantines_lonely_frag`.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080
