@@ -1,5 +1,7 @@
-# IsolatedIdentity adds this directory to PYTHONPATH. When PROXY_BASE_URL
-# contains :18080, rebuild proxy_get must use swiftclient HTTP to rust.
+# IsolatedIdentity adds this directory to PYTHONPATH (g6_isolated_probe.sh
+# does too). When PROXY_BASE_URL contains :18080, rebuild proxy_get must
+# use swiftclient HTTP to rust — apply the lab patch if the official
+# probe file is present, otherwise fail closed.
 try:
     import g6_rust_proxy_get
 except Exception:

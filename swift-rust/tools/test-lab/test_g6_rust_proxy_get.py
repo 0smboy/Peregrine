@@ -256,6 +256,62 @@ class HttpAndPatch(unittest.TestCase):
         self.assertFalse(changed_again)
         self.assertEqual(again, updated)
 
+    def test_guard_ok_when_official_source_already_routes_http(self):
+        official = (
+            adapter.OFFICIAL_PROXY_GET_HEAD
+            + "        status, headers, body = self.int_client.get_object(a, c, o)\n"
+        )
+        patched, _ = adapter.apply_lab_proxy_get_to_source(official)
+        adapter.rust_object_get_guard(
+            environ={"PROXY_BASE_URL": "http://127.0.0.1:18080"},
+            conf_text=EGG_CONF,
+            adapter_installed=False,
+            source_routes_http=adapter.probe_source_routes_rust_http(patched),
+        )
+
+    def test_prepare_rewrites_official_probe_and_is_idempotent(self):
+        import tempfile
+
+        official = (
+            adapter.OFFICIAL_PROXY_GET_HEAD
+            + "        status, headers, body = self.int_client.get_object(a, c, o)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "test_reconstructor_rebuild.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(official)
+            env = {
+                "PROXY_BASE_URL": "http://127.0.0.1:18080",
+                "G6_REBUILD_PROBE_PATH": path,
+            }
+            first = adapter.prepare_isolated_proxy_get(environ=env, probe_path=path)
+            self.assertTrue(first["isolated"])
+            self.assertTrue(first["probe_changed"])
+            self.assertTrue(first["probe_routes_http"])
+            with open(path, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertTrue(adapter.probe_source_routes_rust_http(body))
+            second = adapter.prepare_isolated_proxy_get(environ=env, probe_path=path)
+            self.assertFalse(second["probe_changed"])
+            self.assertTrue(second["probe_routes_http"])
+
+    def test_find_official_probe_prefers_g6_rebuild_probe_path(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as fh:
+            fh.write(b"# probe\n")
+            path = fh.name
+        try:
+            found = adapter.find_official_probe({"G6_REBUILD_PROBE_PATH": path})
+            self.assertEqual(found, path)
+        finally:
+            os.unlink(path)
+
+    def test_prepare_is_noop_without_18080(self):
+        result = adapter.prepare_isolated_proxy_get(environ={})
+        self.assertFalse(result["isolated"])
+        self.assertFalse(result["probe_changed"])
+
 
 if __name__ == "__main__":
     unittest.main()

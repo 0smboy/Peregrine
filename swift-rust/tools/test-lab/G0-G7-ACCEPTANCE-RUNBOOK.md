@@ -140,14 +140,19 @@ token as PUT/POST), `test_rebuild_missing_frags` **PASSED** (rc=0, ~10s,
 30× `G6_DIAG proxy-server: EC GET status=200 reason=ok`). Do **not**
 reopen gather-bucket chasing for this single-test.
 
+IsolatedIdentity **must** launch G6 probes through the harness (not
+bare `pytest` on official `proxy_get`). Evidence
+`/workspace/rebuild-once-988b81b-httpget/` (2026-09-06). This single
+identity is green on rust HTTP for `988b81b`; the G6 179 ledger is
+still **FAIL**. Do not call G6 GREEN.
+
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080
-export PYTHONPATH=/path/to/Peregrine/swift-rust/tools/test-lab:$PYTHONPATH
-# Durable lab file patch (same honesty as bak.httpget-988b81b):
-python3 swift-rust/tools/test-lab/g6_rust_proxy_get.py --apply-probe \
-  /root/work/swift-master/test/probe/test_reconstructor_rebuild.py
-# Runtime wrap + fail-closed if InternalClient GET still runs:
-#   pytest -p g6_rust_proxy_get ...
+# Required IsolatedIdentity entry (apply lab proxy_get + fail closed):
+swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
+  test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_missing_frags -vv
+# Equivalent pre-hook before any other IsolatedIdentity pytest:
+#   python3 swift-rust/tools/test-lab/g6_rust_proxy_get.py --prepare
 #   python3 swift-rust/tools/test-lab/g6_rust_proxy_get.py --check
 ```
 

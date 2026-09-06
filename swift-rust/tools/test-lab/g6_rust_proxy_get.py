@@ -8,21 +8,24 @@ HTTP ``:18080`` (swiftclient, same auth as PUT/POST) that tip **PASSED**
 reason=ok``). Lab patch: if ``PROXY_BASE_URL`` contains ``:18080``,
 ``proxy_get()`` uses ``swiftclient``; else InternalClient.
 
-This module is that honesty for the runner:
+This module is that honesty for the IsolatedIdentity runner:
 
-1. Auto-route ``TestReconstructorRebuild.proxy_get`` the same way.
-2. Optionally rewrite the on-disk probe (``--apply-probe``).
-3. Fail closed if ``:18080`` is set but ``InternalClient.get_object``
-   still runs (no silent ``swift[python-pid]`` assert GETs).
+1. ``--prepare`` / ``g6_isolated_probe.sh`` rewrite official ``proxy_get``
+   when ``PROXY_BASE_URL`` contains ``:18080`` (same as lab
+   ``bak.httpget-988b81b``).
+2. Runtime-wrap ``TestReconstructorRebuild.proxy_get`` the same way.
+3. Fail closed if ``:18080`` is set and GET would still use
+   ``InternalClient`` / ``egg:swift#proxy`` (no silent ``swift[python-pid]``
+   assert GETs). A source file already carrying the ``:18080``
+   swiftclient branch is honest.
 
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 Do not reopen gather-bucket chasing for this single-test.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
-    export PYTHONPATH=/path/to/Peregrine/swift-rust/tools/test-lab:$PYTHONPATH
-    python3 g6_rust_proxy_get.py --apply-probe \\
-        /root/work/swift-master/test/probe/test_reconstructor_rebuild.py
-    pytest -p g6_rust_proxy_get test/probe/test_reconstructor_rebuild.py ...
+    # IsolatedIdentity must go through this wrapper (or --prepare):
+    swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \\
+        test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_missing_frags -vv
 """
 from __future__ import annotations
 
@@ -51,6 +54,11 @@ DEFAULT_CONF_PATHS = (
 
 ISOLATED_RUST_PORT_TOKEN = ":18080"
 PROBE_PATCH_MARKER = "Peregrine G6: IsolatedIdentity rust :18080 must HTTP"
+DEFAULT_OFFICIAL_PROBE = (
+    "/root/work/swift-master/test/probe/test_reconstructor_rebuild.py"
+)
+PROBE_PATH_ENV_KEYS = ("G6_REBUILD_PROBE_PATH", "SWIFT_RECONSTRUCTOR_REBUILD")
+SWIFT_SOURCE_ENV_KEYS = ("SWIFT_SOURCE", "SWIFT_REPO", "SWIFT_MASTER")
 
 OFFICIAL_PROXY_GET_HEAD = """    def proxy_get(self):
         # Use internal-client instead of python-swiftclient, since we can't
@@ -148,10 +156,60 @@ def find_internal_client_conf(
     return None
 
 
+def official_probe_candidates(
+    environ: Optional[Mapping[str, str]] = None,
+) -> list[str]:
+    """Lab official probe, then IsolatedIdentity env overrides."""
+    env = environ if environ is not None else os.environ
+    out: list[str] = []
+    for key in PROBE_PATH_ENV_KEYS:
+        raw = (env.get(key) or "").strip()
+        if raw:
+            out.append(raw)
+    for key in SWIFT_SOURCE_ENV_KEYS:
+        raw = (env.get(key) or "").strip()
+        if raw:
+            out.append(
+                os.path.join(raw, "test/probe/test_reconstructor_rebuild.py")
+            )
+    out.append(DEFAULT_OFFICIAL_PROBE)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for path in out:
+        if path not in seen:
+            seen.add(path)
+            uniq.append(path)
+    return uniq
+
+
+def find_official_probe(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    for path in official_probe_candidates(environ):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def official_probe_routes_rust_http(
+    environ: Optional[Mapping[str, str]] = None,
+    text: Optional[str] = None,
+    path: Optional[str] = None,
+) -> bool:
+    if text is not None:
+        return probe_source_routes_rust_http(text)
+    probe = path or find_official_probe(environ)
+    if not probe:
+        return False
+    with open(probe, encoding="utf-8") as fh:
+        return probe_source_routes_rust_http(fh.read())
+
+
 def rust_object_get_guard(
     environ: Optional[Mapping[str, str]] = None,
     conf_text: Optional[str] = None,
     adapter_installed: Optional[bool] = None,
+    source_routes_http: Optional[bool] = None,
 ) -> None:
     """Fail closed when IsolatedIdentity GETs would still use egg:swift#proxy."""
     env = environ if environ is not None else os.environ
@@ -160,6 +218,13 @@ def rust_object_get_guard(
     base = proxy_base_url(env)
     installed = is_installed() if adapter_installed is None else adapter_installed
     if installed:
+        return
+    routed = (
+        official_probe_routes_rust_http(env)
+        if source_routes_http is None
+        else source_routes_http
+    )
+    if routed:
         return
     text = conf_text
     if text is None:
@@ -172,7 +237,8 @@ def rust_object_get_guard(
     if conf_uses_egg_swift_proxy(text) or text == "":
         raise RustProxyGetError(
             f"PROXY_BASE_URL={base} is set but InternalClient GET still uses "
-            "in-process egg:swift#proxy (adapter not installed). "
+            "in-process egg:swift#proxy (adapter not installed; official "
+            "proxy_get has no :18080 swiftclient branch). "
             "G6 rebuild proxy_get would never hit rust :18080."
         )
 
@@ -443,25 +509,64 @@ def install(target: Optional[type] = None) -> bool:
             if cls not in _installed_targets:
                 _installed_targets.append(cls)
             ok = True
-    rust_object_get_guard(adapter_installed=is_installed())
     return ok
 
 
 def uninstall() -> None:
     while _installed_targets:
         cls = _installed_targets.pop()
-        current = getattr(cls, "make_request", None)
-        orig = getattr(current, "_g6_rust_http_orig", None)
-        if orig is not None:
-            cls.make_request = orig
+        for attr in ("make_request", "proxy_get"):
+            current = getattr(cls, attr, None)
+            orig = getattr(current, "_g6_rust_http_orig", None)
+            if orig is not None:
+                setattr(cls, attr, orig)
+
+
+def prepare_isolated_proxy_get(
+    environ: Optional[Mapping[str, str]] = None,
+    probe_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """IsolatedIdentity entry: apply lab ``proxy_get`` + fail closed.
+
+    When ``PROXY_BASE_URL`` contains ``:18080``, rewrite the official
+    probe if present (same honesty as ``bak.httpget-988b81b``), wrap
+    runtime ``proxy_get``, and refuse ``egg:swift#proxy`` GET unless
+    one of those routes is live.
+    """
+    env = environ if environ is not None else os.environ
+    result: dict[str, Any] = {
+        "proxy_base_url": proxy_base_url(env),
+        "isolated": uses_isolated_rust_proxy(env),
+        "probe_path": None,
+        "probe_changed": False,
+        "probe_routes_http": False,
+        "adapter_installed": False,
+    }
+    if not result["isolated"]:
+        return result
+    path = probe_path or find_official_probe(env)
+    result["probe_path"] = path
+    if path:
+        result["probe_changed"] = apply_lab_proxy_get_to_file(path)
+        result["probe_routes_http"] = official_probe_routes_rust_http(
+            env, path=path
+        )
+    result["adapter_installed"] = install()
+    rust_object_get_guard(
+        environ=env,
+        adapter_installed=is_installed(),
+        source_routes_http=result["probe_routes_http"],
+    )
+    return result
 
 
 def maybe_autostart() -> bool:
-    if not uses_isolated_rust_proxy():
-        return False
-    ok = install()
-    rust_object_get_guard(adapter_installed=is_installed())
-    return ok
+    result = prepare_isolated_proxy_get()
+    return bool(
+        result["adapter_installed"]
+        or result["probe_routes_http"]
+        or not result["isolated"]
+    )
 
 
 def pytest_configure(config):  # noqa: ARG001
@@ -488,9 +593,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="fail closed if PROXY_BASE_URL is set without the rust GET adapter",
+        help="fail closed if :18080 is set without swiftclient proxy_get "
+        "(adapter or already-patched official source)",
     )
     parser.add_argument("--install", action="store_true")
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="IsolatedIdentity hook: apply lab proxy_get + fail closed",
+    )
     parser.add_argument(
         "--apply-probe",
         metavar="PATH",
@@ -502,6 +613,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         changed = apply_lab_proxy_get_to_file(args.apply_probe)
         print(f"apply_probe={args.apply_probe} changed={changed}")
         return 0
+    if args.prepare:
+        result = prepare_isolated_proxy_get()
+        print(
+            "prepare isolated={isolated} PROXY_BASE_URL={proxy_base_url!r} "
+            "probe={probe_path} changed={probe_changed} "
+            "routes_http={probe_routes_http} "
+            "adapter_installed={adapter_installed}".format(**result)
+        )
+        return 0
     if args.install:
         ok = maybe_autostart()
         print(f"adapter_installed={ok} PROXY_BASE_URL={proxy_base_url()!r}")
@@ -509,7 +629,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.check:
         rust_object_get_guard()
         print(
-            f"ok PROXY_BASE_URL={proxy_base_url()!r} adapter_installed={is_installed()}"
+            f"ok PROXY_BASE_URL={proxy_base_url()!r} "
+            f"adapter_installed={is_installed()} "
+            f"probe_routes_http={official_probe_routes_rust_http()}"
         )
         return 0
     parser.print_help()
