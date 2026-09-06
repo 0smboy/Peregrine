@@ -36,6 +36,10 @@ const N: usize = K + M;
 const EC_POLICY: i64 = 1;
 const SEGMENT_SIZE: usize = 1024; // small, to force a multi-segment archive
 
+/// liberasurecode is process-global; two Hyper EC clusters in one test
+/// binary SIGSEGV if they encode at the same time.
+static EC_CLUSTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn hash_cfg() -> swift_core::hashing::HashPathConfig {
     swift_core::hashing::HashPathConfig::new(b"".to_vec(), b"changeme".to_vec()).unwrap()
 }
@@ -288,6 +292,7 @@ fn rmtree_one_durable_hash_dir(obj_dirs: &[PathBuf]) -> PathBuf {
 
 #[test]
 fn test_ec_object_put_get_round_trip_and_fragment_loss() {
+    let _ec = EC_CLUSTER_LOCK.lock().unwrap();
     let tmp = std::env::temp_dir().join(format!("swift-ec-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
@@ -678,6 +683,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
 /// because ndata=4 and five archives remain — including before once.
 #[test]
 fn test_internal_client_get_after_post_and_single_frag_rmtree() {
+    let _ec = EC_CLUSTER_LOCK.lock().unwrap();
     let tmp = std::env::temp_dir().join(format!(
         "swift-ec-rebuild-once-{}-{}",
         std::process::id(),
