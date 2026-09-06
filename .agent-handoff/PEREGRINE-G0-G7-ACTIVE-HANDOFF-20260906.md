@@ -35,7 +35,7 @@ Package/unit green is not field acceptance.
 | **G1** environment | **NOT RUN** | Preflight unit tests exist | No Swift1–4 census from this VM |
 | **G2** build / pipeline | **NOT RUN** | Offline build not executed here | No locked Linux artifact hashes for this commit |
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
-| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / **`668b948` still 556/40/54**. All 8 `listing_*_direct` still fail. Sample: `'Listing of /v1/AUTH_test/<uuid>/' not found in 'index contents'` | TempURL Hyper path. Staticweb now has fail-then-pass tests that reject a raw index-object body (`test_reassemble_listing_direct_ignores_index_bytes_without_web_headers`) | Do **not** call G4 GREEN. The 8 listing identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
+| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: still **8 `listing_*_direct` fails**, but the body is Listing HTML (`<!DOCTYPE html>…<title>Listing of …</title>…<table id="listing">`), not `index contents`. Sample: `'<a href="./174c0506…">…</a>' not found` | TempURL Hyper path. Staticweb listing hrefs now emit official `./{quote(name)}` (45a303c). Fail-then-pass: `test_listing_html_field_object_href_is_dot_slash_quoted_name`, `test_field_listing_direct_href_dot_slash_through_hyper` | Do **not** call G4 GREEN. The 8 listing identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
 | **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4** (was 114/32/29/4). `container_sync` theme **13→2** (`test_sync` + `test_sync_slo_manifest` ERROR). Sync transport fixed. **32 FAIL still open** — likely `reconstructor_rebuild` (~14), reconciler, expirer, sharder | Partner SYNC after `break_nodes` still dialed ring `6010` while isolated object servers listen on `16210`. In-repo now remaps from `SWIFT_DIR/object-server/*.conf`. **Not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
@@ -110,6 +110,16 @@ runner retry/timeout issues. Replay exactly 179 identities.
    the index object. Index-style (`listings=false`) still serves the
    index. **Not** a field replay.
 
+   **Listing href `./` (unit only, after `93bd70c`).** Field on `93bd70c`
+   confirmed the index→listing mode flip: title and `<table id="listing">`
+   exist. Official `_test_listing` still failed looking for
+   `'<a href="./{quote(link)}">{link}</a>'` (OpenStack 45a303c / bug
+   1884285). Rust emitted `href="{quote(shown)}"` with no `./`. In-repo
+   now prefixes object and subdir hrefs with `./` and `%2E`-encodes `.`
+   like Python. CSS stays `quote(css)` / `../{quote(css)}` (no `./`).
+   Parent `../` is unchanged. **Not** a field replay. Do **not** call
+   the 8 identities closed.
+
 ### G4 listing±CSS hypotheses (`668b948` vs official `TestStaticWeb`)
 
 Labelled as hypotheses. Official suite:
@@ -124,6 +134,9 @@ Labelled as hypotheses. Official suite:
 | Auth/Host copy incomplete for TempAuth | **Not the field hole.** `84751c9` score identical to `5434983`. |
 | CSS href vs unit fixtures | **Unlikely for ascii.** Official names are `uuid4().hex`. |
 | staticweb not in isolated pipeline | **Unlikely.** Index/301 would also fail. |
+| Object href missing `./` prefix | **Primary leftover on `93bd70c`.** Title/table exist; official assert is `'<a href="./{uuid}">'`. Fail-then-pass: `test_listing_html_field_object_href_is_dot_slash_quoted_name`. |
+| Empty listing table / parse empty | **Possible secondary.** Same assert fails if no object rows. In-repo grouping + JSON/text parse still emit rows; field replay required. |
+| CSS href form | **Unlikely for uuid.** Official container CSS is `quote(css)` without `./`; dir CSS is `../{css}`. |
 
 Do **not** call the 8 identities closed until `.functests` on a SHA that moves the field score.
 6. **G6 container-sync / reconstructor follow-up (unit only, not GREEN).**

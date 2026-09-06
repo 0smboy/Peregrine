@@ -25,7 +25,11 @@
 //!
 //! The listing HTML structure mirrors Python's (`Listing of …`, a table with
 //! Name/Size/Date columns, a `../` parent row, `subdir` rows, then object rows
-//! carrying `type-<ct>` classes and human-readable sizes). Listing subrequests
+//! carrying `type-<ct>` classes and human-readable sizes). Object and subdir
+//! hrefs use the official `./{quote(name)}` form (45a303c / bug 1884285) so
+//! names like `prefix//obj` become `.//obj`. Dots in those hrefs are `%2E`
+//! like Python `quote(name).replace('.', '%2E')`. CSS stays
+//! `quote(css)` / `../{quote(css)}` with no `./`. Listing subrequests
 //! copy the original request's auth/Host context (Python `make_env`) and force
 //! JSON. Listing subrequests drop `X-Backend-Listing-Out-Content-Type` and set
 //! `X-Backend-Source: staticweb` so Hyper `listing_formats` cannot rewrite the
@@ -121,6 +125,12 @@ fn quote(s: &str) -> String {
     out
 }
 
+/// Official `_listing` href target after 45a303c: `./` + `quote(name)` with
+/// `.` forced to `%2E`, then the TempURL query (already `?…`).
+fn listing_href(shown: &str, tempurl_qs: &str) -> String {
+    format!("./{}{}", quote(shown).replace('.', "%2E"), tempurl_qs)
+}
+
 /// One entry from a container listing (the fields staticweb renders).
 #[derive(Debug, Clone)]
 pub enum ListingItem {
@@ -188,9 +198,8 @@ fn build_listing_html_full(
             let shown = subdir.strip_prefix(prefix).unwrap_or(subdir);
             body.push_str("   <tr class=\"item subdir\">\n");
             body.push_str(&format!(
-                "    <td class=\"colname\"><a href=\"{}{}\">{}</a></td>\n",
-                quote(shown),
-                tempurl_qs,
+                "    <td class=\"colname\"><a href=\"{}\">{}</a></td>\n",
+                listing_href(shown, tempurl_qs),
                 html_escape(shown)
             ));
             body.push_str(
@@ -219,9 +228,8 @@ fn build_listing_html_full(
                 .replace('T', " ");
             body.push_str(&format!("   <tr class=\"item {}\">\n", classes.join(" ")));
             body.push_str(&format!(
-                "    <td class=\"colname\"><a href=\"{}{}\">{}</a></td>\n",
-                quote(shown),
-                tempurl_qs,
+                "    <td class=\"colname\"><a href=\"{}\">{}</a></td>\n",
+                listing_href(shown, tempurl_qs),
                 html_escape(shown)
             ));
             body.push_str(&format!(
@@ -1074,6 +1082,65 @@ mod tests {
             html.contains(r#"<link type="text/css" rel="stylesheet" href="listings.css" />"#),
             "{html}"
         );
+        assert!(
+            !html.contains(r#"href="./listings.css""#),
+            "official _build_css_path does not prefix CSS with ./: {html}"
+        );
+    }
+
+    /// Field G4 on `93bd70c`: title + `<table id="listing">` exist, but
+    /// official `_test_listing` `'<a href="./{quote(link)}">{link}</a>'` is
+    /// missing. Names are `uuid4().hex` (no dots).
+    #[test]
+    fn test_listing_html_field_object_href_is_dot_slash_quoted_name() {
+        let name = "174c0506bc3d4bec986aa2dfb6f49ab3";
+        let items = vec![ListingItem::Object {
+            name: name.into(),
+            content_type: "application/octet-stream".into(),
+            bytes: 4,
+            last_modified: "2026-07-16T00:00:00.0".into(),
+        }];
+        let html = build_listing_html(
+            "/v1/AUTH_test/c7a1e2b3c4d5e6f7a8b9c0d1e2f30415/",
+            "",
+            &items,
+        );
+        assert!(
+            html.contains(
+                "<title>Listing of /v1/AUTH_test/c7a1e2b3c4d5e6f7a8b9c0d1e2f30415/</title>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<table id=\"listing\">"), "{html}");
+        assert!(
+            html.contains(&format!("<a href=\"./{name}\">{name}</a>")),
+            "official listing_*_direct href missing: {html}"
+        );
+        assert!(
+            !html.contains(&format!("<a href=\"{name}\">{name}</a>")),
+            "pre-45a303c href without ./ must not be the object link: {html}"
+        );
+        assert!(
+            html.contains("class=\"item"),
+            "listing table must not be empty: {html}"
+        );
+    }
+
+    /// 45a303c / bug 1884285: listing `prefix/` + object `prefix//obj`
+    /// must link to `.//obj`, not `/obj`.
+    #[test]
+    fn test_listing_html_double_slash_object_uses_dot_slash_href() {
+        let items = vec![ListingItem::Object {
+            name: "prefix//obj".into(),
+            content_type: "text/plain".into(),
+            bytes: 1,
+            last_modified: "2026-07-16T00:00:00.0".into(),
+        }];
+        let html = build_listing_html("/v1/a/c/prefix/", "prefix/", &items);
+        assert!(
+            html.contains("<a href=\".//obj\">/obj</a>"),
+            "double-slash leaf must be ./ + /obj: {html}"
+        );
     }
 
     #[test]
@@ -1090,7 +1157,8 @@ mod tests {
         let html = build_listing_html("/v1/a/c/", "", &items);
         assert!(html.contains("<title>Listing of /v1/a/c/</title>"));
         assert!(html.contains("class=\"item subdir\""));
-        assert!(html.contains("<a href=\"photos/\">photos/</a>"));
+        assert!(html.contains("<a href=\"./photos/\">photos/</a>"));
+        assert!(html.contains("<a href=\"./readme%2Etxt\">readme.txt</a>"));
         assert!(html.contains("class=\"item type-text type-plain\""));
         assert!(html.contains("<td class=\"colsize\">2Ki</td>"));
         assert!(html.contains("<td class=\"coldate\">2026-07-16 12:00:00</td>"));
@@ -1583,8 +1651,14 @@ mod tests {
         quote(s)
     }
 
+    /// Official `_test_listing`: `'<a href="./{0}">{1}</a>'.format(quote(link), link)`.
+    /// Hrefs also `%2E`-encode `.` like Python `quote(name).replace('.', '%2E')`.
     fn python_link(name: &str) -> String {
-        format!("<a href=\"{}\">{}</a>", python_quote(name), name)
+        format!(
+            "<a href=\"./{}\">{}</a>",
+            python_quote(name).replace('.', "%2E"),
+            name
+        )
     }
 
     fn python_css_link(href: &str) -> String {
@@ -1834,7 +1908,7 @@ mod tests {
     /// did that and stayed green.
     ///
     /// Mirrors OpenStack `test_staticweb.py` `_test_listing` assertions:
-    /// `Listing of {unquote(path)}`, `<a href="{quote(link)}">{link}</a>`,
+    /// `Listing of {unquote(path)}`, `<a href="./{quote(link)}">{link}</a>`,
     /// CSS `<link type="text/css" rel="stylesheet" href="{quote(css)}" />`.
     async fn assert_listing_direct_field_pipeline(
         env: DirectListingEnv,
@@ -1895,6 +1969,18 @@ mod tests {
             "title missing in {body}"
         );
         assert!(
+            body.contains("<table id=\"listing\">"),
+            "field 93bd70c table missing: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "<a href=\"./{}\">{}</a>",
+                python_quote(&index),
+                index
+            )),
+            "field 93bd70c official './{{quote(link)}}' object href missing: {body}"
+        );
+        assert!(
             body.contains(&python_link(&index)),
             "index link missing: {body}"
         );
@@ -1910,6 +1996,10 @@ mod tests {
             assert!(
                 body.contains(&python_css_link(&css_name)),
                 "container CSS missing: {body}"
+            );
+            assert!(
+                !body.contains(&format!("href=\"./{css_name}\"")),
+                "official container CSS has no ./ prefix: {body}"
             );
         } else {
             assert!(
@@ -1939,6 +2029,18 @@ mod tests {
             "dir title missing in {body}"
         );
         assert!(
+            body.contains("<table id=\"listing\">"),
+            "field 93bd70c dir table missing: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "<a href=\"./{}\">{}</a>",
+                python_quote(&dir_obj_leaf),
+                dir_obj_leaf
+            )),
+            "field 93bd70c dir './{{quote(link)}}' href missing: {body}"
+        );
+        assert!(
             body.contains(&python_link(&dir_obj_leaf)),
             "dir obj link missing: {body}"
         );
@@ -1961,6 +2063,15 @@ mod tests {
                 "dir CSS missing: {body}"
             );
         }
+    }
+
+    /// Field G4 on `93bd70c`: Listing HTML is already the mode (title +
+    /// table), but official `'<a href="./{uuid}">{uuid}</a>'` is absent.
+    #[tokio::test]
+    async fn test_field_listing_direct_href_dot_slash_through_hyper() {
+        let mut env = DirectListingEnv::field_ascii();
+        env.index = "174c0506bc3d4bec986aa2dfb6f49ab3".into();
+        assert_listing_direct_field_pipeline(env, true, true).await;
     }
 
     #[tokio::test]
@@ -2142,6 +2253,10 @@ mod tests {
             body.contains(&format!("Listing of {container_path}")),
             "official _test_listing expects Listing of {container_path} in body, got {body:?}"
         );
+        assert!(
+            body.contains("<table id=\"listing\">"),
+            "field 93bd70c: title without table: {body:?}"
+        );
         assert_ne!(
             body.trim(),
             INDEX_OBJECT_BYTES,
@@ -2150,6 +2265,10 @@ mod tests {
         assert_ne!(
             body, INDEX_OBJECT_BYTES,
             "body must not equal the index object content"
+        );
+        assert!(
+            body.contains(&format!("<a href=\"./{index}\">{index}</a>")),
+            "field 93bd70c official './{{name}}' href missing: {body}"
         );
         assert!(
             body.contains(&python_link(index)),
