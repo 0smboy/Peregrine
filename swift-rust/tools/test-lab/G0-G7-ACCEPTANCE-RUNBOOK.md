@@ -148,9 +148,12 @@ strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|
 awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
 # ca2081b: suffix_syncs>0 and rebuilt=0 is reconstruct_fa skip, not overlay
 # 57b7456: SSYNC/REPLICATE 507/503 before reconstruct_fa; INFO was blind
-awk '/mount_check|fallocate_reserve|devices|bind_port/' /etc/g6-rust/object-server/*.conf
+awk '/mount_check|disable_fallocate|fallocate_reserve|devices|bind_port|^\[' \
+  /etc/g6-rust/object-server/*.conf
+# effective parse (not the file text): must show mount_check=false
+grep -E 'swift-object-server: devices=|mount_check=' \
+  /var/log/g6-rust/object-*.log | tail
 df -h /srv/1/node /dev/sda4
-find /srv/*/node -maxdepth 2 -name .ismount
 grep -E 'reconstruct_fa|got 507|got 503|Drive:|unmounted|object-reconstructor:' \
   /var/log/g6-rust/*/object-reconstructor*.log | tail
 ```

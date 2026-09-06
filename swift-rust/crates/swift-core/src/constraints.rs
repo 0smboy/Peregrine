@@ -654,6 +654,13 @@ auto_create_account_prefix = !
         );
         // existing dir passes check_dir
         assert_eq!(check_dir(&tmp, "sdb1").unwrap(), tmp.join("sdb1"));
+        // Field G6: isolated devices are plain dirs; mount_check=false
+        // must accept them (REPLICATE/SSYNC check_drive).
+        assert_eq!(
+            check_drive(&tmp, "sdb1", false).unwrap(),
+            tmp.join("sdb1"),
+            "mount_check=false must accept a plain device directory"
+        );
         // missing dir fails
         assert!(check_dir(&tmp, "nope")
             .unwrap_err()

@@ -323,10 +323,7 @@ impl ObjectListenOverlay {
 }
 
 fn conf_get(conf: &SwiftConfig, key: &str) -> Option<String> {
-    conf.get("app:object-server", key)
-        .ok()
-        .flatten()
-        .or_else(|| conf.get("DEFAULT", key).ok().flatten())
+    crate::object_server_conf::object_server_conf_get(conf, key)
 }
 
 fn conf_bind_port(conf: &SwiftConfig) -> Option<u32> {

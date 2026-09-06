@@ -117,3 +117,35 @@ fn mount_check_false_allows_a_plain_saio_device_directory() {
     let delete = server.handle(request("DELETE", "3", b""));
     assert_eq!(delete.status, 204);
 }
+
+#[test]
+fn replicate_and_ssync_accept_a_plain_dir_when_mount_check_is_false() {
+    let devices = TestDevices::new("replicate-plain");
+    std::fs::create_dir_all(devices.path().join("sdb6")).unwrap();
+    let server = server(devices.path(), false);
+    let replicate = server.handle(Request {
+        method: "REPLICATE".into(),
+        path: "/sdb6/400".into(),
+        query_string: String::new(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    });
+    assert_eq!(
+        replicate.status, 200,
+        "REPLICATE check_drive must accept a plain dir when mount_check=false, got {}",
+        replicate.reason
+    );
+
+    let ssync = server.handle(Request {
+        method: "SSYNC".into(),
+        path: "/sdb6/400".into(),
+        query_string: String::new(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    });
+    assert_ne!(
+        ssync.status, 507,
+        "SSYNC check_drive must not 507 a plain dir when mount_check=false, got {} {:?}",
+        ssync.status, ssync.reason
+    );
+}

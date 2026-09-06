@@ -32,6 +32,7 @@ use std::pin::Pin;
 pub mod daemonutil;
 pub mod expirer;
 pub mod localdev;
+pub mod object_server_conf;
 pub mod reconstruction_spool;
 /// The EC object reconstructor: ssync-driven SYNC/REVERT partition jobs
 /// (feature-independent) plus the fragment rebuild path, which links
@@ -7106,6 +7107,38 @@ mod fallocate_reserve_tests {
         // a tiny reserve passes and the object lands
         let ok = tiny_server(&dir, FallocateReserve::Bytes(1));
         assert_eq!(ok.handle(put_request(b"body")).status, 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replicate_accepts_plain_dir_when_mount_check_is_false() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-mc-false-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sdb6")).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(Vec::new(), b"mc-false-repl".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(0, PolicyKind::Replication)]),
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: ContainerUpdateMode::Sync,
+        });
+        let resp = server.handle(Request {
+            method: "REPLICATE".into(),
+            path: "/sdb6/400".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        });
+        assert_eq!(
+            resp.status, 200,
+            "field g6-rust: mount_check=false must not 507 REPLICATE on a plain dir"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

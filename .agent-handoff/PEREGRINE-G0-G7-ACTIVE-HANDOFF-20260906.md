@@ -311,13 +311,17 @@ Do **not** re-fix listen overlay or CSS. Do **not** call G6 GREEN.
    `ca2081b` were already remapped (`16220/sdb6#2`).
 5. Manager binary same isolated rust bin, conf under
    `/etc/g6-rust/object-server/*.conf`.
-6. Swift1 disk: `df -h /srv/1/node /dev/sda4`. Confirm
-   `mount_check` / `fallocate_reserve` in
-   `/etc/g6-rust/object-server/*.conf`. Isolated dirs on a shared root
-   need `mount_check=false` (SAIO) or a `.ismount` stub — do **not**
-   set reserve to 0. After this SHA, `mount_check=true` without a mount
-   logs a startup warning and 507s with `Drive: <device>` /
-   `X-Backend-No-Space-Reason: unmounted`.
+6. Field already has `mount_check = false` and `disable_fallocate =
+   true` in `/etc/g6-rust/object-server/{1..4}.conf`; devices are plain
+   dirs (no `.ismount`). Do **not** tell operators to set those again.
+   `57b7456` 507 + empty `Drive:` is then either (a) conf lookup that
+   only read `[app:object-server]`/`[DEFAULT]` and missed
+   `[object-server]`, or (b) a non-check_drive 507 (`swob_response`
+   empty Drive). After this SHA, startup INFO logs the **effective**
+   `devices` / `mount_check` / `disable_fallocate`. Grep
+   `swift-object-server: devices=`. `[object-server]`-only
+   `mount_check=false` now loads. `disable_fallocate=true` zeroes the
+   reserve check (Python). Do **not** set reserve to 0 by hand.
 
 ## How to run full G0–G7
 
