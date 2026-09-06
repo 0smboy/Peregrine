@@ -150,6 +150,74 @@ pub trait FragmentFetcher {
     }
 }
 
+/// Remap peer `RingDevice` ports before a fragment GET so isolated listen
+/// ports (`16210`) are used instead of the ring port (`6010`).
+pub struct OverlayFragmentFetcher<'a> {
+    pub inner: &'a dyn FragmentFetcher,
+    pub overlay: &'a crate::localdev::ObjectListenOverlay,
+}
+
+impl FragmentFetcher for OverlayFragmentFetcher<'_> {
+    fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+        self.inner.reconstruction_spool()
+    }
+
+    fn fetch(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) -> Option<FetchedFragment> {
+        self.inner.fetch(
+            &self.overlay.remap_device(node),
+            partition,
+            account,
+            container,
+            object,
+        )
+    }
+
+    fn fetch_at(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Option<FetchedFragment> {
+        self.inner.fetch_at(
+            &self.overlay.remap_device(node),
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        )
+    }
+
+    fn fetch_at_checked(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Result<Option<FetchedFragment>, String> {
+        self.inner.fetch_at_checked(
+            &self.overlay.remap_device(node),
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        )
+    }
+}
+
 /// One object whose local fragment must be rebuilt.
 #[derive(Debug, Clone)]
 pub struct ReconstructJob {
@@ -1512,6 +1580,14 @@ fn ssync_node(dev: &RingDevice, backend_index: i64) -> SsyncNode {
         replication_port: dev.replication_port.unwrap_or(dev.port),
         device: dev.device.clone(),
         backend_index: Some(backend_index),
+    }
+}
+
+/// Rewrite SYNC/REVERT partner ports after `build_part_jobs` so isolated
+/// remaps (`6010` → `16210`) reach the object server `break_nodes` emptied.
+pub fn apply_listen_overlay(job: &mut EcPartJob, overlay: &crate::localdev::ObjectListenOverlay) {
+    for node in job.sync_to.iter_mut().chain(job.sync_handoffs.iter_mut()) {
+        node.replication_port = overlay.listen_port(&node.device, node.replication_port);
     }
 }
 
@@ -4065,6 +4141,131 @@ mod suffix_sync_tests {
         assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
         assert_eq!(stats.failures, 0, "{stats:?}");
         let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Official `break_nodes` `rmtree`s the victim partition. Isolated rings
+    /// still advertise `6010` while the object server listens on `16210`.
+    /// Without the SWIFT_DIR overlay, REPLICATE to the ring port is skipped
+    /// (`SuffixSyncError::Failed`) and the partner never SSYNCs.
+    #[test]
+    fn test_break_nodes_partner_sync_uses_listen_overlay_not_ring_port() {
+        let devices = tmp_root("break-nodes-overlay");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+
+        // Victim partition is gone (break_nodes). Listen port is 16210;
+        // ring still says 6010.
+        let listen_port = 16210u32;
+        let ring_port = 6010u32;
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(listen_port, hashes_value(&[("abc", &[])]))]),
+        };
+        let pusher = RecordingPusher::default();
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+
+        let mut job = sync_job(&part_path, &["abc"], vec![node(ring_port, 2)]);
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert!(
+            pusher.pushes.borrow().is_empty(),
+            "ring port 6010 must not reach the isolated listen port: {stats:?}"
+        );
+        assert_eq!(stats.suffix_syncs, 0, "{stats:?}");
+
+        let mut overlay = crate::localdev::ObjectListenOverlay::empty();
+        overlay.insert("sda1", listen_port);
+        apply_listen_overlay(&mut job, &overlay);
+        assert_eq!(job.sync_to[0].replication_port, listen_port);
+
+        stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(
+            *pusher.pushes.borrow(),
+            vec![(listen_port, vec!["abc".to_string()])],
+            "overlay must SSYNC the emptied victim at the listen port"
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_overlay_fragment_fetcher_rewrites_peer_ring_port() {
+        struct PortRecordingFetcher {
+            seen: std::cell::RefCell<Vec<u32>>,
+        }
+        impl FragmentFetcher for PortRecordingFetcher {
+            fn fetch(
+                &self,
+                node: &RingDevice,
+                _partition: u64,
+                _account: &str,
+                _container: &str,
+                _object: &str,
+            ) -> Option<FetchedFragment> {
+                self.seen
+                    .borrow_mut()
+                    .push(node.replication_port.unwrap_or(node.port));
+                None
+            }
+        }
+        let inner = PortRecordingFetcher {
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut overlay = crate::localdev::ObjectListenOverlay::empty();
+        overlay.insert("d1", 16210);
+        let wrapped = OverlayFragmentFetcher {
+            inner: &inner,
+            overlay: &overlay,
+        };
+        let peer = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "10.0.0.2".into(),
+            port: 6010,
+            replication_ip: None,
+            replication_port: None,
+            device: "d1".into(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let _ = wrapped.fetch(&peer, 0, "a", "c", "o");
+        assert_eq!(
+            *inner.seen.borrow(),
+            vec![16210],
+            "reconstruct_fa peer GET must not dial the ring port"
+        );
     }
 
     // ---- REVERT: partition lock ------------------------------------------

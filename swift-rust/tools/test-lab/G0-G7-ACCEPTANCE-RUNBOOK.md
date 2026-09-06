@@ -112,13 +112,11 @@ Replay the frozen official lists on `$CANDIDATE` only:
 
 Do not import W068/W069/W070 hashes from `17adf0b`.
 
-Field G6 on `1e1c515` was **114 PASS / 32 FAIL / 29 ERROR / 4 SKIP**
-(same as `1f7c401`; `f84ac71` was 115/31). Themes still open:
-`container_sync` 13, `reconstructor_rebuild` 14. Only
-`test_delete_propagate` ever moved PASS. That is **FAIL**, not GREEN.
-`PROXY_BASE_URL=http://127.0.0.1:18080` was set; the miss is source GET
-**transport** (URL/kind were not logged). After this SHA grep
-`kind=` + `proxy_base=` in the same file as the failures.
+Field G6 on **`3d662b1` is 123 PASS / 32 FAIL / 20 ERROR / 4 SKIP**
+(was 114/32/29/4). `container_sync` theme **13→2** (only `test_sync` +
+`test_sync_slo_manifest` ERROR). Sync transport is fixed. **32 FAIL**
+remain — dominant leftover is likely `reconstructor_rebuild` (~14),
+plus reconciler / expirer / sharder. That is **FAIL**, not GREEN.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:
@@ -137,18 +135,20 @@ grep -E 'kind=' /var/log/g6-rust/*/container-sync*.log | tail
 # IsolatedIdentity /etc/g6-rust/proxy-server.conf bind_port
 awk '/bind_(ip|port)/' /etc/g6-rust/proxy-server.conf
 
-# reconstructor: features ec + ring identity
+# reconstructor: features ec + ring identity + listen overlay
 strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|reconstruct'
 # bind_port vs EC ring port; servers_per_port
 awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
-# suffix_syncs=0 means every device was skipped
-grep -E 'suffix_syncs=|skipping device|no ring identity' \
+# suffix_syncs=0 means identity skip OR partner still dials ring 6010
+grep -E 'suffix_syncs=|skipping device|no ring identity|listen overlay' \
   /var/log/g6-rust/*/object-reconstructor*.log | tail
 ```
 
 Do not treat empty-fragment `discover_jobs` skips as a bug: probe
 `break_nodes` deletes the victim hash dir; heal is partner SYNC +
-`reconstruct_fa`, which requires `--features ec`.
+`reconstruct_fa` **to the isolated listen port** (`16210`…), which
+requires `--features ec` and a readable `SWIFT_DIR/object-server/*.conf`
+overlay. Do **not** call G6 GREEN from unit tests.
 
 ## 7. G7 physical matrix
 

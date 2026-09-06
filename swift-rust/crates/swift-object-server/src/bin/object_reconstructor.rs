@@ -247,6 +247,14 @@ fn main() {
     let hash_fetcher = HttpSuffixHashFetcher::default();
     let stop = swift_http::install_sigterm_flag();
     let devices_path = std::path::PathBuf::from(&devices);
+    let listen_overlay =
+        swift_object_server::localdev::ObjectListenOverlay::from_swift_dir(Path::new(&swift_dir));
+    if !listen_overlay.is_empty() {
+        logger.info(&format!(
+            "object-reconstructor: listen overlay from {swift_dir} \
+             (partner REPLICATE/SSYNC uses isolated bind_port, not ring port)"
+        ));
+    }
 
     logger.info(&format!(
         "swift-object-reconstructor: devices={devices} bind_port={bind_port} \
@@ -270,6 +278,7 @@ fn main() {
                 spool.as_ref(),
                 &pusher,
                 &hash_fetcher,
+                &listen_overlay,
                 &logger,
                 &mut total,
             );
@@ -333,6 +342,7 @@ fn sweep_policy(
     spool: Option<&SpoolBudget>,
     pusher: &TcpSsyncPusher,
     hash_fetcher: &HttpSuffixHashFetcher,
+    listen_overlay: &swift_object_server::localdev::ObjectListenOverlay,
     logger: &Logger,
     total: &mut EcSsyncStats,
 ) {
@@ -390,7 +400,7 @@ fn sweep_policy(
                 total.failures += 1;
                 continue;
             };
-            let jobs = build_part_jobs(
+            let mut jobs = build_part_jobs(
                 &part_path,
                 partition,
                 dev_name,
@@ -402,6 +412,9 @@ fn sweep_policy(
                 local_id,
                 Some(policy.scheme),
             );
+            for job in &mut jobs {
+                swift_object_server::reconstructor::apply_listen_overlay(job, listen_overlay);
+            }
             // SYNC jobs rebuild fragments on the fly at the partner's
             // backend index (reconstruct_fa): sources are this partition's
             // primaries — the coherence + local-timestamp checks discard a
@@ -409,8 +422,10 @@ fn sweep_policy(
             // (no codec) there is no rebuilder and mismatched fragments
             // are skipped, as before.
             #[cfg(feature = "ec")]
-            let peers: Vec<swift_ring::RingDevice> =
-                part_nodes.iter().map(|pn| pn.dev.clone()).collect();
+            let peers: Vec<swift_ring::RingDevice> = part_nodes
+                .iter()
+                .map(|pn| listen_overlay.remap_device(pn.dev))
+                .collect();
             #[cfg(feature = "ec")]
             let frag_fetcher = swift_object_server::reconstructor::HttpFragmentFetcher {
                 policy_index: policy.index,
@@ -481,6 +496,10 @@ fn sweep_policy(
                 spool: Some(spool_budget.clone()),
                 ..Default::default()
             };
+            let overlay_fetcher = swift_object_server::reconstructor::OverlayFragmentFetcher {
+                inner: &frag_fetcher,
+                overlay: listen_overlay,
+            };
             let rebuilt = reconstruct_missing(
                 &device_path,
                 policy.index,
@@ -491,7 +510,7 @@ fn sweep_policy(
                 &dev.device,
                 hash_config,
                 diskfile_config,
-                &frag_fetcher,
+                &overlay_fetcher,
             );
             total.rebuilt += rebuilt.rebuilt;
             total.failures += rebuilt.failed;

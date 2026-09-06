@@ -867,3 +867,111 @@ fn suffix_delta_fires_against_an_emptied_victim_partition() {
         "the lost fragment's suffix must be flagged"
     );
 }
+
+/// Official `break_nodes` deletes the whole partition (`shutil.rmtree`).
+/// Isolated rings keep `6010` while the victim listens elsewhere. REPLICATE
+/// to the ring port must fail closed; the SWIFT_DIR overlay must flag the
+/// suffix so partner SYNC can reconstruct_fa onto the emptied node.
+#[test]
+fn break_nodes_rmtree_suffix_delta_uses_listen_overlay() {
+    use swift_object_server::localdev::ObjectListenOverlay;
+    use swift_object_server::reconstructor::{apply_listen_overlay, get_suffixes_to_sync};
+
+    let partner = TestTree::new("bn-partner");
+    let victim = TestTree::new("bn-victim");
+    let partition = 7u64;
+    let ts = "1700000800.00000";
+    put_fragment(
+        &object_server(&partner.root),
+        partition,
+        "obj",
+        ts,
+        3,
+        b"partner frag 3",
+    );
+    put_fragment(
+        &object_server(&victim.root),
+        partition,
+        "obj",
+        ts,
+        2,
+        b"victim frag 2",
+    );
+    let part_dir = victim
+        .root
+        .join("sda1")
+        .join(get_data_dir(EC_POLICY))
+        .join(partition.to_string());
+    std::fs::remove_dir_all(&part_dir).unwrap();
+    assert!(!part_dir.exists(), "break_nodes deletes the partition");
+
+    let address = spawn_server(&victim.root);
+    let partner_part = partner
+        .root
+        .join("sda1")
+        .join(get_data_dir(EC_POLICY))
+        .join(partition.to_string());
+    let object_hash = hash_config()
+        .hash_path("a", Some("c"), Some("obj"))
+        .unwrap();
+    let suffix = object_hash[object_hash.len() - 3..].to_string();
+
+    let ring_node = SsyncNode {
+        replication_ip: address.ip().to_string(),
+        replication_port: 6010,
+        device: "sda1".to_string(),
+        backend_index: Some(2),
+    };
+    let ring_miss = get_suffixes_to_sync(
+        &partner_part,
+        partition,
+        ec_kind(),
+        EC_POLICY,
+        &DiskFileConfig::default().cleanup,
+        Some(3),
+        &ring_node,
+        &HttpSuffixHashFetcher::default(),
+    );
+    assert!(
+        ring_miss.is_err(),
+        "REPLICATE to ring port 6010 must not see the isolated listener"
+    );
+
+    let mut overlay = ObjectListenOverlay::empty();
+    overlay.insert("sda1", address.port() as u32);
+    let mut job_node = ring_node;
+    let mut job = {
+        use swift_object_server::reconstructor::{EcJobType, EcPartJob};
+        EcPartJob {
+            job_type: EcJobType::Sync,
+            frag_index: Some(3),
+            suffixes: vec![suffix.clone()],
+            sync_to: vec![job_node.clone()],
+            sync_handoffs: Vec::new(),
+            partition,
+            path: partner_part.clone(),
+            device: "sda1".into(),
+            primary_frag_index: Some(3),
+        }
+    };
+    apply_listen_overlay(&mut job, &overlay);
+    job_node = job.sync_to[0].clone();
+    assert_eq!(job_node.replication_port, address.port() as u32);
+
+    let suffixes = get_suffixes_to_sync(
+        &partner_part,
+        partition,
+        ec_kind(),
+        EC_POLICY,
+        &DiskFileConfig::default().cleanup,
+        Some(3),
+        &job_node,
+        &HttpSuffixHashFetcher::default(),
+    )
+    .expect("overlay REPLICATE must reach the emptied victim");
+    assert_eq!(
+        suffixes,
+        vec![suffix],
+        "rmtree'd partition is an empty hash dict; the suffix must sync"
+    );
+}

@@ -37,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / **`668b948` still 556/40/54**. All 8 `listing_*_direct` still fail. Sample: `'Listing of /v1/AUTH_test/<uuid>/' not found in 'index contents'` | TempURL Hyper path. Staticweb now has fail-then-pass tests that reject a raw index-object body (`test_reassemble_listing_direct_ignores_index_bytes_without_web_headers`) | Do **not** call G4 GREEN. The 8 listing identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. `f84ac71`: **115/31/29/4**. Field on `1e1c515`: **114/32/29/4** — **no improvement**. `container_sync` still **13**. Logs: `PROXY_BASE_URL=http://127.0.0.1:18080` was set; `source GET transport failure` ×24; **no** `internal_url=` in those files | `internal_url=` was syslog-only; transport `eprintln` swallowed URL/kind. In-repo now logs both on stderr and stops a stale conf URL from ignoring `PROXY_BASE_URL`. **Not** a field replay. Do **not** call G6 GREEN |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4** (was 114/32/29/4). `container_sync` theme **13→2** (`test_sync` + `test_sync_slo_manifest` ERROR). Sync transport fixed. **32 FAIL still open** — likely `reconstructor_rebuild` (~14), reconciler, expirer, sharder | Partner SYNC after `break_nodes` still dialed ring `6010` while isolated object servers listen on `16210`. In-repo now remaps from `SWIFT_DIR/object-server/*.conf`. **Not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -200,6 +200,15 @@ device when `servers_per_port=0` and conf `bind_port` (`16210` …) ≠
 ring port (`6010`). In-repo now falls back to local IP + device name
 (`resolve_ring_device_id`). Still requires a local interface address.
 
+After identity fallback, REPLICATE / SSYNC / fragment GET still used
+the **ring port**. Isolated listeners are `16210`…. Fail-then-pass:
+`test_break_nodes_partner_sync_uses_listen_overlay_not_ring_port` and
+`break_nodes_rmtree_suffix_delta_uses_listen_overlay`. Daemon loads
+`ObjectListenOverlay` from `SWIFT_DIR/object-server/*.conf` (device
+dir → `bind_port`; a single unique bind_port also remaps unmapped
+remote partners). Log line: `listen overlay from …`. **`--features ec`
+is still required** for `reconstruct_fa`. This is not a field replay.
+
 ### Exact Swift2 / Swift1 checks (environmental — do not fake)
 
 **container_sync**
@@ -232,11 +241,13 @@ ring port (`6010`). In-repo now falls back to local IP + device name
 2. Conf `devices` + `bind_port` vs **EC ring** `ip/port/device`;
    `servers_per_port`.
 3. Pass log: `suffix_syncs` / `rebuilt` / `failures`.
-   `suffix_syncs=0` ⇒ identity skip. After this SHA a remapped-port
-   skip should log
-   `skipping device …: no ring identity`.
+   `suffix_syncs=0` ⇒ identity skip **or** partner REPLICATE still
+   hitting ring `6010`. After this SHA expect
+   `listen overlay from /etc/g6-rust` and
+   `skipping device …: no ring identity` only when the dir is not local.
 4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
-   correctly empty; heal must be partner `reconstruct_fa`.
+   correctly empty; heal must be partner `reconstruct_fa` **to the
+   isolated listen port**, not the ring port.
 5. Manager binary same isolated rust bin, conf under
    `/etc/g6-rust/object-server/*.conf`.
 
