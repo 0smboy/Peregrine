@@ -1070,21 +1070,21 @@ impl IncomingBody {
     /// teed into a destination PUT without materializing the object).
     ///
     /// Legacy raw-channel adapter: the receiver cannot observe allocations
-    /// owned by senders or queued payload lengths. Its historical declared-
-    /// length accounting is NOT evidence of a streaming memory bound. New
-    /// request producers must use [`Self::metered_channel`]; COPY adapters
-    /// need a metered response-body handoff before this can be removed.
+    /// owned by senders or queued payload lengths.
+    ///
+    /// Content-Length is protocol metadata only. This constructor must not
+    /// charge `request_body_buffer_bytes` with the declared object length —
+    /// that number is not memory occupancy. New request producers must use
+    /// [`Self::metered_channel`]. COPY adapters still use this until a
+    /// metered response-body handoff exists; their occupancy is therefore
+    /// uncounted, not falsely counted as the whole object.
     pub fn from_channel(
         rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
         content_length: Option<u64>,
         scope: Option<swift_runtime::TaskScope>,
         max_body: u64,
     ) -> Self {
-        let buffered = content_length.unwrap_or(0) as usize;
         let metrics = ConcurrencyMetrics::current();
-        if let Some(ref m) = metrics {
-            m.add_request_body_buffer(buffered as i64);
-        }
         Self {
             inner: IncomingInner::Channel {
                 rx,
@@ -1097,7 +1097,7 @@ impl IncomingBody {
             upload_lifetime: None,
             on_upgrade: None,
             metrics,
-            buffered,
+            buffered: 0,
             channel_inflight: None,
             async_interim: None,
         }
@@ -2470,6 +2470,35 @@ mod tests {
     use crate::body::body_too_large;
     use std::net::Shutdown;
     use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn from_channel_does_not_charge_declared_object_length() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let baseline = IncomingBody::from_bytes(vec![0; 37], u64::MAX);
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
+                let declared = 64 * 1024 * 1024;
+                let mut body = IncomingBody::from_channel(rx, Some(declared), None, u64::MAX);
+                assert_eq!(body.content_length(), Some(declared));
+                assert_eq!(
+                    metrics.snapshot().request_body_buffer_bytes,
+                    37,
+                    "Content-Length is not memory occupancy"
+                );
+                tx.send(Ok(vec![7; 19])).await.unwrap();
+                let chunk = body.next_chunk().await.unwrap().unwrap();
+                assert_eq!(chunk, vec![7; 19]);
+                assert_eq!(
+                    metrics.snapshot().request_body_buffer_bytes,
+                    37,
+                    "legacy channel occupancy stays uncounted, not object-sized"
+                );
+                drop((baseline, body, tx));
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn metered_incoming_counts_allocations_not_declared_length() {

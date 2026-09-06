@@ -114,6 +114,72 @@ class G7FailClosedClassification(unittest.TestCase):
         result = self.classify("eio", raw, target=1)
         self.assertEqual(result["verdict"], "NOT RUN")
 
+    def test_fd_exhaust_without_injection_is_fail(self):
+        raw = {**raw_base(1, health=True), "fd_info": "12 files"}
+        result = self.classify("fd_exhaust", raw, target=1)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertIn("fd exhaustion", result["reason"])
+
+    def test_ssync_interrupt_requires_injection_and_error_ack(self):
+        raw = {
+            **raw_base(1),
+            "fault_armed": True,
+            "fault_hits": 1,
+            "success_ack": False,
+            "error_ack": True,
+            "tmp_count": 0,
+            "committed_objects": 0,
+        }
+        result = self.classify("ssync_interrupt", raw, target=1)
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_ssync_interrupt_success_ack_is_fail(self):
+        raw = {
+            **raw_base(1),
+            "fault_armed": True,
+            "fault_hits": 1,
+            "success_ack": True,
+            "error_ack": False,
+            "tmp_count": 0,
+            "committed_objects": 0,
+        }
+        result = self.classify("ssync_interrupt", raw, target=1)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertIn("success-acknowledged", result["reason"])
+
+    def test_ssync_interrupt_without_injection_is_fail(self):
+        raw = {**raw_base(1), "tmp_count": 0, "committed_objects": 0}
+        result = self.classify("ssync_interrupt", raw, target=1)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertIn("not injected", result["reason"])
+
+    def test_ec_fragment_loss_requires_removal_and_matching_get(self):
+        raw = {
+            **raw_base(1, health=True),
+            "fault_armed": True,
+            "fault_hits": 1,
+            "fragments_removed": 1,
+            "put_status": 201,
+            "get_after": 200,
+            "body_match": True,
+        }
+        result = self.classify("ec_fragment_loss", raw, target=1)
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_ec_fragment_loss_without_removal_is_fail(self):
+        raw = {
+            **raw_base(1, health=True),
+            "fault_armed": True,
+            "fault_hits": 1,
+            "fragments_removed": 0,
+            "put_status": 201,
+            "get_after": 200,
+            "body_match": True,
+        }
+        result = self.classify("ec_fragment_loss", raw, target=1)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertIn("fragments were removed", result["reason"])
+
     def test_durability_sigterm_requires_barrier_observation(self):
         raw = {
             **raw_base(1),

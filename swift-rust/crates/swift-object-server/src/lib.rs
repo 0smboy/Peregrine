@@ -74,7 +74,7 @@ use swift_diskfile::{
 };
 use swift_http::{
     http_date, split_path, unquote, AsyncRequest, AsyncService, Body, ChainReader, ClockHealth,
-    HeaderKeyDict, Match, MimeDocs, Range, Request, Response, STREAM_CHUNK,
+    HeaderKeyDict, IncomingBodySender, Match, MimeDocs, Range, Request, Response, STREAM_CHUNK,
 };
 use swift_runtime::{
     ConcurrencyMetrics, DeviceId, DeviceIoLimits, DurabilityBarrier, StorageExecutor,
@@ -157,13 +157,89 @@ fn async_body_read_error(error: &std::io::Error) -> Response {
     }
 }
 
-async fn ingest_mime_object_async(
-    storage: &StorageExecutor,
+/// Open PUT writer whose unlink cannot run on the reactor thread.
+///
+/// Drop submits `close()` onto the storage domain and keeps the device
+/// permit until the physical cleanup returns. `take()` yields the writer
+/// for a later storage-bound put/commit without running Drop cleanup.
+struct WriterLease {
+    writer: Option<swift_diskfile::DiskFileWriter>,
+    storage: StorageExecutor,
     device: DeviceId,
-    mut writer: swift_diskfile::DiskFileWriter,
+    class: TrafficClass,
+}
+
+impl WriterLease {
+    fn new(
+        storage: StorageExecutor,
+        device: DeviceId,
+        class: TrafficClass,
+        writer: swift_diskfile::DiskFileWriter,
+    ) -> Self {
+        Self {
+            writer: Some(writer),
+            storage,
+            device,
+            class,
+        }
+    }
+
+    fn writer(&self) -> &swift_diskfile::DiskFileWriter {
+        self.writer.as_ref().expect("writer lease empty")
+    }
+
+    async fn write_chunk(&mut self, chunk: Vec<u8>) -> Result<(), Response> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let writer = self.writer.take().expect("writer lease empty");
+        match self
+            .storage
+            .run_finite(self.device.clone(), self.class, move || {
+                let mut writer = writer;
+                writer.write(&chunk)?;
+                Ok::<_, DiskFileError>(writer)
+            })
+            .await
+        {
+            Ok(Ok(writer)) => {
+                self.writer = Some(writer);
+                Ok(())
+            }
+            Ok(Err(DiskFileError::NoSpace)) => Err(swob_response(507)),
+            Ok(Err(DiskFileError::Io(error))) if error.raw_os_error() == Some(28) => {
+                Err(swob_response(507))
+            }
+            Ok(Err(DiskFileError::Io(_))) => Err(plain_response(500, "disk I/O error")),
+            Ok(Err(error)) => Err(plain_response(500, &error.to_string())),
+            Err(error) => Err(plain_response(500, &error.to_string())),
+        }
+    }
+
+    fn take(mut self) -> swift_diskfile::DiskFileWriter {
+        let writer = self.writer.take().expect("writer lease empty");
+        std::mem::forget(self);
+        writer
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        if let Some(mut writer) = self.writer.take() {
+            let _ = self
+                .storage
+                .submit_held(self.device.clone(), self.class, move || {
+                    writer.close();
+                });
+        }
+    }
+}
+
+async fn ingest_mime_object_async(
+    lease: &mut WriterLease,
     body: &mut swift_http::IncomingBody,
     boundary: &[u8],
-) -> Result<(swift_diskfile::DiskFileWriter, Vec<u8>), Response> {
+) -> Result<Vec<u8>, Response> {
     let mut delim = b"\r\n--".to_vec();
     delim.extend_from_slice(boundary);
     let start = delim[2..].to_vec();
@@ -195,45 +271,20 @@ async fn ingest_mime_object_async(
             if let Some(i) = find_bytes(&buf, &delim) {
                 let piece = buf[..i].to_vec();
                 let leftover = buf[i + delim.len()..].to_vec();
-                if !piece.is_empty() {
-                    writer = storage
-                        .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                            writer.write(&piece)?;
-                            Ok::<_, DiskFileError>(writer)
-                        })
-                        .await
-                        .map_err(|e| plain_response(500, &e.to_string()))?
-                        .map_err(|e| plain_response(500, &e.to_string()))?;
-                }
-                return Ok((writer, leftover));
+                lease.write_chunk(piece).await?;
+                return Ok(leftover);
             }
             if buf.len() > delim.len() {
                 let keep = delim.len() - 1;
                 let piece = buf[..buf.len() - keep].to_vec();
                 buf.drain(..buf.len() - keep);
-                writer = storage
-                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                        writer.write(&piece)?;
-                        Ok::<_, DiskFileError>(writer)
-                    })
-                    .await
-                    .map_err(|e| plain_response(500, &e.to_string()))?
-                    .map_err(|e| plain_response(500, &e.to_string()))?;
+                lease.write_chunk(piece).await?;
             }
         }
     }
     if phase == 2 {
-        if !buf.is_empty() {
-            writer = storage
-                .run_finite(device, TrafficClass::Foreground, move || {
-                    writer.write(&buf)?;
-                    Ok::<_, DiskFileError>(writer)
-                })
-                .await
-                .map_err(|e| plain_response(500, &e.to_string()))?
-                .map_err(|e| plain_response(500, &e.to_string()))?;
-        }
-        return Ok((writer, Vec::new()));
+        lease.write_chunk(buf).await?;
+        return Ok(Vec::new());
     }
     Err(plain_response(400, "no object body MIME doc"))
 }
@@ -660,7 +711,7 @@ async fn drive_ssync_session(
     let mut successes = 0usize;
     let mut failures = 0usize;
     let mut update_scope: Option<TaskScope> = None;
-    let mut update_tx: Option<tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>> = None;
+    let mut update_tx: Option<IncomingBodySender> = None;
     let mut update_task = None;
     async {
         loop {
@@ -673,7 +724,6 @@ async fn drive_ssync_session(
                                 .await;
                             return;
                         }
-                        let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
                         let mut headers = update.headers;
                         headers.set("X-Backend-Storage-Policy-Index", policy_index);
                         headers.set("X-Backend-Replication", "True");
@@ -689,17 +739,31 @@ async fn drive_ssync_session(
                         let content_length = headers
                             .get("Content-Length")
                             .and_then(|value| value.parse().ok());
+                        let (body_tx, body) = match swift_http::IncomingBody::metered_channel(
+                            2,
+                            STREAM_CHUNK,
+                            content_length,
+                            None,
+                            max_object as u64,
+                        ) {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Ok(format!(
+                                        ":ERROR: 0 {}\n",
+                                        python_repr(&error.to_string())
+                                    )
+                                    .into_bytes()))
+                                    .await;
+                                return;
+                            }
+                        };
                         let request = AsyncRequest {
                             method: update.method,
                             path: format!("/{device}/{partition}{}", unquote(&update.path)),
                             query_string: String::new(),
                             headers,
-                            body: swift_http::IncomingBody::from_channel(
-                                body_rx,
-                                content_length,
-                                None,
-                                max_object as u64,
-                            ),
+                            body,
                         };
                         let mut child_server = server.clone_execution_context();
                         child_server.replication_session_lock =
@@ -727,7 +791,7 @@ async fn drive_ssync_session(
                         // An early HTTP rejection may close its receiver. Continue
                         // draining the bounded wire body and count that response at
                         // UpdateEnd; never retain the rest of a rejected object.
-                        if let Some(sender) = update_tx.as_ref() {
+                        if let Some(sender) = update_tx.as_mut() {
                             if sender.send(Ok(bytes)).await.is_err() {
                                 update_tx = None;
                             }
@@ -1974,7 +2038,7 @@ impl ObjectServer {
             Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
             Err(e) => return plain_response(500, &e.to_string()),
         };
-        let mut writer = match self
+        let writer = match self
             .storage()
             .run_finite(device.clone(), traffic_class, move || df.create(".data"))
             .await
@@ -1984,6 +2048,12 @@ impl ObjectServer {
             Ok(Err(e)) => return plain_response(500, &e.to_string()),
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        let mut lease = WriterLease::new(
+            self.storage().clone(),
+            device.clone(),
+            traffic_class,
+            writer,
+        );
         let mut footers: Vec<(String, String)> = Vec::new();
         let mut mime_boundary: Option<String> = None;
         if mime {
@@ -2006,40 +2076,28 @@ impl ObjectServer {
                     return swob_response(499);
                 }
             }
-            writer = match ingest_mime_object_async(
-                self.storage(),
-                device.clone(),
-                writer,
-                &mut areq.body,
-                boundary.as_bytes(),
-            )
-            .await
-            {
-                Ok((w, leftover)) => {
-                    let trailing = if have_footer {
-                        match ingest_mime_footer_async(
-                            &mut areq.body,
-                            leftover,
-                            boundary.as_bytes(),
-                        )
-                        .await
-                        {
-                            Ok((found, trailing)) => {
-                                footers = found;
-                                trailing
-                            }
-                            Err(resp) => return resp,
-                        }
-                    } else {
-                        leftover
-                    };
-                    if let Err(resp) = drain_mime_phase(&mut areq.body, trailing).await {
-                        return resp;
+            let leftover =
+                match ingest_mime_object_async(&mut lease, &mut areq.body, boundary.as_bytes())
+                    .await
+                {
+                    Ok(leftover) => leftover,
+                    Err(resp) => return resp,
+                };
+            let trailing = if have_footer {
+                match ingest_mime_footer_async(&mut areq.body, leftover, boundary.as_bytes()).await
+                {
+                    Ok((found, trailing)) => {
+                        footers = found;
+                        trailing
                     }
-                    w
+                    Err(resp) => return resp,
                 }
-                Err(resp) => return resp,
+            } else {
+                leftover
             };
+            if let Err(resp) = drain_mime_phase(&mut areq.body, trailing).await {
+                return resp;
+            }
             mime_boundary = Some(boundary);
         } else {
             loop {
@@ -2048,26 +2106,12 @@ impl ObjectServer {
                     Ok(None) => break,
                     Err(error) => return async_body_read_error(&error),
                 };
-                writer = match self
-                    .storage()
-                    .run_finite(device.clone(), traffic_class, move || {
-                        writer.write(&chunk)?;
-                        Ok::<_, DiskFileError>(writer)
-                    })
-                    .await
-                {
-                    Ok(Ok(w)) => w,
-                    Ok(Err(DiskFileError::NoSpace)) => return swob_response(507),
-                    Ok(Err(DiskFileError::Io(e))) if e.raw_os_error() == Some(28) => {
-                        return swob_response(507)
-                    }
-                    Ok(Err(DiskFileError::Io(_))) => return plain_response(500, "disk I/O error"),
-                    Ok(Err(e)) => return plain_response(500, &e.to_string()),
-                    Err(e) => return plain_response(500, &e.to_string()),
-                };
+                if let Err(resp) = lease.write_chunk(chunk).await {
+                    return resp;
+                }
             }
         }
-        let (upload_size, etag) = writer.chunks_finished();
+        let (upload_size, etag) = lease.writer().chunks_finished();
         if declared_len.is_some_and(|declared| declared != upload_size) {
             return swob_response(499);
         }
@@ -2136,6 +2180,7 @@ impl ObjectServer {
             headers: req.headers.clone(),
             path: req.path.clone(),
         };
+        let mut writer = lease.take();
         let mut resp = if multiphase {
             let Some(boundary) = mime_boundary else {
                 return plain_response(400, "multiphase commit requires a MIME body");
@@ -2186,12 +2231,26 @@ impl ObjectServer {
                 Err(error) => return plain_response(500, &error.to_string()),
             };
             if areq.body.send_continue(&[]).await.is_err() {
+                drop(WriterLease::new(
+                    self.storage().clone(),
+                    device.clone(),
+                    traffic_class,
+                    writer,
+                ));
                 return swob_response(499);
             }
             let commit_trailing =
                 match ingest_mime_commit_async(&mut areq.body, boundary.as_bytes()).await {
                     Ok(trailing) => trailing,
-                    Err(response) => return response,
+                    Err(response) => {
+                        drop(WriterLease::new(
+                            self.storage().clone(),
+                            device.clone(),
+                            traffic_class,
+                            writer,
+                        ));
+                        return response;
+                    }
                 };
             let no_commit = completion
                 .headers
@@ -6306,6 +6365,11 @@ mod fallocate_reserve_tests {
                 assert!(output.contains(":ERROR:"), "truncated tail={tail:?}, reset={transport_error}: {output:?}");
                 assert!(!output.contains(":UPDATES: START"), "incomplete session was acknowledged: {output:?}");
                 assert_eq!(server.handle(get_named("incomplete")).status, 404);
+                assert!(
+                    tmp_files(&dir).is_empty(),
+                    "interrupted SSYNC must not leave tmp: {:?}",
+                    tmp_files(&dir)
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

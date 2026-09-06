@@ -45,7 +45,9 @@ use crate::body::Body;
 use crate::dates::http_date;
 use crate::headers::HeaderKeyDict;
 use crate::request::{decoded_path_is_utf8, reason_phrase, unquote, Response};
-use crate::server::{AsyncInterimCommand, AsyncRequest, AsyncService, IncomingBody, ServerConfig};
+use crate::server::{
+    AsyncInterimCommand, AsyncRequest, AsyncService, IncomingBody, IncomingBodySender, ServerConfig,
+};
 
 /// Decode a Hyper header value the way WSGI/Swift does: UTF-8 when the
 /// octets are valid UTF-8 (Python `str_to_wsgi` puts UTF-8 on the wire),
@@ -913,9 +915,16 @@ async fn serve_object_mime_handoff(
     }
 
     let (read_half, write_half) = stream.into_split();
-    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
     let (interim_tx, interim_rx) = tokio::sync::mpsc::channel::<AsyncInterimCommand>(2);
     let scope = swift_runtime::TaskScope::bounded(1);
+    let (body_tx, mut body) = IncomingBody::metered_channel(
+        8,
+        crate::body::STREAM_CHUNK,
+        None,
+        Some(scope.clone()),
+        config.max_body_bytes,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
     let wire_task = scope
         .spawn(drive_object_multiphase_wire(
             leftover,
@@ -926,8 +935,6 @@ async fn serve_object_mime_handoff(
             config.max_body_bytes,
         ))
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let mut body =
-        IncomingBody::from_channel(body_rx, None, Some(scope.clone()), config.max_body_bytes);
     body.attach_async_interim(interim_tx);
     let idle_secs = if config.body_idle_timeout_secs > 0 {
         config.body_idle_timeout_secs
@@ -1015,7 +1022,7 @@ async fn drive_object_multiphase_wire(
     leftover: Vec<u8>,
     read_half: tokio::net::tcp::OwnedReadHalf,
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    body_tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    mut body_tx: IncomingBodySender,
     mut interim_rx: tokio::sync::mpsc::Receiver<AsyncInterimCommand>,
     max_body: u64,
 ) -> (tokio::net::tcp::OwnedWriteHalf, std::io::Result<()>) {
@@ -1041,7 +1048,7 @@ async fn drive_object_multiphase_wire(
         }
         let _ = command.ack.send(Ok(()));
         let pump_result = tokio::select! {
-            result = pump_chunked(&mut source, &body_tx, max_body) => result,
+            result = pump_chunked(&mut source, &mut body_tx, max_body) => result,
             early = interim_rx.recv() => {
                 let Some(early) = early else {
                     // The service returned or timed out and dropped the body.
@@ -1151,15 +1158,20 @@ async fn serve_swift_utf8_handoff(
         stream.flush().await?;
     }
     let (read_half, mut write_half) = stream.into_split();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
     let scope = swift_runtime::TaskScope::bounded(1);
     let max_body = config.max_body_bytes;
-    let body_scope = scope.clone();
-    let _ = body_scope.spawn(async move {
+    let (tx, mut body) = IncomingBody::metered_channel(
+        8,
+        crate::body::STREAM_CHUNK,
+        content_length,
+        Some(scope.clone()),
+        max_body,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let _ = scope.spawn(async move {
         pump_swift_compat_request_body(leftover, read_half, tx, chunked, content_length, max_body)
             .await;
     });
-    let mut body = IncomingBody::from_channel(rx, content_length, Some(scope), max_body);
     let idle_secs = if config.body_idle_timeout_secs > 0 {
         config.body_idle_timeout_secs
     } else {
@@ -1220,7 +1232,7 @@ async fn serve_swift_utf8_handoff(
 async fn pump_swift_compat_request_body(
     leftover: Vec<u8>,
     read_half: tokio::net::tcp::OwnedReadHalf,
-    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    mut tx: IncomingBodySender,
     chunked: bool,
     content_length: Option<u64>,
     max_body: u64,
@@ -1231,9 +1243,9 @@ async fn pump_swift_compat_request_body(
         rh: read_half,
     };
     let result = if chunked {
-        pump_chunked(&mut source, &tx, max_body).await
+        pump_chunked(&mut source, &mut tx, max_body).await
     } else {
-        pump_length(&mut source, &tx, content_length.unwrap_or(0), max_body).await
+        pump_length(&mut source, &mut tx, content_length.unwrap_or(0), max_body).await
     };
     if let Err(error) = result {
         let _ = tx.send(Err(error)).await;
@@ -1277,13 +1289,19 @@ async fn serve_ssync_handoff(
         .get("Content-Length")
         .and_then(|s| s.parse::<u64>().ok());
     let (rh, mut wh) = stream.into_split();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
     let scope = swift_runtime::TaskScope::bounded(1);
     let max_body = config.max_body_bytes;
+    let (tx, mut body) = IncomingBody::metered_channel(
+        8,
+        crate::body::STREAM_CHUNK,
+        content_length,
+        Some(scope.clone()),
+        max_body,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
     let _ = scope.spawn(async move {
         pump_ssync_request_body(leftover, rh, tx, chunked, content_length, max_body).await;
     });
-    let mut body = IncomingBody::from_channel(rx, content_length, Some(scope), max_body);
     let idle_secs = if config.body_idle_timeout_secs > 0 {
         config.body_idle_timeout_secs
     } else {
@@ -1341,7 +1359,7 @@ async fn serve_ssync_handoff(
 async fn pump_ssync_request_body(
     leftover: Vec<u8>,
     rh: tokio::net::tcp::OwnedReadHalf,
-    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    mut tx: IncomingBodySender,
     chunked: bool,
     content_length: Option<u64>,
     max_body: u64,
@@ -1352,9 +1370,9 @@ async fn pump_ssync_request_body(
         rh,
     };
     let result = if chunked {
-        pump_chunked(&mut src, &tx, max_body).await
+        pump_chunked(&mut src, &mut tx, max_body).await
     } else {
-        pump_length(&mut src, &tx, content_length.unwrap_or(0), max_body).await
+        pump_length(&mut src, &mut tx, content_length.unwrap_or(0), max_body).await
     };
     if let Err(e) = result {
         let _ = tx.send(Err(e)).await;
@@ -1425,7 +1443,7 @@ impl ByteSrc {
 
 async fn pump_chunked(
     src: &mut ByteSrc,
-    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    tx: &mut IncomingBodySender,
     max_body: u64,
 ) -> std::io::Result<()> {
     let mut decoded = 0u64;
@@ -1484,7 +1502,7 @@ async fn pump_chunked(
 
 async fn pump_length(
     src: &mut ByteSrc,
-    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    tx: &mut IncomingBodySender,
     length: u64,
     max_body: u64,
 ) -> std::io::Result<()> {

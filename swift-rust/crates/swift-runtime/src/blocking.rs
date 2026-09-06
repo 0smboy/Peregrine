@@ -311,6 +311,7 @@ impl Inner {
 pub struct BlockingJob<T> {
     state: Arc<AtomicU8>,
     rx: mpsc::Receiver<Result<T, BlockingJoinError>>,
+    detach: bool,
 }
 
 impl<T> BlockingJob<T> {
@@ -353,10 +354,22 @@ impl<T> BlockingJob<T> {
     pub fn is_started(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_STARTED
     }
+
+    /// Drop this handle without cancelling a still-queued job.
+    ///
+    /// Cleanup and other must-run finite work use this so request
+    /// cancellation cannot skip a queued unlink. The receiver is dropped;
+    /// the closure still runs to completion (or until domain shutdown).
+    pub fn detach(mut self) {
+        self.detach = true;
+    }
 }
 
 impl<T> Drop for BlockingJob<T> {
     fn drop(&mut self) {
+        if self.detach {
+            return;
+        }
         let _ = self.state.compare_exchange(
             STATE_QUEUED,
             STATE_CANCELLED,
@@ -472,7 +485,11 @@ impl BlockingDomain {
             queue.push_back(job);
         }
         self.inner.notify.notify_one();
-        Ok(BlockingJob { state, rx })
+        Ok(BlockingJob {
+            state,
+            rx,
+            detach: false,
+        })
     }
 
     /// Submit and join. Fail-closed on a full queue (does not wait for a slot).

@@ -337,6 +337,16 @@ impl ThreadedPosixIo {
         }
     }
 
+    /// Enqueue a finite job. The caller owns the [`BlockingJob`] and must
+    /// join or [`crate::BlockingJob::detach`] it.
+    pub fn submit<F, T>(&self, f: F) -> Result<crate::BlockingJob<T>, StorageError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.domain.submit(f).map_err(StorageError::from)
+    }
+
     async fn run_op<T, F>(&self, f: F) -> Result<T, StorageError>
     where
         F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -635,6 +645,35 @@ impl StorageExecutor {
                 f()
             })
             .await
+    }
+
+    /// Submit a must-run finite job and detach the waiter.
+    ///
+    /// Request cancellation must not skip upload cleanup. The device permit
+    /// (when admitted) is moved onto the blocking job and released only after
+    /// `f` returns. If the device is already at cap, the job still runs on
+    /// the bounded POSIX domain — cleanup is mandatory — without charging a
+    /// second device slot.
+    pub fn submit_held<F>(
+        &self,
+        device: DeviceId,
+        class: TrafficClass,
+        f: F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let permit = match self.try_acquire_device(device, class) {
+            Ok(permit) => Some(permit),
+            Err(StorageError::DeviceBusy { .. } | StorageError::DeviceClassBusy { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        let job = self.io.submit(move || {
+            let _permit = permit;
+            f();
+        })?;
+        job.detach();
+        Ok(())
     }
 }
 
@@ -1029,5 +1068,37 @@ mod tests {
                 .unwrap(),
             23
         );
+    }
+
+    #[tokio::test]
+    async fn submit_held_keeps_device_permit_after_waiter_is_dropped() {
+        let exec = StorageExecutor::new(
+            StorageExecutorConfig::new(2, 4, DeviceIoLimits::new(1, 2, 2, 2, 2)).unwrap(),
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std_mpsc::sync_channel::<()>(1);
+        exec.submit_held(sda(), TrafficClass::Foreground, move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release cleanup");
+        })
+        .unwrap();
+        wait_until(|| entered_rx.try_recv().is_ok()).await;
+        assert_eq!(exec.stats().device_ops_active, 1);
+        let started = exec.stats().blocking.started_total;
+        assert!(matches!(
+            exec.run_finite(sda(), TrafficClass::Foreground, || ())
+                .await,
+            Err(StorageError::DeviceBusy {
+                active: 1,
+                cap: 1,
+                ..
+            })
+        ));
+        assert_eq!(exec.stats().blocking.started_total, started);
+        release_tx.send(()).unwrap();
+        wait_until(|| exec.stats().device_ops_active == 0).await;
     }
 }
