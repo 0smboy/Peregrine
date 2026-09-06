@@ -7469,6 +7469,25 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn tmp_files_recursive(devices: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        fn walk(dir: &Path, acc: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    walk(&p, acc);
+                } else if p.is_file() {
+                    acc.push(p);
+                }
+            }
+        }
+        walk(devices, &mut out);
+        out
+    }
+
     fn tmp_files(devices: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let walk = |dir: &Path, acc: &mut Vec<PathBuf>| {
@@ -7555,6 +7574,60 @@ mod fallocate_reserve_tests {
             "disconnect must not leave tmp: {:?}",
             tmp_files(&dir)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_future_cancel_unlinks_tmp_on_storage_domain() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cancel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let before = server.storage().stats().blocking.started_total;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+        let put = tokio::spawn({
+            let server = server.clone_execution_context();
+            async move {
+                server
+                    .handle_async(async_put(
+                        "4002",
+                        "cancel-o",
+                        swift_http::IncomingBody::from_channel(rx, Some(1_048_576), None, u64::MAX),
+                        Some(1_048_576),
+                    ))
+                    .await
+            }
+        });
+        tx.send(Ok(vec![b'x'; 4096])).await.unwrap();
+        let start = std::time::Instant::now();
+        while server.storage().stats().blocking.started_total == before
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "first chunk must reach the POSIX write before cancel"
+        );
+        put.abort();
+        let _ = put.await;
+        drop(tx);
+        let start = std::time::Instant::now();
+        while !tmp_files_recursive(&dir).is_empty()
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            tmp_files_recursive(&dir).is_empty(),
+            "cancelled PUT must unlink tmp via submit_held: {:?}",
+            tmp_files_recursive(&dir)
+        );
+        assert_eq!(server.handle(get_named("cancel-o")).status, 404);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

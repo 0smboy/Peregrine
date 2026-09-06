@@ -42,6 +42,16 @@ def raw_base(target=1, *, health=False):
     return raw
 
 
+class G7FrozenCandidate(unittest.TestCase):
+    def test_pending_freeze_cannot_be_scored(self):
+        with self.assertRaises(ValueError):
+            g7.require_frozen_candidate({"candidate_commit": "PENDING_FREEZE"})
+        with self.assertRaises(ValueError):
+            g7.require_frozen_candidate({"candidate_commit": ""})
+        sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        self.assertEqual(g7.require_frozen_candidate({"candidate_commit": sha}), sha)
+
+
 class G7FailClosedClassification(unittest.TestCase):
     def classify(self, kind, raw, **case_fields):
         case = {"_name": "unit", "kind": kind, **case_fields}

@@ -1101,4 +1101,63 @@ mod tests {
         release_tx.send(()).unwrap();
         wait_until(|| exec.stats().device_ops_active == 0).await;
     }
+
+    #[tokio::test]
+    async fn submit_held_unlinks_on_posix_domain_after_caller_returns() {
+        let exec = exec_open();
+        let dir = tmpdir();
+        let path = dir.join("tmp.data");
+        std::fs::write(&path, b"x").unwrap();
+        exec.submit_held(sda(), TrafficClass::Foreground, {
+            let path = path.clone();
+            move || {
+                std::fs::remove_file(&path).expect("cleanup must unlink");
+            }
+        })
+        .unwrap();
+        wait_until(|| !path.exists()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn submit_held_runs_cleanup_without_second_device_slot() {
+        let exec = StorageExecutor::new(
+            StorageExecutorConfig::new(2, 4, DeviceIoLimits::new(1, 2, 2, 2, 2)).unwrap(),
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std_mpsc::sync_channel::<()>(1);
+        exec.submit_held(sda(), TrafficClass::Foreground, move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release the occupying job");
+        })
+        .unwrap();
+        wait_until(|| entered_rx.try_recv().is_ok()).await;
+        assert_eq!(exec.stats().device_ops_active, 1);
+
+        let dir = tmpdir();
+        let path = dir.join("must-unlink");
+        std::fs::write(&path, b"tmp").unwrap();
+        let (done_tx, done_rx) = std_mpsc::sync_channel::<()>(1);
+        exec.submit_held(sda(), TrafficClass::Foreground, {
+            let path = path.clone();
+            move || {
+                let _ = std::fs::remove_file(&path);
+                done_tx.send(()).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            exec.stats().device_ops_active,
+            1,
+            "cleanup at device cap must not charge a second slot"
+        );
+        wait_until(|| done_rx.try_recv().is_ok()).await;
+        assert!(!path.exists(), "cleanup at cap must still run");
+        release_tx.send(()).unwrap();
+        wait_until(|| exec.stats().device_ops_active == 0).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

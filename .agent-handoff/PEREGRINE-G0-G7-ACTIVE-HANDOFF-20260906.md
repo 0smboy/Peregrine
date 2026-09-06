@@ -16,7 +16,7 @@ swiftfuse were **not** touched. Do not deploy this candidate.
 | Parent checkpoint | `885b57c38dcc60c2e263f23a109668718ebce785` (`codex/g0-g7-safety-20260905`) |
 | Parent tag | `g0-g7-checkpoint-20260905` (prerelease, **unaccepted**) |
 | This continuation | `aa2643dc8796c8ff28cd71e55011eb0c1394ca53` |
-| Formal G0–G7 field replay | **NOT RUN** on this commit (cloud VM cannot reach Swift2) |
+| Formal G0–G7 field replay | **NOT RUN** — **blocked on Swift2 SSH** from this cloud VM |
 
 Freeze `candidate_commit` in
 `swift-rust/tools/test-lab/g7/acceptance.yaml` and
@@ -74,11 +74,27 @@ Follow `swift-rust/tools/test-lab/G0-G7-ACCEPTANCE-RUNBOOK.md` on Swift2.
 Do not run G7/G8 against VIP `:8080` / `:8085`. Isolated rust data-plane
 only (`acceptance.yaml` port `18080`, forbidden ports listed there).
 
+## Blocked on Swift2 SSH
+
+This cloud VM cannot open SSH to Swift2 / Swift1 / Swift4. No live
+`/proc/exe` census, locked Linux artifact, official `.functests`, 179
+ledger, or isolated `:18080` G7 matrix can be recorded from here. Package
+and unit results below are **not** field GREEN.
+
+In-repo helpers for the next Swift2 runner (still no production touch):
+
+- `python3 swift-rust/tools/test-lab/freeze-candidate.py` — idempotent
+  `PENDING_FREEZE` → SHA; prints G0 checklist fields the runbook requires.
+- `python3 swift-rust/tools/test-lab/g6_ledger.py LEDGER.json` — fail-closed
+  179-identity score. Retry-to-PASS and leftover timeout children cannot
+  become PASS.
+
 ## Remaining blockers for the next runner
 
-1. SSH to Swift2, checkout this branch, freeze the candidate SHA, offline
+1. SSH to Swift2, checkout this branch, run `freeze-candidate.py`, offline
    locked build, record G0 identity.
-2. Replay G4/G5/G6 on **that exact SHA** (179 identities, no retry-to-PASS).
+2. Replay G4/G5/G6 on **that exact SHA** (179 identities). Score G6 with
+   `g6_ledger.py`. No retry-to-PASS.
 3. Replay G7 with injectors that actually hit (EIO mapper, ENOSPC loop
    device, fd ulimit, DurabilityBarrier probe). `NOT RUN` keeps the gate RED.
 4. Do not mark production ACCEPT until every gate in the table is GREEN

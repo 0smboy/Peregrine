@@ -33,10 +33,25 @@ def sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def require_frozen_candidate(spec):
+    """Scored G7 cannot start while candidate_commit is PENDING_FREEZE."""
+    sha = spec.get("candidate_commit") if isinstance(spec, dict) else None
+    if not isinstance(sha, str) or not GIT_SHA_RE.fullmatch(sha.strip().lower()):
+        raise ValueError(
+            "candidate_commit is not a frozen 40-char git SHA "
+            f"(got {sha!r}; run freeze-candidate.py on Swift2 first)"
+        )
+    return sha.strip().lower()
+
+
 def load_frozen():
     # YAML is the frozen human file; JSON is the byte-identical machine form
     # generated at freeze time so the runner has no PyYAML dependency.
     spec = json.loads(JSON_PATH.read_text())
+    require_frozen_candidate(spec)
     spec["_sha256"] = sha256_file(YAML_PATH)
     spec["_json_sha256"] = sha256_file(JSON_PATH)
     spec["_bytes"] = YAML_PATH.stat().st_size

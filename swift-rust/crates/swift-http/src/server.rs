@@ -2471,6 +2471,20 @@ mod tests {
     use std::net::Shutdown;
     use std::os::fd::AsRawFd;
 
+    #[test]
+    fn production_http_pumps_use_metered_channel_not_legacy_occupancy() {
+        let hyper = include_str!("hyper_serve.rs");
+        let prod = hyper.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            prod.contains("IncomingBody::metered_channel"),
+            "production HTTP pumps must meter occupancy"
+        );
+        assert!(
+            !prod.contains("IncomingBody::from_channel"),
+            "production HTTP pumps must not use the uncounted Content-Length channel"
+        );
+    }
+
     #[tokio::test]
     async fn from_channel_does_not_charge_declared_object_length() {
         let metrics = ConcurrencyMetrics::new();

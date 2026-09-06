@@ -11,28 +11,19 @@ A package-green result on a laptop is **not** a gate GREEN.
 ```bash
 cd /path/to/Peregrine
 git checkout cursor/g0-g7-acceptance-1ad4   # or the SHA you will accept
-CANDIDATE=$(git rev-parse HEAD)
-echo "$CANDIDATE"
-
-# Write the SHA into the G7 freeze files BEFORE the first scored G7 run.
-python3 - <<PY
-from pathlib import Path
-for rel in (
-    "swift-rust/tools/test-lab/g7/acceptance.yaml",
-    "swift-rust/tools/test-lab/g7/acceptance.json",
-):
-    p = Path(rel)
-    text = p.read_text()
-    text = text.replace("PENDING_FREEZE", "$CANDIDATE")
-    p.write_text(text)
-PY
-sha256sum swift-rust/tools/test-lab/g7/acceptance.yaml \
-          swift-rust/tools/test-lab/g7/acceptance.json
+# Writes PENDING_FREEZE → HEAD in acceptance.yaml + acceptance.json.
+# Idempotent for the same SHA. Refuses a different SHA. No production touch.
+python3 swift-rust/tools/test-lab/freeze-candidate.py
+# Preview only:
+# python3 swift-rust/tools/test-lab/freeze-candidate.py --dry-run
 ```
 
-Record `CANDIDATE`, both sha256 values, `rustc --version`, and
-`sha256sum swift-rust/Cargo.lock` in the G0 manifest. After this point do
-not edit `acceptance.yaml` thresholds.
+The script prints the G0 in-repo checklist (`peregrine_git_sha`, both
+acceptance sha256 values, `Cargo.lock` sha256, `rustc --version`,
+worktree dirty count). Remaining G0 keys (`python_swift_git_sha`, live
+`/proc/exe`, rings, …) stay **NOT RUN** until Swift2 fills
+`TEST-PROVENANCE.json`. After this point do not edit `acceptance.yaml`
+thresholds.
 
 ## 1. In-repo unit gates (can also run on this cloud VM)
 
@@ -44,8 +35,11 @@ cd /path/to/Peregrine/swift-rust
 cargo test -p swift-runtime --lib storage
 cargo test -p swift-http --lib from_channel_does_not_charge
 cargo test -p swift-http --lib metered_incoming
+cargo test -p swift-http --lib production_http_pumps_use_metered
 cargo test -p swift-object-server --lib async_ssync_does_not_ack
 cargo test -p swift-object-server --lib streaming_put_client_disconnect
+cargo test -p swift-object-server --lib streaming_put_future_cancel
+cargo test -p swift-runtime --lib submit_held
 # Linux + liberasurecode only:
 cargo test -p swift-proxy-server --test ec_integration --features ec
 ```
@@ -105,7 +99,9 @@ Replay the frozen official lists on `$CANDIDATE` only:
 - G4: Swift `test/functional` identity list, exact-name diff vs Python
 - G5: Swift `test/s3api` + pinned Ceph `s3-tests`
 - G6: 147 replication + 32 EC identities, merge **once** into the 179
-  ledger. No auto-retry-to-PASS. Leave leftover timeout processes at FAIL.
+  ledger. Score with `python3 swift-rust/tools/test-lab/g6_ledger.py LEDGER.json`.
+  No auto-retry-to-PASS. Leftover timeout children stay TIMEOUT/FAIL,
+  never PASS. The scorer unit tests encode those holes; do not bypass them.
 
 Do not import W068/W069/W070 hashes from `17adf0b`.
 

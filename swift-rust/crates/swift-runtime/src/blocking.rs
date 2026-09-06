@@ -800,4 +800,38 @@ mod tests {
             "aborted queued job must not run"
         );
     }
+
+    #[tokio::test]
+    async fn detach_does_not_cancel_queued_job() {
+        let domain = BlockingDomain::with_bounds(1, 4).unwrap();
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std_mpsc::sync_channel::<()>(1);
+        let ran_queued = Arc::new(AtomicBool::new(false));
+
+        let in_flight = domain
+            .submit(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                21u32
+            })
+            .unwrap();
+        wait_until(|| entered_rx.try_recv().is_ok()).await;
+
+        let ran = Arc::clone(&ran_queued);
+        let queued = domain
+            .submit(move || {
+                ran.store(true, Ordering::SeqCst);
+                22u32
+            })
+            .unwrap();
+        queued.detach();
+
+        release_tx.send(()).unwrap();
+        assert_eq!(in_flight.join().await.unwrap(), 21);
+        wait_until(|| ran_queued.load(Ordering::SeqCst)).await;
+        assert!(
+            ran_queued.load(Ordering::SeqCst),
+            "detached queued cleanup must still run"
+        );
+    }
 }
