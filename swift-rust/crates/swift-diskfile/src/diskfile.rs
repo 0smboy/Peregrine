@@ -598,6 +598,18 @@ impl DiskFile {
         Ok(self.opened()?.metafile_metadata.as_ref())
     }
 
+    /// Frag index of the opened data file (filename `#N` / `#N#d`), used
+    /// when GET/HEAD must echo `X-Object-Sysmeta-Ec-Frag-Index` even if
+    /// the xattr stored that value as an int.
+    pub fn opened_ec_frag_index(&self) -> Result<Option<i64>, DiskFileError> {
+        Ok(self
+            .opened()?
+            .ondisk
+            .data_info
+            .as_ref()
+            .and_then(|info| info.frag_index))
+    }
+
     pub fn content_length(&self) -> Result<u64, DiskFileError> {
         Ok(self.opened()?.content_length)
     }

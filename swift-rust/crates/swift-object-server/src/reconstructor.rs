@@ -562,7 +562,9 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
                     continue;
                 }
                 if key == "X-Object-Sysmeta-Ec-Frag-Index" {
-                    metadata.push((k.clone(), MetaValue::Int(target_frag_index)));
+                    // String so object-server GET echoes the header for
+                    // proxy EC GET (Int sysmeta used to be dropped).
+                    metadata.push((k.clone(), MetaValue::Str(target_frag_index.to_string())));
                     continue;
                 }
             }
@@ -2685,6 +2687,24 @@ pub fn process_part_job(
                         };
                         stats.rebuilt += report.rebuilt;
                         stats.reconstruct_fa_attempts += report.reconstruct_fa_attempts;
+                        if report.rebuilt > 0 {
+                            stats.log_lines.push(format!(
+                                "reconstruct_fa PUT -> {}:{}/{} backend_index={} durable={} rebuilt={}",
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device,
+                                report
+                                    .last_rebuild_target
+                                    .or(node.backend_index)
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                                report
+                                    .last_rebuild_durable
+                                    .map(|d| if d { "true" } else { "false" })
+                                    .unwrap_or("?"),
+                                report.rebuilt
+                            ));
+                        }
                         if let Some(error) = report.last_rebuild_error {
                             stats.note(format!(
                                 "reconstruct_fa part {} -> {}:{}/{}: {error}",

@@ -118,12 +118,13 @@ Field G6 on **`3d662b1` is 123/32/20/4**. Field on **`ca2081b` is
 124/30/21/4**. Field on **`57b7456` is 123/32/20/4**. Field on
 **`1682fdb` is 125/30/20/4**. Overlay is firing; `--features ec`
 verified; `mount_check=false` confirmed; in-window **507=0**. Theme
-`test_reconstructor_rebuild` still 14 (Δ0). Single-test
-`test_rebuild_missing_frags` still `proxy_get` 404 after once×N.
-Same window: `rebuilt=1`/`rebuilt=2` **and**
-`sync … -> 127.0.0.3:16230/sdb7: Expected status 200; got 503`.
-That is **FAIL**, not GREEN. Do not re-guess listen overlay, CSS, or
-mount_check.
+`test_reconstructor_rebuild` still 14 (Δ0). Field on **`7ee3f35`**:
+single-test still `proxy_get` 404 / errors=6 after once; **503 in
+window: NONE**; `rebuilt>0` with matching `reconstruct_fa_attempts`.
+Connect-503 is closed. Do not re-guess listen overlay, CSS,
+mount_check, or 503-connect. Leftover is durable `#N#d.data` at the
+deleted `backend_index` and proxy GET seeing
+`X-Object-Sysmeta-Ec-Frag-Index`. That is **FAIL**, not GREEN.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:
@@ -146,11 +147,13 @@ awk '/bind_(ip|port)/' /etc/g6-rust/proxy-server.conf
 strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|reconstruct'
 # bind_port vs EC ring port; servers_per_port
 awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
-# 1682fdb leftover: concurrent once×4 503 on victim SSYNC, not 507
+# 7ee3f35 leftover: 404 after once with rebuilt>0; 503-connect closed
 pgrep -af swift-object-reconstructor
 # kill leftover /usr/local/bin (Aug 9) processes — they pollute syslog
-grep -E 'once start|once done|swift_dir_source|overlay_entries|reconstruct_fa_attempts|got 503|retry|Unavailable-Reason|admission' \
+grep -E 'once start|once done|reconstruct_fa PUT|backend_index=|durable=|reconstruct_fa_attempts|got 503' \
   /var/log/g6-rust/*/object-reconstructor*.log | tail
+# victim device after once (example failed= sdb7#0)
+find /srv/*/node/sdb7 -name '*#0#d.data' -o -name '*#0.data' | head
 awk '/mount_check|disable_fallocate|fallocate_reserve|devices|bind_port|^\[' \
   /etc/g6-rust/object-server/*.conf
 # effective parse (not the file text): must show mount_check=false

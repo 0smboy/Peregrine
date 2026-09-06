@@ -783,6 +783,14 @@ pub struct SenderReport {
     /// Last non-retryable `reconstruct_fa` skip (no builder, not enough
     /// fragments, timestamp mismatch). SSYNC can still complete.
     pub last_rebuild_error: Option<String>,
+    /// Receiver `backend_index` of the last reconstruct_fa PUT (wire
+    /// `X-Object-Sysmeta-Ec-Frag-Index`). Field leftover after `7ee3f35`:
+    /// `rebuilt>0` must land at the emptied index, not a different peer.
+    pub last_rebuild_target: Option<i64>,
+    /// Whether that PUT omitted `X-Backend-No-Commit` (receiver commits
+    /// `{ts}#N#d.data`). Field `proxy_get` 404 after once is (a) if this
+    /// is false for a durable local source.
+    pub last_rebuild_durable: Option<bool>,
 }
 
 /// `ssync_sender.Sender` for one node+job.
@@ -1296,22 +1304,28 @@ impl Sender<'_> {
                         }
                     }
                     if want.data {
-                        let is_durable = df
-                            .durable_timestamp()
-                            .ok()
-                            .flatten()
-                            .is_some_and(|durable_ts| df.data_timestamp().ok() == Some(durable_ts));
+                        // SYNC opens the durable set (`include_non_durable=false`).
+                        // Do not send No-Commit just because POST-after-PUT made
+                        // data_timestamp vs durable_timestamp look unequal —
+                        // that leaves `{ts}#N.data` on the victim and proxy GET
+                        // without fragment-preferences 404s the healed index.
+                        let is_durable = opened_fragment_is_durable(&df, include_non_durable);
                         match &rebuilt {
                             Some((metadata, body)) => {
-                                self.send_put_rebuilt(wire, &url_path, metadata, body, is_durable)?;
+                                let target = self.sync_frag_target.expect("rebuild path");
+                                self.send_put_rebuilt(
+                                    wire, &url_path, metadata, body, is_durable, target,
+                                )?;
                                 report.rebuilt += 1;
+                                report.last_rebuild_target = Some(target);
+                                report.last_rebuild_durable = Some(is_durable);
                             }
                             None => self.send_put(wire, &url_path, &mut df, is_durable)?,
                         }
                     }
                     if want.meta {
                         if df.data_timestamp().ok() != df.timestamp().ok() {
-                            if !self.send_post(wire, &url_path, &df)? {
+                            if !self.send_post(wire, &url_path, &df, rebuilt.is_some())? {
                                 continue 'objects;
                             }
                         } else if !want.data {
@@ -1432,6 +1446,7 @@ impl Sender<'_> {
         metadata: &Metadata,
         body: &crate::reconstruction_spool::ArchiveBody,
         durable: bool,
+        target_frag_index: i64,
     ) -> Result<(), SsyncSenderError> {
         let mut headers: Vec<(String, String)> =
             vec![("Content-Length".to_string(), body.len().to_string())];
@@ -1440,7 +1455,10 @@ impl Sender<'_> {
         }
         for (key, value) in metadata {
             let MetaValue::Str(key) = key else { continue };
-            if key == "name" || key == "Content-Length" {
+            if key == "name"
+                || key == "Content-Length"
+                || key.eq_ignore_ascii_case("X-Object-Sysmeta-Ec-Frag-Index")
+            {
                 continue;
             }
             let value = match value {
@@ -1450,6 +1468,13 @@ impl Sender<'_> {
             };
             headers.push((key.clone(), value));
         }
+        // Wire index must be the victim backend_index, not the partner's
+        // local fragment. Receiver also injects X-Backend-Ssync-Frag-Index
+        // from the session; keep sysmeta identical so GET echoes N.
+        headers.push((
+            "X-Object-Sysmeta-Ec-Frag-Index".to_string(),
+            target_frag_index.to_string(),
+        ));
         self.send_subrequest_head(wire, "PUT", url_path, &headers)?;
         let mut reader = body.reader();
         let mut buffer = [0u8; swift_http::STREAM_CHUNK];
@@ -1532,6 +1557,7 @@ impl Sender<'_> {
         wire: &mut dyn SsyncWire,
         url_path: &str,
         df: &DiskFile,
+        reconstruct_fa: bool,
     ) -> Result<bool, SsyncSenderError> {
         let Some(metafile_metadata) = df
             .get_metafile_metadata()
@@ -1543,6 +1569,11 @@ impl Sender<'_> {
         let mut headers: Vec<(String, String)> = Vec::new();
         for (key, value) in &metafile_metadata {
             let MetaValue::Str(key) = key else { continue };
+            if reconstruct_fa && key.eq_ignore_ascii_case("X-Object-Sysmeta-Ec-Frag-Index") {
+                // Partner meta must not overwrite the victim backend_index
+                // stamped by send_put_rebuilt.
+                continue;
+            }
             let value = match value {
                 MetaValue::Str(s) => s.clone(),
                 MetaValue::Int(i) => i.to_string(),
@@ -1564,6 +1595,19 @@ impl Sender<'_> {
         let headers = vec![("X-Timestamp".to_string(), timestamp.internal())];
         self.send_subrequest_head(wire, "DELETE", url_path, &headers)
     }
+}
+
+/// SYNC (`include_non_durable=false`) opened the durable generation.
+/// Sending `X-Backend-No-Commit` then leaves `{ts}#N.data` on the victim;
+/// a normal proxy GET requires `#N#d.data` and 404s that index.
+fn opened_fragment_is_durable(df: &DiskFile, include_non_durable: bool) -> bool {
+    let Ok(Some(durable_ts)) = df.durable_timestamp() else {
+        return false;
+    };
+    if !include_non_durable {
+        return true;
+    }
+    df.data_timestamp().ok() == Some(durable_ts)
 }
 
 fn trim_ascii(mut bytes: &[u8]) -> Vec<u8> {

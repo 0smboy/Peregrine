@@ -37,7 +37,7 @@ Package/unit green is not field acceptance.
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
 | **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: 8 `listing_*_direct` (mode already Listing HTML). Field on **`b20f569`**: **565/31/54** — object `./` hrefs passed; leftover is **4× `listing_*_direct_with_css`**. Sample: expected `'<link rel="stylesheet" type="text/css" href="…" />'`, actual type-before-rel | In-repo now emits Python `rel` then `type` then `href`. Fail-then-pass: `test_listing_html_css_link_is_rel_then_type_then_href`. Listing `./` href work (`b20f569`) stays independent of this CSS-order follow-up | Do **not** call G4 GREEN. The 4 CSS identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4**. Field on **`1682fdb`: 125/30/20/4**. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. Single-test `test_rebuild_missing_frags` still `proxy_get` 404 after once×N | Field `1682fdb` (correct bin sha `9437227c…`): `mount_check=false` confirmed, in-window 507=0, overlay fires, pass lines have `rebuilt=1` (×3) and `rebuilt=2` (×1). Smoking gun in the same window: `ERROR object-reconstructor last failure: sync … -> 127.0.0.3:16230/sdb7: Expected status 200; got 503` (`failures=2`). Concurrent Manager.once×4 SSYNC/REPLICATE to the emptied victim 503s (partition lock / admission / storage busy) so reconstruct_fa can count `rebuilt` on another target while the victim PUT never lands. In-repo now names the 503 reason (`Drive:` + `X-Backend-Unavailable-Reason`), retries connect 503 inside `process_part_job` before once returns, and waits DeviceBusy for the flock budget. **Not** a field replay. Do **not** call G6 GREEN. Do **not** re-litigate mount_check / CSS / overlay ports |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Field on **`57b7456`: 123/32/20/4**. Field on **`1682fdb`: 125/30/20/4**. Theme `test_reconstructor_rebuild` still **14 (Δ0)**. Single-test `test_rebuild_missing_frags` still `proxy_get` 404 after once | Field **`7ee3f35`**: once start/done INFO present; correct bin; **got 503 in probe window: NONE**; `rebuilt=1`×3 / `rebuilt=2`×1 with matching `reconstruct_fa_attempts`. Still **errors=6**, `proxy_get` 404 after once. Connect-503 is **closed** — do not re-litigate it, mount_check, CSS, or overlay ports. Leftover is whether reconstruct_fa PUT leaves `{ts}#{backend_index}#d.data` on the emptied victim and whether proxy EC GET can see that header. In-repo now: SYNC reconstruct_fa omits `X-Backend-No-Commit` when the partner opened the durable set (POST-after-PUT); wire `X-Object-Sysmeta-Ec-Frag-Index` is the victim `backend_index`; GET/HEAD stringifies Int sysmeta and falls back to the filename index; once logs `reconstruct_fa PUT -> ip:port/device backend_index=N durable=`. Fail-then-pass: `reconstruct_fa_after_once_leaves_deleted_index_durable_and_gettable`, `ec_get_echoes_int_frag_index_so_proxy_can_count_the_source`. **Not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -286,6 +286,19 @@ In-repo now (unit only, **not GREEN**):
 - Once start/done INFO: `devices=` `policies=` `overlay_entries=`
   `swift_dir_source=` `reconstruct_fa_attempts=`.
 
+Field on **`7ee3f35`**: single-test still **errors=6** / `proxy_get` 404
+after once. Progress vs `1682fdb`: **no in-window 503**; once
+start/done present; `rebuilt>0` with matching
+`reconstruct_fa_attempts`. Victim sweeps after `break_nodes` still
+show `rebuilt=0` / empty jobs — that is correct (heal is partner
+SYNC). Leftover hypotheses (do not re-open 503-connect):
+**(a)** reconstruct_fa PUT counted but not durable at the deleted
+index; **(b)** PUT went to a different peer than the emptied device;
+**(c)** remaining archives should already satisfy ec42 `ndata` but
+GET still 404 (undiscovered / missing `X-Object-Sysmeta-Ec-Frag-Index`).
+In-repo now falsifies (a)/(b) on the wire + hash dir and makes a
+healed Int/filename frag-index GET-visible for (c). **Not GREEN.**
+
 Do **not** call G6 GREEN.
 
 ### Exact Swift2 / Swift1 checks (environmental — do not fake)
@@ -320,15 +333,15 @@ Do **not** call G6 GREEN.
 2. Conf `devices` + `bind_port` vs **EC ring** `ip/port/device`;
    `servers_per_port`.
 3. Pass log: `suffix_syncs` / `rebuilt` / `reconstruct_fa_attempts` /
-   `failures`. Field on `1682fdb`: `rebuilt>0` **and**
-   `got 503` to `16230/sdb7` in the same window — rebuilt on another
-   target is not a victim heal. After this SHA expect
-   `object-reconstructor once start:` / `once done:` and 503 bodies
-   with `Drive:` + `Reason: replication lock timeout` or
-   `Service Unavailable (admission)`. Grep
-   `got 503` / `retry` / `X-Backend-Unavailable-Reason` during the
-   probe window. `rebuilt>=1` on a pass that still 503s the victim is
-   **not** GREEN.
+   `failures`. Field on `7ee3f35`: **no** `got 503` in the probe
+   window; `rebuilt>0` is real. After this SHA grep
+   `reconstruct_fa PUT ->` for `backend_index=` matching `failed=`
+   (e.g. `sdb7#0` → `backend_index=0`) and `durable=true`. On the
+   emptied device after once:
+   `find /srv/*/node/sdb7 -name '*#0#d.data' -o -name '*#0.data'`.
+   `#0.data` without `#0#d.data` is (a). No file is (b). Durable
+   `#0#d.data` + GET still 404 is (c) / proxy fragment discovery.
+   `rebuilt>=1` with `proxy_get` 404 is **not** GREEN.
 4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
    correctly empty; heal must be partner `reconstruct_fa`. Ports on
    `ca2081b` were already remapped (`16220/sdb6#2`).

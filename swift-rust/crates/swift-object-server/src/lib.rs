@@ -1074,6 +1074,17 @@ fn meta_get<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
         .and_then(|(_, v)| v.as_str())
 }
 
+/// Python GET/HEAD stringifies pickled metadata values. An Int
+/// `X-Object-Sysmeta-Ec-Frag-Index` must still reach the proxy or EC GET
+/// treats the 200 as a non-source and can 404 after reconstruct_fa.
+fn meta_as_header(value: &MetaValue) -> Option<String> {
+    match value {
+        MetaValue::Str(s) => Some(s.clone()),
+        MetaValue::Int(i) => Some(i.to_string()),
+        MetaValue::Bytes(b) => String::from_utf8(b.clone()).ok(),
+    }
+}
+
 /// Parse Python's `X-Backend-Fragment-Preferences` JSON while preserving the
 /// semantically important empty list: `[]` means a non-durable EC fragment is
 /// acceptable, whereas an absent header requires the durable set.
@@ -3922,11 +3933,11 @@ impl ObjectServer {
         let etag = meta_get(&orig_metadata, "ETag").unwrap_or("").to_string();
         let orig_sysmeta: Vec<(String, String)> = orig_metadata
             .iter()
-            .filter_map(|(k, v)| match (k, v) {
-                (MetaValue::Str(key), MetaValue::Str(value))
+            .filter_map(|(k, v)| match k {
+                MetaValue::Str(key)
                     if key.to_ascii_lowercase().starts_with("x-object-sysmeta-") =>
                 {
-                    Some((key.clone(), value.clone()))
+                    meta_as_header(v).map(|value| (key.clone(), value))
                 }
                 _ => None,
             })
@@ -4453,6 +4464,7 @@ impl ObjectServer {
             }
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        let opened_frag_index = opened.opened_ec_frag_index().ok().flatten();
 
         let metadata = opened.get_metadata().unwrap().clone();
         let obj_size: u64 = meta_get(&metadata, "Content-Length")
@@ -4523,13 +4535,15 @@ impl ObjectServer {
                 // Python 416 keeps identifying headers so SLO/DLO can see
                 // X-Static-Large-Object and retry without Range.
                 for (k, v) in &metadata {
-                    if let (MetaValue::Str(key), MetaValue::Str(value)) = (k, v) {
+                    if let MetaValue::Str(key) = k {
                         if is_sys_or_user_meta(key)
                             || is_object_transient_sysmeta(key)
                             || is_allowed_header(key)
                             || key.eq_ignore_ascii_case("X-Delete-At")
                         {
-                            resp.headers.set(key, value);
+                            if let Some(value) = meta_as_header(v) {
+                                resp.headers.set(key, value);
+                            }
                         }
                     }
                 }
@@ -4648,14 +4662,25 @@ impl ObjectServer {
         resp.body = body;
         resp.headers.set("Content-Type", &content_type);
         for (k, v) in &metadata {
-            if let (MetaValue::Str(key), MetaValue::Str(value)) = (k, v) {
+            if let MetaValue::Str(key) = k {
                 if is_sys_or_user_meta(key)
                     || is_object_transient_sysmeta(key)
                     || is_allowed_header(key)
                     || key.eq_ignore_ascii_case("X-Delete-At")
                 {
-                    resp.headers.set(key, value);
+                    if let Some(value) = meta_as_header(v) {
+                        resp.headers.set(key, value);
+                    }
                 }
+            }
+        }
+        // reconstruct_fa / local rebuild may persist frag-index as Int.
+        // Proxy EC GET only counts a 200 that carries this header.
+        if matches!(policy, PolicyKind::Ec { .. })
+            && resp.headers.get("X-Object-Sysmeta-Ec-Frag-Index").is_none()
+        {
+            if let Some(fi) = opened_frag_index {
+                resp.headers.set("X-Object-Sysmeta-Ec-Frag-Index", fi);
             }
         }
         resp.headers.set("ETag", format!("\"{etag}\""));
@@ -7715,6 +7740,111 @@ mod fallocate_reserve_tests {
         assert_eq!(
             nondurable_get.body.materialize(u64::MAX).unwrap(),
             &body[..]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ec_get_echoes_int_frag_index_so_proxy_can_count_the_source() {
+        use swift_diskfile::{DiskFile, DiskFileConfig, MetaValue, Metadata};
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ec-int-fi-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let hash_config =
+            HashPathConfig::new(Vec::new(), b"ec-int-frag-index-tests".to_vec()).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: false,
+            hash_config: hash_config.clone(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(
+                2,
+                PolicyKind::Ec {
+                    n_unique_fragments: Some(6),
+                },
+            )]),
+            container_update_timeout: std::time::Duration::from_millis(10),
+            container_update_mode: ContainerUpdateMode::Async,
+        });
+        let body = b"int-frag-index-bytes";
+        let ts: Timestamp = "7000.00000".parse().unwrap();
+        let df = DiskFile::new(
+            &dir.join("sda1"),
+            0,
+            "AUTH_test",
+            "c",
+            "o",
+            PolicyKind::Ec {
+                n_unique_fragments: Some(6),
+            },
+            2,
+            &hash_config,
+            DiskFileConfig::default(),
+        )
+        .unwrap();
+        let mut writer = df.create(".data").unwrap();
+        writer.write(body).unwrap();
+        let metadata: Metadata = vec![
+            (
+                MetaValue::Str("name".into()),
+                MetaValue::Str("/AUTH_test/c/o".into()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".into()),
+                MetaValue::Str(ts.internal()),
+            ),
+            (
+                MetaValue::Str("Content-Type".into()),
+                MetaValue::Str("application/octet-stream".into()),
+            ),
+            (
+                MetaValue::Str("Content-Length".into()),
+                MetaValue::Str(body.len().to_string()),
+            ),
+            (
+                MetaValue::Str("ETag".into()),
+                MetaValue::Str("deadbeef".into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
+                MetaValue::Str("whole-object-etag".into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Content-Length".into()),
+                MetaValue::Str("5".into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                MetaValue::Int(3),
+            ),
+        ];
+        writer.put(metadata).unwrap();
+        writer.commit(&ts).unwrap();
+        writer.close();
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Storage-Policy-Index", "2");
+        let got = server.handle(Request {
+            method: "GET".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        });
+        assert_eq!(got.status, 200, "{}", got.reason);
+        assert_eq!(
+            got.headers.get("X-Object-Sysmeta-Ec-Frag-Index"),
+            Some("3"),
+            "proxy EC GET drops a 200 that lacks this header: {:?}",
+            got.headers
+        );
+        assert_eq!(
+            got.headers.get("X-Backend-Durable-Timestamp"),
+            Some(ts.internal()).as_deref(),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

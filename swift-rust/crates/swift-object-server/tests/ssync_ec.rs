@@ -979,3 +979,242 @@ fn break_nodes_rmtree_suffix_delta_uses_listen_overlay() {
         "rmtree'd partition is an empty hash dict; the suffix must sync"
     );
 }
+
+/// Official probe POSTs after PUT. Partner reconstruct_fa must still send
+/// a durable PUT at the *victim* backend_index (field `sdb7#0`), not
+/// `X-Backend-No-Commit` / partner index 3.
+fn put_fragment_then_post(
+    server: &ObjectServer,
+    partition: u64,
+    object: &str,
+    put_ts: &str,
+    post_ts: &str,
+    frag_index: i64,
+    body: &[u8],
+) {
+    put_fragment(server, partition, object, put_ts, frag_index, body);
+    let policy = EC_POLICY.to_string();
+    let response = server.handle(request(
+        "POST",
+        &format!("/sda1/{partition}/a/c/{object}"),
+        &[
+            ("X-Timestamp", post_ts),
+            ("X-Backend-Storage-Policy-Index", &policy),
+            ("X-Object-Meta-Color", "red"),
+        ],
+        b"",
+    ));
+    assert_eq!(response.status, 202, "probe-shaped POST: {response:?}");
+}
+
+struct RecordingWire {
+    inner: TcpSsyncWire,
+    sent: Vec<u8>,
+}
+
+impl SsyncWire for RecordingWire {
+    fn send(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.sent.extend_from_slice(data);
+        self.inner.send(data)
+    }
+    fn readline(&mut self) -> std::io::Result<Vec<u8>> {
+        self.inner.readline()
+    }
+    fn begin_response_phase(&mut self) -> std::io::Result<()> {
+        self.inner.begin_response_phase()
+    }
+    fn finish_response(&mut self) -> std::io::Result<()> {
+        self.inner.finish_response()
+    }
+    fn accept_no_commit(&self) -> bool {
+        self.inner.accept_no_commit()
+    }
+}
+
+/// Field `7ee3f35` `test_rebuild_missing_frags`: `rebuilt>0` then
+/// `proxy_get` 404. Fail-then-pass: after once, the deleted index is
+/// present as `{ts}#{backend_index}#d.data` and a durable GET echoes
+/// that index so proxy EC GET can count it.
+#[test]
+fn reconstruct_fa_after_once_leaves_deleted_index_durable_and_gettable() {
+    use swift_diskfile::{MetaValue, Metadata};
+    use swift_object_server::reconstruction_spool::ArchiveBody;
+    use swift_object_server::ssync_sender::SyncDiskfileBuilder;
+
+    struct FakeRebuilder;
+    impl SyncDiskfileBuilder for FakeRebuilder {
+        fn rebuild(
+            &self,
+            _object_hash: &str,
+            datafile_metadata: &Metadata,
+            target_frag_index: i64,
+        ) -> Result<(Metadata, ArchiveBody), String> {
+            let mut metadata: Metadata = Vec::new();
+            for (k, v) in datafile_metadata {
+                if let MetaValue::Str(key) = k {
+                    if key.eq_ignore_ascii_case("ETag") {
+                        continue;
+                    }
+                    if key == "X-Object-Sysmeta-Ec-Frag-Index" {
+                        metadata.push((k.clone(), MetaValue::Int(target_frag_index)));
+                        continue;
+                    }
+                }
+                metadata.push((k.clone(), v.clone()));
+            }
+            Ok((metadata, b"rebuilt-at-victim-index".to_vec().into()))
+        }
+    }
+
+    let partner = TestTree::new("once-partner");
+    let victim = TestTree::new("once-victim");
+    let partition = 11u64;
+    let put_ts = "1700000900.00000";
+    let post_ts = "1700000901.00000";
+    // Field failed= `127.0.0.3:16230/sdb7#0`: partner holds another
+    // index; victim backend_index is the deleted one.
+    put_fragment_then_post(
+        &object_server(&partner.root),
+        partition,
+        "obj",
+        put_ts,
+        post_ts,
+        3,
+        b"partner-frag-3",
+    );
+    put_fragment(
+        &object_server(&victim.root),
+        partition,
+        "obj",
+        put_ts,
+        0,
+        b"victim-frag-0",
+    );
+    let victim_part = victim
+        .root
+        .join("sda1")
+        .join(get_data_dir(EC_POLICY))
+        .join(partition.to_string());
+    std::fs::remove_dir_all(&victim_part).unwrap();
+    let victim_dir = hash_dir(&victim.root, partition, "obj");
+    assert!(
+        !victim_dir.exists()
+            || !dir_files(&victim_dir)
+                .iter()
+                .any(|f| f.contains("#0#d.data") || f.contains("#0.data")),
+        "fail: deleted index must be absent after break_nodes: {:?}",
+        dir_files(&victim_dir)
+    );
+    let mut miss_headers = HeaderKeyDict::new();
+    miss_headers.set("X-Backend-Storage-Policy-Index", EC_POLICY.to_string());
+    let miss = object_server(&victim.root).handle(Request {
+        method: "GET".into(),
+        path: format!("/sda1/{partition}/a/c/obj"),
+        query_string: String::new(),
+        headers: miss_headers,
+        body: Vec::new().into(),
+    });
+    assert_eq!(miss.status, 404, "fail: emptied victim GET before once");
+
+    let address = spawn_server(&victim.root);
+    let hc = hash_config();
+    let cfg = DiskFileConfig::default();
+    let job = SsyncJob {
+        device: "sda1".to_string(),
+        partition,
+        policy_index: EC_POLICY,
+        policy: ec_kind(),
+        frag_index: Some(3),
+    };
+    let node = SsyncNode {
+        replication_ip: address.ip().to_string(),
+        replication_port: address.port() as u32,
+        device: "sda1".to_string(),
+        backend_index: Some(0),
+    };
+    let builder = FakeRebuilder;
+    let sender = Sender {
+        devices: &partner.root,
+        hash_config: &hc,
+        diskfile_config: &cfg,
+        job: &job,
+        suffixes: None,
+        include_non_durable: false,
+        max_objects: 0,
+        start_after: None,
+        sync_frag_target: Some(0),
+        diskfile_builder: Some(&builder),
+    };
+    let inner = TcpSsyncWire::connect(
+        &node,
+        &job,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("connect");
+    let mut wire = RecordingWire {
+        inner,
+        sent: Vec::new(),
+    };
+    let report = sender.run(&mut wire).expect("once-shaped SYNC");
+    let sent = String::from_utf8_lossy(&wire.sent);
+    wire.inner.disconnect();
+    assert_eq!(report.rebuilt, 1, "{report:?}");
+    assert_eq!(report.last_rebuild_target, Some(0), "{report:?}");
+    assert_eq!(
+        report.last_rebuild_durable,
+        Some(true),
+        "POST-after-PUT source must still offer a durable reconstruct_fa PUT: {report:?}"
+    );
+    assert!(
+        sent.contains("X-Object-Sysmeta-Ec-Frag-Index: 0"),
+        "wire frag index must be victim backend_index 0, not partner 3: {sent}"
+    );
+    assert!(
+        !sent.to_ascii_lowercase().contains("x-backend-no-commit"),
+        "durable local fragment must not send No-Commit: {sent}"
+    );
+
+    let files = dir_files(&victim_dir);
+    assert!(
+        files.iter().any(|f| f.contains("#0#d.data")),
+        "pass: deleted index must be present+durable after once, got {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with("#0.data")),
+        "healed fragment must not be left non-durable (#0.data): {files:?}"
+    );
+    assert_eq!(
+        std::fs::read(victim_dir.join(format!("{put_ts}#0#d.data"))).unwrap(),
+        b"rebuilt-at-victim-index"
+    );
+
+    let mut get_headers = HeaderKeyDict::new();
+    get_headers.set("X-Backend-Storage-Policy-Index", EC_POLICY.to_string());
+    let mut got = object_server(&victim.root).handle(Request {
+        method: "GET".into(),
+        path: format!("/sda1/{partition}/a/c/obj"),
+        query_string: String::new(),
+        headers: get_headers,
+        body: Vec::new().into(),
+    });
+    assert_eq!(got.status, 200, "healed fragment must be GET-visible");
+    assert_eq!(
+        got.headers.get("X-Object-Sysmeta-Ec-Frag-Index"),
+        Some("0"),
+        "proxy EC GET requires this header to count the source: {:?}",
+        got.headers
+    );
+    let durable = got
+        .headers
+        .get("X-Backend-Durable-Timestamp")
+        .expect("durable timestamp");
+    assert!(
+        durable.contains("1700000900"),
+        "GET must advertise the PUT generation as durable, got {durable}"
+    );
+    assert_eq!(
+        got.body.materialize(u64::MAX).unwrap(),
+        b"rebuilt-at-victim-index"
+    );
+}
