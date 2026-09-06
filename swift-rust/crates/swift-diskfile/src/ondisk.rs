@@ -269,13 +269,11 @@ fn process_ec(
         // ascending frag_index order (stable)
         frag_set.sort_by_key(|f| f.frag_index);
         let timestamp = frag_set[0].timestamp;
-        for frag in &frag_set {
-            if frag.durable == Some(true) {
-                if durable_ts.is_none() || durable_ts.unwrap() < timestamp {
-                    durable_ts = Some(timestamp);
-                }
-                break;
-            }
+        // Filename `#d` is the durable generation. A leftover newer
+        // `.durable` without matching data (POST-after-PUT / reconstruct_fa
+        // POST) must not hide `{put_ts}#N#d.data` from a prefs-less GET.
+        if frag_set.iter().any(|frag| frag.durable == Some(true)) {
+            durable_ts = Some(timestamp);
         }
         let is_durable_set = durable_ts == Some(timestamp);
         if is_durable_set {
@@ -419,5 +417,37 @@ fn verify_ondisk_files(
                 results.durable_frag_set_ts.is_some() || (data && frag_prefs.is_some());
             data == have_durable
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::naming::PolicyKind;
+    use std::path::Path;
+
+    #[test]
+    fn hash_d_data_stays_chosen_when_newer_orphan_durable_exists() {
+        let files = [
+            "1700000901.00000.durable".to_string(),
+            "1700000900.00000#2#d.data".to_string(),
+            "1700000901.00000.meta".to_string(),
+        ];
+        let ondisk = get_ondisk_files(
+            &files,
+            Path::new("/tmp/unused"),
+            true,
+            PolicyKind::Ec {
+                n_unique_fragments: Some(6),
+            },
+            None,
+            None,
+        )
+        .expect("prefs-less GET must open the #d generation");
+        assert_eq!(
+            ondisk.data_info.as_ref().and_then(|info| info.frag_index),
+            Some(2)
+        );
+        assert!(ondisk.durable_frag_set_ts.is_some());
     }
 }

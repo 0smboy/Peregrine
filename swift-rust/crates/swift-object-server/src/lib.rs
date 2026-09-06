@@ -4481,7 +4481,15 @@ impl ObjectServer {
             .data_timestamp()
             .map(|t| t.internal())
             .unwrap_or_default();
-        let durable_ts = opened.durable_timestamp().ok().flatten();
+        let durable_ts = opened.durable_timestamp().ok().flatten().or_else(|| {
+            // Opened `#d.data` must advertise a durable timestamp even when
+            // process_ec could not pair a leftover newer `.durable` file.
+            if opened.opened_ec_is_durable().ok().unwrap_or(false) {
+                opened.data_timestamp().ok()
+            } else {
+                None
+            }
+        });
 
         // Range handling
         // `X-Backend-Ignore-Range-If-Metadata-Present` (set by the SLO/DLO
@@ -4674,11 +4682,10 @@ impl ObjectServer {
                 }
             }
         }
-        // reconstruct_fa / local rebuild may persist frag-index as Int.
-        // Proxy EC GET only counts a 200 that carries this header.
-        if matches!(policy, PolicyKind::Ec { .. })
-            && resp.headers.get("X-Object-Sysmeta-Ec-Frag-Index").is_none()
-        {
+        // Filename index is authoritative for the archive we opened.
+        // Metadata may store Int / omit the key after reconstruct_fa POST
+        // stripped partner sysmeta; proxy EC GET drops a 200 without this.
+        if matches!(policy, PolicyKind::Ec { .. }) {
             if let Some(fi) = opened_frag_index {
                 resp.headers.set("X-Object-Sysmeta-Ec-Frag-Index", fi);
             }
@@ -4699,6 +4706,23 @@ impl ObjectServer {
                 .set("Content-Length", resp.body.content_length().unwrap_or(0));
         } else {
             resp.headers.set("Content-Length", obj_size);
+        }
+        if matches!(policy, PolicyKind::Ec { .. }) && matches!(status, 200 | 206) {
+            // Field harvest greps object-*.log for this token. HTTP header
+            // is the contract; the line proves GET saw the opened index.
+            eprintln!(
+                "object-server: GET {} Ec-Frag-Index={} durable_ts={} data_ts={} status={}",
+                req.path,
+                resp.headers
+                    .get("X-Object-Sysmeta-Ec-Frag-Index")
+                    .unwrap_or("-"),
+                durable_ts
+                    .as_ref()
+                    .map(|t| t.internal())
+                    .unwrap_or_default(),
+                data_ts,
+                status
+            );
         }
         resp
     }

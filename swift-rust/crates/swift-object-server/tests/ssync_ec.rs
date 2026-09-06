@@ -1217,4 +1217,57 @@ fn reconstruct_fa_after_once_leaves_deleted_index_durable_and_gettable() {
         got.body.materialize(u64::MAX).unwrap(),
         b"rebuilt-at-victim-index"
     );
+
+    // Live isolated stack is Hyper `handle_async`, not in-process `handle`.
+    // Field harvest saw 0 Ec-Frag-Index lines; the wire must carry it.
+    let (hyper_status, hyper_headers, hyper_body) = http_get(
+        address,
+        &format!("/sda1/{partition}/a/c/obj"),
+        &[("X-Backend-Storage-Policy-Index", &EC_POLICY.to_string())],
+    );
+    assert_eq!(
+        hyper_status, 200,
+        "Hyper object-server GET on healed victim must be 200"
+    );
+    assert!(
+        hyper_headers
+            .iter()
+            .any(|(k, v)| { k.eq_ignore_ascii_case("X-Object-Sysmeta-Ec-Frag-Index") && v == "0" }),
+        "Hyper GET must echo deleted index: {hyper_headers:?}"
+    );
+    assert_eq!(hyper_body, b"rebuilt-at-victim-index");
+}
+
+fn http_get(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: t\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    conn.write_all(req.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let body = raw[split + 4..].to_vec();
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hdrs = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    (status, hdrs, body)
 }

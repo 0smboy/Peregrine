@@ -403,6 +403,33 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         "Content-Length is the object size"
     );
 
+    // Official probe POSTs after PUT. Field `9a95747` still 404'd proxy_get
+    // after once when remaining ndata 200s had data_ts=PUT and
+    // durable_ts=POST — gather keyed durable set membership by data_ts.
+    let (status, _, _) = http(
+        proxy_addr,
+        "POST",
+        "/v1/AUTH_ec/ecbox/big.bin",
+        &[
+            ("X-Object-Meta-Color", "red"),
+            ("X-Backend-Storage-Policy-Index", "1"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 202, "EC object POST-after-PUT");
+    let (status, _, body) = http(
+        proxy_addr,
+        "GET",
+        "/v1/AUTH_ec/ecbox/big.bin",
+        &[("X-Backend-Storage-Policy-Index", "1")],
+        b"",
+    );
+    assert_eq!(status, 200, "EC GET after POST-after-PUT");
+    assert_eq!(
+        body, payload,
+        "POST must not split the durable EC generation"
+    );
+
     // EC redundancy: destroy nparity fragments and confirm the object still
     // decodes from the surviving ndata.
     for d in obj_dirs.iter().take(M) {

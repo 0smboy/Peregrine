@@ -1361,14 +1361,13 @@ impl ProxyApp {
             etag: String,
             meta: Vec<(String, String)>,
             sources: std::collections::HashMap<i32, AsyncBackendHead>,
+            durable: bool,
         }
 
         let nodes = self.iter_nodes(object_ring, object_part);
         let required = if is_head { 1 } else { ec.ndata };
         let mut buckets: std::collections::HashMap<String, EcResponseBucket> =
             std::collections::HashMap::new();
-        let mut durable_timestamps: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
         let mut saw_404 = false;
         let mut latest_404_timestamp = Timestamp::zero();
         // Python may issue up to twice the replica count. The second pass is
@@ -1381,7 +1380,7 @@ impl ProxyApp {
                     buckets.iter().map(|(timestamp, bucket)| {
                         (
                             timestamp.as_str(),
-                            durable_timestamps.contains(timestamp),
+                            bucket.durable,
                             bucket.sources.keys().copied().collect(),
                         )
                     }),
@@ -1412,34 +1411,35 @@ impl ProxyApp {
                         let Some(data_timestamp) = data_timestamp else {
                             continue;
                         };
-                        if let Some(durable_timestamp) =
-                            resp_header(&head.headers, "X-Backend-Durable-Timestamp")
-                        {
-                            durable_timestamps.insert(durable_timestamp.to_string());
-                        } else if explicit_data_timestamp.is_none() {
-                            // Compatibility with older object servers: without
-                            // a distinct data timestamp Python assumes a
-                            // successful fragment response is durable.
-                            durable_timestamps.insert(data_timestamp.clone());
-                        }
+                        let durable = ec_source_is_durable(
+                            &data_timestamp,
+                            resp_header(&head.headers, "X-Backend-Durable-Timestamp"),
+                            explicit_data_timestamp.is_some(),
+                        );
                         let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                            .and_then(|value| value.parse::<i32>().ok());
+                            .and_then(|value| value.parse::<i32>().ok())
+                            .or(node.backend_index);
                         if let Some(fi) = fi {
                             let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
                                 .unwrap_or_default()
                                 .to_string();
+                            let data_key = version_timestamp_key(&data_timestamp);
                             let bucket =
-                                buckets.entry(data_timestamp.clone()).or_insert_with(|| {
-                                    EcResponseBucket {
-                                        etag: etag.clone(),
-                                        meta: head.headers.clone(),
-                                        sources: std::collections::HashMap::new(),
-                                    }
+                                buckets.entry(data_key).or_insert_with(|| EcResponseBucket {
+                                    etag: etag.clone(),
+                                    meta: head.headers.clone(),
+                                    sources: std::collections::HashMap::new(),
+                                    durable,
                                 });
-                            // Fragments at one timestamp with different EC
-                            // etags can never be decoded together. Python
-                            // rejects the mismatching response too.
-                            if bucket.etag == etag {
+                            bucket.durable |= durable;
+                            // Empty Ec-Etag (healed first) must not poison
+                            // remaining fragments that carry the whole-object
+                            // etag. Only reject two non-empty mismatches.
+                            if bucket.etag.is_empty() && !etag.is_empty() {
+                                bucket.etag = etag.clone();
+                                bucket.meta = head.headers.clone();
+                            }
+                            if ec_etag_compatible(&bucket.etag, &etag) {
                                 bucket.sources.entry(fi).or_insert(head);
                             }
                         }
@@ -1458,9 +1458,10 @@ impl ProxyApp {
                     Ok(_) => {}
                     Err(_) => self.error_limiter.increment(node),
                 }
-                if buckets.iter().any(|(timestamp, bucket)| {
-                    durable_timestamps.contains(timestamp) && bucket.sources.len() >= required
-                }) {
+                if buckets
+                    .values()
+                    .any(|bucket| bucket.durable && bucket.sources.len() >= required)
+                {
                     break 'request_rounds;
                 }
             }
@@ -1475,9 +1476,7 @@ impl ProxyApp {
         let chosen_timestamp = buckets
             .iter()
             .filter(|(timestamp, bucket)| {
-                !tombstone_trumps(timestamp)
-                    && durable_timestamps.contains(*timestamp)
-                    && bucket.sources.len() >= required
+                !tombstone_trumps(timestamp) && bucket.durable && bucket.sources.len() >= required
             })
             .map(|(timestamp, _)| timestamp)
             .max()
@@ -1851,6 +1850,7 @@ impl ProxyApp {
                         port: h.dev.port,
                         device: h.dev.device.clone(),
                         handoff: true,
+                        backend_index: None,
                     })
                     .filter(|node| !self.error_limiter.is_limited(node))
                     .collect()
@@ -3500,6 +3500,51 @@ fn ec_sources_sufficient(is_head: bool, available: usize, ndata: usize) -> bool 
     available >= if is_head { 1 } else { ndata }
 }
 
+/// Bucket key so `1751500123.45678` and `000001751500123.45678` join.
+#[cfg(feature = "ec")]
+fn version_timestamp_key(ts: &str) -> String {
+    ts.parse::<Timestamp>()
+        .map(|t| t.internal())
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+#[cfg(feature = "ec")]
+fn same_data_timestamp(left: &str, right: &str) -> bool {
+    match (left.parse::<Timestamp>(), right.parse::<Timestamp>()) {
+        (Ok(a), Ok(b)) => a.internal() == b.internal(),
+        _ => left == right,
+    }
+}
+
+#[cfg(feature = "ec")]
+fn timestamp_ge(left: &str, right: &str) -> bool {
+    match (left.parse::<Timestamp>(), right.parse::<Timestamp>()) {
+        (Ok(a), Ok(b)) => a >= b,
+        _ => left >= right,
+    }
+}
+
+/// Official probe POSTs after PUT. The data file stays at PUT ts; the
+/// durable marker / X-Timestamp may be the later POST. A 200 is durable
+/// when durable_ts is absent on an old server, equals the data ts, or is
+/// a later generation of the same object.
+#[cfg(feature = "ec")]
+fn ec_source_is_durable(
+    data_timestamp: &str,
+    durable_timestamp: Option<&str>,
+    explicit_data_timestamp: bool,
+) -> bool {
+    match durable_timestamp {
+        Some(dts) => same_data_timestamp(dts, data_timestamp) || timestamp_ge(dts, data_timestamp),
+        None => !explicit_data_timestamp,
+    }
+}
+
+#[cfg(feature = "ec")]
+fn ec_etag_compatible(bucket_etag: &str, incoming: &str) -> bool {
+    bucket_etag.is_empty() || incoming.is_empty() || bucket_etag == incoming
+}
+
 /// Match Python's EC GET classification when no durable generation can be
 /// selected.  A reconstructable generation made entirely from non-durable
 /// fragments is a known-missing object (404), not a backend availability
@@ -3981,6 +4026,39 @@ mod tests {
 
     #[cfg(feature = "ec")]
     #[test]
+    fn post_after_put_durable_header_still_counts_the_data_generation() {
+        // Field 9a95747: remaining+healed GET 200s with data_ts=PUT and
+        // durable_ts=POST must form one durable bucket. The old gather
+        // required durable_timestamps.contains(data_ts) and 404'd.
+        assert!(ec_source_is_durable(
+            "000001700000900.00000",
+            Some("000001700000901.00000"),
+            true
+        ));
+        assert!(ec_source_is_durable(
+            "1700000900.00000",
+            Some("000001700000900.00000"),
+            true
+        ));
+        assert!(!ec_source_is_durable(
+            "000001700000901.00000",
+            Some("000001700000900.00000"),
+            true
+        ));
+        assert!(!ec_source_is_durable("000001700000900.00000", None, true));
+        assert!(ec_source_is_durable("000001700000900.00000", None, false));
+        assert_eq!(
+            version_timestamp_key("1700000900.00000"),
+            version_timestamp_key("000001700000900.00000")
+        );
+        assert!(ec_etag_compatible("", "deadbeef"));
+        assert!(ec_etag_compatible("deadbeef", ""));
+        assert!(ec_etag_compatible("deadbeef", "deadbeef"));
+        assert!(!ec_etag_compatible("deadbeef", "cafebabe"));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
     fn ec_fragment_preferences_expose_non_durable_then_prioritize_durable_bucket() {
         assert_eq!(
             encode_ec_fragment_preferences(std::iter::empty(), 4),
@@ -4044,6 +4122,7 @@ mod tests {
             port: port as u32,
             device: "sda".into(),
             handoff: false,
+            backend_index: None,
         }
     }
 

@@ -610,6 +610,20 @@ impl DiskFile {
             .and_then(|info| info.frag_index))
     }
 
+    /// True when the opened data file is a durable EC fragment (`#d` or
+    /// a matching `.durable`). GET without fragment-preferences requires
+    /// this or DiskFile reports NotExist.
+    pub fn opened_ec_is_durable(&self) -> Result<bool, DiskFileError> {
+        let state = self.opened()?;
+        Ok(state.ondisk.durable_frag_set_ts.is_some()
+            || state
+                .ondisk
+                .data_info
+                .as_ref()
+                .and_then(|info| info.durable)
+                .unwrap_or(false))
+    }
+
     pub fn content_length(&self) -> Result<u64, DiskFileError> {
         Ok(self.opened()?.content_length)
     }

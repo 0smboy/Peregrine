@@ -122,9 +122,10 @@ verified; `mount_check=false` confirmed; in-window **507=0**. Theme
 single-test still `proxy_get` 404 / errors=6 after once; **503 in
 window: NONE**; `rebuilt>0` with matching `reconstruct_fa_attempts`.
 Connect-503 is closed. Do not re-guess listen overlay, CSS,
-mount_check, or 503-connect. Leftover is durable `#N#d.data` at the
-deleted `backend_index` and proxy GET seeing
-`X-Object-Sysmeta-Ec-Frag-Index`. That is **FAIL**, not GREEN.
+mount_check, or 503-connect. Field on **`9a95747`**: durable PUTs
+now match `failed=` victims; still **404×6**. Leftover is GET
+visibility (`X-Object-Sysmeta-Ec-Frag-Index` + DiskFile open) and
+proxy async gather after POST-after-PUT. That is **FAIL**, not GREEN.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:
@@ -147,13 +148,15 @@ awk '/bind_(ip|port)/' /etc/g6-rust/proxy-server.conf
 strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|reconstruct'
 # bind_port vs EC ring port; servers_per_port
 awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
-# 7ee3f35 leftover: 404 after once with rebuilt>0; 503-connect closed
+# 9a95747 leftover: durable PUT matched victims; proxy_get still 404
 pgrep -af swift-object-reconstructor
 # kill leftover /usr/local/bin (Aug 9) processes — they pollute syslog
 grep -E 'once start|once done|reconstruct_fa PUT|backend_index=|durable=|reconstruct_fa_attempts|got 503' \
   /var/log/g6-rust/*/object-reconstructor*.log | tail
-# victim device after once (example failed= sdb7#0)
-find /srv/*/node/sdb7 -name '*#0#d.data' -o -name '*#0.data' | head
+# victim device after once (example failed= sdb7#2)
+find /srv/*/node/sdb7 -name '*#2#d.data' -o -name '*#2.data' | head
+# object-server GET harvest (expect Ec-Frag-Index=2 on the healed hash)
+grep -E 'Ec-Frag-Index|GET .* 200|GET .* 404' /var/log/g6-rust/*/object-*.log | tail
 awk '/mount_check|disable_fallocate|fallocate_reserve|devices|bind_port|^\[' \
   /etc/g6-rust/object-server/*.conf
 # effective parse (not the file text): must show mount_check=false

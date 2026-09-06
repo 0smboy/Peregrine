@@ -77,6 +77,11 @@ struct Node {
     /// 404 from such a node with no tombstone timestamp is not
     /// authoritative (base.py:1104-1112, 1617-1624).
     handoff: bool,
+    /// Ring primary position. For EC this is the fragment index the
+    /// proxy assigned at PUT. Used when a backend 200 omits
+    /// `X-Object-Sysmeta-Ec-Frag-Index` so gather can still count the
+    /// source (field `9a95747` harvest saw 0 of those headers).
+    backend_index: Option<i32>,
 }
 
 /// `swift.common.error_limiter.ErrorLimiter`.
@@ -1681,6 +1686,7 @@ impl ProxyApp {
                 port: n.dev.port,
                 device: n.dev.device.clone(),
                 handoff: false,
+                backend_index: Some(n.index as i32),
             })
             .collect()
     }
@@ -1867,15 +1873,17 @@ impl ProxyApp {
     fn iter_nodes(&self, ring: &Ring, part: u32) -> Vec<Node> {
         let primaries = ring.get_part_nodes(part).unwrap_or_default();
         let limit = (self.config.request_node_count_factor as usize) * primaries.len().max(1);
-        let to_node = |dev: &swift_ring::RingDevice, handoff: bool| Node {
-            ip: dev.ip.clone(),
-            port: dev.port,
-            device: dev.device.clone(),
-            handoff,
-        };
+        let to_node =
+            |dev: &swift_ring::RingDevice, handoff: bool, backend_index: Option<i32>| Node {
+                ip: dev.ip.clone(),
+                port: dev.port,
+                device: dev.device.clone(),
+                handoff,
+                backend_index,
+            };
         let mut out: Vec<Node> = Vec::new();
         for node in &primaries {
-            let n = to_node(node.dev, false);
+            let n = to_node(node.dev, false, Some(node.index as i32));
             if !self.error_limiter.is_limited(&n) {
                 out.push(n);
             }
@@ -1886,7 +1894,7 @@ impl ProxyApp {
                     if out.len() >= limit {
                         break;
                     }
-                    let n = to_node(handoff.dev, true);
+                    let n = to_node(handoff.dev, true, None);
                     if !self.error_limiter.is_limited(&n) {
                         out.push(n);
                     }
@@ -5581,6 +5589,7 @@ impl ProxyApp {
                     port: h.dev.port,
                     device: h.dev.device.clone(),
                     handoff: true,
+                    backend_index: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -5909,7 +5918,8 @@ impl ProxyApp {
                 continue;
             }
             let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                .and_then(|v| v.parse::<i32>().ok());
+                .and_then(|v| v.parse::<i32>().ok())
+                .or(node.backend_index);
             if let Some(fi) = fi {
                 if sources.len() >= ec.ndata && !sources.contains_key(&fi) {
                     continue;
@@ -6294,6 +6304,7 @@ fn ring_nodes(part_nodes: Vec<swift_ring::PartNode<'_>>) -> Vec<Node> {
             port: pn.dev.port,
             device: pn.dev.device.clone(),
             handoff: false,
+            backend_index: Some(pn.index as i32),
         })
         .collect()
 }
@@ -11903,6 +11914,7 @@ mod account_update_headers_tests {
             port,
             device: device.into(),
             handoff: false,
+            backend_index: None,
         }
     }
 
