@@ -15,7 +15,7 @@ swiftfuse were **not** touched. Do not deploy this candidate.
 | Branch | `cursor/g0-g7-acceptance-1ad4` |
 | Parent checkpoint | `885b57c38dcc60c2e263f23a109668718ebce785` (`codex/g0-g7-safety-20260905`) |
 | Parent tag | `g0-g7-checkpoint-20260905` (prerelease, **unaccepted**) |
-| This continuation | see `git rev-parse HEAD` after merge of this handoff commit |
+| This continuation | `aa2643dc8796c8ff28cd71e55011eb0c1394ca53` |
 | Formal G0–G7 field replay | **NOT RUN** on this commit (cloud VM cannot reach Swift2) |
 
 Freeze `candidate_commit` in
