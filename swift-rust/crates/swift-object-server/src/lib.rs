@@ -78,7 +78,7 @@ use swift_http::{
     HeaderKeyDict, IncomingBodySender, Match, MimeDocs, Range, Request, Response, STREAM_CHUNK,
 };
 use swift_runtime::{
-    ConcurrencyMetrics, DeviceId, DeviceIoLimits, DurabilityBarrier, StorageExecutor,
+    ConcurrencyMetrics, DeviceId, DeviceIoLimits, DurabilityBarrier, StorageError, StorageExecutor,
     StorageExecutorConfig, TaskScope, TrafficClass,
 };
 
@@ -534,21 +534,65 @@ fn ssync_check_missing_owned(
 /// Network wait is `IncomingBody::next_chunk` (async socket via Hyper).
 /// Disk work is a finite `StorageExecutor` job (`TrafficClass::Replication`).
 /// The HTTP 200 head is already on the wire before this future runs.
+fn storage_error_is_busy(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::DeviceBusy { .. }
+            | StorageError::DeviceClassBusy { .. }
+            | StorageError::QueueFull { .. }
+    )
+}
+
 async fn acquire_replication_session_lock(
     storage: &StorageExecutor,
     device: DeviceId,
     part_path: PathBuf,
     timeout: f64,
 ) -> Result<swift_core::lockutil::PathLock, Response> {
-    match storage
-        .run_finite(device, TrafficClass::Replication, move || {
-            swift_core::lockutil::lock_path(&part_path, timeout, Some("replication"))
-        })
-        .await
-    {
-        Ok(Ok(guard)) => Ok(guard),
-        Ok(Err(_)) => Err(swob_response(503)),
-        Err(_) => Err(swob_response(503)),
+    // Python waits up to replication_lock_timeout on the partition flock.
+    // Rust used to 503 immediately when the device replication slot was
+    // busy (another SSYNC missing-check/PUT on the same device), so
+    // Manager.once×4 never reached the flock wait. Retry DeviceBusy until
+    // the same wall budget expires.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
+    let partition = part_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_string();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(swob_unavailable(
+                device.as_str(),
+                &format!("replication lock timeout partition={partition} timeout={timeout}"),
+            ));
+        }
+        let wait = remaining.as_secs_f64().max(0.01);
+        let part_path = part_path.clone();
+        match storage
+            .run_finite(device.clone(), TrafficClass::Replication, move || {
+                swift_core::lockutil::lock_path(&part_path, wait, Some("replication"))
+            })
+            .await
+        {
+            Ok(Ok(guard)) => return Ok(guard),
+            Ok(Err(_)) => {
+                return Err(swob_unavailable(
+                    device.as_str(),
+                    &format!("replication lock timeout partition={partition} timeout={timeout}"),
+                ));
+            }
+            Err(error) if storage_error_is_busy(&error) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(swob_unavailable(
+                    device.as_str(),
+                    &format!("storage {error} partition={partition}"),
+                ));
+            }
+        }
     }
 }
 
@@ -1143,6 +1187,27 @@ fn swob_response(status: u16) -> Response {
     resp
 }
 
+/// Field `1682fdb` once×4 logged `Expected status 200; got 503` with no
+/// reason: generic [`swob_response`] HTML and Hyper admission 503s were
+/// indistinguishable from a partition replication lock. Name the drive and
+/// the concrete wait (`replication lock`, `storage … busy`, mutation lock).
+fn swob_unavailable(drive: &str, reason: &str) -> Response {
+    let drive_html = if drive.is_empty() {
+        String::new()
+    } else {
+        format!(" Drive: {drive}")
+    };
+    let mut resp = Response::with_body(
+        503,
+        format!(
+            "<html><h1>Service Unavailable</h1><p>The server is currently unavailable.{drive_html} Reason: {reason}</p></html>"
+        ),
+    );
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    resp.headers.set("X-Backend-Unavailable-Reason", reason);
+    resp
+}
+
 /// Python `HTTPInsufficientStorage(drive=…)`: the field 507 body on
 /// `57b7456` had an empty `Drive:` because [`swob_response`] never filled
 /// the device name. Keep the swob HTML shape and name the drive.
@@ -1549,7 +1614,7 @@ fn open_put_original(
 
 fn mutation_lock_error_response(error: DiskFileError) -> Response {
     match error {
-        DiskFileError::LockTimeout(_) => swob_response(503),
+        DiskFileError::LockTimeout(_) => swob_unavailable("", "object mutation lock timeout"),
         DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
         other => plain_response(500, &other.to_string()),
     }
@@ -3010,7 +3075,13 @@ impl ObjectServer {
             Self::REPLICATION_LOCK_TIMEOUT,
             Some("replication"),
         ) else {
-            return swob_response(503);
+            return swob_unavailable(
+                &device,
+                &format!(
+                    "replication lock timeout partition={raw_partition} timeout={}",
+                    Self::REPLICATION_LOCK_TIMEOUT
+                ),
+            );
         };
 
         let Some(mut wire) = req.body.hijack() else {
@@ -8621,9 +8692,21 @@ mod fallocate_reserve_tests {
             .await;
         assert_eq!(response.status, 503);
         assert!(response.headers.get("X-Backend-Accept-No-Commit").is_none());
+        assert_eq!(
+            response
+                .headers
+                .get("X-Backend-Unavailable-Reason")
+                .unwrap_or(""),
+            "replication lock timeout partition=0 timeout=0.05",
+            "field 1682fdb: 503 must name the lock, not a generic swob body"
+        );
+        let Body::Buffered(bytes) = response.body else {
+            panic!("a busy partition must fail before constructing the SSYNC channel");
+        };
+        let body = String::from_utf8_lossy(&bytes);
         assert!(
-            !matches!(response.body, Body::Channel(_)),
-            "a busy partition must fail before constructing the SSYNC channel"
+            body.contains("Drive: sda1") && body.contains("replication lock timeout"),
+            "SSYNC 503 body must be greppable: {body}"
         );
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);

@@ -30,10 +30,14 @@ use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::parse_storage_policies;
 use swift_diskfile::{get_data_dir, CleanupConfig, DiskFileConfig, PolicyKind};
 use swift_object_server::daemonutil;
+use swift_object_server::object_server_conf::{
+    object_server_conf_get, once_flag_from_args, resolve_swift_dir,
+};
 use swift_object_server::reconstruction_spool::SpoolBudget;
 use swift_object_server::reconstructor::{
-    build_part_jobs, process_part_job, EcScheme, EcSsyncStats, HttpSuffixHashFetcher,
-    TcpSsyncPusher,
+    build_part_jobs, format_listen_overlay_status, format_reconstructor_once_done,
+    format_reconstructor_once_start, format_reconstructor_sweep, process_part_job, EcScheme,
+    EcSsyncStats, HttpSuffixHashFetcher, TcpSsyncPusher,
 };
 #[cfg(feature = "ec")]
 use swift_object_server::reconstructor::{run_once as reconstruct_missing, HttpFragmentFetcher};
@@ -50,6 +54,7 @@ fn parse_conf_file(path: &str) -> SwiftConfig {
 /// One EC policy this daemon covers.
 struct EcPolicy {
     index: u32,
+    name: String,
     kind: PolicyKind,
     scheme: EcScheme,
     ring_path: String,
@@ -57,10 +62,12 @@ struct EcPolicy {
 }
 
 fn main() {
-    let conf_path = std::env::args()
-        .nth(1)
+    let argv: Vec<String> = std::env::args().collect();
+    let conf_path = argv
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "/etc/swift/object-server.conf".to_string());
-    let run_once_only = std::env::args().nth(2).as_deref() == Some("once");
+    let run_once_only = once_flag_from_args(&argv);
     let conf = parse_conf_file(&conf_path);
     let get = |section: &str, key: &str, default: &str| -> String {
         conf.get(section, key)
@@ -69,14 +76,16 @@ fn main() {
             .or_else(|| conf.get("DEFAULT", key).ok().flatten())
             .unwrap_or_else(|| default.to_string())
     };
-    let devices = get("app:object-server", "devices", "/srv/node");
-    let bind_port: u32 = get("app:object-server", "bind_port", "6010")
-        .parse()
+    // Isolated `/etc/g6-rust/object-server/*.conf` puts devices / bind_port
+    // under `[object-server]`. The 1682fdb daemon still used app-or-DEFAULT.
+    let devices = object_server_conf_get(&conf, "devices").unwrap_or_else(|| "/srv/node".into());
+    let bind_port: u32 = object_server_conf_get(&conf, "bind_port")
+        .and_then(|v| v.parse().ok())
         .unwrap_or(6010);
     // When >0 the object server discovers per-device ring ports; conf
     // bind_port is only a base and must not be used for ring identity.
-    let servers_per_port: u32 = get("app:object-server", "servers_per_port", "0")
-        .parse()
+    let servers_per_port: u32 = object_server_conf_get(&conf, "servers_per_port")
+        .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let interval: u64 = get("object-reconstructor", "interval", "30")
         .parse()
@@ -106,7 +115,9 @@ fn main() {
         "/var/cache/swift",
     );
 
-    let swift_dir = std::env::var("SWIFT_DIR").unwrap_or_else(|_| "/etc/swift".to_string());
+    let env_swift_dir = std::env::var("SWIFT_DIR").ok();
+    let (swift_dir, swift_dir_source) =
+        resolve_swift_dir(&conf, Some(conf_path.as_str()), env_swift_dir.as_deref());
     let swift_conf_path =
         std::env::var("SWIFT_CONF").unwrap_or_else(|_| format!("{swift_dir}/swift.conf"));
     let swift_conf = parse_conf_file(&swift_conf_path);
@@ -150,6 +161,7 @@ fn main() {
         );
         ec_policies.push(EcPolicy {
             index: policy.idx(),
+            name: policy.name().to_string(),
             kind: PolicyKind::Ec {
                 n_unique_fragments: Some(ec.ec_n_unique_fragments() as u32),
             },
@@ -249,6 +261,11 @@ fn main() {
     let devices_path = std::path::PathBuf::from(&devices);
     let listen_overlay =
         swift_object_server::localdev::ObjectListenOverlay::from_swift_dir(Path::new(&swift_dir));
+    logger.info(&format_listen_overlay_status(
+        listen_overlay.entry_count(),
+        &swift_dir,
+        swift_dir_source,
+    ));
     if !listen_overlay.is_empty() {
         logger.info(&format!(
             "object-reconstructor: listen overlay from {swift_dir} \
@@ -256,11 +273,30 @@ fn main() {
         ));
     }
 
+    let policy_summary = ec_policies
+        .iter()
+        .map(|p| format!("{}:{}", p.index, p.name))
+        .collect::<Vec<_>>()
+        .join(",");
     logger.info(&format!(
         "swift-object-reconstructor: devices={devices} bind_port={bind_port} \
-         servers_per_port={servers_per_port} interval={interval}s once={run_once_only} policies={}",
-        ec_policies.len()
+         servers_per_port={servers_per_port} interval={interval}s once={run_once_only} \
+         swift_dir={swift_dir} swift_dir_source={swift_dir_source} policies={policy_summary}"
     ));
+    if run_once_only {
+        logger.info(&format_reconstructor_once_start(
+            std::process::id(),
+            &conf_path,
+            &argv.join(" "),
+            &swift_dir,
+            swift_dir_source,
+            &devices,
+            bind_port,
+            listen_overlay.entry_count(),
+            &policy_summary,
+            true,
+        ));
+    }
     loop {
         let pass_start = std::time::Instant::now();
         let mut total = EcSsyncStats::default();
@@ -284,8 +320,13 @@ fn main() {
             );
         }
         logger.info(&format!(
-            "object-reconstructor pass: suffix_syncs={} reverts={} rebuilt={} failures={}",
-            total.suffix_syncs, total.reverts, total.rebuilt, total.failures
+            "object-reconstructor pass: suffix_syncs={} reverts={} rebuilt={} \
+             reconstruct_fa_attempts={} failures={}",
+            total.suffix_syncs,
+            total.reverts,
+            total.rebuilt,
+            total.reconstruct_fa_attempts,
+            total.failures
         ));
         // Field 57b7456: reconstruct_fa / last_rebuild_error never appeared
         // because only the last ERROR was logged. INFO every per-job line.
@@ -311,6 +352,7 @@ fn main() {
             ));
         }
         if run_once_only {
+            logger.info(&format_reconstructor_once_done(&total));
             break;
         }
         if daemonutil::sleep_unless_stopped(interval, &stop) {
@@ -382,7 +424,17 @@ fn sweep_policy(
             continue;
         };
         let part_root = device_path.join(get_data_dir(policy.index));
+        let mut parts_seen = 0u64;
+        let mut jobs_seen = 0u64;
         let Ok(parts) = std::fs::read_dir(&part_root) else {
+            logger.info(&format_reconstructor_sweep(
+                policy.index,
+                &policy.name,
+                dev_name,
+                local_id,
+                0,
+                0,
+            ));
             continue;
         };
         for part_entry in parts.flatten() {
@@ -405,6 +457,7 @@ fn sweep_policy(
                 total.failures += 1;
                 continue;
             };
+            parts_seen += 1;
             let mut jobs = build_part_jobs(
                 &part_path,
                 partition,
@@ -417,6 +470,7 @@ fn sweep_policy(
                 local_id,
                 Some(policy.scheme),
             );
+            jobs_seen += jobs.len() as u64;
             for job in &mut jobs {
                 swift_object_server::reconstructor::apply_listen_overlay(job, listen_overlay);
             }
@@ -480,6 +534,14 @@ fn sweep_policy(
                 );
             }
         }
+        logger.info(&format_reconstructor_sweep(
+            policy.index,
+            &policy.name,
+            dev_name,
+            local_id,
+            parts_seen,
+            jobs_seen,
+        ));
         // Partner SYNC + reconstruct_fa is the usual heal path. Also rebuild
         // locally when this node still has the object hash dir (leftover
         // fragment / metadata) but is missing its own primary index.

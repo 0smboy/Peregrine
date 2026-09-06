@@ -777,6 +777,9 @@ pub struct SenderReport {
     /// Successful `reconstruct_fa` data PUTs (local index ≠ receiver index).
     /// Official `break_nodes` heals here; `EcSsyncStats.rebuilt` must count it.
     pub rebuilt: u64,
+    /// How many wanted data PUTs entered the reconstruct_fa path (success,
+    /// skip, or error). Connect-fail never produces a report, so it stays 0.
+    pub reconstruct_fa_attempts: u64,
     /// Last non-retryable `reconstruct_fa` skip (no builder, not enough
     /// fragments, timestamp mismatch). SSYNC can still complete.
     pub last_rebuild_error: Option<String>,
@@ -1256,6 +1259,7 @@ impl Sender<'_> {
                             })
                         });
                         if local_frag != Some(target) {
+                            report.reconstruct_fa_attempts += 1;
                             let Some(builder) = self.diskfile_builder else {
                                 report.last_rebuild_error = Some(
                                     "reconstruct_fa skipped: no sync_diskfile_builder \
@@ -1757,6 +1761,32 @@ mod tests {
         assert_eq!(
             ssync_unexpected_status(503, "").to_string(),
             "Expected status 200; got 503"
+        );
+    }
+
+    /// Field `1682fdb` once×4: `got 503` with no Drive/reason. A named
+    /// lock/admission body must reach the reconstructor fail line.
+    #[test]
+    fn tcp_wire_connect_includes_503_unavailable_reason() {
+        let html = "<html><h1>Service Unavailable</h1>\
+                    <p>The server is currently unavailable. Drive: sdb7 \
+                    Reason: replication lock timeout partition=3 timeout=15</p></html>";
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
+             X-Backend-Unavailable-Reason: replication lock timeout partition=3 timeout=15\r\n\
+             Content-Length: {}\r\n\r\n{html}",
+            html.len()
+        );
+        let err = match connect_with_test_head(response.as_bytes()) {
+            Err(err) => err,
+            Ok(_) => panic!("503 SSYNC connect must fail"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Expected status 200; got 503")
+                && msg.contains("Drive: sdb7")
+                && msg.contains("replication lock timeout"),
+            "SSYNC 503 must carry the lock reason, got {msg:?}"
         );
     }
 

@@ -251,9 +251,13 @@ pub async fn serve_http1_connection(
 }
 
 pub async fn reject_overloaded(mut stream: tokio::net::TcpStream) {
-    let body = b"Service Unavailable";
+    // Field `1682fdb` SSYNC `got 503` had no body token. Name admission so
+    // reconstructor syslog can tell this apart from a partition lock.
+    let body = b"Service Unavailable (admission)";
     let msg = format!(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\
+         X-Backend-Unavailable-Reason: admission\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(msg.as_bytes()).await;

@@ -2197,6 +2197,11 @@ const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 0.2;
 /// request or lets a peer's receiver limits decide our memory ceiling.
 const EC_SSYNC_PAGE_OBJECTS: usize = 10_000;
 const EC_SSYNC_PASS_OBJECTS: usize = 100_000;
+/// Field `1682fdb` once×4: partner reconstruct_fa counted `rebuilt>0` while
+/// SSYNC connect to the emptied victim returned 503 (lock / admission).
+/// Manager.once exits after one pass; retry the same target so the heal PUT
+/// can land before the process returns. Not a 507 retry.
+const SSYNC_UNAVAILABLE_RETRIES: u32 = 8;
 const EC_REVERT_SNAPSHOT_FILES: usize = 1024;
 const EC_REVERT_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -2442,6 +2447,10 @@ pub struct EcSsyncStats {
     pub suffix_syncs: u64,
     pub reverts: u64,
     pub rebuilt: u64,
+    /// Wanted data PUTs that entered reconstruct_fa (success, skip, or
+    /// error). Connect-fail SSYNC does not increment this — that stays in
+    /// `failures` / `log_lines`. Field `1682fdb` could not tell those apart.
+    pub reconstruct_fa_attempts: u64,
     pub failures: u64,
     pub last_error: Option<String>,
     /// Every SSYNC / reconstruct_fa skip or failure this pass, in order.
@@ -2463,6 +2472,85 @@ impl EcSsyncStats {
         self.failures += 1;
         self.note(msg);
     }
+}
+
+/// Greppable `Manager.once` start line. Stale `/usr/local/bin` (Aug 9)
+/// pass lines lack `rebuilt=` and never emit this token.
+pub fn format_reconstructor_once_start(
+    pid: u32,
+    conf: &str,
+    argv: &str,
+    swift_dir: &str,
+    swift_dir_source: &str,
+    devices: &str,
+    bind_port: u32,
+    overlay_entries: usize,
+    policies: &str,
+    once: bool,
+) -> String {
+    format!(
+        "object-reconstructor once start: pid={pid} conf={conf} argv={argv} \
+         swift_dir={swift_dir} swift_dir_source={swift_dir_source} \
+         devices={devices} bind_port={bind_port} overlay_entries={overlay_entries} \
+         policies={policies} once={once}"
+    )
+}
+
+/// Greppable `Manager.once` end line after the single sweep.
+pub fn format_reconstructor_once_done(stats: &EcSsyncStats) -> String {
+    format!(
+        "object-reconstructor once done: suffix_syncs={} reverts={} rebuilt={} \
+         reconstruct_fa_attempts={} failures={}",
+        stats.suffix_syncs,
+        stats.reverts,
+        stats.rebuilt,
+        stats.reconstruct_fa_attempts,
+        stats.failures
+    )
+}
+
+/// Always emitted, including `overlay_entries=0`. Field `1682fdb` treated
+/// a missing "listen overlay from" line as `listen_overlay=0`.
+pub fn format_listen_overlay_status(
+    overlay_entries: usize,
+    swift_dir: &str,
+    swift_dir_source: &str,
+) -> String {
+    format!(
+        "object-reconstructor: listen_overlay_entries={overlay_entries} \
+         swift_dir={swift_dir} swift_dir_source={swift_dir_source}"
+    )
+}
+
+/// Connect-level 503 (lock / admission / storage busy). 507 and in-band
+/// `:ERROR:` are not this token.
+pub fn is_retryable_ssync_unavailable(err: &str) -> bool {
+    err.contains("got 503")
+        || err.contains("Service Unavailable")
+        || err.contains("replication lock timeout")
+        || err.contains("object mutation lock timeout")
+}
+
+fn ssync_unavailable_backoff(retry: u32) -> std::time::Duration {
+    let shift = retry.saturating_sub(1).min(3);
+    let factor = 1u64.checked_shl(shift).unwrap_or(8);
+    std::time::Duration::from_millis(200u64.saturating_mul(factor))
+}
+
+/// Per-device sweep after `break_nodes`. Victim `jobs=0` is expected
+/// (rmtree); partners must show `jobs>0` for reconstruct_fa to run.
+pub fn format_reconstructor_sweep(
+    policy_index: u32,
+    policy_name: &str,
+    device: &str,
+    local_id: u64,
+    parts: u64,
+    jobs: u64,
+) -> String {
+    format!(
+        "object-reconstructor: sweep policy={policy_index} policy_name={policy_name} \
+         device={device} local_id={local_id} parts={parts} jobs={jobs}"
+    )
 }
 
 /// `reconstructor.process_job`: run one partition job.
@@ -2557,21 +2645,46 @@ pub fn process_part_job(
                             sync_frag_target: node.backend_index,
                             diskfile_builder,
                         };
-                        let report = match pusher.push(&sender, node) {
-                            Ok(report) => report,
-                            Err(e) => {
-                                stats.fail(format!(
-                                    "sync part {} frag {:?} -> {}:{}/{}: {e}",
-                                    job.partition,
-                                    job.frag_index,
-                                    node.replication_ip,
-                                    node.replication_port,
-                                    node.device
-                                ));
-                                break;
+                        let report = {
+                            let mut retries = 0u32;
+                            loop {
+                                match pusher.push(&sender, node) {
+                                    Ok(report) => break Ok(report),
+                                    Err(e) => {
+                                        let msg = format!(
+                                            "sync part {} frag {:?} -> {}:{}/{}: {e}",
+                                            job.partition,
+                                            job.frag_index,
+                                            node.replication_ip,
+                                            node.replication_port,
+                                            node.device
+                                        );
+                                        if is_retryable_ssync_unavailable(&msg)
+                                            && retries < SSYNC_UNAVAILABLE_RETRIES
+                                        {
+                                            retries += 1;
+                                            stats.note(format!(
+                                                "{msg} (retry {retries}/{SSYNC_UNAVAILABLE_RETRIES})"
+                                            ));
+                                            std::thread::sleep(ssync_unavailable_backoff(retries));
+                                            continue;
+                                        }
+                                        // Retryable reconstruct_fa aborts the
+                                        // wire without a SenderReport.
+                                        if msg.contains("rebuild resource refusal") {
+                                            stats.reconstruct_fa_attempts += 1;
+                                        }
+                                        stats.fail(msg);
+                                        break Err(());
+                                    }
+                                }
                             }
                         };
+                        let Ok(report) = report else {
+                            break;
+                        };
                         stats.rebuilt += report.rebuilt;
+                        stats.reconstruct_fa_attempts += report.reconstruct_fa_attempts;
                         if let Some(error) = report.last_rebuild_error {
                             stats.note(format!(
                                 "reconstruct_fa part {} -> {}:{}/{}: {error}",
@@ -4314,6 +4427,7 @@ mod suffix_sync_tests {
             ) -> Result<SenderReport, SsyncSenderError> {
                 let mut report = complete_sender_report(sender)?;
                 report.rebuilt = 1;
+                report.reconstruct_fa_attempts = 1;
                 Ok(report)
             }
         }
@@ -4350,6 +4464,10 @@ mod suffix_sync_tests {
             stats.rebuilt, 1,
             "reconstruct_fa PUT must increment rebuilt: {stats:?}"
         );
+        assert_eq!(
+            stats.reconstruct_fa_attempts, 1,
+            "successful reconstruct_fa is still an attempt: {stats:?}"
+        );
         let _ = std::fs::remove_dir_all(&devices);
     }
 
@@ -4368,6 +4486,7 @@ mod suffix_sync_tests {
             ) -> Result<SenderReport, SsyncSenderError> {
                 let mut report = complete_sender_report(sender)?;
                 report.rebuilt = 0;
+                report.reconstruct_fa_attempts = 1;
                 report.last_rebuild_error = Some("NotEnoughFragments".into());
                 Ok(report)
             }
@@ -4402,6 +4521,10 @@ mod suffix_sync_tests {
         );
         assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
         assert_eq!(stats.rebuilt, 0, "field ca2081b: {stats:?}");
+        assert_eq!(
+            stats.reconstruct_fa_attempts, 1,
+            "skip after updates() is an attempt, not silence: {stats:?}"
+        );
         assert!(
             stats
                 .last_error
@@ -4462,6 +4585,10 @@ mod suffix_sync_tests {
             &mut stats,
         );
         assert_eq!(stats.rebuilt, 0, "{stats:?}");
+        assert_eq!(
+            stats.reconstruct_fa_attempts, 0,
+            "connect-fail never entered reconstruct_fa: {stats:?}"
+        );
         assert!(
             stats
                 .log_lines
@@ -4470,6 +4597,141 @@ mod suffix_sync_tests {
             "SSYNC 507 must be INFO-logged: {stats:?}"
         );
         let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Field `1682fdb` single-test: `rebuilt=1` on one partner while
+    /// `sync … -> 127.0.0.3:16230/sdb7: Expected status 200; got 503`
+    /// left the victim empty. Old process_part_job broke on the first 503.
+    #[test]
+    fn test_process_part_job_retries_ssync_503_then_counts_reconstruct_fa() {
+        struct FailThenHealPusher {
+            remaining_503: std::cell::Cell<u32>,
+        }
+        impl SsyncPusher for FailThenHealPusher {
+            fn push(
+                &self,
+                sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                if self.remaining_503.get() > 0 {
+                    self.remaining_503.set(self.remaining_503.get() - 1);
+                    return Err(SsyncSenderError::from(std::io::Error::other(
+                        "Expected status 200; got 503 body='Drive: sdb7 Reason: replication lock timeout partition=3 timeout=15'",
+                    )));
+                }
+                let mut report = complete_sender_report(sender)?;
+                report.rebuilt = 1;
+                report.reconstruct_fa_attempts = 1;
+                Ok(report)
+            }
+        }
+        let devices = tmp_root("recon-ssync-503-retry");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16230, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16230, 0)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &FailThenHealPusher {
+                remaining_503: std::cell::Cell::new(1),
+            },
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(
+            stats.rebuilt, 1,
+            "heal PUT must land after 503 retry: {stats:?}"
+        );
+        assert_eq!(
+            stats.failures, 0,
+            "retried 503 is not a terminal fail: {stats:?}"
+        );
+        assert!(
+            stats
+                .log_lines
+                .iter()
+                .any(|line| line.contains("got 503") && line.contains("retry 1/")),
+            "INFO must show the 503 retry: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_ssync_503_is_retryable_and_507_is_not() {
+        assert!(is_retryable_ssync_unavailable(
+            "sync part 3 frag Some(1) -> 127.0.0.3:16230/sdb7: Expected status 200; got 503"
+        ));
+        assert!(is_retryable_ssync_unavailable(
+            "Expected status 200; got 503 body='Service Unavailable (admission)'"
+        ));
+        assert!(
+            !is_retryable_ssync_unavailable(
+                "sync part 3 -> 127.0.0.2:16220/sdb6: Expected status 200; got 507 body='Drive: sdb6'"
+            ),
+            "507 is not the 1682fdb once×4 hole"
+        );
+    }
+
+    #[test]
+    fn test_once_start_and_done_lines_name_devices_policy_and_attempts() {
+        let start = format_reconstructor_once_start(
+            4242,
+            "/etc/g6-rust/object-server/3.conf",
+            "swift-object-reconstructor /etc/g6-rust/object-server/3.conf once",
+            "/etc/g6-rust",
+            "conf_path",
+            "/srv/3/node",
+            16230,
+            0,
+            "1:ec",
+            true,
+        );
+        assert!(
+            start.contains("object-reconstructor once start:"),
+            "{start}"
+        );
+        assert!(start.contains("devices=/srv/3/node"), "{start}");
+        assert!(start.contains("bind_port=16230"), "{start}");
+        assert!(start.contains("overlay_entries=0"), "{start}");
+        assert!(start.contains("swift_dir=/etc/g6-rust"), "{start}");
+        assert!(start.contains("swift_dir_source=conf_path"), "{start}");
+        assert!(start.contains("policies=1:ec"), "{start}");
+        assert!(start.contains("once=true"), "{start}");
+        let overlay = format_listen_overlay_status(0, "/etc/swift", "default");
+        assert!(
+            overlay.contains("listen_overlay_entries=0"),
+            "empty overlay must still be a logged token: {overlay}"
+        );
+        assert!(overlay.contains("swift_dir_source=default"), "{overlay}");
+        let sweep = format_reconstructor_sweep(1, "ec", "sdb3", 2, 3, 0);
+        assert!(sweep.contains("sweep policy=1"), "{sweep}");
+        assert!(sweep.contains("device=sdb3"), "{sweep}");
+        assert!(sweep.contains("jobs=0"), "{sweep}");
+        let mut stats = EcSsyncStats::default();
+        stats.suffix_syncs = 2;
+        stats.reconstruct_fa_attempts = 0;
+        stats.rebuilt = 0;
+        let done = format_reconstructor_once_done(&stats);
+        assert!(done.contains("object-reconstructor once done:"), "{done}");
+        assert!(done.contains("reconstruct_fa_attempts=0"), "{done}");
+        assert!(done.contains("rebuilt=0"), "{done}");
     }
 
     #[test]

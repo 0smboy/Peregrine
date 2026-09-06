@@ -225,6 +225,13 @@ impl ObjectListenOverlay {
         self.by_device.is_empty() && self.default_port.is_none()
     }
 
+    /// Device → listen-port mappings loaded from `object-server/*.conf`.
+    /// Field `listen_overlay=0` during the `1682fdb` heal window was the
+    /// absence of this count, not a logged token.
+    pub fn entry_count(&self) -> usize {
+        self.by_device.len()
+    }
+
     pub fn listen_port(&self, device: &str, ring_port: u32) -> u32 {
         self.by_device
             .get(device)
