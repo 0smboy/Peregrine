@@ -182,22 +182,26 @@ rebuild theme **ok=9 / FAILED=3 / ERROR=5** of 17 (was 6/11 on
 `missing_frags` / `non_durable` / `partner_down` / `combo` /
 `unexpired_meta`.
 
-This tip is IsolatedIdentity **IRI → percent-encoded request-target**,
-latin-1 `putheader` names (http.client requires ASCII names), and a
-latin-1 response-head parse (`email.parser` drops
-`X-Object-Meta-\xc3\xa8-…`, which is why UTF8 lonely HEAD only saw
-Content-Type). WSGI aliases (`è` → `Ã¨`) match InternalClient keys.
-Goal: UTF8 `missing_frags` / `non_durable_*` / lonely HEAD leave
-`UnicodeEncodeError`. ASCII twins already PASS — leftover UTF8 after
-this SHA is the next field replay, not reconstructor math. Do **not**
-claim those UTF8 identities PASS from unit tests.
+Field `/workspace/g6-rebuild-e650f12-utf8/` (2026-09-06) on adapter
+`e650f12` / bins `176505e`: UnicodeEncodeError **GONE**. UTF8
+`test_rebuild_non_durable_frags` **PASS**. Do not reopen that, or
+any ASCII green.
 
-Remaining ASCII leftover (separate theme; not this adapter encode):
-`test_sync_expired_object` — official probe
-`AssertionError: Timed out waiting for … to expire after 2s`.
-Adapter already forwards `x-delete-after` (not hop-by-hop). Rust
-object GET already 404s `DiskFileExpired` when `X-Delete-At` is
-past and `allow_open_expired` is off. Do not call expire PASS.
+This tip is reconstructor partner-GET HTTP: `read_internal_http_head`
+used a token-only field-name check, so UTF8 `X-Object-Meta-è-…` on
+the fragment response aborted the whole GET. `reconstruct_fa` then
+gathered 0 archives and UTF8 `test_rebuild_missing_frags`
+`_assert_all_nodes_have_frag` 404'd on the percent-encoded path.
+Accept the same UTF-8 object-meta prefixes Python echoes. Do **not**
+claim UTF8 missing_frags PASS from this unit test.
+
+Still red after this SHA (separate leftovers):
+- UTF8 `test_rebuild_quarantines_lonely_frag` — HEAD missing
+  `x-object-meta-Ãè-…` (only Content-Type). Not this gather parser.
+- ASCII `test_sync_expired_object` — official probe timed out waiting
+  to expire after 2s. Adapter already forwards `x-delete-after`.
+  Rust object GET 404s `DiskFileExpired` when `X-Delete-At` is past
+  and `allow_open_expired` is off. Queued; do not call expire PASS.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080

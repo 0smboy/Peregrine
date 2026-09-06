@@ -1135,6 +1135,27 @@ struct InternalHttpHead {
     headers: BTreeMap<String, String>,
 }
 
+/// Token names, plus UTF-8 `X-Object-Meta-*` / sysmeta (official
+/// `TestReconstructorRebuildUTF8` POST). A token-only check rejected the
+/// whole partner GET, so `reconstruct_fa` gathered 0 archives and UTF8
+/// `test_rebuild_missing_frags` 404'd after once
+/// (`/workspace/g6-rebuild-e650f12-utf8/`, 2026-09-06).
+fn is_internal_http_field_name(name: &str) -> bool {
+    if name.is_empty() || name.contains(['\r', '\n', ':', ' ', '\t']) {
+        return false;
+    }
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    ["x-object-meta-", "x-object-sysmeta-", "x-object-transient-sysmeta-"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && lower.len() > prefix.len())
+}
+
 fn read_internal_http_head(
     reader: &mut DeadlineSocketReader<'_>,
 ) -> Result<InternalHttpHead, String> {
@@ -1176,11 +1197,7 @@ fn read_internal_http_head(
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "malformed HTTP response header".to_string())?;
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
+        if !is_internal_http_field_name(name) {
             return Err(format!("invalid HTTP response header name {name:?}"));
         }
         let name = name.to_ascii_lowercase();
@@ -3217,6 +3234,38 @@ mod suffix_sync_tests {
             Duration::from_secs(2),
         )
         .is_err());
+    }
+
+    #[test]
+    fn internal_http_head_keeps_utf8_object_meta_so_reconstruct_fa_can_gather() {
+        // Official UTF8 class POSTs `x-object-meta-è-…`. Object-server
+        // echoes UTF-8 field names. Token-only names made partner GET
+        // drop the archive (`g6-rebuild-e650f12-utf8` missing_frags 404).
+        assert!(is_internal_http_field_name("X-Object-Sysmeta-Ec-Etag"));
+        assert!(is_internal_http_field_name("X-Object-Meta-\u{e8}-color"));
+        assert!(!is_internal_http_field_name("X-Evil:Name"));
+
+        let response = b"HTTP/1.1 200 OK\r\n\
+Content-Length: 0\r\n\
+X-Object-Sysmeta-Ec-Etag: 0123456789abcdef0123456789abcdef\r\n\
+X-Object-Meta-\xc3\xa8-color: blue\r\n\
+\r\n"
+        .to_vec();
+        let (head, body) =
+            read_test_http_response(response, 0, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(body, b"");
+        assert_eq!(
+            head.headers.get("x-object-sysmeta-ec-etag").map(String::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            head.headers
+                .get("x-object-meta-\u{e8}-color")
+                .map(String::as_str),
+            Some("blue")
+        );
     }
 
     #[test]
