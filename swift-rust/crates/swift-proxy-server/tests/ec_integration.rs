@@ -209,6 +209,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string()), (1, "Policy-1".to_string())],
         default_policy_index: 0,
+        recon_cache_path: tmp.join("recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
