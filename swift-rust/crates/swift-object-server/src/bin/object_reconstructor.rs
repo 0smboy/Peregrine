@@ -422,9 +422,9 @@ fn sweep_policy(
             // (no codec) there is no rebuilder and mismatched fragments
             // are skipped, as before.
             #[cfg(feature = "ec")]
-            let peers: Vec<swift_ring::RingDevice> = part_nodes
+            let peers: Vec<(i64, swift_ring::RingDevice)> = part_nodes
                 .iter()
-                .map(|pn| listen_overlay.remap_device(pn.dev))
+                .map(|pn| (pn.index as i64, listen_overlay.remap_device(pn.dev)))
                 .collect();
             #[cfg(feature = "ec")]
             let frag_fetcher = swift_object_server::reconstructor::HttpFragmentFetcher {
@@ -440,13 +440,18 @@ fn sweep_policy(
                 spool: spool.cloned(),
                 ..Default::default()
             };
+            #[cfg(feature = "ec")]
+            let overlay_fetcher = swift_object_server::reconstructor::OverlayFragmentFetcher {
+                inner: &frag_fetcher,
+                overlay: listen_overlay,
+            };
             for job in &jobs {
                 #[cfg(feature = "ec")]
                 let rebuilder = swift_object_server::reconstructor::EcSyncRebuilder {
                     scheme: policy.scheme,
                     partition,
                     peers: peers.clone(),
-                    fetcher: &frag_fetcher,
+                    fetcher: &overlay_fetcher,
                 };
                 #[cfg(feature = "ec")]
                 let diskfile_builder: Option<

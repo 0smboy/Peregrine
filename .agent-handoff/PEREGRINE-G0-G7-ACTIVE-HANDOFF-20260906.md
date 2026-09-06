@@ -35,9 +35,9 @@ Package/unit green is not field acceptance.
 | **G1** environment | **NOT RUN** | Preflight unit tests exist | No Swift1–4 census from this VM |
 | **G2** build / pipeline | **NOT RUN** | Offline build not executed here | No locked Linux artifact hashes for this commit |
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
-| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: still **8 `listing_*_direct` fails**, but the body is Listing HTML (`<!DOCTYPE html>…<title>Listing of …</title>…<table id="listing">`), not `index contents`. Sample: `'<a href="./174c0506…">…</a>' not found` | TempURL Hyper path. Staticweb listing hrefs now emit official `./{quote(name)}` (45a303c). Fail-then-pass: `test_listing_html_field_object_href_is_dot_slash_quoted_name`, `test_field_listing_direct_href_dot_slash_through_hyper` | Do **not** call G4 GREEN. The 8 listing identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
+| **G4** Swift functional | **RED** — `1f7c401`: **549/47**. `5434983` / `84751c9` / `668b948`: **556/40/54**. Field on **`93bd70c`**: 8 `listing_*_direct` (mode already Listing HTML). Field on **`b20f569`**: **565/31/54** — object `./` hrefs passed; leftover is **4× `listing_*_direct_with_css`**. Sample: expected `'<link rel="stylesheet" type="text/css" href="…" />'`, actual type-before-rel | In-repo now emits Python `rel` then `type` then `href`. Fail-then-pass: `test_listing_html_css_link_is_rel_then_type_then_href`. Listing `./` href work (`b20f569`) stays independent of this CSS-order follow-up | Do **not** call G4 GREEN. The 4 CSS identities stay field-open until Swift2 replays `.functests` on a SHA that actually moves them |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
-| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4** (was 114/32/29/4). `container_sync` theme **13→2** (`test_sync` + `test_sync_slo_manifest` ERROR). Sync transport fixed. **32 FAIL still open** — likely `reconstructor_rebuild` (~14), reconciler, expirer, sharder | Partner SYNC after `break_nodes` still dialed ring `6010` while isolated object servers listen on `16210`. In-repo now remaps from `SWIFT_DIR/object-server/*.conf`. **Not** a field replay. Do **not** call G6 GREEN |
+| **G6** probe / 179 ledger | **FAIL** | `1f7c401`: **114/32/29/4**. Field on **`3d662b1`: 123/32/20/4**. Field on **`ca2081b`: 124/30/21/4**. Overlay fires (195× syslog; partner uses isolated `bind_port`). `suffix_syncs=1–3` but **`rebuilt=0` always**. Theme `test_reconstructor_rebuild` still **14 (Δ0)** | Listen overlay is **not** the leftover. `test_rebuild_missing_frags` proxy_get 404 after once×3: `failed=['127.0.0.2:16220/sdb6#2']` (ports already remapped). In-repo now seeds local fragment, merges timestamp forms, counts reconstruct_fa PUTs as `rebuilt`, and logs the skip. **Not** a field replay. Do **not** call G6 GREEN |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
 | **G8** | **DEFERRED** | — | G0–G7 not all GREEN |
 
@@ -117,8 +117,15 @@ runner retry/timeout issues. Replay exactly 179 identities.
    1884285). Rust emitted `href="{quote(shown)}"` with no `./`. In-repo
    now prefixes object and subdir hrefs with `./` and `%2E`-encodes `.`
    like Python. CSS stays `quote(css)` / `../{quote(css)}` (no `./`).
-   Parent `../` is unchanged. **Not** a field replay. Do **not** call
-   the 8 identities closed.
+   Parent `../` is unchanged. Field on **`b20f569`**: **565/31/54** —
+   object `./` hrefs passed. **Independent of rebuild work.**
+
+   **Listing CSS attr order (unit only, after `b20f569`).** The 4 leftover
+   `listing_*_direct_with_css` fails are attribute order only:
+   official `'<link rel="stylesheet" type="text/css" href="…" />'` vs
+   rust `type` then `rel`. In-repo now emits Python order. Fail-then-pass:
+   `test_listing_html_css_link_is_rel_then_type_then_href`. **Not** a
+   field replay. Do **not** call G4 GREEN.
 
 ### G4 listing±CSS hypotheses (`668b948` vs official `TestStaticWeb`)
 
@@ -134,9 +141,10 @@ Labelled as hypotheses. Official suite:
 | Auth/Host copy incomplete for TempAuth | **Not the field hole.** `84751c9` score identical to `5434983`. |
 | CSS href vs unit fixtures | **Unlikely for ascii.** Official names are `uuid4().hex`. |
 | staticweb not in isolated pipeline | **Unlikely.** Index/301 would also fail. |
-| Object href missing `./` prefix | **Primary leftover on `93bd70c`.** Title/table exist; official assert is `'<a href="./{uuid}">'`. Fail-then-pass: `test_listing_html_field_object_href_is_dot_slash_quoted_name`. |
-| Empty listing table / parse empty | **Possible secondary.** Same assert fails if no object rows. In-repo grouping + JSON/text parse still emit rows; field replay required. |
+| Object href missing `./` prefix | **Closed on field `b20f569` (unit shipped earlier).** Title/table exist; official assert is `'<a href="./{uuid}">'`. Independent of CSS-order and rebuild work. |
+| Empty listing table / parse empty | **Unlikely after `b20f569`.** Object `./` hrefs passed; leftover fails are CSS-only. |
 | CSS href form | **Unlikely for uuid.** Official container CSS is `quote(css)` without `./`; dir CSS is `../{css}`. |
+| CSS `<link>` attr order | **Primary leftover on `b20f569`.** Expected `rel` then `type` then `href`. Fail-then-pass: `test_listing_html_css_link_is_rel_then_type_then_href`. |
 
 Do **not** call the 8 identities closed until `.functests` on a SHA that moves the field score.
 6. **G6 container-sync / reconstructor follow-up (unit only, not GREEN).**
@@ -217,10 +225,30 @@ After identity fallback, REPLICATE / SSYNC / fragment GET still used
 the **ring port**. Isolated listeners are `16210`…. Fail-then-pass:
 `test_break_nodes_partner_sync_uses_listen_overlay_not_ring_port` and
 `break_nodes_rmtree_suffix_delta_uses_listen_overlay`. Daemon loads
-`ObjectListenOverlay` from `SWIFT_DIR/object-server/*.conf` (device
-dir → `bind_port`; a single unique bind_port also remaps unmapped
-remote partners). Log line: `listen overlay from …`. **`--features ec`
-is still required** for `reconstruct_fa`. This is not a field replay.
+`ObjectListenOverlay` from `SWIFT_DIR/object-server/*.conf`. Log line:
+`listen overlay from …`.
+
+Field on **`ca2081b`**: overlay **is** firing (195× syslog;
+`failed=['127.0.0.2:16220/sdb6#2']` already isolated). Pass lines
+`suffix_syncs=1–3` and **`rebuilt=0`**. Official
+`test_rebuild_missing_frags` then `proxy_get` 404. That is **not**
+another port miss.
+
+`EcSsyncStats.rebuilt` only counted local `reconstruct_missing`. After
+`break_nodes` rmtree the victim hash dir is gone → `discover_jobs` is
+correctly empty. Heal is partner `reconstruct_fa`. ca2081b compared
+peer `X-Backend-Data-Timestamp` to the datafile `X-Timestamp` with
+raw `!=` (official tests POST after PUT), did not seed the already-open
+local fragment, and skipped the data PUT on `NotEnoughFragments` while
+still incrementing `suffix_syncs`. In-repo now: `same_data_timestamp` +
+version-key merge, `rebuild_with_local` seed, count reconstruct_fa PUTs
+as `rebuilt`, log `last_rebuild_error`. Fail-then-pass:
+`test_gather_merges_normalized_and_internal_timestamps`,
+`test_reconstruct_fa_local_seed_reaches_ndata_without_self_http`,
+`test_process_part_job_counts_reconstruct_fa_puts_as_rebuilt`,
+`test_process_part_job_surfaces_reconstruct_fa_skip_when_rebuilt_stays_zero`.
+**`--features ec` is still required.** This is not a field replay. Do
+**not** call G6 GREEN. Keep this independent of G4 listing/CSS work.
 
 ### Exact Swift2 / Swift1 checks (environmental — do not fake)
 
@@ -254,13 +282,13 @@ is still required** for `reconstruct_fa`. This is not a field replay.
 2. Conf `devices` + `bind_port` vs **EC ring** `ip/port/device`;
    `servers_per_port`.
 3. Pass log: `suffix_syncs` / `rebuilt` / `failures`.
-   `suffix_syncs=0` ⇒ identity skip **or** partner REPLICATE still
-   hitting ring `6010`. After this SHA expect
-   `listen overlay from /etc/g6-rust` and
-   `skipping device …: no ring identity` only when the dir is not local.
+   Field on `ca2081b`: `suffix_syncs>0` and `rebuilt=0` — overlay
+   connected; reconstruct_fa skipped. After this SHA expect
+   `reconstruct_fa …:` on `last failure:` when a PUT is skipped, and
+   `rebuilt>=1` when a reconstruct_fa PUT lands.
 4. After `break_nodes`, victim hash dir gone ⇒ local `discover_jobs`
-   correctly empty; heal must be partner `reconstruct_fa` **to the
-   isolated listen port**, not the ring port.
+   correctly empty; heal must be partner `reconstruct_fa`. Ports on
+   `ca2081b` were already remapped (`16220/sdb6#2`).
 5. Manager binary same isolated rust bin, conf under
    `/etc/g6-rust/object-server/*.conf`.
 

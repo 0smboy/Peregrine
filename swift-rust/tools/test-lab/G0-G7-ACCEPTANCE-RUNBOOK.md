@@ -101,9 +101,11 @@ Replay the frozen official lists on `$CANDIDATE` only:
   (`index contents`). Field on **`93bd70c` still has 8 `listing_*_direct`
   fails**, but the body is Listing HTML (title + `<table id="listing">`),
   not the index object. Sample: `'<a href="./{uuid}">…</a>'` not found.
-  After this SHA, confirm object links are `href="./{quote(name)}"` and
-  CSS (when set) is `quote(css)` / `../{css}` with no `./` on CSS. Do
-  **not** call G4 GREEN from unit tests.
+  Field on **`b20f569` is 565/31/54** — object `./` hrefs passed.
+  Leftover listing fails are 4× `listing_*_direct_with_css` attribute
+  order (`rel` then `type` then `href`). After this SHA, confirm the
+  `<link>` tag matches that official order. Do **not** call G4 GREEN
+  from unit tests.
 - G5: Swift `test/s3api` + pinned Ceph `s3-tests`
 - G6: 147 replication + 32 EC identities, merge **once** into the 179
   ledger. Score with `python3 swift-rust/tools/test-lab/g6_ledger.py LEDGER.json`.
@@ -112,11 +114,12 @@ Replay the frozen official lists on `$CANDIDATE` only:
 
 Do not import W068/W069/W070 hashes from `17adf0b`.
 
-Field G6 on **`3d662b1` is 123 PASS / 32 FAIL / 20 ERROR / 4 SKIP**
-(was 114/32/29/4). `container_sync` theme **13→2** (only `test_sync` +
-`test_sync_slo_manifest` ERROR). Sync transport is fixed. **32 FAIL**
-remain — dominant leftover is likely `reconstructor_rebuild` (~14),
-plus reconciler / expirer / sharder. That is **FAIL**, not GREEN.
+Field G6 on **`3d662b1` is 123/32/20/4**. Field on **`ca2081b` is
+124/30/21/4**. Overlay is firing; `suffix_syncs=1–3` but `rebuilt=0`.
+`test_reconstructor_rebuild` still 14 (Δ0).
+`test_rebuild_missing_frags` proxy_get 404 after reconstruct once×3
+(`failed=['127.0.0.2:16220/sdb6#2']` — ports already remapped). That
+is **FAIL**, not GREEN. Do not re-guess listen overlay.
 
 If those two themes stay red after rebuilding **this SHA**, check
 environment before another code guess:
@@ -139,16 +142,16 @@ awk '/bind_(ip|port)/' /etc/g6-rust/proxy-server.conf
 strings /root/work/g6-rust-bin/swift-object-reconstructor | grep -E 'liberasure|reconstruct'
 # bind_port vs EC ring port; servers_per_port
 awk '/bind_port|servers_per_port|devices/' /etc/g6-rust/object-server/*.conf
-# suffix_syncs=0 means identity skip OR partner still dials ring 6010
-grep -E 'suffix_syncs=|skipping device|no ring identity|listen overlay' \
+# ca2081b: suffix_syncs>0 and rebuilt=0 is reconstruct_fa skip, not overlay
+grep -E 'suffix_syncs=|rebuilt=|reconstruct_fa|last failure' \
   /var/log/g6-rust/*/object-reconstructor*.log | tail
 ```
 
 Do not treat empty-fragment `discover_jobs` skips as a bug: probe
 `break_nodes` deletes the victim hash dir; heal is partner SYNC +
-`reconstruct_fa` **to the isolated listen port** (`16210`…), which
-requires `--features ec` and a readable `SWIFT_DIR/object-server/*.conf`
-overlay. Do **not** call G6 GREEN from unit tests.
+`reconstruct_fa` (local seed + timestamp-coherent peer fragments),
+which requires `--features ec`. Overlay on `ca2081b` already reached
+isolated ports. Do **not** call G6 GREEN from unit tests.
 
 ## 7. G7 physical matrix
 

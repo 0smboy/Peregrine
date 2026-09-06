@@ -267,6 +267,27 @@ pub fn local_frag_index(
         .position(|pn| pn.dev.ip == my_ip && pn.dev.port == my_port && pn.dev.device == my_device)
 }
 
+fn same_data_timestamp(left: &str, right: &str) -> bool {
+    match (
+        left.parse::<swift_core::timestamp::Timestamp>(),
+        right.parse::<swift_core::timestamp::Timestamp>(),
+    ) {
+        (Ok(a), Ok(b)) => a.internal() == b.internal(),
+        _ => left == right,
+    }
+}
+
+/// Bucket key so a datafile `X-Timestamp` (`1751500123.45678`) and an HTTP
+/// `X-Backend-Data-Timestamp` (same instant, possibly `.internal()` form)
+/// join one reconstruct_fa quorum. Field `test_rebuild_missing_frags` POSTs
+/// after PUT; ca2081b compared the raw strings and dropped every peer.
+#[cfg(feature = "ec")]
+fn version_timestamp_key(ts: &str) -> String {
+    ts.parse::<swift_core::timestamp::Timestamp>()
+        .map(|t| t.internal())
+        .unwrap_or_else(|_| ts.to_string())
+}
+
 /// Gather `ndata` fragment archives for one object from its peers. Keeps
 /// only unique fragment indexes that agree on the object's EC etag, original
 /// length, and data timestamp. A stale first peer must not anchor the entire
@@ -281,9 +302,27 @@ fn gather_coherent_archives(
     ndata: usize,
     fetcher: &dyn FragmentFetcher,
     preferred_timestamp: Option<&str>,
+    seed: Option<FetchedFragment>,
 ) -> Result<(FetchedFragment, Vec<ArchiveBody>), ReconstructError> {
     type VersionKey = (String, String, usize);
     let mut versions: BTreeMap<VersionKey, BTreeMap<i32, FetchedFragment>> = BTreeMap::new();
+    let accept = |frag: &FetchedFragment| {
+        frag.frag_index >= 0
+            && preferred_timestamp
+                .is_none_or(|expected| same_data_timestamp(&frag.timestamp, expected))
+    };
+    if let Some(frag) = seed.filter(|frag| accept(frag)) {
+        let key = (
+            version_timestamp_key(&frag.timestamp),
+            frag.ec_etag.clone(),
+            frag.ec_content_length,
+        );
+        versions
+            .entry(key)
+            .or_default()
+            .entry(frag.frag_index)
+            .or_insert(frag);
+    }
     for node in peers {
         let Some(frag) = fetcher
             .fetch_at_checked(
@@ -298,13 +337,11 @@ fn gather_coherent_archives(
         else {
             continue;
         };
-        if frag.frag_index < 0
-            || preferred_timestamp.is_some_and(|expected| frag.timestamp != expected)
-        {
+        if !accept(&frag) {
             continue;
         }
         let key = (
-            frag.timestamp.clone(),
+            version_timestamp_key(&frag.timestamp),
             frag.ec_etag.clone(),
             frag.ec_content_length,
         );
@@ -433,9 +470,10 @@ fn reconstruct_archives_to_spool(
 pub struct EcSyncRebuilder<'a> {
     pub scheme: EcScheme,
     pub partition: u64,
-    /// Fragment sources: the partition's primaries excluding the node being
-    /// rebuilt to (Python `_make_fragment_requests`' source set).
-    pub peers: Vec<RingDevice>,
+    /// Fragment sources: `(backend_index, device)` for the partition's
+    /// primaries. `reconstruct_fa` skips the node being rebuilt to (Python
+    /// `_make_fragment_requests`).
+    pub peers: Vec<(i64, RingDevice)>,
     pub fetcher: &'a dyn FragmentFetcher,
 }
 
@@ -443,9 +481,19 @@ pub struct EcSyncRebuilder<'a> {
 impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
     fn rebuild(
         &self,
+        object_hash: &str,
+        datafile_metadata: &Metadata,
+        target_frag_index: i64,
+    ) -> Result<(Metadata, ArchiveBody), String> {
+        self.rebuild_with_local(object_hash, datafile_metadata, target_frag_index, None)
+    }
+
+    fn rebuild_with_local(
+        &self,
         _object_hash: &str,
         datafile_metadata: &Metadata,
         target_frag_index: i64,
+        local: Option<FetchedFragment>,
     ) -> Result<(Metadata, ArchiveBody), String> {
         let spool = self
             .fetcher
@@ -454,6 +502,7 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
         let get = |name: &str| {
             datafile_metadata.iter().find_map(|(k, v)| match (k, v) {
                 (MetaValue::Str(k), MetaValue::Str(v)) if k == name => Some(v.clone()),
+                (MetaValue::Str(k), MetaValue::Int(i)) if k == name => Some(i.to_string()),
                 _ => None,
             })
         };
@@ -466,8 +515,18 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             parts.next().ok_or("bad name")?,
         );
         let local_ts = get("X-Timestamp").ok_or("datafile has no X-Timestamp")?;
+        let local_ts = local_ts
+            .parse::<swift_core::timestamp::Timestamp>()
+            .map(|ts| ts.internal())
+            .unwrap_or(local_ts);
+        let sources: Vec<RingDevice> = self
+            .peers
+            .iter()
+            .filter(|(index, _)| *index != target_frag_index)
+            .map(|(_, device)| device.clone())
+            .collect();
         let (chosen, archives) = gather_coherent_archives(
-            &self.peers,
+            &sources,
             self.partition,
             account,
             container,
@@ -475,12 +534,13 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             self.scheme.ndata,
             self.fetcher,
             Some(&local_ts),
+            local,
         )
         .map_err(|e| format!("{e:?}"))?;
         // The rebuilt bytes must belong to the SAME version the sender is
         // offering: peers serving a different timestamp would be labelled
         // with this datafile's metadata and corrupt the receiver's view.
-        if chosen.timestamp != local_ts {
+        if !same_data_timestamp(&chosen.timestamp, &local_ts) {
             return Err(format!(
                 "peers serve timestamp {} but the local fragment is {local_ts}",
                 chosen.timestamp
@@ -538,6 +598,7 @@ pub fn rebuild_job(
         &job.object,
         scheme.ndata,
         fetcher,
+        None,
         None,
     )?;
 
@@ -1264,6 +1325,10 @@ impl HttpFragmentFetcher {
         let target = Self::request_target(node, partition, account, container, object);
         let preference_header = preferred_timestamp
             .map(|timestamp| {
+                let timestamp = timestamp
+                    .parse::<swift_core::timestamp::Timestamp>()
+                    .map(|ts| ts.internal())
+                    .unwrap_or_else(|_| timestamp.to_string());
                 format!(
                     "X-Backend-Fragment-Preferences: {}\r\n",
                     serde_json::json!([{"timestamp": timestamp, "exclude": []}])
@@ -1315,7 +1380,7 @@ impl HttpFragmentFetcher {
             .or_else(|| head.headers.get("x-backend-timestamp"))?
             .clone();
         timestamp.parse::<swift_core::timestamp::Timestamp>().ok()?;
-        if preferred_timestamp.is_some_and(|expected| timestamp != expected) {
+        if preferred_timestamp.is_some_and(|expected| !same_data_timestamp(&timestamp, expected)) {
             return None;
         }
         let content_type = head
@@ -2489,6 +2554,16 @@ pub fn process_part_job(
                                 break;
                             }
                         };
+                        stats.rebuilt += report.rebuilt;
+                        if let Some(error) = report.last_rebuild_error {
+                            stats.last_error = Some(format!(
+                                "reconstruct_fa part {} -> {}:{}/{}: {error}",
+                                job.partition,
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device
+                            ));
+                        }
                         if report.offered_count > page_limit
                             || (report.offered_count > 0 && report.last_offered.is_none())
                         {
@@ -4218,6 +4293,118 @@ mod suffix_sync_tests {
         let _ = std::fs::remove_dir_all(&devices);
     }
 
+    /// Field G6 on `ca2081b`: overlay made partner SSYNC (`suffix_syncs>0`)
+    /// but `rebuilt` stayed 0 because only local `reconstruct_missing`
+    /// incremented it. Official `break_nodes` heals via `reconstruct_fa`.
+    #[test]
+    fn test_process_part_job_counts_reconstruct_fa_puts_as_rebuilt() {
+        struct RebuildReportPusher;
+        impl SsyncPusher for RebuildReportPusher {
+            fn push(
+                &self,
+                sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                let mut report = complete_sender_report(sender)?;
+                report.rebuilt = 1;
+                Ok(report)
+            }
+        }
+        let devices = tmp_root("recon-fa-count");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16210, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16210, 2)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &RebuildReportPusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(
+            stats.rebuilt, 1,
+            "reconstruct_fa PUT must increment rebuilt: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Field G6 on `ca2081b`: overlay made SSYNC complete (`suffix_syncs>0`)
+    /// while reconstruct_fa skipped the data PUT. `rebuilt` stayed 0 and
+    /// `test_rebuild_missing_frags` proxy_get 404'd
+    /// (`failed=['127.0.0.2:16220/sdb6#2']`). Surface the skip reason.
+    #[test]
+    fn test_process_part_job_surfaces_reconstruct_fa_skip_when_rebuilt_stays_zero() {
+        struct SkipRebuildPusher;
+        impl SsyncPusher for SkipRebuildPusher {
+            fn push(
+                &self,
+                sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                let mut report = complete_sender_report(sender)?;
+                report.rebuilt = 0;
+                report.last_rebuild_error = Some("NotEnoughFragments".into());
+                Ok(report)
+            }
+        }
+        let devices = tmp_root("recon-fa-skip");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16220, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16220, 2)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &SkipRebuildPusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(stats.rebuilt, 0, "field ca2081b: {stats:?}");
+        assert!(
+            stats
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("reconstruct_fa") && e.contains("NotEnoughFragments")),
+            "skip reason must reach the pass log: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
     #[test]
     fn test_overlay_fragment_fetcher_rewrites_peer_ring_port() {
         struct PortRecordingFetcher {
@@ -4876,7 +5063,7 @@ mod tests {
         };
         let peers = vec![dev(0), dev(1), dev(2)];
         let (chosen, archives) =
-            gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None)
+            gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None, None)
                 .expect("later coherent quorum");
         assert_eq!(chosen.timestamp, "1751500001.00000");
         assert_eq!(
@@ -4892,9 +5079,36 @@ mod tests {
             ]),
         };
         assert!(matches!(
-            gather_coherent_archives(&peers, 0, "a", "c", "o", 3, &duplicate_fetcher, None),
+            gather_coherent_archives(&peers, 0, "a", "c", "o", 3, &duplicate_fetcher, None, None),
             Err(ReconstructError::NotEnoughFragments)
         ));
+    }
+
+    /// Field `test_rebuild_missing_frags` POSTs after PUT. Local datafile
+    /// `X-Timestamp` is the normal form; peer `X-Backend-Data-Timestamp` may
+    /// be `.internal()`. ca2081b used `!=` and dropped every fragment, so
+    /// reconstruct_fa skipped, `rebuilt` stayed 0, victim `sdb6#2` 404'd.
+    #[test]
+    fn test_gather_merges_normalized_and_internal_timestamps() {
+        let etag = "22222222222222222222222222222222";
+        let fetcher = VersionFetcher {
+            by_node: HashMap::from([(1, fetched_fragment(1, "1751500123.45678", etag, 1))]),
+        };
+        let seed = fetched_fragment(0, "1751500123.45678_0000000000000000", etag, 0);
+        let (chosen, archives) = gather_coherent_archives(
+            &[dev(1), dev(2)],
+            0,
+            "a",
+            "c",
+            "o",
+            2,
+            &fetcher,
+            Some("1751500123.45678"),
+            Some(seed),
+        )
+        .expect("same instant must form one quorum");
+        assert!(same_data_timestamp(&chosen.timestamp, "1751500123.45678"));
+        assert_eq!(archives.len(), 2, "seed + one peer is ndata");
     }
 
     /// A fetcher backed by fragment archives held in memory, keyed by node id
@@ -5062,5 +5276,135 @@ mod tests {
             Err(ReconstructError::NotEnoughFragments)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `reconstruct_fa` must use the already-open local fragment. HTTP GET
+    /// back to this node is what stayed at 0 after overlay connected.
+    #[test]
+    fn test_reconstruct_fa_local_seed_reaches_ndata_without_self_http() {
+        use crate::ssync_sender::SyncDiskfileBuilder;
+        let spool = TestSpool::new(4 * 1024 * 1024);
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 1000,
+        };
+        let driver = EcDriver::new(2, 1).unwrap();
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let archives = driver.encode_object(&data, 1000).unwrap();
+        let ts = "1751500123.45678";
+        let etag = md5_hex(&data);
+        struct PeerOnlyFetcher {
+            archives: Vec<Vec<u8>>,
+            spool: SpoolBudget,
+            etag: String,
+            len: usize,
+            ts: String,
+            seen: std::cell::RefCell<Vec<u64>>,
+        }
+        impl FragmentFetcher for PeerOnlyFetcher {
+            fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+                Some(self.spool.clone())
+            }
+            fn fetch(
+                &self,
+                node: &RingDevice,
+                _p: u64,
+                _a: &str,
+                _c: &str,
+                _o: &str,
+            ) -> Option<FetchedFragment> {
+                self.seen.borrow_mut().push(node.id);
+                if node.id != 1 {
+                    return None;
+                }
+                Some(FetchedFragment {
+                    frag_index: 1,
+                    archive: self.archives.get(1)?.clone().into(),
+                    ec_etag: self.etag.clone(),
+                    ec_content_length: self.len,
+                    timestamp: self.ts.clone(),
+                    content_type: "application/octet-stream".into(),
+                })
+            }
+        }
+        let fetcher = PeerOnlyFetcher {
+            archives: archives.clone(),
+            spool: spool.budget.clone(),
+            etag: etag.clone(),
+            len: data.len(),
+            ts: ts.into(),
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let rebuilder = EcSyncRebuilder {
+            scheme,
+            partition: 7,
+            peers: vec![(0, dev(0)), (1, dev(1)), (2, dev(2))],
+            fetcher: &fetcher,
+        };
+        let metadata: Metadata = vec![
+            (
+                MetaValue::Str("name".into()),
+                MetaValue::Str("/AUTH_test/c/o".into()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".into()),
+                MetaValue::Str(ts.into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                MetaValue::Int(0),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
+                MetaValue::Str(etag),
+            ),
+            (
+                MetaValue::Str("ETag".into()),
+                MetaValue::Str("should-be-dropped".into()),
+            ),
+        ];
+        let without = rebuilder.rebuild("hash", &metadata, 2);
+        assert!(
+            without.is_err(),
+            "HTTP-only to peer 1 is one fragment; ndata=2 must fail: {without:?}"
+        );
+        let seed = FetchedFragment {
+            frag_index: 0,
+            archive: archives[0].clone().into(),
+            ec_etag: md5_hex(&data),
+            ec_content_length: data.len(),
+            timestamp: ts.into(),
+            content_type: "application/octet-stream".into(),
+        };
+        // gather_coherent_archives is reconstruct_fa's fragment collection.
+        // Do not call liberasurecode reconstruct() here: Ubuntu 1.6.2
+        // double-frees when multiple rs_vand descriptors exist (CI uses 1.8.0).
+        // Codec identity is covered by test_rebuild_job_persists_identical_durable_fragment.
+        let (chosen, gathered) = gather_coherent_archives(
+            &rebuilder
+                .peers
+                .iter()
+                .filter(|(index, _)| *index != 2)
+                .map(|(_, device)| device.clone())
+                .collect::<Vec<_>>(),
+            rebuilder.partition,
+            "AUTH_test",
+            "c",
+            "o",
+            scheme.ndata,
+            rebuilder.fetcher,
+            Some(ts),
+            Some(seed),
+        )
+        .expect("local seed + one peer is ndata");
+        assert_eq!(gathered.len(), 2);
+        assert!(same_data_timestamp(&chosen.timestamp, ts));
+        assert!(
+            !fetcher.seen.borrow().contains(&2),
+            "must not GET the emptied victim: {:?}",
+            fetcher.seen.borrow()
+        );
+        let _ = (rebuilder, metadata, archives);
     }
 }

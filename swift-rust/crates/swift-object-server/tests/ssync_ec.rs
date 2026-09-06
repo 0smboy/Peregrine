@@ -783,8 +783,12 @@ fn sync_job_rebuilds_the_fragment_at_the_receivers_index() {
         std::time::Duration::from_secs(10),
     )
     .expect("connect");
-    sender.run(&mut wire).expect("ssync run");
+    let report = sender.run(&mut wire).expect("ssync run");
     wire.disconnect();
+    assert_eq!(
+        report.rebuilt, 1,
+        "field ca2081b: reconstruct_fa PUT must increment rebuilt, not only suffix_syncs: {report:?}"
+    );
     assert_eq!(dir_files(&dir), vec![format!("{ts}#4#d.data")]);
     assert_eq!(
         std::fs::read(dir.join(format!("{ts}#4#d.data"))).unwrap(),

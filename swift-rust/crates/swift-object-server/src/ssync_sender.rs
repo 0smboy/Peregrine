@@ -713,6 +713,12 @@ pub struct SenderReport {
     /// Deterministic `(suffix, object_hash)` cursor of the last offered item.
     /// Callers may start another bounded session strictly after it.
     pub last_offered: Option<(String, String)>,
+    /// Successful `reconstruct_fa` data PUTs (local index ≠ receiver index).
+    /// Official `break_nodes` heals here; `EcSsyncStats.rebuilt` must count it.
+    pub rebuilt: u64,
+    /// Last non-retryable `reconstruct_fa` skip (no builder, not enough
+    /// fragments, timestamp mismatch). SSYNC can still complete.
+    pub last_rebuild_error: Option<String>,
 }
 
 /// `ssync_sender.Sender` for one node+job.
@@ -756,6 +762,56 @@ pub trait SyncDiskfileBuilder {
         datafile_metadata: &Metadata,
         target_frag_index: i64,
     ) -> Result<(Metadata, crate::reconstruction_spool::ArchiveBody), String>;
+
+    /// Same as [`Self::rebuild`], with the already-open local fragment so
+    /// `reconstruct_fa` does not depend on an HTTP GET back to this node.
+    fn rebuild_with_local(
+        &self,
+        object_hash: &str,
+        datafile_metadata: &Metadata,
+        target_frag_index: i64,
+        _local: Option<crate::reconstructor::FetchedFragment>,
+    ) -> Result<(Metadata, crate::reconstruction_spool::ArchiveBody), String> {
+        self.rebuild(object_hash, datafile_metadata, target_frag_index)
+    }
+}
+
+fn meta_str(metadata: &Metadata, name: &str) -> Option<String> {
+    metadata.iter().find_map(|(k, v)| match (k, v) {
+        (MetaValue::Str(k), MetaValue::Str(v)) if k == name => Some(v.clone()),
+        (MetaValue::Str(k), MetaValue::Int(i)) if k == name => Some(i.to_string()),
+        _ => None,
+    })
+}
+
+fn local_rebuild_fragment(
+    df: &mut DiskFile,
+    local_frag: Option<i64>,
+) -> Option<crate::reconstructor::FetchedFragment> {
+    let frag_index = i32::try_from(local_frag?).ok()?;
+    let metadata = df.get_datafile_metadata().ok()?;
+    let ec_etag = meta_str(metadata, "X-Object-Sysmeta-Ec-Etag")?;
+    let ec_content_length = meta_str(metadata, "X-Object-Sysmeta-Ec-Content-Length")?
+        .parse()
+        .ok()?;
+    let timestamp = meta_str(metadata, "X-Timestamp")?;
+    let timestamp = timestamp
+        .parse::<Timestamp>()
+        .map(|ts| ts.internal())
+        .unwrap_or(timestamp);
+    let content_type =
+        meta_str(metadata, "Content-Type").unwrap_or_else(|| "application/octet-stream".into());
+    let mut reader = df.reader().ok()?;
+    let archive = reader.read_all().ok()?;
+    let _ = reader.close();
+    Some(crate::reconstructor::FetchedFragment {
+        frag_index,
+        archive: archive.into(),
+        ec_etag,
+        ec_content_length,
+        timestamp,
+        content_type,
+    })
 }
 
 impl Sender<'_> {
@@ -766,7 +822,7 @@ impl Sender<'_> {
         let include_non_durable = self.include_non_durable && wire.accept_no_commit();
         let mut report = SenderReport::default();
         self.missing_check(wire, include_non_durable, &mut report)?;
-        let completed_updates = self.updates(wire, include_non_durable, &report.send_map)?;
+        let completed_updates = self.updates(wire, include_non_durable, &mut report)?;
         let wanted: BTreeSet<&str> = report
             .send_map
             .iter()
@@ -1077,12 +1133,13 @@ impl Sender<'_> {
         &self,
         wire: &mut dyn SsyncWire,
         include_non_durable: bool,
-        send_map: &[(String, Wanted)],
+        report: &mut SenderReport,
     ) -> Result<BTreeSet<String>, SsyncSenderError> {
         wire.send(&chunk_frame(b":UPDATES: START\r\n"))?;
         let frag_prefs = self.frag_prefs(include_non_durable);
         let mut completed = BTreeSet::new();
-        'objects: for (object_hash, want) in send_map {
+        let send_map = report.send_map.clone();
+        'objects: for (object_hash, want) in &send_map {
             let device_path = self.devices.join(&self.job.device);
             let hash_dir = device_path.join(storage_directory(
                 Path::new(&get_data_dir(self.job.policy_index)),
@@ -1139,12 +1196,23 @@ impl Sender<'_> {
                         });
                         if local_frag != Some(target) {
                             let Some(builder) = self.diskfile_builder else {
+                                report.last_rebuild_error = Some(
+                                    "reconstruct_fa skipped: no sync_diskfile_builder \
+                                     (need --features ec)"
+                                        .into(),
+                                );
                                 continue 'objects;
                             };
-                            let Ok(datafile_metadata) = df.get_datafile_metadata() else {
+                            let Ok(datafile_metadata) = df.get_datafile_metadata().cloned() else {
                                 continue 'objects;
                             };
-                            match builder.rebuild(object_hash, datafile_metadata, target) {
+                            let local = local_rebuild_fragment(&mut df, local_frag);
+                            match builder.rebuild_with_local(
+                                object_hash,
+                                &datafile_metadata,
+                                target,
+                                local,
+                            ) {
                                 Ok(built) => rebuilt = Some(built),
                                 Err(error) if error.contains("(retryable)") => {
                                     // Resource admission is a failed attempt,
@@ -1155,7 +1223,10 @@ impl Sender<'_> {
                                         "rebuild resource refusal: {error}"
                                     )));
                                 }
-                                Err(_) => continue 'objects,
+                                Err(error) => {
+                                    report.last_rebuild_error = Some(error);
+                                    continue 'objects;
+                                }
                             }
                         }
                     }
@@ -1167,7 +1238,8 @@ impl Sender<'_> {
                             .is_some_and(|durable_ts| df.data_timestamp().ok() == Some(durable_ts));
                         match &rebuilt {
                             Some((metadata, body)) => {
-                                self.send_put_rebuilt(wire, &url_path, metadata, body, is_durable)?
+                                self.send_put_rebuilt(wire, &url_path, metadata, body, is_durable)?;
+                                report.rebuilt += 1;
                             }
                             None => self.send_put(wire, &url_path, &mut df, is_durable)?,
                         }

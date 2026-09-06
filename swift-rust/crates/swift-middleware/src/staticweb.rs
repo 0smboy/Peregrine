@@ -163,8 +163,10 @@ fn build_listing_html_full(
     body.push_str("<!DOCTYPE html>\n<html>\n <head>\n");
     body.push_str(&format!("  <title>Listing of {esc_label}</title>\n"));
     if let Some(css) = listings_css {
+        // Official _listing (OpenStack staticweb.py): rel, then type, then href.
+        // Field G4 on b20f569: 4 listing_*_direct_with_css fails were this order.
         body.push_str(&format!(
-            "  <link type=\"text/css\" rel=\"stylesheet\" href=\"{}\" />\n",
+            "  <link rel=\"stylesheet\" type=\"text/css\" href=\"{}\" />\n",
             html_escape(css)
         ));
     } else {
@@ -1079,12 +1081,29 @@ mod tests {
     fn test_listing_html_includes_css() {
         let html = build_listing_html_full("/v1/a/c/", "", &[], Some("listings.css"), "", "");
         assert!(
-            html.contains(r#"<link type="text/css" rel="stylesheet" href="listings.css" />"#),
-            "{html}"
+            html.contains(r#"<link rel="stylesheet" type="text/css" href="listings.css" />"#),
+            "field b20f569 official CSS attr order is rel then type then href: {html}"
+        );
+        assert!(
+            !html.contains(r#"<link type="text/css" rel="stylesheet""#),
+            "type-before-rel is the b20f569 field miss: {html}"
         );
         assert!(
             !html.contains(r#"href="./listings.css""#),
             "official _build_css_path does not prefix CSS with ./: {html}"
+        );
+    }
+
+    /// Field G4 on `b20f569`: listing object `./` hrefs passed; the 4 leftover
+    /// `listing_*_direct_with_css` identities failed on attribute order:
+    /// official `'<link rel="stylesheet" type="text/css" href="…" />'` vs
+    /// rust `type` before `rel`.
+    #[test]
+    fn test_listing_html_css_link_is_rel_then_type_then_href() {
+        let html = build_listing_html_full("/v1/AUTH_test/c/", "", &[], Some("style.css"), "", "");
+        assert!(
+            html.contains(r#"<link rel="stylesheet" type="text/css" href="style.css" />"#),
+            "{html}"
         );
     }
 
@@ -1663,7 +1682,7 @@ mod tests {
 
     fn python_css_link(href: &str) -> String {
         format!(
-            "<link type=\"text/css\" rel=\"stylesheet\" href=\"{}\" />",
+            "<link rel=\"stylesheet\" type=\"text/css\" href=\"{}\" />",
             python_quote(href)
         )
     }
@@ -1773,7 +1792,7 @@ mod tests {
             );
         } else {
             assert!(
-                !body.contains("<link type=\"text/css\""),
+                !body.contains("rel=\"stylesheet\""),
                 "unexpected CSS link: {body}"
             );
         }
@@ -1909,7 +1928,7 @@ mod tests {
     ///
     /// Mirrors OpenStack `test_staticweb.py` `_test_listing` assertions:
     /// `Listing of {unquote(path)}`, `<a href="./{quote(link)}">{link}</a>`,
-    /// CSS `<link type="text/css" rel="stylesheet" href="{quote(css)}" />`.
+    /// CSS `<link rel="stylesheet" type="text/css" href="{quote(css)}" />`.
     async fn assert_listing_direct_field_pipeline(
         env: DirectListingEnv,
         anonymous: bool,
@@ -1991,14 +2010,14 @@ mod tests {
             );
             assert!(
                 !body.contains(&format!(
-                    "<link type=\"text/css\" rel=\"stylesheet\" href=\"./{}\" />",
+                    "<link rel=\"stylesheet\" type=\"text/css\" href=\"./{}\" />",
                     python_quote(&css_name)
                 )),
                 "official container CSS has no ./ prefix: {body}"
             );
         } else {
             assert!(
-                !body.contains("<link type=\"text/css\""),
+                !body.contains("rel=\"stylesheet\""),
                 "unexpected CSS link: {body}"
             );
         }
