@@ -49,6 +49,11 @@
 //! `ip={range}\n{method}\n{expires}\n{path}` (Python `get_hmac`).
 //!
 //! Deferrals: `logger.increment('tempurl.digests.*')` metrics.
+//! Field leftovers after the Hyper `prepare` fix (not HMAC/auth):
+//! `GET_DLO_outside_container` (DLO manifest segments outside the signed
+//! container — a DLO+TempURL ACL, not this filter's HMAC) and remaining
+//! UTF-8 TempURL cases beyond decoded PATH_INFO (see
+//! `test_prepare_accepts_decoded_object_path`).
 //!
 //! Wiring: the proxy supplies a [`KeyProvider`] that HEADs account/container
 //! metadata for `Temp-URL-Key[-2]`. `/info` advertising is done by the proxy

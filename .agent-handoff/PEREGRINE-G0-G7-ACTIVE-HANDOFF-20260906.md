@@ -34,7 +34,7 @@ Package/unit green is not field acceptance.
 | **G1** environment | **NOT RUN** | Preflight unit tests exist | No Swift1–4 census from this VM |
 | **G2** build / pipeline | **NOT RUN** | Offline build not executed here | No locked Linux artifact hashes for this commit |
 | **G3** native async | **NOT RUN** | Counter parser + characterization tests exist | No live `:8081` / isolated `:18080` recon deltas on this commit |
-| **G4** Swift functional | **RED** on frozen `2a6110c` vs isolated `:18080` (119 fails); **not replayed** on later SHAs | TempURL HMAC now runs in `prepare`/`finish` (unit + Hyper-path tests). Not a field replay | Dominant theme on `2a6110c` was TempURL → 401 (79) plus staticweb HTML listing (16). Do **not** call G4 GREEN until official `.functests` replay on the SHA that includes the prepare fix |
+| **G4** Swift functional | **RED** — `1f7c401` vs isolated `:18080`: **549 pass / 47 fail / 54 skip / 0 error**. Not replayed on later SHAs | TempURL `prepare`/`finish` (field 79→1). Staticweb `intercepts_response`/`reassemble_async` is unit-proven only | Do **not** call G4 GREEN. Replay `.functests` on the SHA that includes the staticweb Hyper-path fix |
 | **G5** S3 | **NOT RUN** | Same | Official s3api / Ceph lists not replayed on this SHA |
 | **G6** probe / 179 ledger | **NOT RUN** | Historical W068/W069/W070 GREEN was on `17adf0b`, **not** transferable | Must replay 179 identities once, no retry-to-PASS |
 | **G7** concurrency / faults | **NOT ACCEPTED** | Runner fail-closed unit tests + object-server SSYNC interrupt + proxy EC fragment-loss tests | No physical matrix on isolated G6 rust data-plane for this SHA |
@@ -71,10 +71,17 @@ runner retry/timeout issues. Replay exactly 179 identities.
    `Middleware::handle()`. TempURL HMAC, incoming scrub, query rewrite, and
    `X-Backend-Authorize-Override` / `.wsgi.tempurl` now run in `prepare()`;
    Content-Disposition / outgoing scrub / staticweb container-root 401 run
-   in `finish()`. Sync `handle()` is prepare → next → finish. This is
-   unit-proven only — G4 stays RED until Swift2 replays `.functests`.
-   Staticweb HTML index/listing still only implements `handle()` (separate
-   follow-up; see `staticweb.rs` crate docs).
+   in `finish()`. Field G4 on `1f7c401`: TempURL→401 theme **79→1**.
+   Leftover TempURL edges **not** fixed here (not the same hole):
+   `GET_DLO_outside_container` (DLO segment container vs signed path) and
+   remaining UTF-8 TempURL cases (beyond decoded PATH_INFO HMAC).
+5. **Staticweb on the Hyper path (unit only).** `intercepts_response` +
+   `reassemble_async` serve index, delimiter-`/` HTML listing, 301 slash
+   redirect, CSS link, dir-prefix listing, TempURL query on listing hrefs,
+   and Python `X-Web-Mode` / `.wsgi.tempurl` gating. `handle()` matches.
+   Field 16 HTML index/listing fails are **not** closed until Swift2
+   replays `.functests` on this SHA. Deferred vs Python: custom web-error
+   documents, domain_remap Host listing titles.
 
 ## How to run full G0–G7
 
