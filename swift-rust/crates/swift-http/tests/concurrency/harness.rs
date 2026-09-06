@@ -51,13 +51,32 @@ pub fn open_many(
             let mut attempts = 0usize;
             let mut last_transient = None;
             let mut fatal = None;
+            let mut addr_exhausted = 0u32;
             while streams.len() < quota && Instant::now() < deadline {
                 let addr = addrs[(worker + attempts) % addrs.len()];
                 attempts += 1;
                 match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
                     Ok(stream) => {
+                        addr_exhausted = 0;
                         let _ = stream.set_nodelay(true);
                         streams.push(stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                        last_transient =
+                            Some(format!("{error} kind={:?} addr={addr}", error.kind()));
+                        addr_exhausted += 1;
+                        // Ephemeral-port exhaustion is an OS ceiling, not a
+                        // transient backlog. Do not retry for minutes.
+                        if addr_exhausted >= 16 {
+                            fatal = Some(format!(
+                                "worker={worker} OS ephemeral ports exhausted at {}/{} sockets \
+                                 after {attempts} attempts; last transient={last_transient:?}",
+                                streams.len(),
+                                quota
+                            ));
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(error)
                         if matches!(
@@ -65,9 +84,9 @@ pub fn open_many(
                             std::io::ErrorKind::TimedOut
                                 | std::io::ErrorKind::WouldBlock
                                 | std::io::ErrorKind::ConnectionRefused
-                                | std::io::ErrorKind::AddrNotAvailable
                         ) =>
                     {
+                        addr_exhausted = 0;
                         last_transient =
                             Some(format!("{error} kind={:?} addr={addr}", error.kind()));
                         thread::sleep(Duration::from_millis(1));
