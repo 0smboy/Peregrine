@@ -117,8 +117,10 @@ Python-module `PROXY_BASE_URL`. Historic default `http://127.0.0.1:8080`
 then GETs production. In-repo now: `PROXY_BASE_URL` →
 `[probe_test] proxy_base_url` → `{SWIFT_DIR}/proxy-server.conf`
 `bind_ip`/`bind_port` (wildcard → `127.0.0.1`) → historic `:8080`.
-Do **not** hardcode a guessed `:18080` host (`127.0.0.1` vs `10.0.0.1`
-both exist in lab scripts).
+`SwiftConfig::get("DEFAULT", …)` now reads the DEFAULT map (ConfigParser);
+it previously returned `None`, so a bind-only `[DEFAULT]` file could not
+feed this fallback. Do **not** hardcode a guessed `:18080` host
+(`127.0.0.1` vs `10.0.0.1` both exist in lab scripts).
 
 ### reconstructor_rebuild still 14: local `run_once` is **not** the heal path
 

@@ -584,13 +584,24 @@ impl SwiftConfig {
 
     /// Get an interpolated option value from a section (falling back to
     /// DEFAULT), like `ConfigParser.get`.
+    ///
+    /// `section == "DEFAULT"` reads the DEFAULT map directly. Named-section
+    /// lookup already merges DEFAULT, but `get("DEFAULT", key)` used to
+    /// return `None` because DEFAULT is not in `sections`. Callers that
+    /// write `get(app).or(get("DEFAULT"))` then silently missed bind
+    /// knobs on files that only declare `[DEFAULT]`.
     pub fn get(&self, section: &str, key: &str) -> Result<Option<String>, ConfigError> {
-        let Some(i) = self.sections.iter().position(|(n, _)| n == section) else {
-            return Ok(None);
+        let section_idx = if section == "DEFAULT" {
+            None
+        } else {
+            match self.sections.iter().position(|(n, _)| n == section) {
+                Some(i) => Some(i),
+                None => return Ok(None),
+            }
         };
-        match self.raw_lookup(Some(i), key) {
+        match self.raw_lookup(section_idx, key) {
             None => Ok(None),
-            Some(v) => Ok(Some(self.before_get(Some(i), v)?)),
+            Some(v) => Ok(Some(self.before_get(section_idx, v)?)),
         }
     }
 
@@ -894,6 +905,24 @@ escaped = 100%%
         // missing option/section
         assert_eq!(c.get("app:proxy-server", "nope").unwrap(), None);
         assert_eq!(c.get("no-such-section", "user").unwrap(), None);
+        // ConfigParser allows get('DEFAULT', key); this used to return None.
+        assert_eq!(c.get("DEFAULT", "user").unwrap().as_deref(), Some("swift"));
+        assert_eq!(c.get("DEFAULT", "bind_port").unwrap(), None);
+    }
+
+    #[test]
+    fn get_default_section_without_named_sections() {
+        let c = SwiftConfig::parse(
+            "[DEFAULT]\nbind_port = 18080\nbind_ip = 0.0.0.0\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            c.get("DEFAULT", "bind_port").unwrap().as_deref(),
+            Some("18080")
+        );
+        assert_eq!(c.get("app:proxy-server", "bind_port").unwrap(), None);
     }
 
     #[test]
