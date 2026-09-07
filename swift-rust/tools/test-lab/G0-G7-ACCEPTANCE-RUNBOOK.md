@@ -281,6 +281,18 @@ Reserved GET 2xx already proven (`move_twice` PASS). This tip fills
 Do not chase `sync_expired` 503 (lab noise). Do not reopen rebuild 17/17.
 Not G6 GREEN.
 
+Field `/workspace/g6-merge-symlink-rootcause.txt` (2026-09-07): rust
+container-reconciler dropped reserved-namespace symlinks on **EC →
+replicated** moves. After `reconciler.once()` the symlink was gone from
+both policies and the container listing (only the reserved target
+remained). `wrong=silver/1 → Policy-0` PASS; `wrong=ec42/2 → 0` FAIL
+100%. Official flake ~1/4 matches P(wrong=EC)≈1/3. Ledger residual is
+`TestReservedNamespaceMergePolicyIndex.test_reconcile_symlink` L437
+post-reconciler GET. `%2500` in ClientException is display-only. This
+tip strips source `X-Object-Sysmeta-Ec-*` on dest PUT and only skips
+dest write when dest already has a raw symlink. Keep Allow-Reserved /
+`%00` NULL names. Do not reopen rebuild 17/17. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

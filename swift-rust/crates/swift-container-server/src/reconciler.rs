@@ -32,6 +32,9 @@
 //! Production uses [`HttpReconcileClient`] through an explicitly configured
 //! internal proxy. The proxy is required: it selects the source/destination
 //! policy rings and performs EC encoding on a replication-to-EC move.
+//! EC → replicated reserved symlink moves strip source `X-Object-Sysmeta-Ec-*`
+//! so the dest PUT lands a GET-able symlink (field
+//! `/workspace/g6-merge-symlink-rootcause.txt`, 2026-09-07).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -390,14 +393,44 @@ fn response_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
     )
 }
 
+/// EC fragment-archive sysmeta describes the *source policy* object, not the
+/// destination. Field `/workspace/g6-merge-symlink-rootcause.txt` (2026-09-07):
+/// reserved-namespace symlink **EC → replicated** moves copied
+/// `X-Object-Sysmeta-Ec-*` onto the dest PUT. Dest never landed a GET-able
+/// symlink (source DELETE still ran). Repl → repl (`silver` → `Policy-0`)
+/// PASSed; `ec42` → `Policy-0` FAILed 100%.
+fn is_ec_archive_sysmeta(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .starts_with("x-object-sysmeta-ec-")
+}
+
+/// True when a `?symlink=get` response is the link itself, not a follow.
+fn response_is_raw_symlink(buf: &[u8]) -> bool {
+    let Some(headers) = response_headers(buf) else {
+        return false;
+    };
+    headers.iter().any(|(name, value)| {
+        if value.is_empty() {
+            return false;
+        }
+        let lower = name.to_ascii_lowercase();
+        lower == "x-object-sysmeta-symlink-target"
+            || lower == "x-symlink-target"
+            || (lower == "content-type" && value.to_ascii_lowercase().contains("symlink"))
+    })
+}
+
 /// Headers copied by Python's reconciler from the source GET to the
 /// destination PUT. Response framing, transaction, and backend-selection
 /// headers must not be replayed; object metadata and middleware contracts
-/// (SLO/DLO/symlink) must survive the move.
+/// (SLO/DLO/symlink) must survive the move. EC archive sysmeta must not.
 fn copied_source_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
     let mut copied = Vec::new();
     for (name, value) in response_headers(buf)? {
         let lower = name.to_ascii_lowercase();
+        if is_ec_archive_sysmeta(&lower) {
+            continue;
+        }
         // The reconciler reaches the internal proxy through a pipeline that
         // includes symlink middleware and therefore reads a raw symlink with
         // `?symlink=get`. That middleware exposes the four stored sysmeta
@@ -818,7 +851,10 @@ impl ReconcileClient for HttpReconcileClient<'_> {
                 .or_else(|| header_value(&destination_response, "X-Timestamp"))
                 .and_then(|value| value.parse::<Timestamp>().ok())
                 .unwrap_or(Timestamp::zero());
-            if destination_ts >= record.q_ts {
+            // A followed target (no symlink sysmeta) is not the dest object.
+            // Skipping dest write here left reserved EC→repl symlinks gone
+            // from both policies after source DELETE.
+            if destination_ts >= record.q_ts && response_is_raw_symlink(&destination_response) {
                 return self.delete_from_policy(entry, from_policy, record.q_ts);
             }
         } else if destination_status / 100 != 4 {
@@ -1152,6 +1188,54 @@ mod tests {
                 || name.eq_ignore_ascii_case("x-backend-timestamp")
                 || name.eq_ignore_ascii_case("x-trans-id")
         }));
+    }
+
+    #[test]
+    fn reconciler_copy_strips_ec_archive_sysmeta_keeps_reserved_symlink() {
+        let response = b"HTTP/1.1 200 OK\r\n\
+Content-Type: application/symlink\r\n\
+X-Symlink-Target: c/%00target%00uuid\r\n\
+X-Object-Sysmeta-Ec-Etag: deadbeefdeadbeefdeadbeefdeadbeef\r\n\
+X-Object-Sysmeta-Ec-Content-Length: 0\r\n\
+X-Object-Sysmeta-Ec-Frag-Index: 2\r\n\
+X-Object-Sysmeta-Ec-Scheme: 2+1\r\n\
+X-Object-Sysmeta-Ec-Segment-Size: 1048576\r\n\
+X-Object-Sysmeta-Symlink-Target: c/%00target%00uuid\r\n\
+X-Backend-Timestamp: 1751500001.00000\r\n\r\n";
+        let copied = copied_source_headers(response).unwrap();
+        assert!(copied.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value == "application/symlink"
+        }));
+        assert!(copied.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-object-sysmeta-symlink-target")
+                && value == "c/%00target%00uuid"
+        }));
+        assert!(
+            !copied
+                .iter()
+                .any(|(name, _)| is_ec_archive_sysmeta(name)),
+            "EC→repl dest PUT must not replay source fragment sysmeta: {copied:?}"
+        );
+        assert!(response_is_raw_symlink(response));
+        assert!(!response_is_raw_symlink(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Timestamp: 1751500000.00000\r\n\r\nthis is the target data"
+        ));
+    }
+
+    #[test]
+    fn reserved_null_names_stay_percent_00_on_object_path() {
+        let entry = QueueEntry {
+            policy_index: 2,
+            account: "AUTH_test".into(),
+            container: "\0container\0uuid".into(),
+            obj: "\0symlink\0uuid".into(),
+        };
+        let path = HttpReconcileClient::object_path(&entry);
+        assert!(
+            path.contains("%00container%00uuid") && path.contains("%00symlink%00uuid"),
+            "wire must use %00 not %2500: {path}"
+        );
+        assert!(!path.contains("%2500"));
     }
 
     #[test]
