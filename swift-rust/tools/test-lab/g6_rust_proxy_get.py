@@ -103,6 +103,12 @@ Do not raw-replace IsolatedIdentity ``proxy_get`` with
 swiftclient (drops ``UnexpectedResponse``). Rebuild theme is closed
 for ``982e86a``. Not G6 179 GREEN.
 
+Field ``/workspace/g6-partpower-next-rootcause.txt`` (2026-09-07):
+official partpower setUp asserts ``/etc/swift/backups`` +
+``object.builder``. Isolated G6 is ``SWIFT_DIR=/etc/g6-rust``. The
+launcher stamps that env; setUp ``os.access('/etc/swift*')`` is remapped.
+Do not invent ``/etc/swift``. Do not change rust bins.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
@@ -167,8 +173,15 @@ PROBE_PATCH_MARKER = "Peregrine G6: IsolatedIdentity rust :18080 must HTTP"
 DEFAULT_OFFICIAL_PROBE = (
     "/root/work/swift-master/test/probe/test_reconstructor_rebuild.py"
 )
+DEFAULT_OFFICIAL_PARTPOWER = (
+    "/root/work/swift-master/test/probe/test_object_partpower_increase.py"
+)
 PROBE_PATH_ENV_KEYS = ("G6_REBUILD_PROBE_PATH", "SWIFT_RECONSTRUCTOR_REBUILD")
+PARTPOWER_PATH_ENV_KEYS = ("G6_PARTPOWER_PROBE_PATH",)
 SWIFT_SOURCE_ENV_KEYS = ("SWIFT_SOURCE", "SWIFT_REPO", "SWIFT_MASTER")
+DEFAULT_ISOLATED_SWIFT_DIR = "/etc/g6-rust"
+ETC_SWIFT_PREFIX = "/etc/swift"
+PARTPOWER_SWIFT_DIR_MARKER = "Peregrine G6: IsolatedIdentity SWIFT_DIR"
 
 OFFICIAL_PROXY_GET_HEAD = """    def proxy_get(self):
         # Use internal-client instead of python-swiftclient, since we can't
@@ -357,6 +370,50 @@ def internal_proxy_url(environ: Optional[Mapping[str, str]] = None) -> str:
     """Gatekeeper-free rust listen (``:18082``). Empty when unset."""
     env = environ if environ is not None else os.environ
     return (env.get(G6_INTERNAL_PROXY_URL_ENV) or "").strip()
+
+
+def isolated_swift_dir(environ: Optional[Mapping[str, str]] = None) -> str:
+    """SWIFT_DIR for IsolatedIdentity, else empty.
+
+    Field ``/workspace/g6-partpower-next-rootcause.txt`` (2026-09-07):
+    official ``test_object_partpower_increase`` setUp asserts
+    ``/etc/swift/backups`` and ``/etc/swift/object.builder``. Isolated
+    G6 is ``SWIFT_DIR=/etc/g6-rust`` (already W_OK). Do not invent
+    ``/etc/swift``. Explicit ``SWIFT_DIR`` always wins.
+    """
+    env = environ if environ is not None else os.environ
+    explicit = (env.get("SWIFT_DIR") or "").strip()
+    if explicit:
+        return explicit
+    if uses_isolated_rust_proxy(env):
+        return DEFAULT_ISOLATED_SWIFT_DIR
+    return ""
+
+
+def ensure_isolated_swift_dir(
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Stamp ``SWIFT_DIR=/etc/g6-rust`` when IsolatedIdentity ``:18080``."""
+    env = environ if environ is not None else os.environ
+    current = (env.get("SWIFT_DIR") or "").strip()
+    if current:
+        return current
+    if not uses_isolated_rust_proxy(env):
+        return ""
+    env["SWIFT_DIR"] = DEFAULT_ISOLATED_SWIFT_DIR
+    return DEFAULT_ISOLATED_SWIFT_DIR
+
+
+def rewrite_etc_swift_path(
+    path: str, environ: Optional[Mapping[str, str]] = None
+) -> str:
+    """Map official ``/etc/swift*`` asserts onto IsolatedIdentity SWIFT_DIR."""
+    swift_dir = isolated_swift_dir(environ)
+    if not swift_dir or not path:
+        return path
+    if path == ETC_SWIFT_PREFIX or path.startswith(ETC_SWIFT_PREFIX + "/"):
+        return swift_dir + path[len(ETC_SWIFT_PREFIX) :]
+    return path
 
 
 def ensure_internal_proxy_url(
@@ -591,6 +648,137 @@ def find_official_probe(
         if os.path.isfile(path):
             return path
     return None
+
+
+def official_partpower_candidates(
+    environ: Optional[Mapping[str, str]] = None,
+) -> list[str]:
+    env = environ if environ is not None else os.environ
+    out: list[str] = []
+    for key in PARTPOWER_PATH_ENV_KEYS:
+        raw = (env.get(key) or "").strip()
+        if raw:
+            out.append(raw)
+    for key in SWIFT_SOURCE_ENV_KEYS:
+        raw = (env.get(key) or "").strip()
+        if raw:
+            out.append(
+                os.path.join(raw, "test/probe/test_object_partpower_increase.py")
+            )
+    rebuild = find_official_probe(env)
+    if rebuild:
+        out.append(
+            os.path.join(
+                os.path.dirname(rebuild), "test_object_partpower_increase.py"
+            )
+        )
+    out.append(DEFAULT_OFFICIAL_PARTPOWER)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for path in out:
+        if path not in seen:
+            seen.add(path)
+            uniq.append(path)
+    return uniq
+
+
+def find_official_partpower(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    for path in official_partpower_candidates(environ):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+PARTPOWER_ETC_SWIFT_ACCESS_RE = re.compile(
+    r"(?m)^(?P<ind>[ \t]*)self\.assertTrue\(os\.access\('/etc/swift', os\.W_OK\)\)\n"
+    r"(?P=ind)self\.assertTrue\(os\.access\('/etc/swift/backups', os\.W_OK\)\)\n"
+    r"(?P=ind)self\.assertTrue\(os\.access\('/etc/swift/object\.builder', os\.W_OK\)\)\n"
+    r"(?P=ind)self\.assertTrue\(os\.access\('/etc/swift/object\.ring\.gz', os\.W_OK\)\)\n"
+)
+
+
+def apply_lab_partpower_swift_dir_to_source(text: str) -> tuple[str, bool]:
+    """Retarget official partpower setUp ``/etc/swift*`` asserts to SWIFT_DIR."""
+    if PARTPOWER_SWIFT_DIR_MARKER in (text or ""):
+        return text, False
+
+    def repl(match: re.Match[str]) -> str:
+        ind = match.group("ind")
+        return (
+            f"{ind}# {PARTPOWER_SWIFT_DIR_MARKER}, not /etc/swift.\n"
+            f"{ind}from g6_rust_proxy_get import isolated_swift_dir as _g6_swift_dir\n"
+            f"{ind}_g6_dir = _g6_swift_dir() or '/etc/swift'\n"
+            f"{ind}self.assertTrue(os.access(_g6_dir, os.W_OK))\n"
+            f"{ind}self.assertTrue(os.access(os.path.join(_g6_dir, 'backups'), os.W_OK))\n"
+            f"{ind}self.assertTrue(os.access(os.path.join(_g6_dir, 'object.builder'), os.W_OK))\n"
+            f"{ind}self.assertTrue(os.access(os.path.join(_g6_dir, 'object.ring.gz'), os.W_OK))\n"
+        )
+
+    updated, n = PARTPOWER_ETC_SWIFT_ACCESS_RE.subn(repl, text or "", count=1)
+    return updated, n > 0
+
+
+def apply_lab_partpower_swift_dir_to_file(path: str) -> bool:
+    with open(path, encoding="utf-8") as fh:
+        original = fh.read()
+    updated, changed = apply_lab_partpower_swift_dir_to_source(original)
+    if changed:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(updated)
+    return changed
+
+
+def _wrap_partpower_setup(orig: Callable[..., Any]) -> Callable[..., Any]:
+    """Remap official setUp ``os.access('/etc/swift*')`` onto SWIFT_DIR."""
+
+    def setUp(self):
+        ensure_isolated_swift_dir()
+        real_access = os.access
+
+        def access(path, mode, *args, **kwargs):
+            return real_access(rewrite_etc_swift_path(path), mode, *args, **kwargs)
+
+        os.access = access  # type: ignore[assignment]
+        try:
+            return orig(self)
+        finally:
+            os.access = real_access
+
+    setUp._g6_rust_http_orig = orig  # type: ignore[attr-defined]
+    setUp._g6_partpower_swift_dir = True  # type: ignore[attr-defined]
+    return setUp
+
+
+def install_partpower_setup(target: Optional[type] = None) -> bool:
+    """Wrap official TestPartPowerIncrease.setUp (subclasses inherit)."""
+    classes: list[type] = []
+    if target is not None:
+        classes.append(target)
+    else:
+        try:
+            from test.probe.test_object_partpower_increase import (
+                TestPartPowerIncrease,
+            )
+        except Exception:
+            return False
+        classes.append(TestPartPowerIncrease)
+    ok = False
+    for cls in classes:
+        current = getattr(cls, "setUp", None)
+        if current is None:
+            continue
+        if getattr(current, "_g6_partpower_swift_dir", False):
+            if cls not in _installed_targets:
+                _installed_targets.append(cls)
+            ok = True
+            continue
+        cls.setUp = _wrap_partpower_setup(current)
+        if cls not in _installed_targets:
+            _installed_targets.append(cls)
+        ok = True
+    return ok
 
 
 def official_probe_routes_rust_http(
@@ -1635,6 +1823,7 @@ def install(target: Optional[type] = None) -> bool:
     ok = install_probe_body_read()
     ok = install_probe_proxy_get() or ok
     ok = install_probe_proxy_put() or ok
+    ok = install_partpower_setup() or ok
     cls = target
     if cls is None:
         try:
@@ -1659,7 +1848,7 @@ def install(target: Optional[type] = None) -> bool:
 def uninstall() -> None:
     while _installed_targets:
         cls = _installed_targets.pop()
-        for attr in ("make_request", "proxy_get", "proxy_put", "read"):
+        for attr in ("make_request", "proxy_get", "proxy_put", "read", "setUp"):
             current = getattr(cls, attr, None)
             orig = getattr(current, "_g6_rust_http_orig", None)
             if orig is not None:
@@ -1681,9 +1870,12 @@ def prepare_isolated_proxy_get(
     result: dict[str, Any] = {
         "proxy_base_url": proxy_base_url(env),
         "internal_proxy_url": ensure_internal_proxy_url(env),
+        "swift_dir": ensure_isolated_swift_dir(env),
         "isolated": uses_isolated_rust_proxy(env),
         "probe_path": None,
         "probe_changed": False,
+        "partpower_path": None,
+        "partpower_changed": False,
         "probe_routes_http": False,
         "adapter_installed": False,
     }
@@ -1700,6 +1892,12 @@ def prepare_isolated_proxy_get(
             )
         result["probe_routes_http"] = official_probe_routes_rust_http(
             env, path=path
+        )
+    partpower = find_official_partpower(env)
+    result["partpower_path"] = partpower
+    if partpower:
+        result["partpower_changed"] = apply_lab_partpower_swift_dir_to_file(
+            partpower
         )
     result["adapter_installed"] = install()
     rust_object_get_guard(
@@ -1724,13 +1922,21 @@ def pytest_configure(config):  # noqa: ARG001
         maybe_autostart()
 
 
+def pytest_runtest_setup(item):  # noqa: ARG001
+    """Partpower setUp imports after pytest_configure; wrap then."""
+    if uses_isolated_rust_proxy():
+        ensure_isolated_swift_dir()
+        install_partpower_setup()
+
+
 def pytest_sessionstart(session):  # noqa: ARG001
     base = proxy_base_url()
     if not uses_isolated_rust_proxy():
         return
     print(
         f"G6 rust proxy GET/HEAD: PROXY_BASE_URL={base} "
-        f"G6_INTERNAL_PROXY_URL={internal_proxy_url() or '-'} adapter="
+        f"G6_INTERNAL_PROXY_URL={internal_proxy_url() or '-'} "
+        f"SWIFT_DIR={isolated_swift_dir() or '-'} adapter="
         f"{'installed' if is_installed() else 'MISSING'} route=rust-http",
         flush=True,
     )
@@ -1769,7 +1975,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(
             "prepare isolated={isolated} PROXY_BASE_URL={proxy_base_url!r} "
             "G6_INTERNAL_PROXY_URL={internal_proxy_url!r} "
+            "SWIFT_DIR={swift_dir!r} "
             "probe={probe_path} changed={probe_changed} "
+            "partpower={partpower_path} partpower_changed={partpower_changed} "
             "routes_http={probe_routes_http} "
             "adapter_installed={adapter_installed}".format(**result)
         )

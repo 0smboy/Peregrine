@@ -299,6 +299,17 @@ source: dest PUT is a client `X-Symlink-Target` empty
 waits until dest HEAD `?symlink=get` is GET-able. Keep Allow-Reserved /
 `%00` NULL names. Do not reopen rebuild 17/17. Not G6 GREEN.
 
+Field `/workspace/g6-partpower-next-rootcause.txt` (2026-09-07) on
+`b957130`: `test.probe.test_object_partpower_increase` (EC+Repl,
+test_main/test_canceled — all 4) FAIL in setUp.
+`os.access('/etc/swift/backups', W_OK)` is False because the path is
+missing; `/etc/swift/object.builder` would fail next. Isolated G6 is
+`SWIFT_DIR=/etc/g6-rust` with `object.{builder,ring.gz}` + `backups`
+already W_OK. This tip stamps `SWIFT_DIR` from IsolatedIdentity
+`:18080` (default `/etc/g6-rust`) and remaps those official asserts.
+Do not invent `/etc/swift/backups`. Do not change rust bins. Smoke
+rebuild still PASS. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

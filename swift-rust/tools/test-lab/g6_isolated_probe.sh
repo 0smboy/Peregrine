@@ -34,6 +34,10 @@ export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ "${PROXY_BASE_URL:-}" == *":18080"* ]]; then
   export G6_INTERNAL_PROXY_URL="${G6_INTERNAL_PROXY_URL:-http://127.0.0.1:18082}"
+  # Field /workspace/g6-partpower-next-rootcause.txt (2026-09-07):
+  # official partpower setUp asserts /etc/swift/backups + object.builder.
+  # Isolated G6 is SWIFT_DIR=/etc/g6-rust. Do not invent /etc/swift.
+  export SWIFT_DIR="${SWIFT_DIR:-/etc/g6-rust}"
 fi
 
 python3 "$HERE/g6_rust_proxy_get.py" --prepare

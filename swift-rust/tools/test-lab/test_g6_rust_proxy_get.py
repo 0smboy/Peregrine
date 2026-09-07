@@ -917,6 +917,116 @@ class HttpAndPatch(unittest.TestCase):
         self.assertFalse(result["probe_changed"])
 
 
+class PartPowerSwiftDir(unittest.TestCase):
+    """Field /workspace/g6-partpower-next-rootcause.txt: no /etc/swift invent."""
+
+    def tearDown(self):
+        adapter.uninstall()
+        os.environ.pop("PROXY_BASE_URL", None)
+        os.environ.pop("G6_INTERNAL_PROXY_URL", None)
+        os.environ.pop("SWIFT_DIR", None)
+
+    def test_isolated_swift_dir_defaults_g6_rust_on_18080(self):
+        self.assertEqual(
+            adapter.isolated_swift_dir(
+                {"PROXY_BASE_URL": "http://127.0.0.1:18080"}
+            ),
+            "/etc/g6-rust",
+        )
+        self.assertEqual(
+            adapter.isolated_swift_dir(
+                {
+                    "PROXY_BASE_URL": "http://127.0.0.1:18080",
+                    "SWIFT_DIR": "/tmp/g6-swift",
+                }
+            ),
+            "/tmp/g6-swift",
+        )
+        self.assertEqual(
+            adapter.isolated_swift_dir(
+                {"PROXY_BASE_URL": "http://127.0.0.1:8080"}
+            ),
+            "",
+        )
+
+    def test_rewrite_etc_swift_path_maps_only_etc_swift(self):
+        env = {
+            "PROXY_BASE_URL": "http://127.0.0.1:18080",
+            "SWIFT_DIR": "/etc/g6-rust",
+        }
+        self.assertEqual(
+            adapter.rewrite_etc_swift_path("/etc/swift/backups", env),
+            "/etc/g6-rust/backups",
+        )
+        self.assertEqual(
+            adapter.rewrite_etc_swift_path("/etc/swift/object.builder", env),
+            "/etc/g6-rust/object.builder",
+        )
+        self.assertEqual(
+            adapter.rewrite_etc_swift_path("/etc/swift/object.ring.gz", env),
+            "/etc/g6-rust/object.ring.gz",
+        )
+        self.assertEqual(
+            adapter.rewrite_etc_swift_path("/srv/node/d1", env),
+            "/srv/node/d1",
+        )
+        self.assertEqual(
+            adapter.rewrite_etc_swift_path(
+                "/etc/swift/backups",
+                {"PROXY_BASE_URL": "http://127.0.0.1:8080"},
+            ),
+            "/etc/swift/backups",
+        )
+
+    def test_ensure_isolated_swift_dir_stamps_env(self):
+        env = {"PROXY_BASE_URL": "http://127.0.0.1:18080"}
+        self.assertEqual(adapter.ensure_isolated_swift_dir(env), "/etc/g6-rust")
+        self.assertEqual(env["SWIFT_DIR"], "/etc/g6-rust")
+        keep = {
+            "PROXY_BASE_URL": "http://127.0.0.1:18080",
+            "SWIFT_DIR": "/already",
+        }
+        self.assertEqual(adapter.ensure_isolated_swift_dir(keep), "/already")
+
+    def test_partpower_source_rewrite_retargets_etc_swift_access(self):
+        official = (
+            "        self.assertTrue(os.access('/etc/swift', os.W_OK))\n"
+            "        self.assertTrue(os.access('/etc/swift/backups', os.W_OK))\n"
+            "        self.assertTrue(os.access('/etc/swift/object.builder', os.W_OK))\n"
+            "        self.assertTrue(os.access('/etc/swift/object.ring.gz', os.W_OK))\n"
+        )
+        updated, changed = adapter.apply_lab_partpower_swift_dir_to_source(official)
+        self.assertTrue(changed)
+        self.assertIn(adapter.PARTPOWER_SWIFT_DIR_MARKER, updated)
+        self.assertNotIn("os.access('/etc/swift/backups'", updated)
+        again, changed_again = adapter.apply_lab_partpower_swift_dir_to_source(
+            updated
+        )
+        self.assertFalse(changed_again)
+        self.assertEqual(again, updated)
+
+    def test_partpower_setup_wrap_remaps_os_access(self):
+        import tempfile
+
+        class Probe:
+            def setUp(self):
+                self.backups_ok = os.access("/etc/swift/backups", os.W_OK)
+                self.builder_ok = os.access("/etc/swift/object.builder", os.W_OK)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            backups = os.path.join(tmp, "backups")
+            os.mkdir(backups)
+            open(os.path.join(tmp, "object.builder"), "w").close()
+            os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+            os.environ["SWIFT_DIR"] = tmp
+            self.assertTrue(adapter.install_partpower_setup(Probe))
+            probe = Probe()
+            probe.setUp()
+            self.assertTrue(probe.backups_ok)
+            self.assertTrue(probe.builder_ok)
+            self.assertTrue(os.path.isdir(backups))
+
+
 class ExpireWaitHonesty(unittest.TestCase):
     """ASCII test_sync_expired_object: IsolatedIdentity GET must 404 in ~2s."""
 
