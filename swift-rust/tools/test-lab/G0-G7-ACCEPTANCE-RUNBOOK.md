@@ -256,6 +256,18 @@ reserved-names *after* hop, so plain PUTs stay on `:18080`. Keep expire
 `UnexpectedResponse` + `:18082` GET hop from `4764ef1`. Do not claim
 merge GREEN. Do not reopen rebuild 17/17.
 
+Field `/workspace/g6-merge-xbackend-18082/` (2026-09-07) after
+`8353823` + wrap: merge family **PASS=9 / bad=2**. Brain
+`put_container` only sends `X-Storage-Policy`. Egg
+`InternalClient.make_request` `setdefault('X-Backend-Allow-Reserved-Names',
+'true')` **before** the hop; pure `8353823` stamped after hop so those
+PUTs stayed on `:18080` → **412**. Field wrap before hop cleared
+ReservedNamespace 412 and `test_reconciler_move_object_twice` 200.
+`_HttpResp.environ` is a minimal WSGI dict including `wsgi.url_scheme`
+(empty `{}` was `KeyError` in brain translate on residual 404). Do
+**not** chase residual ReservedNamespace `get_object` 404 in this tip.
+Do not claim merge GREEN. Do not reopen rebuild 17/17.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

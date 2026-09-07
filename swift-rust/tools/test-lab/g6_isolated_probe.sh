@@ -22,10 +22,10 @@
 # Field `/workspace/g6-rebuild-982e86a-unified/` (2026-09-06): 17/17 PASS.
 # Public :18080 gatekeeper strips X-Backend-*. IsolatedIdentity GET and
 # no-commit / backend-header hops use rust :18082 (G6_INTERNAL_PROXY_URL).
-# rust_http_make_request hops :18082 on any caller X-Backend-*
-# (Allow-Reserved-Names, Storage-Policy-Index). Keep rust_http_proxy_get
-# (UnexpectedResponse). Do not raw-replace IsolatedIdentity proxy_get
-# with swiftclient.
+# rust_http_make_request hops :18082 on any X-Backend-* after egg
+# setdefault Allow-Reserved-Names (brain put_container sends only
+# X-Storage-Policy). Keep rust_http_proxy_get (UnexpectedResponse).
+# Do not raw-replace IsolatedIdentity proxy_get with swiftclient.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"

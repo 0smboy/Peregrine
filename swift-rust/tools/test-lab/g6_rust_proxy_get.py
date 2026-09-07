@@ -77,9 +77,17 @@ stripped ``X-Backend-Allow-Reserved-Names`` (ReservedNamespace
 NULL reserved names) and ``X-Backend-Storage-Policy-Index``
 (reconciler HEAD found the object on the wrong policy → **200**).
 Hop ``rust_http_make_request`` to ``G6_INTERNAL_PROXY_URL`` (default
-``:18082``) when the caller sent any ``X-Backend-*``. IsolatedIdentity
-stamps reserved-names *after* hop so plain PUTs stay on ``:18080``.
-Do not reopen rebuild 17/17. Not G6 GREEN.
+``:18082``) when headers carry any ``X-Backend-*``.
+
+Field ``/workspace/g6-merge-xbackend-18082/`` (2026-09-07) after
+``8353823`` + wrap: merge family **PASS=9 / bad=2**. Brain
+``put_container`` only sends ``X-Storage-Policy``. Egg
+``InternalClient.make_request`` ``setdefault``
+``X-Backend-Allow-Reserved-Names`` **before** the hop; pure
+``8353823`` stamped after hop so those PUTs stayed on ``:18080``
+→ **412**. Field wrap before hop cleared ReservedNamespace 412 and
+``move_twice`` 200. Residual ReservedNamespace ``get_object`` 404
+is a separate diagnosis. Do not reopen rebuild 17/17. Not G6 GREEN.
 
 Field ``/workspace/g6-rebuild-982e86a-unified/`` (2026-09-06) on tip
 ``982e86a``: full rebuild theme **17/17 PASS**. Public ``:18080``
@@ -101,6 +109,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import io
 import os
 import re
 import time
@@ -222,6 +231,30 @@ class WsgiHeaderDict(dict):
             return default
 
 
+def minimal_wsgi_environ() -> dict[str, Any]:
+    """Enough WSGI for IsolatedIdentity brain translate on residual 404.
+
+    Field ``/workspace/g6-merge-xbackend-18082/``: empty ``{}`` raised
+    ``KeyError: wsgi.url_scheme``.
+    """
+    return {
+        "REQUEST_METHOD": "GET",
+        "SCRIPT_NAME": "",
+        "PATH_INFO": "/",
+        "QUERY_STRING": "",
+        "SERVER_NAME": "localhost",
+        "SERVER_PORT": "80",
+        "SERVER_PROTOCOL": "HTTP/1.1",
+        "wsgi.version": (1, 0),
+        "wsgi.url_scheme": "http",
+        "wsgi.input": io.BytesIO(b""),
+        "wsgi.errors": io.BytesIO(),
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+    }
+
+
 class _HttpResp:
     """swob-shaped object for ``InternalClient.get_object`` / ``make_request``."""
 
@@ -234,8 +267,7 @@ class _HttpResp:
         )
         self.body = body
         self.app_iter: Iterable[bytes] = [body] if body else []
-        # IsolatedIdentity brain translate reads resp.environ; empty is enough.
-        self.environ: dict[str, Any] = {}
+        self.environ: dict[str, Any] = minimal_wsgi_environ()
 
 
 def proxy_base_url(environ: Optional[Mapping[str, str]] = None) -> str:
@@ -277,11 +309,11 @@ def ensure_internal_proxy_url(
 def headers_need_gatekeeper_bypass(headers: Optional[Mapping[str, Any]]) -> bool:
     """True when the caller sent any ``X-Backend-*`` gatekeeper would strip.
 
-    Field ``/workspace/g6-merge-next-rootcause.txt`` (2026-09-07):
+    Field ``/workspace/g6-merge-xbackend-18082/`` (2026-09-07):
     ``X-Backend-Allow-Reserved-Names`` and
-    ``X-Backend-Storage-Policy-Index`` must hop ``:18082``. IsolatedIdentity
-    may stamp reserved-names later; hop is decided from the caller's
-    headers only.
+    ``X-Backend-Storage-Policy-Index`` must hop ``:18082``.
+    IsolatedIdentity ``make_request`` stamps reserved-names *before*
+    this check (egg ``setdefault``).
     """
     for key, value in _header_items(headers):
         if not value and value != 0:
@@ -300,9 +332,11 @@ def request_proxy_base_url(
     """Public ``:18080`` or internal ``:18082`` for one IsolatedIdentity hop.
 
     IsolatedIdentity GET/HEAD use ``G6_INTERNAL_PROXY_URL`` when set
-    (field unified harness). Any caller ``X-Backend-*`` (reserved-names,
+    (field unified harness). Any ``X-Backend-*`` (reserved-names,
     storage-policy-index, no-commit, fragment-preferences) hops
-    ``:18082``. Plain PUT without those headers stays on public
+    ``:18082``. IsolatedIdentity ``rust_http_make_request`` stamps
+    reserved-names *before* this hop (egg parity). A hop helper call
+    without that stamp still keeps a plain PUT on public
     ``PROXY_BASE_URL``. Expire IsolatedIdentity proxy_get 404 still
     maps to ``UnexpectedResponse``.
     """
@@ -1049,14 +1083,15 @@ def rust_http_make_request(
         )
     env = environ if environ is not None else os.environ
     ensure_internal_proxy_url(env)
-    # Hop from caller headers only. IsolatedIdentity later stamps
-    # X-Backend-Allow-Reserved-Names; that must not send every PUT to
-    # :18082. Caller reserved-names / storage-policy-index must hop.
+    # Egg InternalClient.make_request setdefault reserved-names before
+    # the request is sent. Brain put_container only sends
+    # X-Storage-Policy; hop must see the stamp or :18080 gatekeeper
+    # strips it (field 8353823 → 412). Stamp first, then hop.
     merged = dict(_header_items(headers))
-    base = request_proxy_base_url(method, merged, env)
     for name, value in g6_auth_headers(environ).items():
         merged.setdefault(name, value)
     merged.setdefault("X-Backend-Allow-Reserved-Names", "true")
+    base = request_proxy_base_url(method, merged, env)
     if method.upper() in OBJECT_GET_METHODS:
         merged = force_utf8_compat_request_headers(merged)
     url = join_proxy_url(base, path, params)

@@ -668,7 +668,7 @@ class HttpAndPatch(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(b"".join(resp.app_iter), b"payload")
         self.assertEqual(resp.headers.get("Etag"), "abc")
-        self.assertTrue(hasattr(resp, "environ"))
+        self.assertEqual(resp.environ["wsgi.url_scheme"], "http")
 
     def test_http_404_raises_unexpected(self):
         def opener(req, timeout=None):
@@ -1172,9 +1172,8 @@ class UnifiedInternalHop(unittest.TestCase):
             adapter.request_proxy_base_url("PUT", {"Content-Type": "text/plain"}, env),
             "http://127.0.0.1:18080",
         )
-        # Any caller X-Backend-* hops :18082 (ReservedNamespace + reconciler).
-        # IsolatedIdentity stamps reserved-names *after* hop, so that stamp
-        # alone must not send every PUT to :18082.
+        # Hop helper without IsolatedIdentity stamp: plain PUT stays :18080.
+        # rust_http_make_request stamps reserved-names *before* hop (egg).
         self.assertTrue(
             adapter.headers_need_gatekeeper_bypass(
                 {"X-Backend-Allow-Reserved-Names": "true"}
@@ -1262,11 +1261,9 @@ class UnifiedInternalHop(unittest.TestCase):
     def test_make_request_backend_headers_hop_18082(self):
         """Caller X-Backend-* on rust_http_make_request hops :18082.
 
-        ReservedNamespace put_container stamps Allow-Reserved-Names;
-        reconciler HEAD stamps Storage-Policy-Index. Both were stripped
-        on :18080 (g6-merge-next-rootcause.txt after 4764ef1; PASS=6/bad=5).
-        IsolatedIdentity then setdefault reserved-names — hop stays on
-        caller headers so that stamp does not send every PUT to :18082.
+        Reconciler HEAD stamps Storage-Policy-Index. ReservedNamespace
+        put_container is covered by setdefault-before-hop (brain sends
+        X-Storage-Policy only).
         """
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
         os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
@@ -1330,8 +1327,15 @@ class UnifiedInternalHop(unittest.TestCase):
         self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
         self.assertEqual(seen["policy"], "0")
 
-    def test_make_request_plain_put_stays_18080(self):
-        """IsolatedIdentity reserved-names stamp after hop keeps plain PUT on :18080."""
+    def test_make_request_setdefault_reserved_before_hop(self):
+        """Egg parity: IsolatedIdentity stamps Allow-Reserved-Names before hop.
+
+        Field /workspace/g6-merge-xbackend-18082/ (2026-09-07) on 8353823+wrap:
+        PASS=9/bad=2. Brain put_container only sends X-Storage-Policy.
+        Pure 8353823 stamped reserved-names after hop → stayed :18080 → 412.
+        setdefault before hop cleared ReservedNamespace 412 and move_twice 200.
+        Do not chase residual ReservedNamespace get_object 404.
+        """
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
         os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
         seen = {}
@@ -1359,14 +1363,43 @@ class UnifiedInternalHop(unittest.TestCase):
 
         resp = adapter.rust_http_make_request(
             "PUT",
+            "/v1/.expiring_objects/1234",
+            {"X-Storage-Policy": "gold"},
+            (2,),
+            opener=opener,
+        )
+        self.assertEqual(resp.status_int, 201)
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
+        self.assertEqual(seen["reserved"], "true")
+        self.assertEqual(resp.environ["wsgi.url_scheme"], "http")
+
+        seen.clear()
+        resp = adapter.rust_http_make_request(
+            "PUT",
             "/v1/AUTH_test/c",
             {"X-Timestamp": "1"},
             (2,),
             opener=opener,
         )
         self.assertEqual(resp.status_int, 201)
-        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18080/"))
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
         self.assertEqual(seen["reserved"], "true")
+
+        env = {
+            "PROXY_BASE_URL": "http://127.0.0.1:18080",
+            "G6_INTERNAL_PROXY_URL": "http://127.0.0.1:18082",
+        }
+        # Hop helper without IsolatedIdentity stamp still stays public.
+        self.assertEqual(
+            adapter.request_proxy_base_url("PUT", {"X-Storage-Policy": "gold"}, env),
+            "http://127.0.0.1:18080",
+        )
+        stamped = {"X-Storage-Policy": "gold"}
+        stamped.setdefault("X-Backend-Allow-Reserved-Names", "true")
+        self.assertEqual(
+            adapter.request_proxy_base_url("PUT", stamped, env),
+            "http://127.0.0.1:18082",
+        )
 
     def test_prepare_defaults_internal_url(self):
         import tempfile
