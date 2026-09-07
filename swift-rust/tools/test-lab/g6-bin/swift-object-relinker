@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# IsolatedIdentity PATH shadow for official
+# subprocess.check_call(['swift-object-relinker', ...]).
+# Field /workspace/g6-partpower-ec-relinker-rootcause.txt: Python
+# relinker must set_swift_dir + reload POLICIES from SWIFT_DIR before
+# swift.cli.relinker. Not a rust bin. Do not invent /etc/swift policies.
+set -euo pipefail
+exec python3 -m g6_rust_proxy_get --relinker "$@"

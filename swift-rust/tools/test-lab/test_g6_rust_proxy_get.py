@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -1025,6 +1027,101 @@ class PartPowerSwiftDir(unittest.TestCase):
             self.assertTrue(probe.backups_ok)
             self.assertTrue(probe.builder_ok)
             self.assertTrue(os.path.isdir(backups))
+
+    def test_isolated_relinker_argv_routes_python_relinker_not_path(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        rewritten = adapter.isolated_relinker_argv(
+            ["swift-object-relinker", "relink", "/etc/g6-rust/object-server/1.conf"]
+        )
+        self.assertEqual(rewritten[0], sys.executable)
+        self.assertEqual(rewritten[1:3], ["-m", "g6_rust_proxy_get"])
+        self.assertEqual(rewritten[3], "--relinker")
+        self.assertEqual(
+            rewritten[4:],
+            ["relink", "/etc/g6-rust/object-server/1.conf"],
+        )
+        self.assertEqual(
+            adapter.isolated_relinker_argv(["swift-object-replicator", "once"]),
+            ["swift-object-replicator", "once"],
+        )
+
+    def test_inject_relinker_swift_dir_is_idempotent(self):
+        self.assertEqual(
+            adapter.inject_relinker_swift_dir(
+                ["relink", "/etc/g6-rust/object-server/1.conf"],
+                "/etc/g6-rust",
+            ),
+            [
+                "--swift-dir",
+                "/etc/g6-rust",
+                "relink",
+                "/etc/g6-rust/object-server/1.conf",
+            ],
+        )
+        already = ["--swift-dir", "/etc/g6-rust", "relink", "x.conf"]
+        self.assertEqual(
+            adapter.inject_relinker_swift_dir(already, "/etc/g6-rust"),
+            already,
+        )
+
+    def test_check_call_wrap_rewrites_relinker_only(self):
+        seen = []
+
+        def fake_check_call(cmd, *args, **kwargs):
+            seen.append(list(cmd))
+            return 0
+
+        subprocess.check_call = fake_check_call  # type: ignore[assignment]
+        try:
+            os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+            self.assertTrue(adapter.install_partpower_relinker())
+            subprocess.check_call(
+                ["swift-object-relinker", "cleanup", "/etc/g6-rust/object-server/1.conf"]
+            )
+            subprocess.check_call(["echo", "ok"])
+        finally:
+            adapter.uninstall()
+        self.assertEqual(seen[0][1:4], ["-m", "g6_rust_proxy_get", "--relinker"])
+        self.assertEqual(seen[0][-2:], ["cleanup", "/etc/g6-rust/object-server/1.conf"])
+        self.assertEqual(seen[1], ["echo", "ok"])
+
+    def test_run_isolated_relinker_set_swift_dir_then_python_main(self):
+        calls = []
+
+        def fake_bind(swift_dir):
+            calls.append(("bind", swift_dir))
+
+        class RelinkerMain:
+            def __init__(self):
+                self.argv = None
+
+            def __call__(self, argv=None):
+                self.argv = list(argv)
+                calls.append(("main", self.argv))
+                return 0
+
+        relinker_main = RelinkerMain()
+        fake_relinker = type("cli", (), {"relinker": type("r", (), {"main": relinker_main})})
+        with mock.patch.object(adapter, "bind_relinker_to_swift_dir", fake_bind):
+            with mock.patch.dict(
+                sys.modules,
+                {"swift": type(sys)("swift"), "swift.cli": type(sys)("swift.cli")},
+            ):
+                sys.modules["swift.cli"] = type(sys)("swift.cli")
+                sys.modules["swift.cli.relinker"] = fake_relinker.relinker
+                env = {
+                    "PROXY_BASE_URL": "http://127.0.0.1:18080",
+                    "SWIFT_DIR": "/etc/g6-rust",
+                }
+                rc = adapter.run_isolated_relinker(
+                    ["relink", "/etc/g6-rust/object-server/1.conf"],
+                    environ=env,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0], ("bind", "/etc/g6-rust"))
+        self.assertEqual(calls[1][0], "main")
+        self.assertEqual(calls[1][1][:2], ["--swift-dir", "/etc/g6-rust"])
+        self.assertIn("relink", calls[1][1])
 
 
 class ExpireWaitHonesty(unittest.TestCase):

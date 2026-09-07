@@ -109,6 +109,15 @@ official partpower setUp asserts ``/etc/swift/backups`` +
 launcher stamps that env; setUp ``os.access('/etc/swift*')`` is remapped.
 Do not invent ``/etc/swift``. Do not change rust bins.
 
+Field ``/workspace/g6-partpower-ec-relinker-rootcause.txt`` (2026-09-07):
+EC partpower ERROR exit 2 (``EXIT_NO_APPLICABLE_POLICY``). PATH is
+Python ``swift-object-relinker``. Parent ``set_swift_dir(/etc/g6-rust)``
+mutates ``object-2``; the child imported ``POLICIES`` from prod
+``/etc/swift/swift.conf`` ``(0, object), (1, object-1)`` and never saw
+``object-2``. Repl Policy-0 exists in both so PASS. Child must
+``set_swift_dir`` + reload before ``swift.cli.relinker``. Do not invent
+``/etc/swift`` policies. Not a rust-bin tip.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
@@ -123,6 +132,8 @@ import http.client
 import io
 import os
 import re
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -414,6 +425,63 @@ def rewrite_etc_swift_path(
     if path == ETC_SWIFT_PREFIX or path.startswith(ETC_SWIFT_PREFIX + "/"):
         return swift_dir + path[len(ETC_SWIFT_PREFIX) :]
     return path
+
+
+def is_object_relinker_cmd(cmd: Any) -> bool:
+    if not cmd:
+        return False
+    name = os.path.basename(str(cmd[0]))
+    return name == "swift-object-relinker"
+
+
+def inject_relinker_swift_dir(argv: list[str], swift_dir: str) -> list[str]:
+    """Insert ``--swift-dir`` so ring load matches IsolatedIdentity SWIFT_DIR."""
+    if not swift_dir or "--swift-dir" in argv:
+        return list(argv)
+    return ["--swift-dir", swift_dir, *argv]
+
+
+def isolated_relinker_argv(
+    cmd: Any, environ: Optional[Mapping[str, str]] = None
+) -> list[str]:
+    """Official ``check_call(['swift-object-relinker', …])`` → this adapter.
+
+    Field ``/workspace/g6-partpower-ec-relinker-rootcause.txt``: PATH
+    pyswift-venv relinker must not import ``POLICIES`` from prod
+    ``/etc/swift``. Route the child through ``--relinker`` so it
+    ``set_swift_dir`` + reload first.
+    """
+    cmd = [str(part) for part in cmd]
+    if not is_object_relinker_cmd(cmd):
+        return cmd
+    return [sys.executable, "-m", "g6_rust_proxy_get", "--relinker", *cmd[1:]]
+
+
+def bind_relinker_to_swift_dir(swift_dir: str) -> None:
+    """Point ``SWIFT_CONF_FILE`` at IsolatedIdentity and reload POLICIES."""
+    from swift.common.utils import set_swift_dir
+
+    set_swift_dir(swift_dir)
+    from swift.common.storage_policy import reload_storage_policies
+
+    reload_storage_policies()
+
+
+def run_isolated_relinker(
+    argv: Optional[list[str]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> int:
+    """Python relinker after SWIFT_DIR POLICIES reload. Not a rust bin."""
+    env = environ if environ is not None else os.environ
+    swift_dir = isolated_swift_dir(env)
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if swift_dir:
+        bind_relinker_to_swift_dir(swift_dir)
+        argv = inject_relinker_swift_dir(argv, swift_dir)
+    from swift.cli.relinker import main
+
+    result = main(argv)
+    return int(result) if result is not None else 0
 
 
 def ensure_internal_proxy_url(
@@ -779,6 +847,28 @@ def install_partpower_setup(target: Optional[type] = None) -> bool:
             _installed_targets.append(cls)
         ok = True
     return ok
+
+
+def _wrap_relinker_check_call(orig: Callable[..., Any]) -> Callable[..., Any]:
+    def check_call(cmd, *args, **kwargs):
+        return orig(isolated_relinker_argv(cmd), *args, **kwargs)
+
+    check_call._g6_rust_http_orig = orig  # type: ignore[attr-defined]
+    check_call._g6_partpower_relinker = True  # type: ignore[attr-defined]
+    return check_call
+
+
+def install_partpower_relinker() -> bool:
+    """Rewrite IsolatedIdentity ``swift-object-relinker`` children to --relinker."""
+    current = subprocess.check_call
+    if getattr(current, "_g6_partpower_relinker", False):
+        if subprocess not in _installed_targets:
+            _installed_targets.append(subprocess)
+        return True
+    subprocess.check_call = _wrap_relinker_check_call(current)
+    if subprocess not in _installed_targets:
+        _installed_targets.append(subprocess)
+    return True
 
 
 def official_probe_routes_rust_http(
@@ -1824,6 +1914,8 @@ def install(target: Optional[type] = None) -> bool:
     ok = install_probe_proxy_get() or ok
     ok = install_probe_proxy_put() or ok
     ok = install_partpower_setup() or ok
+    if uses_isolated_rust_proxy():
+        ok = install_partpower_relinker() or ok
     cls = target
     if cls is None:
         try:
@@ -1848,7 +1940,14 @@ def install(target: Optional[type] = None) -> bool:
 def uninstall() -> None:
     while _installed_targets:
         cls = _installed_targets.pop()
-        for attr in ("make_request", "proxy_get", "proxy_put", "read", "setUp"):
+        for attr in (
+            "make_request",
+            "proxy_get",
+            "proxy_put",
+            "read",
+            "setUp",
+            "check_call",
+        ):
             current = getattr(cls, attr, None)
             orig = getattr(current, "_g6_rust_http_orig", None)
             if orig is not None:
@@ -1927,6 +2026,7 @@ def pytest_runtest_setup(item):  # noqa: ARG001
     if uses_isolated_rust_proxy():
         ensure_isolated_swift_dir()
         install_partpower_setup()
+        install_partpower_relinker()
 
 
 def pytest_sessionstart(session):  # noqa: ARG001
@@ -1965,6 +2065,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="rewrite official test_reconstructor_rebuild.py proxy_get "
         "(lab file /root/work/swift-master/test/probe/test_reconstructor_rebuild.py)",
     )
+    raw = list(argv if argv is not None else sys.argv[1:])
+    if raw and raw[0] == "--relinker":
+        return run_isolated_relinker(raw[1:])
     args = parser.parse_args(argv)
     if args.apply_probe:
         changed = apply_lab_proxy_get_to_file(args.apply_probe)

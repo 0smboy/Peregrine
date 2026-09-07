@@ -310,6 +310,17 @@ already W_OK. This tip stamps `SWIFT_DIR` from IsolatedIdentity
 Do not invent `/etc/swift/backups`. Do not change rust bins. Smoke
 rebuild still PASS. Not G6 GREEN.
 
+Field `/workspace/g6-partpower-ec-relinker-rootcause.txt` (2026-09-07)
+on `56d1aee`: Repl partpower PASS; EC `test_{main,canceled}` ERROR
+`swift-object-relinker …/object-server/1.conf` exit 2
+(`EXIT_NO_APPLICABLE_POLICY`). PATH is Python pyswift-venv relinker.
+Parent `set_swift_dir(/etc/g6-rust)` mutates `object-2`; the child
+loaded prod `/etc/swift/swift.conf` POLICIES `(0, object), (1,
+object-1)` and never saw `object-2`. This tip routes the child through
+`--relinker` (`set_swift_dir` + `reload_storage_policies` +
+`--swift-dir`). Do not invent `/etc/swift` policies. Not a rust-bin
+tip. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 
