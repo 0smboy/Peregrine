@@ -486,12 +486,21 @@ impl ProxyObjectSource {
     }
 }
 
-fn object_source_url(base: &str, account: &str, container: &str, name: &str) -> String {
+fn object_source_url(base: &str, account: &str, container: &str, name: &str, slo: bool) -> String {
     // Python's container-sync InternalClient always asks symlink middleware
     // for the link object itself.  Without this query a dynamic link is
     // dereferenced and the target body is copied as an ordinary object.
+    // Field `/workspace/g6-csync-next-rootcause.txt`: Isolated proxy has
+    // SLO in the pipeline. GET `?symlink=get` only reassembles an SLO to
+    // the segment text and dest PUT 422s. When slo=True, also ask for
+    // `multipart-manifest=get` (raw JSON) matching Python.
+    let qs = if slo {
+        "symlink=get&multipart-manifest=get"
+    } else {
+        "symlink=get"
+    };
     format!(
-        "{}/{}/{}/{}?symlink=get",
+        "{}/{}/{}/{}?{qs}",
         base.trim_end_matches('/'),
         pe(account),
         pe(container),
@@ -526,15 +535,8 @@ fn debug_object_source(name: &str, headers: &[(String, String)], body: &[u8]) {
     );
 }
 
-impl ObjectSource for ProxyObjectSource {
-    fn get_object(
-        &self,
-        account: &str,
-        container: &str,
-        name: &str,
-        _storage_policy_index: i64,
-    ) -> Option<(Vec<(String, String)>, Vec<u8>)> {
-        let url = object_source_url(&self.base, account, container, name);
+impl ProxyObjectSource {
+    fn get_once(&self, url: &str) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
         if std::env::var("G6_CONTAINER_SYNC_DEBUG").as_deref() == Ok("1") {
             eprintln!("container-sync-debug: source GET url={url}");
         }
@@ -547,7 +549,7 @@ impl ObjectSource for ProxyObjectSource {
         }
         let (status, resp_headers, body) = match http_exchange_with_fallback(
             "GET",
-            &url,
+            url,
             &headers,
             &[],
             self.timeout,
@@ -569,29 +571,49 @@ impl ObjectSource for ProxyObjectSource {
             if let Some(tok) = self.ensure_token() {
                 headers.push(("X-Auth-Token".into(), tok));
             }
-            let (status, resp_headers, body) = match http_exchange_with_fallback(
+            return match http_exchange_with_fallback(
                 "GET",
-                &url,
+                url,
                 &headers,
                 &[],
                 self.timeout,
                 self.fallback.as_ref(),
             ) {
-                Ok(v) => v,
+                Ok(v) => Some(v),
                 Err(e) => {
                     eprintln!("container-sync: source GET retry transport failure {e}");
-                    return None;
+                    None
                 }
             };
-            if !(200..300).contains(&status) {
-                eprintln!("container-sync: source GET retry status={status}");
-                return None;
-            }
+        }
+        Some((status, resp_headers, body))
+    }
+}
+
+impl ObjectSource for ProxyObjectSource {
+    fn get_object(
+        &self,
+        account: &str,
+        container: &str,
+        name: &str,
+        _storage_policy_index: i64,
+    ) -> Option<(Vec<(String, String)>, Vec<u8>)> {
+        let url = object_source_url(&self.base, account, container, name, false);
+        let (status, resp_headers, body) = self.get_once(&url)?;
+        if !(200..300).contains(&status) {
+            eprintln!("container-sync: source GET status={status}");
+            return None;
+        }
+        if !swift_container_server::is_static_large_object(&resp_headers) {
             debug_object_source(name, &resp_headers, &body);
             return Some((resp_headers, body));
         }
+        // slo=True: Isolated proxy SLO would have returned the segment
+        // bytes. Re-GET the raw JSON manifest for dest PUT.
+        let slo_url = object_source_url(&self.base, account, container, name, true);
+        let (status, resp_headers, body) = self.get_once(&slo_url)?;
         if !(200..300).contains(&status) {
-            eprintln!("container-sync: source GET status={status}");
+            eprintln!("container-sync: source SLO GET status={status}");
             return None;
         }
         debug_object_source(name, &resp_headers, &body);
@@ -1160,6 +1182,7 @@ mod proxy_base_tests {
         object_source_url, parse_http_url, proxy_base_from_proxy_server_conf,
         proxy_base_to_auth_url, proxy_base_to_internal_url, replace_url_host_port,
         resolve_internal_client_url, resolve_proxy_base, rewrite_loopback_8080, HttpErrorKind,
+        ProxyObjectSource,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1422,9 +1445,20 @@ mod proxy_base_tests {
                 "http://127.0.0.1:18082/v1/",
                 "AUTH_a",
                 "source container",
-                "link/name"
+                "link/name",
+                false,
             ),
             "http://127.0.0.1:18082/v1/AUTH_a/source%20container/link%2Fname?symlink=get"
+        );
+        assert_eq!(
+            object_source_url(
+                "http://127.0.0.1:18082/v1/",
+                "AUTH_a",
+                "source container",
+                "manifest",
+                true,
+            ),
+            "http://127.0.0.1:18082/v1/AUTH_a/source%20container/manifest?symlink=get&multipart-manifest=get"
         );
     }
 
@@ -1445,5 +1479,67 @@ mod proxy_base_tests {
             Some(b"abc".to_vec())
         );
         assert_eq!(super::dechunk(b"0\r\nX-Check: yes\r\n"), None);
+    }
+
+    #[test]
+    fn source_get_refetches_slo_manifest_json() {
+        use std::sync::{Arc, Mutex};
+        use swift_container_server::ObjectSource;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_thread = seen.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = vec![0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                seen_thread.lock().unwrap().push(req.clone());
+                let (slo, body): (&str, &[u8]) = if req.contains("multipart-manifest=get") {
+                    ("True", br#"[{"name":"/segs/s1","hash":"abc","bytes":12}]"#)
+                } else {
+                    ("True", b"segment body")
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nX-Static-Large-Object: {slo}\r\n\
+                     X-Timestamp: 1751500001.00000\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.write_all(body);
+            }
+        });
+        let src = ProxyObjectSource {
+            base: format!("http://127.0.0.1:{port}/v1"),
+            auth_url: String::new(),
+            auth_user: String::new(),
+            auth_key: String::new(),
+            token: std::sync::Mutex::new(None),
+            timeout: Duration::from_secs(2),
+            fallback: None,
+        };
+        let (_headers, body) = src.get_object("a", "c", "manifest", 0).expect("SLO GET");
+        assert_eq!(
+            body, br#"[{"name":"/segs/s1","hash":"abc","bytes":12}]"#,
+            "must PUT raw JSON, not segment text"
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert!(
+            reqs[0].contains("symlink=get") && !reqs[0].contains("multipart-manifest=get"),
+            "first GET is symlink-only: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1].contains("multipart-manifest=get"),
+            "slo=True re-GET: {}",
+            reqs[1]
+        );
     }
 }

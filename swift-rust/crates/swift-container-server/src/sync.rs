@@ -912,6 +912,13 @@ impl HttpSyncClient {
     }
 }
 
+/// Python container-sync: `slo = config_true_value(X-Static-Large-Object)`.
+pub fn is_static_large_object(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("x-static-large-object") && config_true_value(value)
+    })
+}
+
 fn newest_source_timestamp(row: &SyncRow, headers: &[(String, String)]) -> Option<String> {
     let source_raw = headers
         .iter()
@@ -981,6 +988,14 @@ impl SyncClient for HttpSyncClient {
                     ctx.storage_policy_index,
                 ) else {
                     return false;
+                };
+                // Python: when slo=True, dest PUT uses multipart-manifest=put
+                // so the JSON manifest is stored as an SLO, not a regular
+                // object. Signing still uses the path without the query.
+                let put_url = if is_static_large_object(&obj_headers) {
+                    format!("{url}?multipart-manifest=put")
+                } else {
+                    url.clone()
                 };
                 // The container row may be stale when an object-server PUT
                 // could not update any container replica.  Python uses the
@@ -1066,8 +1081,14 @@ impl SyncClient for HttpSyncClient {
                     &nonce,
                     &extra,
                 );
-                let status =
-                    http_request_with_tls("PUT", &url, &headers, &body, self.timeout, &self.tls);
+                let status = http_request_with_tls(
+                    "PUT",
+                    &put_url,
+                    &headers,
+                    &body,
+                    self.timeout,
+                    &self.tls,
+                );
                 if !destination_put_accepted(status) {
                     eprintln!("container-sync: destination PUT status={status}");
                 }
@@ -1638,6 +1659,23 @@ mod tests {
     }
 
     #[test]
+    fn test_is_static_large_object() {
+        assert!(is_static_large_object(&[(
+            "X-Static-Large-Object".into(),
+            "True".into()
+        )]));
+        assert!(is_static_large_object(&[(
+            "x-static-large-object".into(),
+            "1".into()
+        )]));
+        assert!(!is_static_large_object(&[(
+            "X-Static-Large-Object".into(),
+            "False".into()
+        )]));
+        assert!(!is_static_large_object(&[("ETag".into(), "abc".into())]));
+    }
+
+    #[test]
     fn test_source_put_headers_match_python_normalization() {
         assert_eq!(
             normalize_source_put_header("ETag", "\"7008d51685b171535a9114d25d60d18e\"".into()),
@@ -2175,6 +2213,81 @@ cluster_c1 = http://127.0.0.1:8080/v1/
         assert!(
             methods.iter().any(|line| line.starts_with("PUT ")),
             "{methods:?}"
+        );
+    }
+
+    #[test]
+    fn test_http_sync_put_slo_uses_multipart_manifest_put() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_thread = seen.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    seen_thread
+                        .lock()
+                        .unwrap()
+                        .push(req.lines().next().unwrap_or("").to_string());
+                    if req.starts_with("HEAD ") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    } else {
+                        let _ =
+                            stream.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+                    }
+                }
+            }
+        });
+        let manifest = br#"[{"name":"/segs/s1","hash":"abc","bytes":12}]"#;
+        let mut objects = HashMap::new();
+        objects.insert(
+            "a/c/manifest".into(),
+            (
+                vec![
+                    ("X-Timestamp".into(), "1751500001.00000".into()),
+                    ("X-Static-Large-Object".into(), "True".into()),
+                    ("ETag".into(), "manifest-etag".into()),
+                ],
+                manifest.to_vec(),
+            ),
+        );
+        let client = HttpSyncClient::new(Box::new(MapObjectSource { objects }), 2.0);
+        let row = SyncRow {
+            row_id: 1,
+            name: "manifest".into(),
+            created_at: "1751500001.00000".into(),
+            deleted: false,
+            size: manifest.len() as i64,
+            content_type: "application/json".into(),
+            etag: "manifest-etag".into(),
+        };
+        let ctx = SyncContext {
+            sync_to: format!("http://{addr}/v1/dst/c"),
+            user_key: "secret".into(),
+            realm: None,
+            realm_key: None,
+            account: "a".into(),
+            container: "c".into(),
+            storage_policy_index: 0,
+        };
+        assert!(client.sync_row(&row, &SyncAction::Put, &ctx), "SLO PUT");
+        server.join().unwrap();
+        let methods = seen.lock().unwrap().clone();
+        assert!(
+            methods
+                .iter()
+                .any(|line| line.starts_with("HEAD ") && !line.contains("multipart-manifest")),
+            "HEAD stays unadorned: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|line| line.starts_with("PUT ") && line.contains("multipart-manifest=put")),
+            "slo=True dest PUT must use multipart-manifest=put: {methods:?}"
         );
     }
 

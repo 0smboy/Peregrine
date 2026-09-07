@@ -353,6 +353,16 @@ This harness tip stamps that env when IsolatedIdentity `:18080` sets
 `SWIFT_DIR=/etc/g6-rust` (explicit `SWIFT_CONF` wins). Do not invent
 `/etc/swift`. Not a rust-bin tip. Not G6 GREEN.
 
+Field `/workspace/g6-csync-next-rootcause.txt` (2026-09-07) on
+`8e30c8b`: `test.probe.test_container_sync` PASS=14 ERROR=1.
+`test_sync` CLEARED. Residual `test_sync_slo_manifest`: dest listing
+empty after sync once. Rust `swift-container-sync` GETs SLO with only
+`?symlink=get` (Isolated proxy reassembles to `"segment body"`) so dest
+PUT **422**. Python: when `slo=True`, GET `multipart-manifest=get` and
+PUT `multipart-manifest=put` with the raw JSON manifest. This tip
+does that. Leave harness `8e30c8b` alone. Field will rebuild
+container-sync. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

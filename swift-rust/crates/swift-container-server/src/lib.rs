@@ -60,7 +60,7 @@ pub use sharder::{
 };
 pub use sync::{
     build_sync_headers, container_sync_ordinal, destination_already_current,
-    destination_put_accepted, get_sig, owns_object, process_container_db,
+    destination_put_accepted, get_sig, is_static_large_object, owns_object, process_container_db,
     run_once as sync_run_once, run_once_for_ring as sync_run_once_for_ring, sync_auth_header,
     sync_rows, validate_sync_to, ContainerSyncConfig, ContainerSyncLocality, ContainerSyncRealms,
     ContainerSyncStore, EmptyObjectSource, HttpCallResult, HttpSyncClient, MapObjectSource,
