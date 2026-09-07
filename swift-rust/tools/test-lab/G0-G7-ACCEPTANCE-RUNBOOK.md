@@ -289,8 +289,14 @@ remained). `wrong=silver/1 → Policy-0` PASS; `wrong=ec42/2 → 0` FAIL
 100%. Official flake ~1/4 matches P(wrong=EC)≈1/3. Ledger residual is
 `TestReservedNamespaceMergePolicyIndex.test_reconcile_symlink` L437
 post-reconciler GET. `%2500` in ClientException is display-only. This
-tip strips source `X-Object-Sysmeta-Ec-*` on dest PUT and only skips
-dest write when dest already has a raw symlink. Keep Allow-Reserved /
+tip `775f752` stripped `X-Object-Sysmeta-Ec-*` and skipped dest write
+only when dest HEAD was a raw symlink — field still **FAIL_404**
+(forced `wrong=ec42/2`). Dest HEAD through IsolatedIdentity can 200
+the EC *source* as `application/symlink`, so skip + source DELETE
+leaves dest empty. This tip never skips dest write for a symlink
+source: dest PUT is a client `X-Symlink-Target` empty
+`application/symlink` (empty MD5, no Target-Etag) and source DELETE
+waits until dest HEAD `?symlink=get` is GET-able. Keep Allow-Reserved /
 `%00` NULL names. Do not reopen rebuild 17/17. Not G6 GREEN.
 
 If leftover themes stay red after the 176505e theme replay, check

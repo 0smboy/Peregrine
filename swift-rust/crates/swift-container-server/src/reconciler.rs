@@ -32,9 +32,15 @@
 //! Production uses [`HttpReconcileClient`] through an explicitly configured
 //! internal proxy. The proxy is required: it selects the source/destination
 //! policy rings and performs EC encoding on a replication-to-EC move.
-//! EC → replicated reserved symlink moves strip source `X-Object-Sysmeta-Ec-*`
-//! so the dest PUT lands a GET-able symlink (field
-//! `/workspace/g6-merge-symlink-rootcause.txt`, 2026-09-07).
+//!
+//! Reserved EC → replicated symlink moves (field
+//! `/workspace/g6-merge-symlink-rootcause.txt`, 2026-09-07; tip `775f752`
+//! still FAIL_404): IsolatedIdentity dest HEAD `?symlink=get` can 200 the
+//! *source* EC object as `application/symlink`, so a dest-already-present
+//! skip plus source DELETE leaves both policies empty. Dest PUT therefore
+//! always writes a client `X-Symlink-Target` symlink (empty body, empty
+//! MD5) onto the dest policy and confirms a GET-able raw symlink *before*
+//! source DELETE.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -418,6 +424,133 @@ fn response_is_raw_symlink(buf: &[u8]) -> bool {
             || lower == "x-symlink-target"
             || (lower == "content-type" && value.to_ascii_lowercase().contains("symlink"))
     })
+}
+
+const MD5_OF_EMPTY: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
+fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Client/sysmeta target from a `?symlink=get` source (or dest confirm).
+fn symlink_target_from_response(buf: &[u8]) -> Option<String> {
+    let headers = response_headers(buf)?;
+    for name in [
+        "x-object-sysmeta-symlink-target",
+        "x-symlink-target",
+    ] {
+        if let Some(value) = header_ci(&headers, name) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn symlink_target_account_from_response(buf: &[u8]) -> Option<String> {
+    let headers = response_headers(buf)?;
+    for name in [
+        "x-object-sysmeta-symlink-target-account",
+        "x-symlink-target-account",
+    ] {
+        if let Some(value) = header_ci(&headers, name) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Dest HEAD through IsolatedIdentity is not a skip signal for symlink
+/// sources: an EC GET of the misplaced object looks like a raw symlink
+/// with `dest_ts >= q_ts`. Skipping dest write then DELETEs the only copy.
+fn should_skip_dest_write(source_is_symlink: bool) -> bool {
+    !source_is_symlink
+}
+
+/// Client-header dest PUT so symlink middleware stores `application/symlink`
+/// plus the container-update override etag. Do not replay EC GET ETag or
+/// `X-Symlink-Target-Etag` (dest-policy revalidation 409).
+fn symlink_dest_put_headers(
+    target: &str,
+    account: Option<&str>,
+    put_timestamp: &str,
+    to_policy: &str,
+    extra_sysmeta: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("Content-Type".to_string(), "application/symlink".to_string()),
+        ("X-Symlink-Target".to_string(), target.to_string()),
+        ("ETag".to_string(), MD5_OF_EMPTY.to_string()),
+        ("X-Timestamp".to_string(), put_timestamp.to_string()),
+        (
+            "X-Backend-Storage-Policy-Index".to_string(),
+            to_policy.to_string(),
+        ),
+        (
+            "X-Backend-Allow-Reserved-Names".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "X-Backend-Use-Replication-Network".to_string(),
+            "true".to_string(),
+        ),
+    ];
+    if let Some(account) = account {
+        headers.push(("X-Symlink-Target-Account".to_string(), account.to_string()));
+    }
+    headers.extend(extra_sysmeta);
+    headers
+}
+
+/// Non-EC / non-symlink-target sysmeta that must survive a client dest PUT
+/// (versioning marker, user meta). Symlink target fields are set from the
+/// client `X-Symlink-*` headers so middleware owns the stored form.
+fn extra_sysmeta_for_symlink_dest(buf: &[u8]) -> Vec<(String, String)> {
+    let Some(copied) = copied_source_headers(buf) else {
+        return Vec::new();
+    };
+    copied
+        .into_iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            (lower.starts_with("x-object-sysmeta-")
+                && !lower.starts_with("x-object-sysmeta-symlink-")
+                && !is_ec_archive_sysmeta(&lower))
+                || lower.starts_with("x-object-meta-")
+                || lower.starts_with("x-object-transient-sysmeta-")
+        })
+        .collect()
+}
+
+fn response_is_getable_symlink(buf: &[u8]) -> bool {
+    if !response_is_raw_symlink(buf) || symlink_target_from_response(buf).is_none() {
+        return false;
+    }
+    let Some(headers) = response_headers(buf) else {
+        return false;
+    };
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("symlink")
+    })
+}
+
+/// Dest confirm must be a GET-able symlink *and* at least the dest PUT
+/// timestamp. An EC source HEAD is also `application/symlink` but older.
+fn dest_symlink_confirm_ok(buf: &[u8], min_ts: Timestamp) -> bool {
+    if !response_is_getable_symlink(buf) {
+        return false;
+    }
+    let seen = header_value(buf, "X-Backend-Timestamp")
+        .or_else(|| header_value(buf, "X-Timestamp"))
+        .and_then(|value| value.parse::<Timestamp>().ok())
+        .unwrap_or(Timestamp::zero());
+    seen >= min_ts
 }
 
 /// Headers copied by Python's reconciler from the source GET to the
@@ -820,6 +953,42 @@ impl HttpReconcileClient<'_> {
         )
         .is_some_and(|(status, _)| (200..300).contains(&status) || status == 404)
     }
+
+    fn destination_retains_symlink(
+        &self,
+        entry: &QueueEntry,
+        policy: i64,
+        put_timestamp: &str,
+    ) -> bool {
+        let Ok(min_ts) = put_timestamp.parse::<Timestamp>() else {
+            return false;
+        };
+        let headers = [
+            ("X-Backend-Storage-Policy-Index", policy.to_string()),
+            ("X-Backend-Allow-Reserved-Names", "true".to_string()),
+            ("X-Backend-Use-Replication-Network", "true".to_string()),
+        ];
+        let path = format!("{}?symlink=get", Self::object_path(entry));
+        raw_request(self.proxy_host, "HEAD", &path, &headers, &[]).is_some_and(|(status, buf)| {
+            (200..300).contains(&status) && dest_symlink_confirm_ok(&buf, min_ts)
+        })
+    }
+
+    fn destination_has_object(&self, entry: &QueueEntry, policy: i64) -> bool {
+        let headers = [
+            ("X-Backend-Storage-Policy-Index", policy.to_string()),
+            ("X-Backend-Allow-Reserved-Names", "true".to_string()),
+            ("X-Backend-Use-Replication-Network", "true".to_string()),
+        ];
+        raw_request(
+            self.proxy_host,
+            "HEAD",
+            &Self::object_path(entry),
+            &headers,
+            &[],
+        )
+        .is_some_and(|(status, _)| (200..300).contains(&status))
+    }
 }
 
 impl ReconcileClient for HttpReconcileClient<'_> {
@@ -830,8 +999,10 @@ impl ReconcileClient for HttpReconcileClient<'_> {
         let path = Self::object_path(entry);
         let raw_path = format!("{path}?symlink=get");
 
-        // If the destination already has a version at least as new as the
-        // queue entry, only the misplaced source needs a tombstone.
+        // Dest HEAD is only a liveness check. IsolatedIdentity dest HEAD
+        // `?symlink=get` can 200 the EC *source* as a raw symlink
+        // (`dest_ts >= q_ts`); 775f752 still skipped dest write and DELETE'd
+        // source → FAIL_404. Symlink sources always dest-PUT + confirm.
         let destination_headers = [
             ("X-Backend-Storage-Policy-Index", to_pi.as_str()),
             ("X-Backend-Allow-Reserved-Names", "true"),
@@ -846,20 +1017,17 @@ impl ReconcileClient for HttpReconcileClient<'_> {
         ) else {
             return false;
         };
-        if (200..300).contains(&destination_status) {
+        let dest_already_newer = if (200..300).contains(&destination_status) {
             let destination_ts = header_value(&destination_response, "X-Backend-Timestamp")
                 .or_else(|| header_value(&destination_response, "X-Timestamp"))
                 .and_then(|value| value.parse::<Timestamp>().ok())
                 .unwrap_or(Timestamp::zero());
-            // A followed target (no symlink sysmeta) is not the dest object.
-            // Skipping dest write here left reserved EC→repl symlinks gone
-            // from both policies after source DELETE.
-            if destination_ts >= record.q_ts && response_is_raw_symlink(&destination_response) {
-                return self.delete_from_policy(entry, from_policy, record.q_ts);
-            }
+            destination_ts >= record.q_ts
         } else if destination_status / 100 != 4 {
             return false;
-        }
+        } else {
+            false
+        };
 
         let Some((status, source_response)) = raw_request(
             self.proxy_host,
@@ -886,10 +1054,6 @@ impl ReconcileClient for HttpReconcileClient<'_> {
         let Some(body) = decoded_http_body(&source_response) else {
             return false;
         };
-        let etag = header_value(&source_response, "ETag")
-            .unwrap_or("")
-            .trim_matches('"')
-            .to_string();
         let Some(source_timestamp) = header_value(&source_response, "X-Backend-Timestamp")
             .or_else(|| header_value(&source_response, "X-Timestamp"))
         else {
@@ -901,32 +1065,70 @@ impl ReconcileClient for HttpReconcileClient<'_> {
         if source_timestamp < record.q_ts {
             return false;
         }
+        let symlink_target = symlink_target_from_response(&source_response);
+        let source_is_symlink = symlink_target.is_some();
+        // Never skip dest write for a symlink: dest HEAD of the EC source
+        // is `dest_already_newer` + raw symlink and must not DELETE source.
+        if dest_already_newer && should_skip_dest_write(source_is_symlink) {
+            return self.delete_from_policy(entry, from_policy, record.q_ts);
+        }
         // `slightly_later_timestamp(ts, offset=3)`: retain the raw time and
         // add an internal offset so the destination supersedes the source.
         let copy_base = source_timestamp.max(record.q_ts);
         let Some(put_timestamp) = timestamp_with_offset(&copy_base.internal(), 3) else {
             return false;
         };
-        let Some(mut put_headers) = copied_source_headers(&source_response) else {
-            return false;
+        let (put_headers, put_body): (Vec<(String, String)>, &[u8]) = if let Some(target) =
+            symlink_target
+        {
+            (
+                symlink_dest_put_headers(
+                    &target,
+                    symlink_target_account_from_response(&source_response).as_deref(),
+                    &put_timestamp,
+                    &to_pi,
+                    extra_sysmeta_for_symlink_dest(&source_response),
+                ),
+                &[],
+            )
+        } else {
+            let Some(mut put_headers) = copied_source_headers(&source_response) else {
+                return false;
+            };
+            put_headers.push(("X-Timestamp".to_string(), put_timestamp.clone()));
+            put_headers.push(("X-Backend-Storage-Policy-Index".to_string(), to_pi.clone()));
+            put_headers.push((
+                "X-Backend-Allow-Reserved-Names".to_string(),
+                "true".to_string(),
+            ));
+            put_headers.push((
+                "X-Backend-Use-Replication-Network".to_string(),
+                "true".to_string(),
+            ));
+            let etag = header_value(&source_response, "ETag")
+                .unwrap_or("")
+                .trim_matches('"')
+                .to_string();
+            put_headers.push(("ETag".to_string(), etag));
+            (put_headers, body.as_slice())
         };
-        put_headers.push(("X-Timestamp".to_string(), put_timestamp));
-        put_headers.push(("X-Backend-Storage-Policy-Index".to_string(), to_pi.clone()));
-        put_headers.push((
-            "X-Backend-Allow-Reserved-Names".to_string(),
-            "true".to_string(),
-        ));
-        put_headers.push((
-            "X-Backend-Use-Replication-Network".to_string(),
-            "true".to_string(),
-        ));
-        put_headers.push(("ETag".to_string(), etag));
 
-        let Some((put_status, _)) = raw_request(self.proxy_host, "PUT", &path, &put_headers, &body)
+        let Some((put_status, _)) =
+            raw_request(self.proxy_host, "PUT", &path, &put_headers, put_body)
         else {
             return false;
         };
         if !(200..300).contains(&put_status) {
+            return false;
+        }
+        // Do not tombstone the source until dest retains a GET-able object.
+        // 775f752 dest PUT 2xx (or dest-HEAD skip) still left dest empty.
+        let dest_ok = if source_is_symlink {
+            self.destination_retains_symlink(entry, to_policy, &put_timestamp)
+        } else {
+            self.destination_has_object(entry, to_policy)
+        };
+        if !dest_ok {
             return false;
         }
 
@@ -1220,6 +1422,59 @@ X-Backend-Timestamp: 1751500001.00000\r\n\r\n";
         assert!(!response_is_raw_symlink(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Timestamp: 1751500000.00000\r\n\r\nthis is the target data"
         ));
+        assert!(response_is_getable_symlink(response));
+        assert_eq!(
+            symlink_target_from_response(response).as_deref(),
+            Some("c/%00target%00uuid")
+        );
+        assert!(!should_skip_dest_write(true));
+        assert!(should_skip_dest_write(false));
+        let dest_headers = symlink_dest_put_headers(
+            "c/%00target%00uuid",
+            None,
+            "1751500001.00000_0000000000000003",
+            "0",
+            extra_sysmeta_for_symlink_dest(response),
+        );
+        assert!(dest_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-symlink-target") && value == "c/%00target%00uuid"
+        }));
+        assert!(dest_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value == "application/symlink"
+        }));
+        assert!(dest_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("etag") && value == MD5_OF_EMPTY
+        }));
+        assert!(dest_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-backend-storage-policy-index") && value == "0"
+        }));
+        assert!(
+            !dest_headers
+                .iter()
+                .any(|(name, _)| name.to_ascii_lowercase().starts_with("x-object-sysmeta-ec-")
+                    || name.eq_ignore_ascii_case("x-symlink-target-etag")),
+            "dest PUT must not replay EC etag or force dest-policy target revalidation: {dest_headers:?}"
+        );
+        assert!(!response_is_getable_symlink(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Symlink-Target: c/o\r\n\r\n"
+        ));
+        assert!(!response_is_getable_symlink(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/symlink\r\n\r\n"
+        ));
+        let put_ts: Timestamp = "1751500001.00000_0000000000000003".parse().unwrap();
+        let source_shaped = b"HTTP/1.1 200 OK\r\n\
+Content-Type: application/symlink\r\n\
+X-Symlink-Target: c/%00target%00uuid\r\n\
+X-Timestamp: 1751500001.00000\r\n\r\n";
+        let dest_landed = b"HTTP/1.1 200 OK\r\n\
+Content-Type: application/symlink\r\n\
+X-Symlink-Target: c/%00target%00uuid\r\n\
+X-Timestamp: 1751500001.00000_0000000000000003\r\n\r\n";
+        assert!(
+            !dest_symlink_confirm_ok(source_shaped, put_ts),
+            "EC source HEAD must not count as dest retained"
+        );
+        assert!(dest_symlink_confirm_ok(dest_landed, put_ts));
     }
 
     #[test]
