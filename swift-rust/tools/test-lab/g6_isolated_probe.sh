@@ -24,7 +24,9 @@
 # no-commit / backend-header hops use rust :18082 (G6_INTERNAL_PROXY_URL).
 # rust_http_make_request hops :18082 on any X-Backend-* after egg
 # setdefault Allow-Reserved-Names (brain put_container sends only
-# X-Storage-Policy). Keep rust_http_proxy_get (UnexpectedResponse).
+# X-Storage-Policy). Residual ReservedNamespace 404 ERROR was
+# translate_client_exception KeyError (incomplete _HttpResp.environ).
+# Keep rust_http_proxy_get (UnexpectedResponse).
 # Do not raw-replace IsolatedIdentity proxy_get with swiftclient.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

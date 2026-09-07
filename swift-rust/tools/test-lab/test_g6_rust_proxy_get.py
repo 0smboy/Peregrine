@@ -694,6 +694,16 @@ class HttpAndPatch(unittest.TestCase):
                 unexpected_cls=Boom,
             )
         self.assertEqual(ctx.exception.resp.status_int, 404)
+        translated = adapter.brain_translate_unexpected(ctx.exception)
+        self.assertEqual(translated["http_status"], 404)
+        self.assertEqual(translated["http_scheme"], "http")
+        self.assertEqual(translated["http_host"], "127.0.0.1")
+        self.assertEqual(translated["http_port"], "18082")
+        self.assertEqual(translated["http_path"], "/v1/a/c/o")
+        self.assertEqual(translated["http_query"], "")
+        self.assertTrue(translated["http_reason"])
+        for key in adapter.TRANSLATE_ENVIRON_KEYS:
+            self.assertIn(key, ctx.exception.resp.environ)
 
     def test_internal_client_get_and_head_route_to_rust_http_on_18080(self):
         os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
@@ -1326,6 +1336,72 @@ class UnifiedInternalHop(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
         self.assertEqual(seen["policy"], "0")
+
+    def test_unexpected_404_brain_translate_fields_no_keyerror(self):
+        """Official translate_client_exception must not KeyError on 404.
+
+        Field /workspace/g6-merge-404-rootcause.txt (2026-09-07): residual
+        ReservedNamespace get_object / reconcile_symlink ERROR was incomplete
+        _HttpResp.environ (not a missing object). Reserved GET 2xx already
+        proven (move_twice PASS). Fill scheme/host/port/path/query from the
+        request URL plus explanation.
+        """
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
+
+        class Boom(Exception):
+            def __init__(self, message, resp):
+                super().__init__(message)
+                self.resp = resp
+
+        def opener(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "Not Found",
+                EmailMessage(),
+                io.BytesIO(b"Not Found"),
+            )
+
+        with self.assertRaises(Boom) as ctx:
+            adapter.rust_http_make_request(
+                "GET",
+                "/v1/.expiring_objects/1234/obj",
+                {},
+                (2,),
+                params={"format": "json"},
+                opener=opener,
+                unexpected_cls=Boom,
+            )
+        resp = ctx.exception.resp
+        self.assertEqual(resp.environ["wsgi.url_scheme"], "http")
+        self.assertEqual(resp.environ["SERVER_NAME"], "127.0.0.1")
+        self.assertEqual(resp.environ["SERVER_PORT"], "18082")
+        self.assertEqual(resp.environ["PATH_INFO"], "/v1/.expiring_objects/1234/obj")
+        self.assertEqual(resp.environ["QUERY_STRING"], "format=json")
+        self.assertTrue(resp.explanation)
+        translated = adapter.brain_translate_unexpected(ctx.exception)
+        self.assertEqual(translated["http_status"], 404)
+        self.assertEqual(translated["http_port"], "18082")
+        self.assertEqual(translated["http_path"], "/v1/.expiring_objects/1234/obj")
+        self.assertEqual(translated["http_query"], "format=json")
+        self.assertEqual(translated["http_reason"], resp.explanation)
+
+        built = adapter._HttpResp(
+            404,
+            {},
+            b"Not Found",
+            url="http://127.0.0.1:18082/v1/AUTH_test/c/o?symlink=get",
+            method="GET",
+        )
+        self.assertEqual(built.environ["PATH_INFO"], "/v1/AUTH_test/c/o")
+        self.assertEqual(built.environ["QUERY_STRING"], "symlink=get")
+        self.assertEqual(built.environ["SERVER_PORT"], "18082")
+        fake_err = Boom("Unexpected response: 404 Not Found", built)
+        self.assertEqual(
+            adapter.brain_translate_unexpected(fake_err)["http_query"],
+            "symlink=get",
+        )
 
     def test_make_request_setdefault_reserved_before_hop(self):
         """Egg parity: IsolatedIdentity stamps Allow-Reserved-Names before hop.

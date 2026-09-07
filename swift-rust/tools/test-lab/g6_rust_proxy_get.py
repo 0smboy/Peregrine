@@ -87,7 +87,12 @@ Field ``/workspace/g6-merge-xbackend-18082/`` (2026-09-07) after
 ``8353823`` stamped after hop so those PUTs stayed on ``:18080``
 → **412**. Field wrap before hop cleared ReservedNamespace 412 and
 ``move_twice`` 200. Residual ReservedNamespace ``get_object`` 404
-is a separate diagnosis. Do not reopen rebuild 17/17. Not G6 GREEN.
+was brain ``translate_client_exception`` KeyError (incomplete
+``_HttpResp.environ`` / missing ``explanation``), not a missing
+object. Field ``/workspace/g6-merge-404-rootcause.txt`` (2026-09-07):
+fill environ from the request URL + ``explanation``. Reserved GET
+2xx already proven (``move_twice`` PASS). Do not reopen rebuild
+17/17. Not G6 GREEN. ``sync_expired`` 503 is lab noise.
 
 Field ``/workspace/g6-rebuild-982e86a-unified/`` (2026-09-06) on tip
 ``982e86a``: full rebuild theme **17/17 PASS**. Public ``:18080``
@@ -231,22 +236,47 @@ class WsgiHeaderDict(dict):
             return default
 
 
-def minimal_wsgi_environ() -> dict[str, Any]:
-    """Enough WSGI for IsolatedIdentity brain translate on residual 404.
+TRANSLATE_ENVIRON_KEYS = (
+    "wsgi.url_scheme",
+    "SERVER_NAME",
+    "SERVER_PORT",
+    "PATH_INFO",
+    "QUERY_STRING",
+)
 
-    Field ``/workspace/g6-merge-xbackend-18082/``: empty ``{}`` raised
-    ``KeyError: wsgi.url_scheme``.
+
+def wsgi_environ_from_url(
+    url: str = "",
+    method: str = "GET",
+) -> dict[str, Any]:
+    """Brain-translate-ready WSGI environ from the IsolatedIdentity request URL.
+
+    Official ``test.probe.brain.translate_client_exception`` reads
+    ``wsgi.url_scheme``, ``SERVER_NAME``, ``SERVER_PORT``, ``PATH_INFO``,
+    ``QUERY_STRING``. Field ``/workspace/g6-merge-404-rootcause.txt``
+    (2026-09-07): dummy ``wsgi.url_scheme``-only / ``PATH_INFO=/``
+    environ KeyError'd on residual ReservedNamespace 404.
     """
+    parsed = urllib.parse.urlparse(url or "http://127.0.0.1/")
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "127.0.0.1"
+    if parsed.port:
+        port = str(parsed.port)
+    else:
+        port = "443" if scheme == "https" else "80"
+    path = parsed.path or "/"
+    query = parsed.query or ""
     return {
-        "REQUEST_METHOD": "GET",
+        "REQUEST_METHOD": str(method or "GET").upper(),
         "SCRIPT_NAME": "",
-        "PATH_INFO": "/",
-        "QUERY_STRING": "",
-        "SERVER_NAME": "localhost",
-        "SERVER_PORT": "80",
+        "PATH_INFO": path,
+        "QUERY_STRING": query,
+        "SERVER_NAME": host,
+        "SERVER_PORT": port,
         "SERVER_PROTOCOL": "HTTP/1.1",
+        "HTTP_HOST": f"{host}:{port}",
         "wsgi.version": (1, 0),
-        "wsgi.url_scheme": "http",
+        "wsgi.url_scheme": scheme,
         "wsgi.input": io.BytesIO(b""),
         "wsgi.errors": io.BytesIO(),
         "wsgi.multithread": False,
@@ -255,10 +285,50 @@ def minimal_wsgi_environ() -> dict[str, Any]:
     }
 
 
+def minimal_wsgi_environ() -> dict[str, Any]:
+    return wsgi_environ_from_url("")
+
+
+def response_explanation(status: int, body: bytes) -> str:
+    if body:
+        text = body.decode("utf-8", "replace").strip()
+        if text:
+            return text
+    return http.client.responses.get(int(status), "Unknown")
+
+
+def brain_translate_unexpected(err: Any) -> dict[str, Any]:
+    """Official ``test.probe.brain.translate_client_exception`` field access.
+
+    Must not KeyError. ``http_reason`` is ``resp.explanation``.
+    """
+    resp = err.resp
+    return {
+        "http_scheme": resp.environ["wsgi.url_scheme"],
+        "http_host": resp.environ["SERVER_NAME"],
+        "http_port": resp.environ["SERVER_PORT"],
+        "http_path": urllib.parse.quote(resp.environ["PATH_INFO"]),
+        "http_query": resp.environ["QUERY_STRING"],
+        "http_status": resp.status_int,
+        "http_reason": resp.explanation,
+        "http_response_content": resp.body,
+        "http_response_headers": resp.headers,
+    }
+
+
 class _HttpResp:
     """swob-shaped object for ``InternalClient.get_object`` / ``make_request``."""
 
-    def __init__(self, status: int, headers: Mapping[str, str], body: bytes):
+    def __init__(
+        self,
+        status: int,
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        url: str = "",
+        method: str = "GET",
+        explanation: Optional[str] = None,
+    ):
         self.status_int = int(status)
         phrase = http.client.responses.get(self.status_int, "Unknown")
         self.status = f"{self.status_int} {phrase}"
@@ -267,7 +337,10 @@ class _HttpResp:
         )
         self.body = body
         self.app_iter: Iterable[bytes] = [body] if body else []
-        self.environ: dict[str, Any] = minimal_wsgi_environ()
+        self.environ: dict[str, Any] = wsgi_environ_from_url(url, method)
+        self.explanation = (
+            explanation if explanation is not None else response_explanation(status, body)
+        )
 
 
 def proxy_base_url(environ: Optional[Mapping[str, str]] = None) -> str:
@@ -828,12 +901,16 @@ def _http_resp_from_head(
     leftover: bytes,
     *,
     expect_body: bool,
+    url: str = "",
+    method: str = "GET",
 ) -> _HttpResp:
     if not expect_body or status in {204, 304} or 100 <= status < 200:
-        return _HttpResp(status, headers, b"")
+        return _HttpResp(status, headers, b"", url=url, method=method)
     te = (_header_lookup(headers, "Transfer-Encoding") or "").lower()
     if "chunked" in te:
-        return _HttpResp(status, headers, _read_chunked_body(sock, leftover))
+        return _HttpResp(
+            status, headers, _read_chunked_body(sock, leftover), url=url, method=method
+        )
     length_s = _header_lookup(headers, "Content-Length")
     if length_s is not None:
         try:
@@ -846,14 +923,14 @@ def _http_resp_from_head(
             if not chunk:
                 break
             body += chunk
-        return _HttpResp(status, headers, body[:length])
+        return _HttpResp(status, headers, body[:length], url=url, method=method)
     body = leftover
     while True:
         chunk = sock.recv(65536)
         if not chunk:
             break
         body += chunk
-    return _HttpResp(status, headers, body)
+    return _HttpResp(status, headers, body, url=url, method=method)
 
 
 def _read_http_message(
@@ -862,6 +939,8 @@ def _read_http_message(
     *,
     expect_body: bool,
     initial: bytes = b"",
+    url: str = "",
+    method: str = "GET",
 ) -> _HttpResp:
     """Read one final HTTP response, skipping informational 1xx heads."""
     leftover = initial or b""
@@ -870,7 +949,14 @@ def _read_http_message(
         if 100 <= status < 200:
             continue
         return _http_resp_from_head(
-            sock, timeout, status, headers, leftover, expect_body=expect_body
+            sock,
+            timeout,
+            status,
+            headers,
+            leftover,
+            expect_body=expect_body,
+            url=url,
+            method=method,
         )
 
 
@@ -920,17 +1006,37 @@ def rust_http_send_body(
                 conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
                 _eventlet_hub_yield()
             return _read_http_message(
-                conn.sock, timeout, expect_body=True, initial=leftover
+                conn.sock,
+                timeout,
+                expect_body=True,
+                initial=leftover,
+                url=url,
+                method=method,
             )
         if status == 417:
             conn.close()
             return _put_without_expect(
-                connection_cls, host, port, path, method, headers, payload, timeout
+                connection_cls,
+                host,
+                port,
+                path,
+                method,
+                headers,
+                payload,
+                timeout,
+                url=url,
             )
         # Final response before the body (error / empty PUT). Do not send
         # payload. Leftover is this response's body, not a parse error.
         return _http_resp_from_head(
-            conn.sock, timeout, status, headers, leftover, expect_body=True
+            conn.sock,
+            timeout,
+            status,
+            headers,
+            leftover,
+            expect_body=True,
+            url=url,
+            method=method,
         )
     except (BrokenPipeError, ConnectionResetError) as err:
         raise RustProxyGetError(
@@ -952,6 +1058,7 @@ def _put_without_expect(
     headers: Optional[Mapping[str, Any]],
     payload: bytes,
     timeout: float,
+    url: str = "",
 ) -> _HttpResp:
     conn = connection_cls(host, port, timeout=timeout)
     try:
@@ -964,7 +1071,9 @@ def _put_without_expect(
         for offset in range(0, len(payload), PUT_SEND_CHUNK):
             conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
             _eventlet_hub_yield()
-        return _read_http_message(conn.sock, timeout, expect_body=True)
+        return _read_http_message(
+            conn.sock, timeout, expect_body=True, url=url, method=method
+        )
     finally:
         try:
             conn.close()
@@ -1005,7 +1114,11 @@ def rust_http_no_body(
         conn.putheader("Connection", "close")
         conn.endheaders()
         return _read_http_message(
-            conn.sock, timeout, expect_body=method_u != "HEAD"
+            conn.sock,
+            timeout,
+            expect_body=method_u != "HEAD",
+            url=url,
+            method=method_u,
         )
     finally:
         try:
@@ -1058,11 +1171,23 @@ def rust_http_exchange(
         with open_url(req, timeout=timeout) as resp:
             body = resp.read()
             status = getattr(resp, "status", None) or resp.getcode()
-            return _HttpResp(int(status), wsgi_response_headers(dict(resp.headers)), body)
+            return _HttpResp(
+                int(status),
+                wsgi_response_headers(dict(resp.headers)),
+                body,
+                url=url,
+                method=method_u,
+            )
     except urllib.error.HTTPError as err:
         body = err.read() if err.fp is not None else b""
         hdrs = dict(err.headers) if err.headers is not None else {}
-        return _HttpResp(int(err.code), wsgi_response_headers(hdrs), body)
+        return _HttpResp(
+            int(err.code),
+            wsgi_response_headers(hdrs),
+            body,
+            url=url,
+            method=method_u,
+        )
 
 
 def rust_http_make_request(
@@ -1276,7 +1401,22 @@ def unexpected_expired(resp: Optional[_HttpResp] = None, path: str = "") -> Exce
     # Official expire wait checks e.resp.status_int == 404. A rust 200
     # that is already past X-Delete-At must not leak status 200.
     if resp is None or int(getattr(resp, "status_int", 0)) != 404:
-        resp = _HttpResp(404, headers, b"Not Found\n")
+        url = ""
+        env = getattr(resp, "environ", None) or {}
+        if env.get("PATH_INFO"):
+            scheme = env.get("wsgi.url_scheme") or "http"
+            host = env.get("SERVER_NAME") or "127.0.0.1"
+            port = env.get("SERVER_PORT") or "80"
+            query = env.get("QUERY_STRING") or ""
+            url = f"{scheme}://{host}:{port}{env['PATH_INFO']}"
+            if query:
+                url += f"?{query}"
+        elif path:
+            url = join_proxy_url(
+                internal_proxy_url() or proxy_base_url() or DEFAULT_INTERNAL_PROXY_URL,
+                path,
+            )
+        resp = _HttpResp(404, headers, b"Not Found\n", url=url, method="GET")
     msg = "Unexpected response: 404"
     if path:
         msg += f" {path}"

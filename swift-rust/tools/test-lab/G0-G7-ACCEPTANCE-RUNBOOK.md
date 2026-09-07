@@ -268,6 +268,19 @@ ReservedNamespace 412 and `test_reconciler_move_object_twice` 200.
 **not** chase residual ReservedNamespace `get_object` 404 in this tip.
 Do not claim merge GREEN. Do not reopen rebuild 17/17.
 
+Field `/workspace/g6-merge-404-rootcause.txt` (2026-09-07): residual
+ReservedNamespace ERROR (merge `get_object` + `reconcile_symlink`) is
+**not** a missing object after the Allow-Reserved hop. Official
+`brain.translate_client_exception` needs `wsgi.url_scheme`,
+`SERVER_NAME`, `SERVER_PORT`, `PATH_INFO`, `QUERY_STRING` from the
+request URL plus `resp.explanation`. Incomplete environ KeyError'd:
+symlink L406 expected broken-symlink 404 → ClientException; merge L137
+`_get_object_patiently` must see ClientException(404) to retry.
+Reserved GET 2xx already proven (`move_twice` PASS). This tip fills
+`_HttpResp` from the request URL. Keep setdefault-Allow-Reserved-before-hop.
+Do not chase `sync_expired` 503 (lab noise). Do not reopen rebuild 17/17.
+Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 
