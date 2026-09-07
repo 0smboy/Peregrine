@@ -927,6 +927,7 @@ class PartPowerSwiftDir(unittest.TestCase):
         os.environ.pop("PROXY_BASE_URL", None)
         os.environ.pop("G6_INTERNAL_PROXY_URL", None)
         os.environ.pop("SWIFT_DIR", None)
+        os.environ.pop("SWIFT_CONF", None)
 
     def test_isolated_swift_dir_defaults_g6_rust_on_18080(self):
         self.assertEqual(
@@ -989,6 +990,55 @@ class PartPowerSwiftDir(unittest.TestCase):
             "SWIFT_DIR": "/already",
         }
         self.assertEqual(adapter.ensure_isolated_swift_dir(keep), "/already")
+
+    def test_isolated_swift_conf_defaults_g6_rust_on_18080(self):
+        self.assertEqual(
+            adapter.isolated_swift_conf(
+                {"PROXY_BASE_URL": "http://127.0.0.1:18080"}
+            ),
+            "/etc/g6-rust/swift.conf",
+        )
+        self.assertEqual(
+            adapter.isolated_swift_conf(
+                {
+                    "PROXY_BASE_URL": "http://127.0.0.1:18080",
+                    "SWIFT_DIR": "/tmp/g6-swift",
+                }
+            ),
+            "/tmp/g6-swift/swift.conf",
+        )
+        self.assertEqual(
+            adapter.isolated_swift_conf(
+                {
+                    "PROXY_BASE_URL": "http://127.0.0.1:18080",
+                    "SWIFT_CONF": "/already/swift.conf",
+                }
+            ),
+            "/already/swift.conf",
+        )
+        self.assertEqual(
+            adapter.isolated_swift_conf(
+                {"PROXY_BASE_URL": "http://127.0.0.1:8080"}
+            ),
+            "",
+        )
+
+    def test_ensure_isolated_swift_conf_stamps_env(self):
+        env = {"PROXY_BASE_URL": "http://127.0.0.1:18080"}
+        self.assertEqual(
+            adapter.ensure_isolated_swift_conf(env), "/etc/g6-rust/swift.conf"
+        )
+        self.assertEqual(env["SWIFT_CONF"], "/etc/g6-rust/swift.conf")
+        keep = {
+            "PROXY_BASE_URL": "http://127.0.0.1:18080",
+            "SWIFT_CONF": "/already/swift.conf",
+        }
+        self.assertEqual(
+            adapter.ensure_isolated_swift_conf(keep), "/already/swift.conf"
+        )
+        classic = {"PROXY_BASE_URL": "http://127.0.0.1:8080"}
+        self.assertEqual(adapter.ensure_isolated_swift_conf(classic), "")
+        self.assertNotIn("SWIFT_CONF", classic)
 
     def test_partpower_source_rewrite_retargets_etc_swift_access(self):
         official = (
@@ -1703,6 +1753,9 @@ class UnifiedInternalHop(unittest.TestCase):
         self.assertTrue(result["isolated"])
         self.assertEqual(result["internal_proxy_url"], "http://127.0.0.1:18082")
         self.assertEqual(env[adapter.G6_INTERNAL_PROXY_URL_ENV], "http://127.0.0.1:18082")
+        self.assertEqual(result["swift_dir"], "/etc/g6-rust")
+        self.assertEqual(result["swift_conf"], "/etc/g6-rust/swift.conf")
+        self.assertEqual(env["SWIFT_CONF"], "/etc/g6-rust/swift.conf")
 
     def test_isolated_wrap_still_calls_rust_http_proxy_get(self):
         """Do not raw-replace IsolatedIdentity proxy_get (drops UnexpectedResponse)."""

@@ -345,6 +345,14 @@ dir, no `quarantined/`) matching Python `dark_data.py`. Leave
 rebuild/merge/partpower/revert alone. Field will rebuild
 object-auditor. Not G6 GREEN.
 
+Field dark_data on `2ef7d6e` (2026-09-07): first IsolatedIdentity
+auditor run without `SWIFT_CONF` defaulted rust to prod
+`/etc/swift/swift.conf` and Deletion failed. With
+`SWIFT_CONF=/etc/g6-rust/swift.conf` Deletion+Quarantining **PASS=2**.
+This harness tip stamps that env when IsolatedIdentity `:18080` sets
+`SWIFT_DIR=/etc/g6-rust` (explicit `SWIFT_CONF` wins). Do not invent
+`/etc/swift`. Not a rust-bin tip. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

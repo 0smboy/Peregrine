@@ -109,6 +109,14 @@ official partpower setUp asserts ``/etc/swift/backups`` +
 launcher stamps that env; setUp ``os.access('/etc/swift*')`` is remapped.
 Do not invent ``/etc/swift``. Do not change rust bins.
 
+Field dark_data on ``2ef7d6e`` (2026-09-07): rust object-auditor
+defaults ``SWIFT_CONF`` to prod ``/etc/swift/swift.conf``. First
+auditor run without Isolated ``SWIFT_CONF`` failed Deletion; with
+``SWIFT_CONF=/etc/g6-rust/swift.conf`` Deletion+Quarantining PASS=2.
+The launcher stamps that env when IsolatedIdentity ``:18080`` sets
+``SWIFT_DIR``. Explicit ``SWIFT_CONF`` wins. Do not invent
+``/etc/swift``.
+
 Field ``/workspace/g6-partpower-ec-relinker-rootcause.txt`` (2026-09-07):
 EC partpower ERROR exit 2 (``EXIT_NO_APPLICABLE_POLICY``). PATH is
 Python ``swift-object-relinker``. Parent ``set_swift_dir(/etc/g6-rust)``
@@ -191,6 +199,7 @@ PROBE_PATH_ENV_KEYS = ("G6_REBUILD_PROBE_PATH", "SWIFT_RECONSTRUCTOR_REBUILD")
 PARTPOWER_PATH_ENV_KEYS = ("G6_PARTPOWER_PROBE_PATH",)
 SWIFT_SOURCE_ENV_KEYS = ("SWIFT_SOURCE", "SWIFT_REPO", "SWIFT_MASTER")
 DEFAULT_ISOLATED_SWIFT_DIR = "/etc/g6-rust"
+DEFAULT_ISOLATED_SWIFT_CONF = DEFAULT_ISOLATED_SWIFT_DIR + "/swift.conf"
 ETC_SWIFT_PREFIX = "/etc/swift"
 PARTPOWER_SWIFT_DIR_MARKER = "Peregrine G6: IsolatedIdentity SWIFT_DIR"
 
@@ -413,6 +422,38 @@ def ensure_isolated_swift_dir(
         return ""
     env["SWIFT_DIR"] = DEFAULT_ISOLATED_SWIFT_DIR
     return DEFAULT_ISOLATED_SWIFT_DIR
+
+
+def isolated_swift_conf(environ: Optional[Mapping[str, str]] = None) -> str:
+    """SWIFT_CONF for IsolatedIdentity, else empty.
+
+    Field dark_data on ``2ef7d6e``: rust auditor without SWIFT_CONF
+    read prod ``/etc/swift/swift.conf``. Isolated G6 is
+    ``SWIFT_DIR/swift.conf``. Do not invent ``/etc/swift``. Explicit
+    ``SWIFT_CONF`` always wins.
+    """
+    env = environ if environ is not None else os.environ
+    explicit = (env.get("SWIFT_CONF") or "").strip()
+    if explicit:
+        return explicit
+    swift_dir = isolated_swift_dir(env)
+    if swift_dir:
+        return swift_dir.rstrip("/") + "/swift.conf"
+    return ""
+
+
+def ensure_isolated_swift_conf(
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Stamp ``SWIFT_CONF=$SWIFT_DIR/swift.conf`` on IsolatedIdentity."""
+    env = environ if environ is not None else os.environ
+    current = (env.get("SWIFT_CONF") or "").strip()
+    if current:
+        return current
+    conf = isolated_swift_conf(env)
+    if conf:
+        env["SWIFT_CONF"] = conf
+    return conf
 
 
 def rewrite_etc_swift_path(
@@ -803,6 +844,7 @@ def _wrap_partpower_setup(orig: Callable[..., Any]) -> Callable[..., Any]:
 
     def setUp(self):
         ensure_isolated_swift_dir()
+        ensure_isolated_swift_conf()
         real_access = os.access
 
         def access(path, mode, *args, **kwargs):
@@ -1970,6 +2012,7 @@ def prepare_isolated_proxy_get(
         "proxy_base_url": proxy_base_url(env),
         "internal_proxy_url": ensure_internal_proxy_url(env),
         "swift_dir": ensure_isolated_swift_dir(env),
+        "swift_conf": ensure_isolated_swift_conf(env),
         "isolated": uses_isolated_rust_proxy(env),
         "probe_path": None,
         "probe_changed": False,
@@ -2025,6 +2068,7 @@ def pytest_runtest_setup(item):  # noqa: ARG001
     """Partpower setUp imports after pytest_configure; wrap then."""
     if uses_isolated_rust_proxy():
         ensure_isolated_swift_dir()
+        ensure_isolated_swift_conf()
         install_partpower_setup()
         install_partpower_relinker()
 
@@ -2036,7 +2080,8 @@ def pytest_sessionstart(session):  # noqa: ARG001
     print(
         f"G6 rust proxy GET/HEAD: PROXY_BASE_URL={base} "
         f"G6_INTERNAL_PROXY_URL={internal_proxy_url() or '-'} "
-        f"SWIFT_DIR={isolated_swift_dir() or '-'} adapter="
+        f"SWIFT_DIR={isolated_swift_dir() or '-'} "
+        f"SWIFT_CONF={isolated_swift_conf() or '-'} adapter="
         f"{'installed' if is_installed() else 'MISSING'} route=rust-http",
         flush=True,
     )
@@ -2079,6 +2124,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "prepare isolated={isolated} PROXY_BASE_URL={proxy_base_url!r} "
             "G6_INTERNAL_PROXY_URL={internal_proxy_url!r} "
             "SWIFT_DIR={swift_dir!r} "
+            "SWIFT_CONF={swift_conf!r} "
             "probe={probe_path} changed={probe_changed} "
             "partpower={partpower_path} partpower_changed={partpower_changed} "
             "routes_http={probe_routes_http} "

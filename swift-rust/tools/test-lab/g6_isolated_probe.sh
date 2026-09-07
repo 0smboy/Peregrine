@@ -38,6 +38,11 @@ if [[ "${PROXY_BASE_URL:-}" == *":18080"* ]]; then
   # official partpower setUp asserts /etc/swift/backups + object.builder.
   # Isolated G6 is SWIFT_DIR=/etc/g6-rust. Do not invent /etc/swift.
   export SWIFT_DIR="${SWIFT_DIR:-/etc/g6-rust}"
+  # Field dark_data on 2ef7d6e: rust object-auditor defaults SWIFT_CONF
+  # to prod /etc/swift/swift.conf. Isolated hash+policies are
+  # SWIFT_DIR/swift.conf. Explicit SWIFT_CONF wins. Do not invent
+  # /etc/swift.
+  export SWIFT_CONF="${SWIFT_CONF:-${SWIFT_DIR}/swift.conf}"
   # Field /workspace/g6-partpower-ec-relinker-rootcause.txt (2026-09-07):
   # PATH Python relinker must set_swift_dir+reload POLICIES before exec.
   # Do not invent /etc/swift policies. Not a rust relinker.
@@ -47,7 +52,7 @@ fi
 python3 "$HERE/g6_rust_proxy_get.py" --prepare
 
 if [[ $# -eq 0 ]]; then
-  echo "g6_isolated_probe: prepared PYTHONPATH=${PYTHONPATH} PROXY_BASE_URL=${PROXY_BASE_URL:-} G6_INTERNAL_PROXY_URL=${G6_INTERNAL_PROXY_URL:-}" >&2
+  echo "g6_isolated_probe: prepared PYTHONPATH=${PYTHONPATH} PROXY_BASE_URL=${PROXY_BASE_URL:-} G6_INTERNAL_PROXY_URL=${G6_INTERNAL_PROXY_URL:-} SWIFT_DIR=${SWIFT_DIR:-} SWIFT_CONF=${SWIFT_CONF:-}" >&2
   echo "usage: $0 pytest|python3 ...   # IsolatedIdentity G6 probe command" >&2
   exit 0
 fi
