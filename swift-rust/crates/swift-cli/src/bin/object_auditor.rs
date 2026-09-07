@@ -25,12 +25,13 @@
 use std::path::{Path, PathBuf};
 
 use swift_cli::auditor_daemon::object_auditor_recon_update;
+use swift_cli::dark_data::watcher_from_conf;
 use swift_core::config::SwiftConfig;
 use swift_core::daemon::{dump_recon, epoch_secs_now, sleep_unless_stopped};
 use swift_core::hashing::HashPathConfig;
 use swift_core::obslog::{LogLevel, Logger};
 use swift_core::storage_policy::parse_storage_policies;
-use swift_diskfile::{audit_device, audit_devices, DiskFileConfig, PolicyKind};
+use swift_diskfile::{audit_device, audit_devices_with_watcher, DiskFileConfig, PolicyKind};
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
     let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -155,21 +156,27 @@ fn run_daemon(conf_path: &str, run_once_only: bool) {
     });
     let policies = policy_kinds(&swift_conf);
     let stop = swift_http::install_sigterm_flag();
+    let mut dark_data = watcher_from_conf(&conf, hash_config.clone());
 
     logger.info(&format!(
         "swift-object-auditor: devices={devices} mount_check={mount_check} \
-         interval={interval}s policies={} once={run_once_only}",
-        policies.len()
+         interval={interval}s policies={} once={run_once_only} dark_data={}",
+        policies.len(),
+        dark_data
+            .as_ref()
+            .map(|w| format!("{:?}", w.config.action))
+            .unwrap_or_else(|| "off".into())
     ));
 
     loop {
         let start = epoch_secs_now();
-        let report = audit_devices(
+        let report = audit_devices_with_watcher(
             Path::new(&devices),
             mount_check,
             &policies,
             &hash_config,
             &DiskFileConfig::default(),
+            dark_data.as_mut(),
         );
         let end = epoch_secs_now();
         logger.info(&format!(

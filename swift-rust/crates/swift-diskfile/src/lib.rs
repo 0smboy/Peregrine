@@ -42,8 +42,9 @@ mod ondisk;
 mod relinker;
 
 pub use auditor::{
-    audit_device, audit_devices, audit_locations, audit_object, list_devices, AuditOutcome,
-    AuditReport,
+    audit_device, audit_device_with_watcher, audit_devices, audit_devices_with_watcher,
+    audit_locations, audit_object, audit_object_with_watcher, list_devices, AuditOutcome,
+    AuditReport, ObjectAuditWatcher, WatcherDecision,
 };
 pub use cleanup::{
     cleanup_ondisk_files, get_partition_hashes, hash_suffix_repl, CleanupConfig, CleanupResult,

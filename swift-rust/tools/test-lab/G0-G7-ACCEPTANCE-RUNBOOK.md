@@ -332,6 +332,19 @@ rust skipped on `want.meta` and left the handoff tombstone. This tip
 sends DELETE when `want.data` even if `want.meta`. Field will rebuild
 object-reconstructor. Not G6 GREEN.
 
+Field `/workspace/g6-dark-next-rootcause.txt` (2026-09-07) on
+`ba4c985`: `test.probe.test_dark_data` PASS=1 FAIL=1.
+`TestDarkDataQuarantining.test_dark_data` PASS;
+`TestDarkDataDeletion.test_dark_data` FAIL — expected
+`/srv/1/node/sdb1/quarantined` to **not** exist after dark_data
+`action=delete`, but the rust auditor still created it. Probe remaps
+`SWIFT_DIR` and runs rust `swift-object-auditor`; quarantine action
+works, delete was not honored. Not reconstructor/`ba4c985`. Not a
+harness `SWIFT_DIR` tip. This tip honors `action=delete` (rmtree hash
+dir, no `quarantined/`) matching Python `dark_data.py`. Leave
+rebuild/merge/partpower/revert alone. Field will rebuild
+object-auditor. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

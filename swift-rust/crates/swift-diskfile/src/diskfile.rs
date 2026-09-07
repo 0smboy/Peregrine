@@ -606,6 +606,12 @@ impl DiskFile {
         Ok(&self.opened()?.metadata)
     }
 
+    /// On-disk `.data` path of the opened object (Python auditor
+    /// `data_file_path` handed to watchers).
+    pub fn opened_data_file(&self) -> Result<&Path, DiskFileError> {
+        Ok(&self.opened()?.data_file)
+    }
+
     pub fn get_datafile_metadata(&self) -> Result<&Metadata, DiskFileError> {
         Ok(&self.opened()?.datafile_metadata)
     }
