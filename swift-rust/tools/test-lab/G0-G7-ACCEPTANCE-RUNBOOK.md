@@ -241,6 +241,21 @@ IsolatedIdentity ``unexpected bytes after informational response head
 those bytes as the next response. Do not claim merge GREEN from units.
 Do not reopen rebuild / expire / `:18082` no-commit.
 
+Field `/workspace/g6-merge-next-rootcause.txt` (2026-09-07) after
+`4764ef1` (100-continue leftover gone): merge family **PASS=6 / bad=5**.
+`rust_http_make_request` still sent caller `X-Backend-*` to public
+`:18080`. Gatekeeper stripped `X-Backend-Allow-Reserved-Names`
+(ReservedNamespace `put_container` → `check_utf8(..., internal=False)`
+→ **412** on NULL reserved names, 4 ERROR) and
+`X-Backend-Storage-Policy-Index` (`test_reconciler_move_object_twice`
+HEAD found the object on the wrong policy → **200** where the test
+expects 4xx before `reconciler.once()`). This tip hops
+`rust_http_make_request` to `G6_INTERNAL_PROXY_URL` (default `:18082`)
+when the caller sent any `X-Backend-*`. IsolatedIdentity still stamps
+reserved-names *after* hop, so plain PUTs stay on `:18080`. Keep expire
+`UnexpectedResponse` + `:18082` GET hop from `4764ef1`. Do not claim
+merge GREEN. Do not reopen rebuild 17/17.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

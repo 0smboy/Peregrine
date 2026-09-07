@@ -275,7 +275,7 @@ class Utf8PathAndHeaders(unittest.TestCase):
             req.full_url.encode("ascii")
             self.assertEqual(
                 req.full_url,
-                "http://127.0.0.1:18080/v1/AUTH_ec/c%C3%A8/o%C3%A8",
+                "http://127.0.0.1:18082/v1/AUTH_ec/c%C3%A8/o%C3%A8",
             )
             return FakeResp()
 
@@ -653,7 +653,7 @@ class HttpAndPatch(unittest.TestCase):
 
         def opener(req, timeout=None):
             self.assertEqual(req.get_method(), "GET")
-            self.assertEqual(req.full_url, "http://127.0.0.1:18080/v1/AUTH_ec/c/o")
+            self.assertEqual(req.full_url, "http://127.0.0.1:18082/v1/AUTH_ec/c/o")
             self.assertEqual(req.get_header("X-backend-allow-reserved-names"), "true")
             return FakeResp()
 
@@ -668,6 +668,7 @@ class HttpAndPatch(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(b"".join(resp.app_iter), b"payload")
         self.assertEqual(resp.headers.get("Etag"), "abc")
+        self.assertTrue(hasattr(resp, "environ"))
 
     def test_http_404_raises_unexpected(self):
         def opener(req, timeout=None):
@@ -1171,13 +1172,33 @@ class UnifiedInternalHop(unittest.TestCase):
             adapter.request_proxy_base_url("PUT", {"Content-Type": "text/plain"}, env),
             "http://127.0.0.1:18080",
         )
-        self.assertFalse(
+        # Any caller X-Backend-* hops :18082 (ReservedNamespace + reconciler).
+        # IsolatedIdentity stamps reserved-names *after* hop, so that stamp
+        # alone must not send every PUT to :18082.
+        self.assertTrue(
             adapter.headers_need_gatekeeper_bypass(
                 {"X-Backend-Allow-Reserved-Names": "true"}
             )
         )
         self.assertTrue(
+            adapter.headers_need_gatekeeper_bypass(
+                {"X-Backend-Storage-Policy-Index": "0"}
+            )
+        )
+        self.assertTrue(
             adapter.headers_need_gatekeeper_bypass({"x-backend-no-commit": "True"})
+        )
+        self.assertEqual(
+            adapter.request_proxy_base_url(
+                "PUT", {"X-Backend-Allow-Reserved-Names": "true"}, env
+            ),
+            "http://127.0.0.1:18082",
+        )
+        self.assertEqual(
+            adapter.request_proxy_base_url(
+                "HEAD", {"X-Backend-Storage-Policy-Index": "0"}, env
+            ),
+            "http://127.0.0.1:18082",
         )
 
     def test_rust_http_proxy_get_uses_18082_and_keeps_unexpected_404(self):
@@ -1237,6 +1258,115 @@ class UnifiedInternalHop(unittest.TestCase):
         )
         self.assertEqual(resp.status_int, 201)
         self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
+
+    def test_make_request_backend_headers_hop_18082(self):
+        """Caller X-Backend-* on rust_http_make_request hops :18082.
+
+        ReservedNamespace put_container stamps Allow-Reserved-Names;
+        reconciler HEAD stamps Storage-Policy-Index. Both were stripped
+        on :18080 (g6-merge-next-rootcause.txt after 4764ef1; PASS=6/bad=5).
+        IsolatedIdentity then setdefault reserved-names — hop stays on
+        caller headers so that stamp does not send every PUT to :18082.
+        """
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
+        seen = {}
+
+        class FakeResp:
+            status = 204
+            headers = {}
+
+            def read(self):
+                return b""
+
+            def getcode(self):
+                return 204
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["method"] = req.get_method()
+            seen["reserved"] = req.get_header("X-backend-allow-reserved-names")
+            seen["policy"] = req.get_header("X-backend-storage-policy-index")
+            return FakeResp()
+
+        resp = adapter.rust_http_make_request(
+            "PUT",
+            "/v1/.expiring_objects/1234",
+            {"X-Backend-Allow-Reserved-Names": "true"},
+            (2,),
+            opener=opener,
+        )
+        self.assertEqual(resp.status_int, 204)
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
+        self.assertEqual(seen["reserved"], "true")
+
+        seen.clear()
+
+        class HeadResp(FakeResp):
+            status = 404
+
+            def getcode(self):
+                return 404
+
+        def head_opener(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["policy"] = req.get_header("X-backend-storage-policy-index")
+            return HeadResp()
+
+        resp = adapter.rust_http_make_request(
+            "HEAD",
+            "/v1/AUTH_test/c/o",
+            {"X-Backend-Storage-Policy-Index": "0"},
+            (2, 4),
+            opener=head_opener,
+        )
+        self.assertEqual(resp.status_int, 404)
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
+        self.assertEqual(seen["policy"], "0")
+
+    def test_make_request_plain_put_stays_18080(self):
+        """IsolatedIdentity reserved-names stamp after hop keeps plain PUT on :18080."""
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
+        seen = {}
+
+        class FakeResp:
+            status = 201
+            headers = {}
+
+            def read(self):
+                return b""
+
+            def getcode(self):
+                return 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["reserved"] = req.get_header("X-backend-allow-reserved-names")
+            return FakeResp()
+
+        resp = adapter.rust_http_make_request(
+            "PUT",
+            "/v1/AUTH_test/c",
+            {"X-Timestamp": "1"},
+            (2,),
+            opener=opener,
+        )
+        self.assertEqual(resp.status_int, 201)
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18080/"))
+        self.assertEqual(seen["reserved"], "true")
 
     def test_prepare_defaults_internal_url(self):
         import tempfile

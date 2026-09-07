@@ -69,6 +69,18 @@ merge PUTs ERRORed ``unexpected bytes after informational response
 head (29 leftover)``. IsolatedIdentity ``100 Continue`` must treat
 coalesced leftover as the next response, not raise.
 
+Field ``/workspace/g6-merge-next-rootcause.txt`` (2026-09-07) after
+``4764ef1``: merge family **PASS=6 / bad=5**. ``rust_http_make_request``
+still sent caller ``X-Backend-*`` to public ``:18080``. Gatekeeper
+stripped ``X-Backend-Allow-Reserved-Names`` (ReservedNamespace
+``put_container`` → ``check_utf8(..., internal=False)`` → **412** on
+NULL reserved names) and ``X-Backend-Storage-Policy-Index``
+(reconciler HEAD found the object on the wrong policy → **200**).
+Hop ``rust_http_make_request`` to ``G6_INTERNAL_PROXY_URL`` (default
+``:18082``) when the caller sent any ``X-Backend-*``. IsolatedIdentity
+stamps reserved-names *after* hop so plain PUTs stay on ``:18080``.
+Do not reopen rebuild 17/17. Not G6 GREEN.
+
 Field ``/workspace/g6-rebuild-982e86a-unified/`` (2026-09-06) on tip
 ``982e86a``: full rebuild theme **17/17 PASS**. Public ``:18080``
 gatekeeper strips ``X-Backend-*``. IsolatedIdentity GET and no-commit
@@ -222,6 +234,8 @@ class _HttpResp:
         )
         self.body = body
         self.app_iter: Iterable[bytes] = [body] if body else []
+        # IsolatedIdentity brain translate reads resp.environ; empty is enough.
+        self.environ: dict[str, Any] = {}
 
 
 def proxy_base_url(environ: Optional[Mapping[str, str]] = None) -> str:
@@ -261,17 +275,18 @@ def ensure_internal_proxy_url(
 
 
 def headers_need_gatekeeper_bypass(headers: Optional[Mapping[str, Any]]) -> bool:
-    """True when the client sent an ``X-Backend-*`` gatekeeper would strip.
+    """True when the caller sent any ``X-Backend-*`` gatekeeper would strip.
 
-    IsolatedIdentity always stamps ``X-Backend-Allow-Reserved-Names``;
-    that alone must not hop ``:18082``.
+    Field ``/workspace/g6-merge-next-rootcause.txt`` (2026-09-07):
+    ``X-Backend-Allow-Reserved-Names`` and
+    ``X-Backend-Storage-Policy-Index`` must hop ``:18082``. IsolatedIdentity
+    may stamp reserved-names later; hop is decided from the caller's
+    headers only.
     """
     for key, value in _header_items(headers):
         if not value and value != 0:
             continue
         folded = ascii_lower_http_token(str(key)).replace("_", "-")
-        if folded == "x-backend-allow-reserved-names":
-            continue
         if folded.startswith("x-backend-"):
             return True
     return False
@@ -285,10 +300,11 @@ def request_proxy_base_url(
     """Public ``:18080`` or internal ``:18082`` for one IsolatedIdentity hop.
 
     IsolatedIdentity GET/HEAD use ``G6_INTERNAL_PROXY_URL`` when set
-    (field unified harness). PUTs with ``X-Backend-No-Commit`` /
-    fragment-preferences do the same. Client IsolatedIdentity
-    IsolatedIdentity proxy_get expire 404 still maps to
-    ``UnexpectedResponse``.
+    (field unified harness). Any caller ``X-Backend-*`` (reserved-names,
+    storage-policy-index, no-commit, fragment-preferences) hops
+    ``:18082``. Plain PUT without those headers stays on public
+    ``PROXY_BASE_URL``. Expire IsolatedIdentity proxy_get 404 still
+    maps to ``UnexpectedResponse``.
     """
     public = proxy_base_url(environ)
     internal = internal_proxy_url(environ)
@@ -1031,8 +1047,13 @@ def rust_http_make_request(
             "PROXY_BASE_URL does not point at isolated rust :18080; "
             "refusing to rewrite InternalClient HTTP"
         )
+    env = environ if environ is not None else os.environ
+    ensure_internal_proxy_url(env)
+    # Hop from caller headers only. IsolatedIdentity later stamps
+    # X-Backend-Allow-Reserved-Names; that must not send every PUT to
+    # :18082. Caller reserved-names / storage-policy-index must hop.
     merged = dict(_header_items(headers))
-    base = request_proxy_base_url(method, merged, environ)
+    base = request_proxy_base_url(method, merged, env)
     for name, value in g6_auth_headers(environ).items():
         merged.setdefault(name, value)
     merged.setdefault("X-Backend-Allow-Reserved-Names", "true")
