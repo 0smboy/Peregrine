@@ -139,6 +139,7 @@ class Utf8PathAndHeaders(unittest.TestCase):
     def tearDown(self):
         adapter.uninstall()
         os.environ.pop("PROXY_BASE_URL", None)
+        os.environ.pop("G6_INTERNAL_PROXY_URL", None)
 
     def test_encode_swift_request_path_quotes_e_grave(self):
         self.assertEqual(
@@ -408,6 +409,7 @@ class HttpAndPatch(unittest.TestCase):
     def tearDown(self):
         adapter.uninstall()
         os.environ.pop("PROXY_BASE_URL", None)
+        os.environ.pop("G6_INTERNAL_PROXY_URL", None)
 
     def test_http_put_sends_body_and_no_commit_header(self):
         class FakeResp:
@@ -521,6 +523,79 @@ class HttpAndPatch(unittest.TestCase):
         self.assertEqual(headers.get("expect"), "100-continue")
         self.assertEqual(headers.get("x-backend-no-commit"), "True")
         self.assertEqual(headers.get("connection"), "close")
+
+    def test_coalesced_100_continue_plus_final_is_not_leftover_error(self):
+        """Field g6-merge-982e86a: 29 leftover after 100 Continue is the 2xx."""
+        received = {}
+        final = (
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+
+        def serve():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            received["port"] = sock.getsockname()[1]
+            received["ready"].set()
+            conn, _addr = sock.accept()
+            sock.close()
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                _head, rest = buf.split(b"\r\n\r\n", 1)
+                # Coalesce 100 + start of 201 (field: 29 leftover bytes).
+                prefix = final[:29]
+                received["coalesced_leftover"] = len(prefix)
+                conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n" + prefix)
+                length = 0
+                for line in _head.split(b"\r\n")[1:]:
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                while len(rest) < length:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    rest += chunk
+                received["body"] = rest[:length]
+                conn.sendall(final[29:])
+            finally:
+                conn.close()
+
+        received["ready"] = threading.Event()
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(received["ready"].wait(2), "test server did not bind")
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        resp = adapter.rust_http_exchange(
+            "PUT",
+            f"http://127.0.0.1:{received['port']}/v1/AUTH_ec/c/o",
+            {},
+            timeout=5.0,
+            data=b"merge-put",
+        )
+        thread.join(2)
+        self.assertEqual(received["coalesced_leftover"], 29)
+        self.assertEqual(resp.status_int, 201)
+        self.assertEqual(received["body"], b"merge-put")
+
+    def test_read_http_head_returns_coalesced_leftover(self):
+        pair = socket.socketpair()
+        try:
+            pair[0].sendall(
+                b"HTTP/1.1 100 Continue\r\n\r\n" + b"HTTP/1.1 201 Created\r\n"
+            )
+            pair[0].close()
+            status, _headers, leftover = adapter._read_http_head(pair[1], 2.0)
+            self.assertEqual(status, 100)
+            self.assertEqual(leftover, b"HTTP/1.1 201 Created\r\n")
+        finally:
+            pair[1].close()
 
     def test_read_request_body_from_fileobj(self):
         self.assertEqual(adapter.read_request_body(None), b"")
@@ -837,6 +912,7 @@ class ExpireWaitHonesty(unittest.TestCase):
     def tearDown(self):
         adapter.uninstall()
         os.environ.pop("PROXY_BASE_URL", None)
+        os.environ.pop("G6_INTERNAL_PROXY_URL", None)
 
     def test_resolve_delete_after_becomes_delete_at(self):
         now = 1_700_000_000.4
@@ -1049,6 +1125,153 @@ class ExpireWaitHonesty(unittest.TestCase):
             adapter.probe_object_path(Probe()),
             "/v1/AUTH_test/cont%C3%A8-x/obj%C3%A8-y",
         )
+
+
+class UnifiedInternalHop(unittest.TestCase):
+    """Field g6-rebuild-982e86a-unified: :18082 GET + expire UnexpectedResponse."""
+
+    def tearDown(self):
+        adapter.uninstall()
+        os.environ.pop("PROXY_BASE_URL", None)
+        os.environ.pop("G6_INTERNAL_PROXY_URL", None)
+
+    def test_ensure_internal_defaults_on_18080(self):
+        env = {"PROXY_BASE_URL": "http://127.0.0.1:18080"}
+        self.assertEqual(
+            adapter.ensure_internal_proxy_url(env),
+            "http://127.0.0.1:18082",
+        )
+        self.assertEqual(env[adapter.G6_INTERNAL_PROXY_URL_ENV], "http://127.0.0.1:18082")
+        env_keep = {
+            "PROXY_BASE_URL": "http://127.0.0.1:18080",
+            "G6_INTERNAL_PROXY_URL": "http://10.0.0.1:18082",
+        }
+        self.assertEqual(
+            adapter.ensure_internal_proxy_url(env_keep),
+            "http://10.0.0.1:18082",
+        )
+        self.assertEqual(adapter.ensure_internal_proxy_url({}), "")
+
+    def test_get_and_no_commit_hop_18082_plain_put_stays_18080(self):
+        env = {
+            "PROXY_BASE_URL": "http://127.0.0.1:18080",
+            "G6_INTERNAL_PROXY_URL": "http://127.0.0.1:18082",
+        }
+        self.assertEqual(
+            adapter.request_proxy_base_url("GET", {}, env),
+            "http://127.0.0.1:18082",
+        )
+        self.assertEqual(
+            adapter.request_proxy_base_url(
+                "PUT", {"x-backend-no-commit": "True"}, env
+            ),
+            "http://127.0.0.1:18082",
+        )
+        self.assertEqual(
+            adapter.request_proxy_base_url("PUT", {"Content-Type": "text/plain"}, env),
+            "http://127.0.0.1:18080",
+        )
+        self.assertFalse(
+            adapter.headers_need_gatekeeper_bypass(
+                {"X-Backend-Allow-Reserved-Names": "true"}
+            )
+        )
+        self.assertTrue(
+            adapter.headers_need_gatekeeper_bypass({"x-backend-no-commit": "True"})
+        )
+
+    def test_rust_http_proxy_get_uses_18082_and_keeps_unexpected_404(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
+        seen = {}
+
+        class Probe:
+            url = "http://127.0.0.1:18080/v1/AUTH_test"
+            token = "tk"
+            container_name = "c"
+            object_name = "expired"
+
+        def opener(req, timeout=None):
+            seen["url"] = req.full_url
+            raise urllib.error.HTTPError(
+                req.full_url, 404, "Not Found", EmailMessage(), io.BytesIO(b"")
+            )
+
+        with self.assertRaises(Exception) as ctx:
+            adapter.rust_http_proxy_get(Probe(), opener=opener)
+        self.assertEqual(ctx.exception.resp.status_int, 404)
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
+
+    def test_no_commit_put_uses_18082(self):
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+        os.environ["G6_INTERNAL_PROXY_URL"] = "http://127.0.0.1:18082"
+        seen = {}
+
+        class FakeResp:
+            status = 201
+            headers = {}
+
+            def read(self):
+                return b""
+
+            def getcode(self):
+                return 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(req, timeout=None):
+            seen["url"] = req.full_url
+            return FakeResp()
+
+        resp = adapter.rust_http_make_request(
+            "PUT",
+            "/v1/AUTH_ec/c/o",
+            {"x-backend-no-commit": "True"},
+            (2,),
+            opener=opener,
+            body=b"v2",
+        )
+        self.assertEqual(resp.status_int, 201)
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:18082/"))
+
+    def test_prepare_defaults_internal_url(self):
+        import tempfile
+
+        official = (
+            adapter.OFFICIAL_PROXY_GET_HEAD
+            + "        status, headers, body = self.int_client.get_object(a, c, o)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "test_reconstructor_rebuild.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(official)
+            env = {
+                "PROXY_BASE_URL": "http://127.0.0.1:18080",
+                "G6_REBUILD_PROBE_PATH": path,
+            }
+            result = adapter.prepare_isolated_proxy_get(environ=env, probe_path=path)
+        self.assertTrue(result["isolated"])
+        self.assertEqual(result["internal_proxy_url"], "http://127.0.0.1:18082")
+        self.assertEqual(env[adapter.G6_INTERNAL_PROXY_URL_ENV], "http://127.0.0.1:18082")
+
+    def test_isolated_wrap_still_calls_rust_http_proxy_get(self):
+        """Do not raw-replace IsolatedIdentity proxy_get (drops UnexpectedResponse)."""
+        os.environ["PROXY_BASE_URL"] = "http://127.0.0.1:18080"
+
+        class Probe:
+            def proxy_get(self):
+                raise AssertionError("official IsolatedIdentity proxy_get used")
+
+        self.assertTrue(adapter.install_probe_proxy_get(Probe))
+        with mock.patch.object(
+            adapter, "rust_http_proxy_get", return_value=({}, "deadbeef")
+        ) as routed:
+            Probe().proxy_get()
+        routed.assert_called_once()
 
 
 if __name__ == "__main__":

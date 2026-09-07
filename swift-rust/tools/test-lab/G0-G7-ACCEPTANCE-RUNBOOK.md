@@ -202,27 +202,44 @@ Honesty for leftover B: field kept lonely HEAD on
 `WsgiHeaderDict`. `client.head_object` / urllib3 dropped UTF-8 meta
 (the `Ãè` WSGI name). Do not move that HEAD onto urllib3.
 
-This tip is ASCII `test_sync_expired_object`. Official wait is a
-`while`/`else` poll (`x-delete-after=2` + 1s) for IsolatedIdentity
-`proxy_get` to raise `UnexpectedResponse` with `status_int=404`
-(DiskFileExpired / proxy GET). IsolatedIdentity PUT is swiftclient
-`put_object` (not `make_request`); IsolatedIdentity GET was
-swiftclient (404 is `ClientException`, not the wait `except`). This
-tip: rust HTTP IsolatedIdentity `proxy_get` maps 404 →
-`UnexpectedResponse`; PUT `X-Delete-After` → `X-Delete-At`; rust EC
-GET 404s when reconstructed `X-Delete-At` is past (replication GET
-still opens expired frags). In-repo
-`test_ec_delete_after_get_404s_within_two_seconds` is not field
-expire PASS. Not G6 GREEN until that IsolatedIdentity PASS + a
-rebuild-theme replay.
+Field `/workspace/g6-rebuild-982e86a-expire/` (2026-09-06) on tip
+`982e86a`: ASCII + UTF8 `test_sync_expired_object` **PASS**. Do not
+reopen expire.
+
+Field `/workspace/g6-rebuild-982e86a-unified/` (2026-09-06) on the
+same SHA: full `test.probe.test_reconstructor_rebuild` **17/17 PASS**
+(~248s). Rebuild theme is **closed** for `982e86a`. This tip lands
+that unified IsolatedIdentity harness so bare `g6_isolated_probe.sh`
+reproduces it:
+
+- Public `:18080` **gatekeeper** strips every `X-Backend-*`
+  (`X-Backend-No-Commit`, Fragment-Preferences, …). Do not weaken
+  gatekeeper.
+- IsolatedIdentity GET (`rust_http_proxy_get`) and no-commit /
+  backend-header PUTs hop rust **`:18082`** when
+  `G6_INTERNAL_PROXY_URL` is set (`g6_isolated_probe.sh` defaults
+  `http://127.0.0.1:18082` if IsolatedIdentity `:18080`).
+- Keep IsolatedIdentity `proxy_get` on `rust_http_proxy_get`
+  (expire `UnexpectedResponse` + `X-Delete-After` → `X-Delete-At`).
+  Do **not** raw-replace IsolatedIdentity `proxy_get` with swiftclient.
 
 ```bash
 export PROXY_BASE_URL=http://127.0.0.1:18080
-# IC no-commit / fragment-preferences (gatekeeper-free):
-# export PROXY_BASE_URL=http://127.0.0.1:18082
+# G6_INTERNAL_PROXY_URL defaults to http://127.0.0.1:18082
 swift-rust/tools/test-lab/g6_isolated_probe.sh pytest \
-  test/probe/test_reconstructor_rebuild.py::TestReconstructorRebuild::test_rebuild_with_non_durable_newer_data -vv
+  test/probe/test_reconstructor_rebuild.py -vv
 ```
+
+Not G6 179 GREEN. Next leftovers are non-rebuild (container_merge,
+sharder, expirer, …).
+
+Field `/workspace/g6-merge-982e86a/` (2026-09-06) on `982e86a` +
+unified harness: merge family **PASS=5 / FAIL=1 / ERROR=5 / SKIP=1**
+(bad=6 vs historical 11). Rebuild stays 17/17. Primary ERROR was
+IsolatedIdentity ``unexpected bytes after informational response head
+(29 leftover)`` after ``100 Continue`` — IsolatedIdentity now keeps
+those bytes as the next response. Do not claim merge GREEN from units.
+Do not reopen rebuild / expire / `:18082` no-commit.
 
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:

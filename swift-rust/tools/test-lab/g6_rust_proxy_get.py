@@ -64,6 +64,20 @@ converts PUT ``X-Delete-After`` → ``X-Delete-At``, and 404s IsolatedIdentity
 GET when that timestamp is past — even if rust still returns 200.
 Do not call field expire PASS from units.
 
+Field ``/workspace/g6-merge-982e86a/`` (2026-09-06): ReservedNamespace
+merge PUTs ERRORed ``unexpected bytes after informational response
+head (29 leftover)``. IsolatedIdentity ``100 Continue`` must treat
+coalesced leftover as the next response, not raise.
+
+Field ``/workspace/g6-rebuild-982e86a-unified/`` (2026-09-06) on tip
+``982e86a``: full rebuild theme **17/17 PASS**. Public ``:18080``
+gatekeeper strips ``X-Backend-*``. IsolatedIdentity GET and no-commit
+/ backend-header hops use rust ``:18082`` when ``G6_INTERNAL_PROXY_URL``
+is set (bare ``g6_isolated_probe.sh`` defaults it).
+Do not raw-replace IsolatedIdentity ``proxy_get`` with
+swiftclient (drops ``UnexpectedResponse``). Rebuild theme is closed
+for ``982e86a``. Not G6 179 GREEN.
+
 ``PROXY_BASE_URL`` without ``:18080`` (classic ``:8080``) is left alone.
 
     export PROXY_BASE_URL=http://127.0.0.1:18080
@@ -106,6 +120,16 @@ DEFAULT_CONF_PATHS = (
 
 
 ISOLATED_RUST_PORT_TOKEN = ":18080"
+# Public IsolatedIdentity :18080 pipeline includes gatekeeper, which strips
+# every X-Backend-* (X-Backend-No-Commit, Fragment-Preferences, …).
+# Field 17/17 (`/workspace/g6-rebuild-982e86a-unified/`, 2026-09-06)
+# sent IsolatedIdentity GET and no-commit / backend-header traffic to
+# rust :18082 (no gatekeeper) via G6_INTERNAL_PROXY_URL. IsolatedIdentity
+# IsolatedIdentity proxy_get still raises UnexpectedResponse on expire 404 —
+# do not raw-replace IsolatedIdentity proxy_get with swiftclient.
+ISOLATED_INTERNAL_PORT_TOKEN = ":18082"
+G6_INTERNAL_PROXY_URL_ENV = "G6_INTERNAL_PROXY_URL"
+DEFAULT_INTERNAL_PROXY_URL = "http://127.0.0.1:18082"
 PUT_SEND_CHUNK = 64 * 1024
 PUT_TIMEOUT_SECS = 120.0
 BODY_READ_CHUNK = 64 * 1024
@@ -208,6 +232,73 @@ def proxy_base_url(environ: Optional[Mapping[str, str]] = None) -> str:
 def uses_isolated_rust_proxy(environ: Optional[Mapping[str, str]] = None) -> bool:
     """Lab gate: IsolatedIdentity rust listen is ``:18080``, not production ``:8080``."""
     return ISOLATED_RUST_PORT_TOKEN in proxy_base_url(environ)
+
+
+def internal_proxy_url(environ: Optional[Mapping[str, str]] = None) -> str:
+    """Gatekeeper-free rust listen (``:18082``). Empty when unset."""
+    env = environ if environ is not None else os.environ
+    return (env.get(G6_INTERNAL_PROXY_URL_ENV) or "").strip()
+
+
+def ensure_internal_proxy_url(
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Bare IsolatedIdentity probe: IsolatedIdentity ``:18080`` implies ``:18082``.
+
+    Field 17/17 used ``G6_INTERNAL_PROXY_URL=http://127.0.0.1:18082`` with
+    public ``PROXY_BASE_URL`` still ``:18080``. Do not point
+    ``PROXY_BASE_URL`` at ``:18082`` (IsolatedIdentity wrap keys on
+    ``:18080``).
+    """
+    env = environ if environ is not None else os.environ
+    current = internal_proxy_url(env)
+    if current:
+        return current
+    if not uses_isolated_rust_proxy(env):
+        return ""
+    env[G6_INTERNAL_PROXY_URL_ENV] = DEFAULT_INTERNAL_PROXY_URL
+    return DEFAULT_INTERNAL_PROXY_URL
+
+
+def headers_need_gatekeeper_bypass(headers: Optional[Mapping[str, Any]]) -> bool:
+    """True when the client sent an ``X-Backend-*`` gatekeeper would strip.
+
+    IsolatedIdentity always stamps ``X-Backend-Allow-Reserved-Names``;
+    that alone must not hop ``:18082``.
+    """
+    for key, value in _header_items(headers):
+        if not value and value != 0:
+            continue
+        folded = ascii_lower_http_token(str(key)).replace("_", "-")
+        if folded == "x-backend-allow-reserved-names":
+            continue
+        if folded.startswith("x-backend-"):
+            return True
+    return False
+
+
+def request_proxy_base_url(
+    method: str,
+    headers: Optional[Mapping[str, Any]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Public ``:18080`` or internal ``:18082`` for one IsolatedIdentity hop.
+
+    IsolatedIdentity GET/HEAD use ``G6_INTERNAL_PROXY_URL`` when set
+    (field unified harness). PUTs with ``X-Backend-No-Commit`` /
+    fragment-preferences do the same. Client IsolatedIdentity
+    IsolatedIdentity proxy_get expire 404 still maps to
+    ``UnexpectedResponse``.
+    """
+    public = proxy_base_url(environ)
+    internal = internal_proxy_url(environ)
+    if not internal:
+        return public
+    if str(method or "").upper() in OBJECT_GET_METHODS:
+        return internal
+    if headers_need_gatekeeper_bypass(headers):
+        return internal
+    return public
 
 
 def quote_swift_path_segment(part: str) -> str:
@@ -645,12 +736,10 @@ def _read_chunked_body(sock: Any, initial: bytes) -> bytes:
     return b"".join(chunks)
 
 
-def _read_http_message(
-    sock: Any, timeout: float, *, expect_body: bool
-) -> _HttpResp:
-    """Read one final HTTP response, keeping non-ASCII header names."""
+def _recv_until_head(sock: Any, timeout: float, initial: bytes = b"") -> tuple[bytes, bytes]:
+    """Read through ``\\r\\n\\r\\n``. Leftover is the next message, not an error."""
     sock.settimeout(timeout)
-    buf = b""
+    buf = initial or b""
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
         if not chunk:
@@ -663,7 +752,33 @@ def _read_http_message(
             f"no HTTP response head from rust :18080 ({buf[:200]!r})"
         )
     head, leftover = buf.split(b"\r\n\r\n", 1)
+    return head, leftover
+
+
+def _read_http_head(
+    sock: Any, timeout: float, initial: bytes = b""
+) -> tuple[int, dict[str, str], bytes]:
+    """Read one HTTP head. Coalesced bytes after 1xx are the next response.
+
+    Field ``/workspace/g6-merge-982e86a/`` (2026-09-06): rust ``:18082``
+    sent ``100 Continue`` plus the final 2xx in one recv (29 leftover).
+    Raising ``unexpected bytes after informational response head``
+    ERRORed ReservedNamespace merge/reconcile PUTs.
+    """
+    head, leftover = _recv_until_head(sock, timeout, initial)
     status, headers = parse_http_header_block(head)
+    return status, headers, leftover
+
+
+def _http_resp_from_head(
+    sock: Any,
+    timeout: float,
+    status: int,
+    headers: Mapping[str, str],
+    leftover: bytes,
+    *,
+    expect_body: bool,
+) -> _HttpResp:
     if not expect_body or status in {204, 304} or 100 <= status < 200:
         return _HttpResp(status, headers, b"")
     te = (_header_lookup(headers, "Transfer-Encoding") or "").lower()
@@ -691,32 +806,22 @@ def _read_http_message(
     return _HttpResp(status, headers, body)
 
 
-def _read_http_head(sock: Any, timeout: float) -> tuple[int, bytes]:
-    """Read one HTTP response head from a raw (possibly greened) socket."""
-    sock.settimeout(timeout)
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-        if len(buf) > 64 * 1024:
-            raise RustProxyGetError("HTTP response head too large from rust :18080")
-    if b"\r\n\r\n" not in buf:
-        raise RustProxyGetError(
-            f"no HTTP response head from rust :18080 ({buf[:200]!r})"
+def _read_http_message(
+    sock: Any,
+    timeout: float,
+    *,
+    expect_body: bool,
+    initial: bytes = b"",
+) -> _HttpResp:
+    """Read one final HTTP response, skipping informational 1xx heads."""
+    leftover = initial or b""
+    while True:
+        status, headers, leftover = _read_http_head(sock, timeout, leftover)
+        if 100 <= status < 200:
+            continue
+        return _http_resp_from_head(
+            sock, timeout, status, headers, leftover, expect_body=expect_body
         )
-    head, leftover = buf.split(b"\r\n\r\n", 1)
-    if leftover:
-        raise RustProxyGetError(
-            "unexpected bytes after informational response head "
-            f"({len(leftover)} leftover)"
-        )
-    status_line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
-    parts = status_line.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        raise RustProxyGetError(f"bad HTTP status line {status_line!r}")
-    return int(parts[1]), head
 
 
 def rust_http_send_body(
@@ -757,19 +862,26 @@ def rust_http_send_body(
         conn.putheader("Connection", "close")
         conn.endheaders()
         wait = min(float(timeout), CONTINUE_WAIT_SECS) if timeout else CONTINUE_WAIT_SECS
-        status, _head = _read_http_head(conn.sock, wait)
+        status, headers, leftover = _read_http_head(conn.sock, wait)
+        while 100 < status < 200:
+            status, headers, leftover = _read_http_head(conn.sock, wait, leftover)
         if status == 100:
             for offset in range(0, len(payload), PUT_SEND_CHUNK):
                 conn.send(bytes(payload[offset : offset + PUT_SEND_CHUNK]))
                 _eventlet_hub_yield()
-            return _read_http_message(conn.sock, timeout, expect_body=True)
+            return _read_http_message(
+                conn.sock, timeout, expect_body=True, initial=leftover
+            )
         if status == 417:
             conn.close()
             return _put_without_expect(
                 connection_cls, host, port, path, method, headers, payload, timeout
             )
-        # Final response before the body (error). Do not send payload.
-        return _HttpResp(status, {}, b"")
+        # Final response before the body (error / empty PUT). Do not send
+        # payload. Leftover is this response's body, not a parse error.
+        return _http_resp_from_head(
+            conn.sock, timeout, status, headers, leftover, expect_body=True
+        )
     except (BrokenPipeError, ConnectionResetError) as err:
         raise RustProxyGetError(
             f"BrokenPipe PUT {url} ({len(payload)} bytes) to rust :18080: {err}"
@@ -919,8 +1031,8 @@ def rust_http_make_request(
             "PROXY_BASE_URL does not point at isolated rust :18080; "
             "refusing to rewrite InternalClient HTTP"
         )
-    base = proxy_base_url(environ)
     merged = dict(_header_items(headers))
+    base = request_proxy_base_url(method, merged, environ)
     for name, value in g6_auth_headers(environ).items():
         merged.setdefault(name, value)
     merged.setdefault("X-Backend-Allow-Reserved-Names", "true")
@@ -1145,6 +1257,10 @@ def rust_http_proxy_get(
     A rust 200 loops until the 2s+1 timeout. IsolatedIdentity 404s when
     rust 404s, when GET still carries a past ``X-Delete-At``, or when
     IsolatedIdentity PUT stashed that timestamp and the clock is past.
+
+    When ``G6_INTERNAL_PROXY_URL`` is set, IsolatedIdentity GET uses that
+    rust ``:18082`` hop (no gatekeeper). Do not raw-replace IsolatedIdentity
+    ``proxy_get`` with swiftclient: 404 must stay ``UnexpectedResponse``.
     """
     path = probe_object_path(probe)
     if probe_delete_at_expired(probe):
@@ -1368,6 +1484,7 @@ def prepare_isolated_proxy_get(
     env = environ if environ is not None else os.environ
     result: dict[str, Any] = {
         "proxy_base_url": proxy_base_url(env),
+        "internal_proxy_url": ensure_internal_proxy_url(env),
         "isolated": uses_isolated_rust_proxy(env),
         "probe_path": None,
         "probe_changed": False,
@@ -1416,7 +1533,8 @@ def pytest_sessionstart(session):  # noqa: ARG001
     if not uses_isolated_rust_proxy():
         return
     print(
-        f"G6 rust proxy GET/HEAD: PROXY_BASE_URL={base} adapter="
+        f"G6 rust proxy GET/HEAD: PROXY_BASE_URL={base} "
+        f"G6_INTERNAL_PROXY_URL={internal_proxy_url() or '-'} adapter="
         f"{'installed' if is_installed() else 'MISSING'} route=rust-http",
         flush=True,
     )
@@ -1454,6 +1572,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = prepare_isolated_proxy_get()
         print(
             "prepare isolated={isolated} PROXY_BASE_URL={proxy_base_url!r} "
+            "G6_INTERNAL_PROXY_URL={internal_proxy_url!r} "
             "probe={probe_path} changed={probe_changed} "
             "routes_http={probe_routes_http} "
             "adapter_installed={adapter_installed}".format(**result)
