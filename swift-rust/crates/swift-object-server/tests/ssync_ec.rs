@@ -599,6 +599,157 @@ fn reconstructor_revert_moves_a_handoff_fragment_and_purges_it() {
     );
 }
 
+/// Field `/workspace/g6-revert-next-rootcause.txt` on `c788bb9`:
+/// `test_delete_propagate` — after `revive_drive(primaries)` the remaining
+/// handoff still 404s **with** `X-Backend-Timestamp` because SSYNC skipped
+/// DELETE when the revived primary (older `.data`) asked for `dm`.
+/// One revert `once()` must push the tombstone and purge the handoff `.ts`.
+#[test]
+fn reconstructor_revert_purges_handoff_delete_tombstone_on_first_pass() {
+    let handoff = TestTree::new("revert-ts-src");
+    let primary = TestTree::new("revert-ts-dst");
+    let partition = 0u64;
+    // Tombstones older than reclaim_age are purged on write; use now.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let put_ts = format!("{now}.00000");
+    let delete_ts = format!("{}.00000", now + 1);
+
+    let primary_server = object_server(&primary.root);
+    put_fragment(
+        &primary_server,
+        partition,
+        "gone",
+        &put_ts,
+        2,
+        b"stale-primary-frag",
+    );
+    let dest_dir = hash_dir(&primary.root, partition, "gone");
+    assert!(
+        dir_files(&dest_dir)
+            .iter()
+            .any(|name| name.ends_with(".data")),
+        "revived primary still has the PUT fragment: {:?}",
+        dir_files(&dest_dir)
+    );
+
+    let handoff_server = object_server(&handoff.root);
+    let policy = EC_POLICY.to_string();
+    let deleted = handoff_server.handle(request(
+        "DELETE",
+        &format!("/sda1/{partition}/a/c/gone"),
+        &[
+            ("X-Timestamp", &delete_ts),
+            ("X-Backend-Storage-Policy-Index", &policy),
+        ],
+        &[],
+    ));
+    assert_eq!(
+        deleted.status, 404,
+        "fresh handoff DELETE is 404: {deleted:?}"
+    );
+    let src_dir = hash_dir(&handoff.root, partition, "gone");
+    assert!(
+        dir_files(&src_dir).iter().any(|name| name.ends_with(".ts")),
+        "handoff must hold the delete tombstone: {:?}",
+        dir_files(&src_dir)
+    );
+
+    let address = spawn_server(&primary.root);
+    let live_port = address.port() as u32;
+    let dev = |id: u64| RingDevice {
+        id,
+        region: 1,
+        zone: 1,
+        ip: "127.0.0.1".to_string(),
+        port: live_port,
+        replication_ip: None,
+        replication_port: None,
+        device: "sda1".to_string(),
+        weight: 1.0,
+        meta: String::new(),
+        extra: Default::default(),
+    };
+    // All primaries listen: first once() after revive samples nparity+1
+    // and every target must accept the tombstone DELETE.
+    let devs: Vec<Option<RingDevice>> = (0..6u64).map(|i| Some(dev(i))).collect();
+    let r2p2d = (0..6u32).map(|i| vec![i]).collect();
+    let ring = Ring::new(RingData::from_parts(devs, 32, r2p2d), hash_config());
+    let part_nodes = ring.get_part_nodes(partition as u32).unwrap();
+
+    let hc = hash_config();
+    let cfg = DiskFileConfig::default();
+    let cleanup = swift_diskfile::CleanupConfig::default();
+    let part_path = handoff
+        .root
+        .join("sda1")
+        .join(get_data_dir(EC_POLICY))
+        .join(partition.to_string());
+    let jobs = build_part_jobs(
+        &part_path,
+        partition,
+        "sda1",
+        ec_kind(),
+        &cleanup,
+        &part_nodes,
+        &[],
+        2,
+        99,
+        Some(swift_object_server::reconstructor::EcScheme {
+            ndata: 4,
+            nparity: 2,
+            segment_size: 1024,
+        }),
+    );
+    let revert = jobs
+        .iter()
+        .find(|job| job.job_type == EcJobType::Revert && job.frag_index.is_none())
+        .expect("tombstone-only revert job");
+    assert!(
+        !revert.sync_to.is_empty()
+            && revert
+                .sync_to
+                .iter()
+                .all(|node| node.replication_port == live_port),
+        "first-pass tombstone revert must target revived primaries: {:?}",
+        revert.sync_to
+    );
+
+    let pusher = TcpSsyncPusher {
+        conn_timeout: std::time::Duration::from_secs(5),
+        node_timeout: std::time::Duration::from_secs(10),
+    };
+    let mut stats = EcSsyncStats::default();
+    process_part_job(
+        &handoff.root,
+        &hc,
+        &cfg,
+        EC_POLICY,
+        ec_kind(),
+        revert,
+        &pusher,
+        &HttpSuffixHashFetcher::default(),
+        None,
+        &mut stats,
+    );
+    assert_eq!(stats.failures, 0, "{stats:?}");
+    assert_eq!(stats.reverts, 1, "{stats:?}");
+    assert!(
+        !src_dir.exists() || !dir_files(&src_dir).iter().any(|name| name.ends_with(".ts")),
+        "handoff delete tombstone must be gone after first once(): {:?}",
+        dir_files(&src_dir)
+    );
+    assert!(
+        dir_files(&dest_dir)
+            .iter()
+            .any(|name| name.ends_with(".ts")),
+        "revived primary must receive the delete tombstone: {:?}",
+        dir_files(&dest_dir)
+    );
+}
+
 /// A SYNC job whose local fragment index differs from the receiver's
 /// backend index: the diskfile builder rebuilds the fragment at the
 /// target index (obj.py reconstruct_fa / sync_diskfile_builder), and the

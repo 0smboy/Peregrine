@@ -1359,14 +1359,13 @@ impl Sender<'_> {
                     timestamp,
                     metadata,
                 }) => {
-                    if want.meta {
-                        continue 'objects;
-                    }
                     if want.data {
-                        // The tombstone carries no name metadata we can trust
-                        // for the path; Python reads df.account/container/obj
-                        // which get_diskfile_from_hash resolved from the
-                        // quarantine-safe metadata. Use the tombstone's name.
+                        // Python DiskFileDeleted: send DELETE when the
+                        // receiver wants data. A revived primary that still
+                        // has older .data wants `dm` because a tombstone
+                        // offer's ts_meta defaults to ts_data. Skipping on
+                        // want.meta left the handoff tombstone in place
+                        // (test_delete_propagate first once() after revive).
                         let name = metadata.iter().find_map(|(k, v)| match (k, v) {
                             (MetaValue::Str(k), MetaValue::Str(v)) if k == "name" => {
                                 Some(v.clone())
@@ -1390,6 +1389,8 @@ impl Sender<'_> {
                             continue 'objects;
                         }
                         self.send_delete(wire, &percent_encode(&name), &timestamp)?;
+                    } else if want.meta {
+                        continue 'objects;
                     }
                 }
                 // DiskFileErrors are expected while opening the diskfile;
@@ -2234,6 +2235,74 @@ mod tests {
         assert!(
             !payload.contains("DELETE /a/c/different-object"),
             "misnamed tombstone must not delete an unrelated receiver object"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sender_deletes_tombstone_when_receiver_wants_dm() {
+        // Field /workspace/g6-revert-next-rootcause.txt: after primary
+        // revive, encode_wanted asks for `dm` (tombstone ts_meta defaults
+        // to ts_data). Python still send_delete; rust used to skip.
+        let dir =
+            std::env::temp_dir().join(format!("ssync-sender-tombstone-dm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let object_hash = hc.hash_path("a/c/o", None, None).unwrap();
+        let suffix = &object_hash[object_hash.len() - 3..];
+        let hash_dir = dir.join("sda1/objects/3").join(suffix).join(&object_hash);
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        let tombstone = hash_dir.join("1751500999.00000.ts");
+        std::fs::write(&tombstone, b"").unwrap();
+        let metadata = vec![
+            (
+                MetaValue::Str("name".to_string()),
+                MetaValue::Str("/a/c/o".to_string()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".to_string()),
+                MetaValue::Str("1751500999.00000".to_string()),
+            ),
+        ];
+        write_metadata(&tombstone, &metadata, DEFAULT_XATTR_SIZE).unwrap();
+        let cfg = DiskFileConfig::default();
+        let job = SsyncJob {
+            device: "sda1".to_string(),
+            partition: 3,
+            policy_index: 0,
+            policy: PolicyKind::Replication,
+            frag_index: None,
+        };
+        let suffixes = [suffix.to_string()];
+        let sender = Sender {
+            devices: &dir,
+            hash_config: &hc,
+            diskfile_config: &cfg,
+            job: &job,
+            suffixes: Some(&suffixes),
+            include_non_durable: false,
+            max_objects: 0,
+            start_after: None,
+            sync_frag_target: None,
+            diskfile_builder: None,
+        };
+        let wanted = format!("{object_hash} dm");
+        let mut wire = FakeWire::new(&[
+            ":MISSING_CHECK: START",
+            &wanted,
+            ":MISSING_CHECK: END",
+            ":UPDATES: START",
+            ":UPDATES: END",
+        ]);
+        let report = sender.run(&mut wire).expect("envelope remains usable");
+        assert!(
+            report.can_delete_objs.contains_key(&object_hash),
+            "tombstone DELETE must authorize local handoff cleanup: {report:?}"
+        );
+        let payload = String::from_utf8(wire.sent_payload()).unwrap();
+        assert!(
+            payload.contains("DELETE /a/c/o"),
+            "receiver dm want must still emit DELETE, got {payload:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

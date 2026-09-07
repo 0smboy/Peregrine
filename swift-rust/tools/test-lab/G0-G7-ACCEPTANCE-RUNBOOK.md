@@ -321,6 +321,17 @@ object-1)` and never saw `object-2`. This tip routes the child through
 `--swift-dir`). Do not invent `/etc/swift` policies. Not a rust-bin
 tip. Not G6 GREEN.
 
+Field `/workspace/g6-revert-next-rootcause.txt` (2026-09-07) on
+`c788bb9`: `test.probe.test_reconstructor_revert` PASS=3 FAIL=1.
+`test_handoff_non_durable` CLEARED. Residual `test_delete_propagate`:
+after `revive_drive(primaries)` + `reconstructor.once(hnodes[1])`,
+handoff still 404 **with** `X-Backend-Timestamp`. A revived primary
+that still has older `.data` wants SSYNC `dm` (tombstone `ts_meta`
+defaults to `ts_data`). Python `DiskFileDeleted` still `send_delete`;
+rust skipped on `want.meta` and left the handoff tombstone. This tip
+sends DELETE when `want.data` even if `want.meta`. Field will rebuild
+object-reconstructor. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 
