@@ -363,6 +363,18 @@ PUT `multipart-manifest=put` with the raw JSON manifest. This tip
 does that. Leave harness `8e30c8b` alone. Field will rebuild
 container-sync. Not G6 GREEN.
 
+Field G6 `test.probe.test_object_metadata_replication.Test.test_object_delete_is_replicated`
+(probe L203, 2026-09-08): BrainSplitter handoff-only PUT then
+primary-only DELETE; after `object-replicator.once` ×2, IC GET
+`expect_statuses=(4,)` was UnexpectedResponse 200. Handoff still had
+older live `.data`; primaries had newer `DiskFileDeleted` `.ts`; GET
+`:18082` served the handoff timestamp. This tip: rust SSYNC
+`send_delete` for a real `DiskFile::delete` tombstone when the
+receiver wants `d`/`dm`; unlink obsolete `.data` beside a newer `.ts`;
+rehash candidate suffixes before the update() diff so `.ts` vs `.data`
+cannot look equal. Not EC reconstructor; not proxy GET; not harness.
+Field will rebuild object-replicator + object-server. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

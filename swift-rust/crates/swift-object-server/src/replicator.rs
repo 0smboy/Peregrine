@@ -218,8 +218,9 @@ fn local_hashes(
     partition_path: &Path,
     policy: PolicyKind,
     cleanup: &CleanupConfig,
+    recalculate: &[String],
 ) -> Option<SuffixHashMap> {
-    match get_partition_hashes(partition_path, policy, &[], false, cleanup) {
+    match get_partition_hashes(partition_path, policy, recalculate, false, cleanup) {
         Ok((_hashed, hashes)) => dict_value_to_map(hashes.to_value()),
         Err(_) => None,
     }
@@ -246,7 +247,7 @@ pub fn replicate_partition(
     let Some(local) = ({
         let _scan =
             swift_core::stage::StageTimer::start("object-replicator", "replication", "scan");
-        local_hashes(partition_path, policy, cleanup)
+        local_hashes(partition_path, policy, cleanup, &[])
     }) else {
         stats.failures += 1;
         return;
@@ -270,6 +271,18 @@ pub fn replicate_partition(
                 stats.failures += 1;
                 continue;
             }
+        };
+        let diff = divergent_suffixes(&local, &remote);
+        if diff.is_empty() {
+            continue;
+        }
+        // Python `update`: rehash the candidate suffixes locally, then
+        // diff again. A stale hashes.pkl entry must not hide a newer
+        // primary .ts from an older handoff/peer .data (or the reverse).
+        // This is a local get_hashes(recalculate=), not a second REPLICATE.
+        let Some(local) = local_hashes(partition_path, policy, cleanup, &diff) else {
+            stats.failures += 1;
+            continue;
         };
         let diff = divergent_suffixes(&local, &remote);
         if diff.is_empty() {
@@ -1122,6 +1135,38 @@ mod tests {
             divergent_suffixes(&invalid, &HashMap::new()),
             vec!["abc".to_string()]
         );
+    }
+
+    #[test]
+    fn test_suffix_hash_newer_tombstone_diverges_from_older_data() {
+        // Primary .ts and handoff .data in the same suffix must not compare
+        // equal or update() skips SSYNC and the live .data survives.
+        let root = tmpdir("suffix-ts-vs-data");
+        let data_suffix = root.join("data").join("abc");
+        let ts_suffix = root.join("ts").join("abc");
+        let hash = "00000000000000000000000000000abc";
+        std::fs::create_dir_all(data_suffix.join(hash)).unwrap();
+        std::fs::create_dir_all(ts_suffix.join(hash)).unwrap();
+        std::fs::write(data_suffix.join(hash).join("1788832700.00000.data"), b"old").unwrap();
+        std::fs::write(ts_suffix.join(hash).join("1788832710.00000.ts"), b"").unwrap();
+        let cfg = CleanupConfig {
+            reclaim_age: 365.0 * 24.0 * 3600.0 * 50.0,
+            ..CleanupConfig::default()
+        };
+        let data_hash = swift_diskfile::hash_suffix_repl(&data_suffix, &cfg)
+            .unwrap()
+            .expect("data suffix");
+        let ts_hash = swift_diskfile::hash_suffix_repl(&ts_suffix, &cfg)
+            .unwrap()
+            .expect("ts suffix");
+        assert_ne!(
+            data_hash, ts_hash,
+            "tombstone and older .data must diverge so SSYNC runs"
+        );
+        let local = HashMap::from([("abc".to_string(), Some(ts_hash))]);
+        let remote = HashMap::from([("abc".to_string(), Some(data_hash))]);
+        assert_eq!(divergent_suffixes(&local, &remote), vec!["abc".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

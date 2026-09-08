@@ -194,6 +194,77 @@ pub fn decode_wanted(parts: &[&str]) -> Wanted {
     wanted
 }
 
+/// Python `yield_hashes` / `get_diskfile_from_hash` call `cleanup_ondisk_files`
+/// before offering or opening. Drop files older than a winning `.ts` / `.data`
+/// so a leftover handoff `.data` cannot shadow a newer tombstone. Reclaim-age
+/// tombstone expiry stays with the hasher, not this SSYNC pass.
+fn unlink_obsolete_diskfiles(hash_dir: &Path, policy: PolicyKind, frag_index: Option<i64>) {
+    let Ok(entries) = std::fs::read_dir(hash_dir) else {
+        return;
+    };
+    let files: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect();
+    let Ok(ondisk) = get_ondisk_files(&files, hash_dir, false, policy, frag_index, None) else {
+        return;
+    };
+    for info in &ondisk.obsolete {
+        let _ = std::fs::remove_file(hash_dir.join(&info.filename));
+    }
+}
+
+fn metadata_name(metadata: &Metadata) -> Option<String> {
+    metadata.iter().find_map(|(key, value)| {
+        let is_name = match key {
+            MetaValue::Str(key) => key == "name",
+            MetaValue::Bytes(key) => key == b"name",
+            MetaValue::Int(_) => false,
+        };
+        if !is_name {
+            return None;
+        }
+        match value {
+            MetaValue::Str(name) => Some(name.clone()),
+            MetaValue::Bytes(name) => String::from_utf8(name.clone()).ok(),
+            MetaValue::Int(_) => None,
+        }
+    })
+}
+
+/// A tombstone is opened by hash, so confirm its `name` metadata hashes back
+/// to this object before issuing DELETE. Accept both the single-path and
+/// account/container/object `hash_path` forms.
+fn tombstone_name_matches_object_hash(
+    hash_config: &HashPathConfig,
+    name: &str,
+    object_hash: &str,
+) -> bool {
+    let path = name.trim_start_matches('/');
+    if hash_config.hash_path(path, None, None).ok().as_deref() == Some(object_hash) {
+        return true;
+    }
+    let mut parts = path.splitn(3, '/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(account), Some(container), Some(object))
+            if !account.is_empty() && !container.is_empty() && !object.is_empty() =>
+        {
+            hash_config
+                .hash_path(account, Some(container), Some(object))
+                .ok()
+                .as_deref()
+                == Some(object_hash)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct SsyncSenderError {
     message: String,
@@ -1088,6 +1159,7 @@ impl Sender<'_> {
                 {
                     continue;
                 }
+                unlink_obsolete_diskfiles(&entry.path(), self.job.policy, self.job.frag_index);
                 let timestamps = object_timestamps_from_hash_dir_strict(
                     &entry.path(),
                     self.job.policy,
@@ -1220,6 +1292,7 @@ impl Sender<'_> {
                 self.job.partition,
                 object_hash,
             ));
+            unlink_obsolete_diskfiles(&hash_dir, self.job.policy, self.job.frag_index);
             let mut df = DiskFile::from_hash_dir(
                 &device_path,
                 &hash_dir,
@@ -1359,27 +1432,19 @@ impl Sender<'_> {
                     timestamp,
                     metadata,
                 }) => {
-                    if want.data {
+                    if want.data || want.meta {
                         // Python DiskFileDeleted: send DELETE when the
-                        // receiver wants data. A revived primary that still
-                        // has older .data wants `dm` because a tombstone
-                        // offer's ts_meta defaults to ts_data. Skipping on
-                        // want.meta left the handoff tombstone in place
-                        // (test_delete_propagate first once() after revive).
-                        let name = metadata.iter().find_map(|(k, v)| match (k, v) {
-                            (MetaValue::Str(k), MetaValue::Str(v)) if k == "name" => {
-                                Some(v.clone())
-                            }
-                            _ => None,
-                        });
-                        let Some(name) = name else {
+                        // receiver wants data or meta. A peer that still has
+                        // older .data wants `d`/`dm` because a tombstone
+                        // offer's ts_meta defaults to ts_data
+                        // (BrainSplitter delete_is_replicated / revert
+                        // test_delete_propagate). Skipping left the older
+                        // .data in place and GET :18082 200'd it.
+                        let Some(name) = metadata_name(&metadata) else {
                             continue 'objects;
                         };
-                        let name_hash = self
-                            .hash_config
-                            .hash_path(name.trim_start_matches('/'), None, None)
-                            .ok();
-                        if name_hash.as_deref() != Some(object_hash.as_str()) {
+                        if !tombstone_name_matches_object_hash(self.hash_config, &name, object_hash)
+                        {
                             // A tombstone is looked up by hash and therefore
                             // has not passed DiskFile::open's normal
                             // metadata-name collision check. Never let a
@@ -1389,8 +1454,6 @@ impl Sender<'_> {
                             continue 'objects;
                         }
                         self.send_delete(wire, &percent_encode(&name), &timestamp)?;
-                    } else if want.meta {
-                        continue 'objects;
                     }
                 }
                 // DiskFileErrors are expected while opening the diskfile;
@@ -2303,6 +2366,117 @@ mod tests {
         assert!(
             payload.contains("DELETE /a/c/o"),
             "receiver dm want must still emit DELETE, got {payload:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sender_diskfile_delete_tombstone_wins_over_older_data_want() {
+        // Field G6 test_object_delete_is_replicated: BrainSplitter
+        // handoff-only PUT then primary-only DELETE. The primary's
+        // DiskFile::delete tombstone (name stamped by writer.put) must
+        // send_delete when the receiver still holds older .data (`dm`).
+        let dir = std::env::temp_dir().join(format!(
+            "ssync-sender-delete-over-data-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sda1");
+        std::fs::create_dir_all(&device).unwrap();
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let object_hash = hc.hash_path("a", Some("c"), Some("o")).unwrap();
+        let suffix = object_hash[object_hash.len() - 3..].to_string();
+        let df = DiskFile::new(
+            &device,
+            3,
+            "a",
+            "c",
+            "o",
+            PolicyKind::Replication,
+            0,
+            &hc,
+            cfg.clone(),
+        )
+        .unwrap();
+        let put_ts: Timestamp = "1788832700.00000".parse().unwrap();
+        let delete_ts: Timestamp = "1788832710.00000".parse().unwrap();
+        let mut writer = df.create(".data").unwrap();
+        writer.write(b"old").unwrap();
+        writer
+            .put(vec![
+                (
+                    MetaValue::Str("X-Timestamp".into()),
+                    MetaValue::Str(put_ts.internal()),
+                ),
+                (
+                    MetaValue::Str("Content-Type".into()),
+                    MetaValue::Str("text/plain".into()),
+                ),
+                (
+                    MetaValue::Str("Content-Length".into()),
+                    MetaValue::Str("3".into()),
+                ),
+                (
+                    MetaValue::Str("ETag".into()),
+                    MetaValue::Str("c8c605999f3d8352c0cad54ed90c676d".into()),
+                ),
+            ])
+            .unwrap();
+        writer.close();
+        df.delete(&delete_ts).unwrap();
+        let hash_dir = df.datadir().to_path_buf();
+        let leftover_data: Vec<String> = std::fs::read_dir(&hash_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".data"))
+            .collect();
+        assert!(
+            leftover_data.is_empty(),
+            "DiskFile::delete must unlink obsolete .data: {leftover_data:?}"
+        );
+        let job = SsyncJob {
+            device: "sda1".to_string(),
+            partition: 3,
+            policy_index: 0,
+            policy: PolicyKind::Replication,
+            frag_index: None,
+        };
+        let suffixes = [suffix];
+        let sender = Sender {
+            devices: &dir,
+            hash_config: &hc,
+            diskfile_config: &cfg,
+            job: &job,
+            suffixes: Some(&suffixes),
+            include_non_durable: false,
+            max_objects: 0,
+            start_after: None,
+            sync_frag_target: None,
+            diskfile_builder: None,
+        };
+        let wanted = format!("{object_hash} dm");
+        let mut wire = FakeWire::new(&[
+            ":MISSING_CHECK: START",
+            &wanted,
+            ":MISSING_CHECK: END",
+            ":UPDATES: START",
+            ":UPDATES: END",
+        ]);
+        let report = sender.run(&mut wire).expect("envelope remains usable");
+        assert!(
+            report.can_delete_objs.contains_key(&object_hash),
+            "tombstone DELETE must authorize local handoff cleanup: {report:?}"
+        );
+        let payload = String::from_utf8(wire.sent_payload()).unwrap();
+        assert!(
+            payload.contains("DELETE /a/c/o"),
+            "primary DiskFileDeleted must send_delete over older handoff .data, got {payload:?}"
+        );
+        assert!(
+            payload.contains(&delete_ts.internal()),
+            "DELETE must carry the newer tombstone timestamp, got {payload:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

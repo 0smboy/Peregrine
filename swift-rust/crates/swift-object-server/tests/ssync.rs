@@ -777,3 +777,84 @@ fn python_stdlib_batch_fixture_can_generate_request_and_parse_response() {
     );
     assert_eq!(reply.lines()[1], format!("{offered_hash} dm").into_bytes());
 }
+
+fn object_files_ending(root: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn ssync_missing_check_wants_newer_tombstone_over_older_data() {
+    // BrainSplitter delete_is_replicated: handoff still has live .data at
+    // T1; primary offers a newer .ts at T2. Receiver must ask for `d`/`dm`
+    // so the sender can send_delete.
+    let tree = TestTree::new();
+    let server = server(&tree.root, false);
+    put(&server, "stale", "1788832700.00000", b"old");
+    let hash = hash_config()
+        .hash_path("a", Some("c"), Some("stale"))
+        .unwrap();
+    let reply = ssync(
+        &server,
+        &session(&[format!("{hash} 1788832710.00000")], &[]),
+    );
+    assert_eq!(reply.status(), 200);
+    let body = String::from_utf8_lossy(reply.wire_body()).into_owned();
+    assert!(
+        body.contains(&format!("{hash} d")) || body.contains(&format!("{hash} dm")),
+        "newer tombstone offer must be wanted over older .data: {body}"
+    );
+}
+
+#[test]
+fn ssync_newer_tombstone_deletes_older_handoff_data() {
+    let tree = TestTree::new();
+    let server = server(&tree.root, false);
+    put(&server, "stale", "1788832700.00000", b"old");
+    assert_eq!(get(&server, "stale").status, 200);
+    assert!(
+        !object_files_ending(&tree.root, ".data").is_empty(),
+        "precondition: handoff still has live .data"
+    );
+
+    let hash = hash_config()
+        .hash_path("a", Some("c"), Some("stale"))
+        .unwrap();
+    let updates = b"DELETE /a/c/stale\r\n\
+X-Timestamp: 1788832710.00000\r\n\
+\r\n";
+    let reply = ssync(
+        &server,
+        &session(&[format!("{hash} 1788832710.00000")], updates),
+    );
+    assert_eq!(reply.status(), 200);
+    let gone = get(&server, "stale");
+    assert!(
+        (400..500).contains(&gone.status),
+        "GET after tombstone SSYNC must be 4xx, got {}",
+        gone.status
+    );
+    assert!(
+        object_files_ending(&tree.root, ".data").is_empty(),
+        "newer .ts must clean obsolete .data, leftover {:?}",
+        object_files_ending(&tree.root, ".data")
+    );
+}

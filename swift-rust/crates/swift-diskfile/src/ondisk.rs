@@ -450,4 +450,38 @@ mod tests {
         );
         assert!(ondisk.durable_frag_set_ts.is_some());
     }
+
+    #[test]
+    fn newer_tombstone_makes_older_data_obsolete() {
+        // BrainSplitter delete_is_replicated: primary .ts at T2 must win
+        // over handoff .data at T1 so cleanup can unlink the live object.
+        let files = [
+            "1788832700.00000.data".to_string(),
+            "1788832710.00000.ts".to_string(),
+        ];
+        let ondisk = get_ondisk_files(
+            &files,
+            Path::new("/tmp/unused"),
+            true,
+            PolicyKind::Replication,
+            None,
+            None,
+        )
+        .expect("newer .ts + older .data is a valid on-disk set");
+        assert!(
+            ondisk.data_info.is_none(),
+            "older .data must not stay selected: {ondisk:?}"
+        );
+        assert_eq!(
+            ondisk.ts_info.as_ref().map(|info| info.filename.as_str()),
+            Some("1788832710.00000.ts")
+        );
+        assert!(
+            ondisk
+                .obsolete
+                .iter()
+                .any(|info| info.filename == "1788832700.00000.data"),
+            "older .data must be obsolete: {ondisk:?}"
+        );
+    }
 }
