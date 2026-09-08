@@ -66,6 +66,13 @@ pub fn match_completed_mpu_etag(
 pub const SYS_CONTAINER_UPDATE_OVERRIDE_ETAG: &str =
     "X-Object-Sysmeta-Container-Update-Override-Etag";
 
+/// Python complete MPU: `serialize_header('', {'s3_etag': etag})`.
+/// Blank base so SLO fills the listing hash; leftover `s3_etag=` survives
+/// SLO's `; slo_etag=` merge and is promoted on Swift JSON listings.
+pub fn container_update_override_s3_etag(s3_etag: &str) -> String {
+    format!("; s3_etag={s3_etag}")
+}
+
 /// Python `get_container_update_override_key('size')`. Listing `bytes`
 /// otherwise stays the SLO manifest length (137) instead of assembled size.
 pub const SYS_CONTAINER_UPDATE_OVERRIDE_SIZE: &str =
@@ -380,6 +387,14 @@ mod tests {
     fn segments_and_part_names() {
         assert_eq!(segments_container("b"), "b+segments");
         assert_eq!(part_object_name("k", "uid", 3), "k/uid/00000003");
+    }
+
+    #[test]
+    fn complete_mpu_override_etag_is_blank_base_s3_etag_param() {
+        assert_eq!(
+            container_update_override_s3_etag("deadbeef-2"),
+            "; s3_etag=deadbeef-2"
+        );
     }
 
     #[test]

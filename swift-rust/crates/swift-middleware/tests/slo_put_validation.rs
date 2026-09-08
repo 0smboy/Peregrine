@@ -67,6 +67,15 @@ fn run_manifest_put_with_client_etag(
     heads: Vec<(&str, Response)>,
     client_etag: Option<&str>,
 ) -> (Response, Vec<CapturedPut>) {
+    run_manifest_put_with_headers(manifest, heads, client_etag, &[])
+}
+
+fn run_manifest_put_with_headers(
+    manifest: Value,
+    heads: Vec<(&str, Response)>,
+    client_etag: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (Response, Vec<CapturedPut>) {
     // Canned HEAD responses likewise torn into Sync parts.
     let heads: Arc<HashMap<String, (u16, HeaderKeyDict)>> = Arc::new(
         heads
@@ -112,6 +121,9 @@ fn run_manifest_put_with_client_etag(
     headers.set("Content-Length", body.len().to_string());
     if let Some(client_etag) = client_etag {
         headers.set("Etag", client_etag);
+    }
+    for (name, value) in extra_headers {
+        headers.set(name, value);
     }
     let request = Request {
         method: "PUT".to_string(),
@@ -583,8 +595,131 @@ fn container_listing_splits_slo_etag_from_hash() {
     .unwrap();
     assert_eq!(v[0]["hash"], "deadbeef");
     assert_eq!(v[0]["slo_etag"], "\"slohash\"");
+    assert!(v[0].get("s3_etag").is_none(), "{v}");
     assert_eq!(v[1]["subdir"], "p/");
     let _ = listing;
+}
+
+fn listing_json_via_slo(hash: &str) -> Value {
+    let listing = serde_json::to_vec(&json!([{
+        "name": "assembled.bin",
+        "bytes": 6,
+        "hash": hash,
+        "content_type": "application/octet-stream",
+        "last_modified": "2020-01-01T00:00:00.000000"
+    }]))
+    .unwrap();
+    let backend: NextFn = Arc::new(move |_r: Request| {
+        let mut resp = Response::with_body(200, listing.clone());
+        resp.headers
+            .set("Content-Type", "application/json; charset=utf-8");
+        resp
+    });
+    let req = Request {
+        method: "GET".into(),
+        path: "/v1/a/c".into(),
+        query_string: "format=json".into(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let mut resp = Slo::new().handle(req, &backend);
+    resp.body.materialize(u64::MAX).unwrap();
+    serde_json::from_slice(match &resp.body {
+        swift_http::Body::Buffered(b) => b,
+        _ => panic!("expected buffered"),
+    })
+    .unwrap()
+}
+
+#[test]
+fn container_listing_promotes_s3_etag_and_slo_etag() {
+    let composite = "65d79814053817eae59f7c7cee98d3f8-2";
+    let v = listing_json_via_slo(&format!("cafef00d; s3_etag={composite}; slo_etag=slohash"));
+    assert_eq!(v[0]["hash"], "cafef00d");
+    assert_eq!(v[0]["slo_etag"], "\"slohash\"");
+    assert_eq!(v[0]["s3_etag"], format!("\"{composite}\""));
+}
+
+#[test]
+fn mpu_s3_etag_override_survives_slo_put_and_listing() {
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let composite = "b4b77f5320cfe9ce9c0c70c35e84d511-2";
+    let (response, writes) = run_manifest_put_with_headers(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        None,
+        &[
+            (
+                "X-Object-Sysmeta-Container-Update-Override-Etag",
+                &format!("; s3_etag={composite}"),
+            ),
+            ("X-Object-Sysmeta-S3Api-Etag", composite),
+        ],
+    );
+    assert_eq!(response.status, 201);
+    let physical_etag = md5_hex(&writes[0].body);
+    let override_etag = writes[0]
+        .headers
+        .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        .expect("SLO PUT must set listing override");
+    assert!(
+        override_etag.contains(&format!("s3_etag={composite}")),
+        "{override_etag}"
+    );
+    assert!(
+        override_etag.contains(&format!("slo_etag={slo_etag}")),
+        "{override_etag}"
+    );
+    assert!(
+        override_etag.contains(&physical_etag),
+        "blank-base override must use stored-manifest MD5: {override_etag}"
+    );
+
+    let listed = listing_json_via_slo(override_etag);
+    assert_eq!(listed[0]["hash"], physical_etag);
+    assert_eq!(listed[0]["slo_etag"], format!("\"{slo_etag}\""));
+    assert_eq!(listed[0]["s3_etag"], format!("\"{composite}\""));
+}
+
+#[test]
+fn mpu_s3_etag_sysmeta_seeds_override_when_complete_sent_bare_composite() {
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let composite = "65d79814053817eae59f7c7cee98d3f8-1";
+    let (response, writes) = run_manifest_put_with_headers(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        None,
+        &[
+            ("X-Object-Sysmeta-Container-Update-Override-Etag", composite),
+            ("X-Object-Sysmeta-S3Api-Etag", composite),
+        ],
+    );
+    assert_eq!(response.status, 201);
+    let override_etag = writes[0]
+        .headers
+        .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        .expect("SLO PUT must set listing override");
+    assert!(
+        override_etag.contains(&format!("s3_etag={composite}")),
+        "{override_etag}"
+    );
+    assert!(
+        override_etag.contains(&format!("slo_etag={slo_etag}")),
+        "{override_etag}"
+    );
+    let listed = listing_json_via_slo(override_etag);
+    assert_eq!(listed[0]["s3_etag"], format!("\"{composite}\""));
+    assert_eq!(listed[0]["slo_etag"], format!("\"{slo_etag}\""));
 }
 
 #[test]

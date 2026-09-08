@@ -45,8 +45,11 @@
 //! **Concurrency:** PUT segment HEAD uses up to `concurrent_gets` threads
 //! (default 10). Heartbeat whitespace respects `yield_frequency` (seconds
 //! between yields; default 10). Container listing SLO-etag refetch is
-//! available via [`refetch_listing_slo_etag`]. bulk Accept negotiation on
-//! delete beyond JSON is residual. When the expirer `UPDATE` enqueue fails,
+//! available via [`refetch_listing_slo_etag`]. JSON listings promote both
+//! `slo_etag` and leftover `s3_etag` (Python SLO + ListingEtag). MPU
+//! complete leftover override params are preserved on PUT. bulk Accept
+//! negotiation on delete beyond JSON is residual. When the expirer
+//! `UPDATE` enqueue fails,
 //! a best-effort background segment-DELETE thread is used instead of
 //! Python's bare 503.
 
@@ -88,6 +91,7 @@ const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
 const SYSMETA_SLO_ETAG: &str = "X-Object-Sysmeta-Slo-Etag";
 const SYSMETA_SLO_SIZE: &str = "X-Object-Sysmeta-Slo-Size";
 const OVERRIDE_ETAG: &str = "X-Object-Sysmeta-Container-Update-Override-Etag";
+const SYS_S3API_ETAG: &str = "X-Object-Sysmeta-S3Api-Etag";
 const ETG_IS_AT: &str = "X-Backend-Etag-Is-At";
 
 /// Default expirer account (Python `EXPIRER_ACCOUNT_NAME`).
@@ -1039,8 +1043,47 @@ fn apply_slo_put_listing_headers(req: &mut Request, json_etag: &str, slo_etag: &
         ct.push_str(&format!(";swift_bytes={total}"));
     }
     req.headers.set("Content-Type", ct);
-    req.headers
-        .set(OVERRIDE_ETAG, format!("{json_etag}; slo_etag={slo_etag}"));
+    // Python slo.py: leftover override params (s3_etag) survive, then
+    // `; slo_etag=` is appended. A blank base (`; s3_etag=…`) is replaced
+    // with the stored-manifest MD5. Bare rust-s3api composites are seeded
+    // from X-Object-Sysmeta-S3Api-Etag so ListingEtag / this rewrite can
+    // promote a top-level `s3_etag` on Swift JSON listings.
+    req.headers.set(
+        OVERRIDE_ETAG,
+        merge_slo_listing_override_etag(req, json_etag, slo_etag),
+    );
+}
+
+fn merge_slo_listing_override_etag(req: &Request, json_etag: &str, slo_etag: &str) -> String {
+    let existing = req.headers.get(OVERRIDE_ETAG).unwrap_or("");
+    let (val, params) = match existing.split_once(';') {
+        Some((v, rest)) => (v, Some(rest)),
+        None => (existing, None),
+    };
+    let mut base = if val.trim().is_empty() {
+        json_etag.to_string()
+    } else {
+        val.to_string()
+    };
+    if let Some(params) = params {
+        base.push(';');
+        base.push_str(params);
+    }
+    if !listing_hash_has_param(&base, "s3_etag") {
+        if let Some(s3) = req.headers.get(SYS_S3API_ETAG).filter(|s| !s.is_empty()) {
+            base.push_str("; s3_etag=");
+            base.push_str(s3.trim().trim_matches('"'));
+        }
+    }
+    format!("{base}; slo_etag={slo_etag}")
+}
+
+fn listing_hash_has_param(hash: &str, name: &str) -> bool {
+    hash.split(';').skip(1).any(|part| {
+        part.trim()
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim() == name)
+    })
 }
 
 fn rewrite_listing_slo_etag(resp: &mut Response) {
@@ -1071,9 +1114,30 @@ fn rewrite_listing_slo_etag(resp: &mut Response) {
         let Some(hash) = obj.get("hash").and_then(|v| v.as_str()).map(str::to_string) else {
             continue;
         };
-        if let Some((etag, slo)) = split_listing_slo_etag(&hash) {
-            obj.insert("hash".into(), etag.into());
-            obj.insert("slo_etag".into(), format!("\"{slo}\"").into());
+        let (etag, params) = parse_listing_hash_params(&hash);
+        let mut leftover = String::new();
+        let mut slo = None;
+        let mut s3 = None;
+        for (k, v) in params {
+            if k == "slo_etag" && slo.is_none() {
+                slo = Some(v);
+            } else if k == "s3_etag" && s3.is_none() {
+                s3 = Some(v);
+            } else {
+                leftover.push_str("; ");
+                leftover.push_str(&k);
+                leftover.push('=');
+                leftover.push_str(&v);
+            }
+        }
+        if slo.is_some() || s3.is_some() {
+            obj.insert("hash".into(), format!("{etag}{leftover}").into());
+            if let Some(slo) = slo {
+                obj.insert("slo_etag".into(), format!("\"{slo}\"").into());
+            }
+            if let Some(s3) = s3 {
+                obj.insert("s3_etag".into(), format!("\"{s3}\"").into());
+            }
         }
         if let Some(ct) = obj
             .get("content_type")
@@ -1107,29 +1171,25 @@ fn rewrite_listing_slo_etag(resp: &mut Response) {
     resp.body = body.into();
 }
 
-/// Split `{etag}; slo_etag={slo}` (Python parse_header on listing hash).
-fn split_listing_slo_etag(hash: &str) -> Option<(String, String)> {
-    let mut etag = String::new();
-    let mut slo = None;
-    let mut first = true;
-    for part in hash.split(';') {
-        let part = part.trim();
-        if first {
-            etag = part.to_string();
-            first = false;
-            continue;
-        }
-        let Some((k, v)) = part.split_once('=') else {
-            continue;
-        };
-        if k.trim() == "slo_etag" {
-            slo = Some(v.trim().trim_matches('"').to_string());
-        } else {
-            etag.push_str("; ");
-            etag.push_str(part);
-        }
-    }
-    slo.filter(|s| !s.is_empty()).map(|s| (etag, s))
+/// Python `parse_header` on a listing hash: first token is the etag, later
+/// `k=v` tokens are leftover params (`slo_etag`, `s3_etag`, …).
+fn parse_listing_hash_params(hash: &str) -> (String, Vec<(String, String)>) {
+    let mut parts = hash.split(';');
+    let etag = parts.next().unwrap_or("").trim().to_string();
+    let params = parts
+        .filter_map(|part| {
+            let part = part.trim();
+            let (k, v) = part.split_once('=')?;
+            let k = k.trim();
+            let v = v.trim().trim_matches('"');
+            if k.is_empty() || v.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect();
+    (etag, params)
 }
 
 fn if_none_match_put_rejected(req: &Request) -> Option<Response> {

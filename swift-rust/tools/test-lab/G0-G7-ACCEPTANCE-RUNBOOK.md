@@ -375,6 +375,18 @@ rehash candidate suffixes before the update() diff so `.ts` vs `.data`
 cannot look equal. Not EC reconstructor; not proxy GET; not harness.
 Field will rebuild object-replicator + object-server. Not G6 GREEN.
 
+Field G6 `test.probe.test_mpu.TestMixedPolicyMPU.test_mixed_policy_upload`
+(2026-09-08): after mixed-policy MPU complete, S3 HEAD/ListBucket
+composite ETag was OK but Swift `get_container` JSON had `slo_etag`
+and no top-level `s3_etag` (probe L142). Pipeline already has
+`listing_formats` + `s3api`. Rust s3api complete seeded a bare
+composite on `Container-Update-Override-Etag`; rust SLO then
+overwrote that header to `{manifest_md5}; slo_etag=…`, dropping
+`; s3_etag=`. Python complete uses `serialize_header('', {s3_etag})`
+and SLO preserves leftover params. This tip: seed `; s3_etag=` on
+complete; SLO preserve + promote `s3_etag` on Swift JSON listings.
+Proxy only. Leave SSYNC tombstone-over-data alone. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

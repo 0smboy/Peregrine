@@ -158,12 +158,12 @@ use crate::lifecycle_exec::{
     SYS_TRANSITIONED,
 };
 use crate::mpu::{
-    aws_multipart_etag, complete_multipart_xml, initiate_response, list_multipart_uploads_xml,
-    list_parts_xml_full, match_completed_mpu_etag, new_upload_id, parse_complete_body,
-    parse_upload_marker_name, part_object_name, segments_container, slo_manifest_json,
-    upload_marker_name, CompletedMpuEtagMatch, ListedPart, ListedUpload,
-    SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, SYS_CONTAINER_UPDATE_OVERRIDE_SIZE, SYS_S3API_ETAG,
-    SYS_S3API_UPLOAD_ID,
+    aws_multipart_etag, complete_multipart_xml, container_update_override_s3_etag,
+    initiate_response, list_multipart_uploads_xml, list_parts_xml_full, match_completed_mpu_etag,
+    new_upload_id, parse_complete_body, parse_upload_marker_name, part_object_name,
+    segments_container, slo_manifest_json, upload_marker_name, CompletedMpuEtagMatch, ListedPart,
+    ListedUpload, SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, SYS_CONTAINER_UPDATE_OVERRIDE_SIZE,
+    SYS_S3API_ETAG, SYS_S3API_UPLOAD_ID,
 };
 use crate::object_lock_worm::{
     apply_default_retention_headers, bypass_governance_requested,
@@ -9469,7 +9469,10 @@ async fn handle_mpu_complete_async(
     put.headers.set(SYS_S3API_UPLOAD_ID, upload_id);
     if let Some(ref etag) = s3_etag {
         put.headers.set(SYS_S3API_ETAG, etag);
-        put.headers.set(SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, etag);
+        put.headers.set(
+            SYS_CONTAINER_UPDATE_OVERRIDE_ETAG,
+            container_update_override_s3_etag(etag),
+        );
     }
     let assembled: u64 = sized.iter().map(|(_, _, n)| *n).sum();
     put.headers
@@ -14250,8 +14253,12 @@ fn handle_mpu_complete(
     put.headers.set(SYS_S3API_UPLOAD_ID, upload_id);
     if let Some(ref etag) = s3_etag {
         put.headers.set(SYS_S3API_ETAG, etag);
-        // Live object-server uses this value as the listing hash (no SLO merge).
-        put.headers.set(SYS_CONTAINER_UPDATE_OVERRIDE_ETAG, etag);
+        // Python: serialize_header('', {'s3_etag': etag}). SLO fills the
+        // listing hash and appends slo_etag without dropping this param.
+        put.headers.set(
+            SYS_CONTAINER_UPDATE_OVERRIDE_ETAG,
+            container_update_override_s3_etag(etag),
+        );
     }
     let assembled: u64 = sized.iter().map(|(_, _, n)| *n).sum();
     put.headers
@@ -18985,7 +18992,7 @@ mod tests {
         );
         assert_eq!(
             stamped_override.lock().unwrap().as_deref(),
-            Some("b4b77f5320cfe9ce9c0c70c35e84d511-2")
+            Some("; s3_etag=b4b77f5320cfe9ce9c0c70c35e84d511-2")
         );
         assert_eq!(
             stamped_uid.lock().unwrap().as_deref(),
