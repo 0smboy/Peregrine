@@ -4729,11 +4729,12 @@ impl ObjectServer {
 
     /// `container_update`: synchronous PUT/DELETE to the container servers
     /// named by X-Container-Host/Partition/Device. Replicas are contacted in
-    /// parallel under `container_update_timeout`; any node that cannot be
-    /// updated synchronously (unreachable, non-2xx, timeout, or none supplied)
-    /// causes an async_pending write so the object-updater daemon replays the
-    /// update later — without this, a container listing permanently misses the
-    /// object when a container node is down.
+    /// parallel under `container_update_timeout`; any named node that cannot
+    /// be updated synchronously (unreachable, non-2xx, timeout) causes an
+    /// async_pending write so the object-updater daemon replays the update
+    /// later — without this, a container listing permanently misses the
+    /// object when a container node is down. A missing side-channel is not a
+    /// failure: Python leaves `updates` empty and writes no pickle.
     #[allow(clippy::too_many_arguments)]
     fn container_update(
         &self,
@@ -4803,26 +4804,28 @@ impl ObjectServer {
             percent_encode(obj)
         );
         let pending_container_path = shard.map(|(a, c)| format!("{a}/{c}"));
-        // A well-formed side channel gives matching host/device lists and a
-        // partition; otherwise there is nothing to update synchronously and the
-        // whole update goes async.
+        // Python `container_update` (obj/server.py): without a partition the
+        // host/device zip is discarded (`updates = []`) and no
+        // `pickle_async_update` runs. EC fragments not selected by
+        // `num_container_updates` therefore carry no side-channel and must
+        // not emit async_pending — treating that as failure is what pushed
+        // Isolated `TestObjectUpdaterStatsRunForever` to 280 ≥ 240.
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
-        let all_ok = if well_formed {
-            fanout_container_http(
-                op,
-                &hosts,
-                &devices,
-                partition,
-                &path,
-                update,
-                policy_index,
-                self.config.container_update_timeout,
-                Some(&self.config.hash_config),
-            )
-        } else {
-            false
-        };
+        if !well_formed {
+            return;
+        }
+        let all_ok = fanout_container_http(
+            op,
+            &hosts,
+            &devices,
+            partition,
+            &path,
+            update,
+            policy_index,
+            self.config.container_update_timeout,
+            Some(&self.config.hash_config),
+        );
         if !all_ok {
             self.write_async_pending(
                 op,
@@ -4908,26 +4911,28 @@ impl ObjectServer {
         let obj = obj.to_string();
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
+        // Same as the sync path: no proxy side-channel means this replica was
+        // not chosen for a container update. Do not invent a ring-wide fanout
+        // or write async_pending (Python `updates = []`).
+        if !well_formed {
+            return;
+        }
         // Python: one container replica per object replica. Replacing hosts
         // with every shard primary (3×3 CU per DELETE) timed out after shard 0
         // (probe L692 leftover obj-0100+). Trust the proxy host first; ring-
         // lookup the shard only when that fanout fails (path/host mismatch).
-        let mut all_ok = if well_formed {
-            fanout_container_http_async(
-                op_owned.clone(),
-                hosts.clone(),
-                devices.clone(),
-                partition.clone(),
-                path.clone(),
-                update.clone(),
-                policy_index,
-                timeout,
-                Some(self.config.hash_config.clone()),
-            )
-            .await
-        } else {
-            false
-        };
+        let mut all_ok = fanout_container_http_async(
+            op_owned.clone(),
+            hosts.clone(),
+            devices.clone(),
+            partition.clone(),
+            path.clone(),
+            update.clone(),
+            policy_index,
+            timeout,
+            Some(self.config.hash_config.clone()),
+        )
+        .await;
         if !all_ok && backend_container_path.is_some() {
             if let Some((part, ring_hosts, ring_devs)) =
                 shard_container_ring_targets(&upd_account, &upd_container, &self.config.hash_config)

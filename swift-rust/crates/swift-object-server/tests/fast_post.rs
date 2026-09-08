@@ -40,13 +40,21 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
             .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
         policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
-        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_timeout: std::time::Duration::from_millis(50),
         container_update_mode: ContainerUpdateMode::Sync,
     }
 }
 
+/// Closed container replica so POST listing-header assertions can inspect
+/// the pickle without treating a missing side-channel as a pending.
+const FAIL_CU: &[(&str, &str)] = &[
+    ("X-Container-Host", "127.0.0.1:1"),
+    ("X-Container-Device", "sda1"),
+    ("X-Container-Partition", "0"),
+];
+
 fn put(server: &ObjectServer, ts: &str, ctype: &str) {
-    put_with(server, ts, ctype, &[]);
+    put_with(server, ts, ctype, FAIL_CU);
 }
 
 fn put_with(server: &ObjectServer, ts: &str, ctype: &str, extra: &[(&str, &str)]) {
@@ -70,6 +78,9 @@ fn put_with(server: &ObjectServer, ts: &str, ctype: &str, extra: &[(&str, &str)]
 fn post(server: &ObjectServer, ts: &str, extra: &[(&str, &str)]) -> Response {
     let mut headers = HeaderKeyDict::new();
     headers.set("X-Timestamp", ts);
+    for (k, v) in FAIL_CU {
+        headers.set(*k, *v);
+    }
     for (k, v) in extra {
         headers.set(k, v);
     }
