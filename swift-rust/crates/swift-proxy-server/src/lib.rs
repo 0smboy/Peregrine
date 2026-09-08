@@ -769,6 +769,19 @@ fn finalize_service_g6_diag(mut resp: Response, via: &str, method: &str, path: &
     resp
 }
 
+/// Python `server.py get_controller` / `obj.py GETorHEAD`: an explicit
+/// `X-Backend-Storage-Policy-Index` — including `0` — selects that policy's
+/// object ring and controller. Remapping `0` onto an EC container made
+/// InternalClient GETs for Policy-0 and ec42 hit the same fragments, so
+/// `test_expirer_object_split_brain` saw the object in both policies
+/// (L131) or a timestamp-less EC 404 when the data lived on Policy-0 (L105).
+pub(crate) fn resolve_object_storage_policy(
+    header_policy: Option<i64>,
+    container_policy: i64,
+) -> i64 {
+    header_policy.unwrap_or(container_policy)
+}
+
 /// Python EC GET `best_response` on fragment 404s copies the winning
 /// `X-Backend-Timestamp`. A synthesized HTML 404 must do the same so
 /// InternalClient / `get_object_metadata(..., acceptable_statuses=(4,))`
@@ -3618,7 +3631,7 @@ impl ProxyApp {
         if !info.exists() {
             return swob_response(info.write_failure_status());
         }
-        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let policy_index: i64 = resolve_object_storage_policy(header_policy, info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return text_response(
                 503,
@@ -5433,9 +5446,12 @@ impl ProxyApp {
             if !info.exists() {
                 return swob_response(info.write_failure_status());
             }
-            header_policy.unwrap_or(info.policy_index)
+            resolve_object_storage_policy(header_policy, info.policy_index)
         } else {
-            header_policy.unwrap_or_else(|| self.container_policy_index(account, container))
+            resolve_object_storage_policy(
+                header_policy,
+                self.container_policy_index(account, container),
+            )
         };
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return text_response(
@@ -9136,6 +9152,94 @@ mod stale_read_and_post_tests {
         let unavailable = attach_backend_timestamp(swob_response(503), ts);
         assert_eq!(unavailable.status, 503);
         assert!(unavailable.headers.get("X-Backend-Timestamp").is_none());
+    }
+
+    fn policies_with_backend_timestamp(per_policy: &[(i64, Option<Timestamp>)]) -> Vec<i64> {
+        per_policy
+            .iter()
+            .filter_map(|(policy, ts)| ts.filter(|ts| ts.is_truthy()).map(|_| *policy))
+            .collect()
+    }
+
+    #[test]
+    fn test_expirer_split_brain_ec42_policy0_isolation() {
+        // Probe test_expirer_object_split_brain with forced
+        // old_policy=ec42 (2) ↔ wrong_policy=Policy-0 (0) and the inverse.
+        // InternalClient GET/DELETE send X-Backend-Storage-Policy-Index.
+        const POLICY_0: i64 = 0;
+        const EC42: i64 = 2;
+        let create_ts: Timestamp = "1788834800.00000".parse().unwrap();
+        let tombstone_ts: Timestamp = "1788834802.00000".parse().unwrap();
+
+        // GET/DELETE must not remap explicit 0 onto an EC container (or
+        // the reverse). Python get_controller / GETorHEAD use the header.
+        assert_eq!(
+            resolve_object_storage_policy(Some(POLICY_0), EC42),
+            POLICY_0,
+            "Policy-0 GET on an ec42 container stays on Policy-0"
+        );
+        assert_eq!(
+            resolve_object_storage_policy(Some(EC42), POLICY_0),
+            EC42,
+            "ec42 GET on a Policy-0 container stays on ec42"
+        );
+        assert_eq!(resolve_object_storage_policy(None, EC42), EC42);
+        assert_eq!(resolve_object_storage_policy(None, POLICY_0), POLICY_0);
+        assert_eq!(
+            resolve_object_storage_policy(Some(POLICY_0), POLICY_0),
+            POLICY_0
+        );
+        assert_eq!(resolve_object_storage_policy(Some(EC42), EC42), EC42);
+
+        // L105 Policy-0 → ec42: object lives on Policy-0. Isolated GET
+        // with header 0 must see the expired timestamp, not a bare EC 404.
+        let old = POLICY_0;
+        let wrong = EC42;
+        let get_old = resolve_object_storage_policy(Some(old), wrong);
+        let get_wrong = resolve_object_storage_policy(Some(wrong), wrong);
+        assert_eq!(get_old, POLICY_0);
+        assert_eq!(get_wrong, EC42);
+        let expired_on_old = swob_404_with_backend_timestamp(create_ts);
+        let empty_wrong = swob_404_with_backend_timestamp(Timestamp::zero());
+        assert_eq!(
+            expired_on_old.headers.get("X-Backend-Timestamp"),
+            Some(create_ts.internal().as_str())
+        );
+        assert!(empty_wrong.headers.get("X-Backend-Timestamp").is_none());
+
+        // L131 ec42 → Policy-0 after 2nd expire: DELETE tombstones only
+        // the policy that actually held the object. The other policy's
+        // empty 404 must not count as "found".
+        let after_delete = policies_with_backend_timestamp(&[
+            (EC42, Some(tombstone_ts)),
+            (POLICY_0, None),
+        ]);
+        assert_eq!(after_delete, vec![EC42]);
+        assert!(tombstone_ts > create_ts);
+
+        // The old remap (header 0 + EC container → EC) made both probe
+        // GETs observe the same timestamped 404.
+        let remapped_both = policies_with_backend_timestamp(&[
+            (POLICY_0, Some(tombstone_ts)),
+            (EC42, Some(tombstone_ts)),
+        ]);
+        assert_eq!(
+            remapped_both.len(),
+            2,
+            "sanity: a crossed GET is what L131 reports"
+        );
+        let isolated = policies_with_backend_timestamp(&[
+            (
+                POLICY_0,
+                if resolve_object_storage_policy(Some(POLICY_0), EC42) == EC42 {
+                    Some(tombstone_ts)
+                } else {
+                    None
+                },
+            ),
+            (EC42, Some(tombstone_ts)),
+        ]);
+        assert_eq!(isolated, vec![EC42]);
     }
 
     #[test]

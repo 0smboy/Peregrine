@@ -1213,13 +1213,11 @@ impl ProxyApp {
             .container_info_async(account, container)
             .await
             .policy_index;
-        // InternalClient may send policy 0. Do not let that hide an EC
-        // container (field 2c64a89: Ec-Frag 200s exist, gather never ran).
-        let policy_index: i64 = match header_policy {
-            Some(0) if self.ec_policies.contains_key(&container_policy) => container_policy,
-            Some(p) => p,
-            None => container_policy,
-        };
+        // Python honors an explicit index including 0 (obj.py GETorHEAD).
+        // Do not remap Policy-0 onto an EC container: that is the
+        // expirer split-brain isolation contract.
+        let policy_index: i64 =
+            super::resolve_object_storage_policy(header_policy, container_policy);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return super::with_g6_diag(
                 Response::with_body(
@@ -2227,7 +2225,8 @@ impl ProxyApp {
         if !info.exists() {
             return swob_response(404);
         }
-        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let policy_index: i64 =
+            super::resolve_object_storage_policy(header_policy, info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return swob_response(503);
         };
@@ -3465,7 +3464,8 @@ impl ProxyApp {
         if !info.exists() {
             return swob_response(404);
         }
-        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let policy_index: i64 =
+            super::resolve_object_storage_policy(header_policy, info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return swob_response(503);
         };
