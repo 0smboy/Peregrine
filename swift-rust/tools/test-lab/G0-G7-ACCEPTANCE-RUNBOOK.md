@@ -396,6 +396,16 @@ returned a bare `swob_response(404)`. Python `best_response` copies the
 winning fragment 404 headers. This tip stamps `X-Backend-Timestamp` on
 those synthesized 404s. Proxy only. Not object-expirer. Not G6 GREEN.
 
+Field G6 EC GET residuals (2026-09-08):
+`test_ec_missing_all_durable_fragments` GET 200 after `#d` strip;
+`test_ec_handoff_overwrite` returned the stale primary etag despite
+`{new:4, old:1}`. OS fragment sanities passed. Rust gather served any
+complete (including non-durable) bucket and round-0 joined every first
+bucket regardless of Ec-Etag. Python serves only
+`best_bucket.durable && shortfall<=0` and pretends a non-durable
+complete set is 404s; newest durable complete wins. This tip: that
+chooser. Proxy EC GET only. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

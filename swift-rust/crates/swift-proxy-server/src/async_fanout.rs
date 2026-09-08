@@ -1517,13 +1517,17 @@ impl ProxyApp {
                         let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
                             .unwrap_or_default()
                             .to_string();
-                        // Round 0 is one durable generation. Join every
-                        // unique index even when POST/PUT timestamps or
-                        // fragment ETags disagree (field: 5×200 → 404).
+                        // Round 0 joins POST-after-PUT timestamp noise
+                        // (same Ec-Etag). Different etags stay in their
+                        // own generation — Python keys by data_ts and
+                        // best_bucket picks the newest durable complete.
                         let data_key = if round == 0 {
                             ec_round0_bucket_key(
-                                buckets.keys().next().map(String::as_str),
+                                buckets
+                                    .iter()
+                                    .map(|(key, bucket)| (key.as_str(), bucket.etag.as_str())),
                                 &data_timestamp,
+                                &etag,
                             )
                         } else {
                             version_timestamp_key(&data_timestamp)
@@ -1539,7 +1543,7 @@ impl ProxyApp {
                             bucket.etag = etag.clone();
                             bucket.meta = head.headers.clone();
                         }
-                        if round == 0 || ec_etag_compatible(&bucket.etag, &etag) {
+                        if ec_etag_compatible(&bucket.etag, &etag) {
                             bucket.sources.entry(fi).or_insert(head);
                         } else {
                             skipped_etag += 1;
@@ -1574,39 +1578,18 @@ impl ProxyApp {
                 .map(|ts| ts < latest_404_timestamp)
                 .unwrap_or(false)
         };
-        let chosen_timestamp = buckets
+        let summaries: Vec<EcGatherBucketView> = buckets
             .iter()
-            .filter(|(timestamp, bucket)| {
-                !tombstone_trumps(timestamp) && bucket.durable && bucket.sources.len() >= required
+            .map(|(key, bucket)| EcGatherBucketView {
+                key,
+                durable: bucket.durable,
+                n_sources: bucket.sources.len(),
             })
-            .map(|(timestamp, _)| timestamp)
-            .max()
-            .cloned();
-        let chosen_timestamp = match chosen_timestamp {
-            Some(ts) => ts,
-            None => {
-                // Field `4f7a82c` single-frag 404: ndata remaining 200s
-                // were collected then classified non-durable, so
-                // ec_no_durable_status pretended they were 404. If a
-                // complete generation survived tombstones, serve it —
-                // that is the official probe's "remaining ndata must
-                // decode" case, including after once.
-                if let Some(ts) = buckets
-                    .iter()
-                    .filter(|(timestamp, bucket)| {
-                        !tombstone_trumps(timestamp) && bucket.sources.len() >= required
-                    })
-                    .map(|(timestamp, _)| timestamp.clone())
-                    .max()
-                {
-                    ts
-                } else {
-                    let has_reconstructable_nondurable_bucket =
-                        buckets.iter().any(|(timestamp, bucket)| {
-                            !tombstone_trumps(timestamp) && bucket.sources.len() >= required
-                        });
-                    let all_good_older_than_tombstone = latest_404_timestamp.is_truthy()
-                        && buckets.keys().all(|timestamp| tombstone_trumps(timestamp));
+            .collect();
+        let chosen_timestamp =
+            match decide_ec_gather(&summaries, required, latest_404_timestamp, saw_404) {
+                EcGatherDecision::Serve(key) => key,
+                EcGatherDecision::Miss(status) => {
                     let bucket_summary = buckets
                         .iter()
                         .map(|(key, bucket)| {
@@ -1620,117 +1603,51 @@ impl ProxyApp {
                         })
                         .collect::<Vec<_>>()
                         .join(",");
-                    // Field f4051f4: 5 unique-index 200s still 404'd when
-                    // they sat in split generation buckets. Merge every
-                    // unique index that is not older than a truthy tombstone
-                    // — that is the official probe contract (ndata of 6).
-                    let mut flat = std::collections::HashMap::new();
-                    for bucket in buckets.values_mut() {
-                        for (fi, head) in std::mem::take(&mut bucket.sources) {
-                            let src_ts = super::source_timestamp(&head.headers);
-                            if latest_404_timestamp.is_truthy() && src_ts < latest_404_timestamp {
-                                continue;
-                            }
-                            flat.entry(fi).or_insert(head);
-                        }
-                    }
-                    if flat.len() >= required {
-                        let flat_key = "flat".to_string();
-                        let merged = EcResponseBucket {
-                            etag: String::new(),
-                            meta: flat
-                                .values()
-                                .next()
-                                .map(|head| head.headers.clone())
-                                .unwrap_or_default(),
-                            sources: flat,
-                            durable: true,
-                        };
-                        buckets.insert(flat_key.clone(), merged);
-                        flat_key
-                    } else if all_good_older_than_tombstone {
-                        log_ec_gather_miss(
-                            self,
-                            path,
-                            404,
-                            "tombstone_trumps",
-                            policy_index,
-                            ec.ndata,
-                            n200,
-                            &seen_idxs,
-                            skipped_no_ts,
-                            skipped_no_fi,
-                            skipped_etag,
-                            &bucket_summary,
-                            &latest_404_timestamp.internal(),
-                            saw_404,
-                        );
-                        return super::with_g6_diag(
-                            super::swob_404_with_backend_timestamp(latest_404_timestamp),
-                            g6_ec_diag(
-                                "tombstone_trumps",
-                                404,
-                                policy_index,
-                                ec.ndata,
-                                &seen_idxs,
-                                n200,
-                            ),
-                        );
+                    let miss_reason = if status == 404
+                        && latest_404_timestamp.is_truthy()
+                        && buckets.keys().all(|timestamp| tombstone_trumps(timestamp))
+                    {
+                        "tombstone_trumps"
+                    } else if status == 404 && buckets.values().any(|b| b.sources.len() >= required)
+                    {
+                        "nondurable_only"
+                    } else if buckets.is_empty() {
+                        "empty_buckets"
                     } else {
-                        // Official test_rebuild_quarantines_lonely_frag:
-                        // some durable frags but fewer than ndata cannot
-                        // decode → 503 Service Unavailable. An empty
-                        // collection plus an explicit 404 (every hash dir
-                        // gone) is the known-missing 404. Do not treat
-                        // `saw_404 && flat.len() < ndata` as 404 — that
-                        // hid the lonely-frag pre-quarantine GET
-                        // (`fd53360` field `/workspace/rebuild-lonely-fd53360/`).
-                        // ≥ndata remaining still decodes above
-                        // (`test_rebuild_missing_frags`).
-                        let status = ec_no_durable_status(
-                            has_reconstructable_nondurable_bucket,
-                            saw_404,
-                            buckets.is_empty() || flat.is_empty(),
-                        );
-                        let miss_reason = if buckets.is_empty() {
-                            "empty_buckets"
-                        } else {
-                            "no_complete_bucket"
-                        };
-                        log_ec_gather_miss(
-                            self,
-                            path,
-                            status,
+                        "no_complete_bucket"
+                    };
+                    log_ec_gather_miss(
+                        self,
+                        path,
+                        status,
+                        miss_reason,
+                        policy_index,
+                        ec.ndata,
+                        n200,
+                        &seen_idxs,
+                        skipped_no_ts,
+                        skipped_no_fi,
+                        skipped_etag,
+                        &bucket_summary,
+                        &latest_404_timestamp.internal(),
+                        saw_404,
+                    );
+                    return super::with_g6_diag(
+                        super::attach_backend_timestamp(
+                            swob_response(status),
+                            latest_404_timestamp,
+                        ),
+                        g6_ec_diag(
                             miss_reason,
+                            status,
                             policy_index,
                             ec.ndata,
-                            n200,
                             &seen_idxs,
-                            skipped_no_ts,
-                            skipped_no_fi,
-                            skipped_etag,
-                            &bucket_summary,
-                            &latest_404_timestamp.internal(),
-                            saw_404,
-                        );
-                        return super::with_g6_diag(
-                            super::attach_backend_timestamp(
-                                swob_response(status),
-                                latest_404_timestamp,
-                            ),
-                            g6_ec_diag(
-                                miss_reason,
-                                status,
-                                policy_index,
-                                ec.ndata,
-                                &seen_idxs,
-                                n200,
-                            ),
-                        );
-                    }
+                            n200,
+                        ),
+                    );
                 }
-            }
-        };
+            };
         let chosen = buckets
             .remove(&chosen_timestamp)
             .expect("chosen EC response bucket must exist");
@@ -3815,11 +3732,82 @@ fn client_get_should_404_expired(headers: &HeaderKeyDict, meta: &[(String, Strin
 }
 
 /// Bucket key so `1751500123.45678` and `000001751500123.45678` join.
-#[cfg(feature = "ec")]
 fn version_timestamp_key(ts: &str) -> String {
     ts.parse::<Timestamp>()
         .map(|t| t.internal())
         .unwrap_or_else(|_| ts.to_string())
+}
+
+/// Python `ECGetResponseCollection.best_bucket` view used by the gather
+/// chooser. Tests cover this without linking liberasurecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EcGatherBucketView<'a> {
+    key: &'a str,
+    durable: bool,
+    n_sources: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EcGatherDecision {
+    Serve(String),
+    Miss(u16),
+}
+
+fn bucket_key_timestamp(key: &str) -> Timestamp {
+    key.parse().unwrap_or_else(|_| Timestamp::zero())
+}
+
+fn tombstone_trumps_key(key: &str, latest_404: Timestamp) -> bool {
+    let ts = bucket_key_timestamp(key);
+    ts.is_truthy() && ts < latest_404
+}
+
+/// Serve only a complete durable generation (Python
+/// `best_bucket.shortfall <= 0 and best_bucket.durable`). A reconstructable
+/// but entirely non-durable set is 404 (`test_ec_missing_all_durable_fragments`).
+/// Newest durable complete wins (`test_ec_handoff_overwrite`).
+fn decide_ec_gather(
+    buckets: &[EcGatherBucketView<'_>],
+    required: usize,
+    latest_404: Timestamp,
+    saw_404: bool,
+) -> EcGatherDecision {
+    let mut best: Option<&EcGatherBucketView<'_>> = None;
+    for bucket in buckets {
+        if !bucket.durable || bucket.n_sources < required {
+            continue;
+        }
+        if tombstone_trumps_key(bucket.key, latest_404) {
+            continue;
+        }
+        match best {
+            None => best = Some(bucket),
+            Some(cur) => {
+                if bucket_key_timestamp(bucket.key) > bucket_key_timestamp(cur.key) {
+                    best = Some(bucket);
+                }
+            }
+        }
+    }
+    if let Some(bucket) = best {
+        return EcGatherDecision::Serve(bucket.key.to_string());
+    }
+    let has_nondurable_complete = buckets.iter().any(|bucket| {
+        bucket.n_sources >= required && !tombstone_trumps_key(bucket.key, latest_404)
+    });
+    let all_trumped = latest_404.is_truthy()
+        && !buckets.is_empty()
+        && buckets
+            .iter()
+            .all(|bucket| tombstone_trumps_key(bucket.key, latest_404));
+    if all_trumped {
+        return EcGatherDecision::Miss(404);
+    }
+    EcGatherDecision::Miss(ec_no_durable_status(
+        has_nondurable_complete,
+        saw_404,
+        buckets.is_empty(),
+    ))
 }
 
 #[cfg(feature = "ec")]
@@ -3854,7 +3842,6 @@ fn ec_source_is_durable(
     }
 }
 
-#[cfg(feature = "ec")]
 fn ec_etag_compatible(bucket_etag: &str, incoming: &str) -> bool {
     bucket_etag.is_empty() || incoming.is_empty() || bucket_etag == incoming
 }
@@ -3864,7 +3851,6 @@ fn ec_etag_compatible(bucket_etag: &str, incoming: &str) -> bool {
 /// fragments is a known-missing object (404), not a backend availability
 /// failure.  Incomplete fragment sets remain 503 even when another backend
 /// returned 404: they do not prove that reconstruction was possible.
-#[cfg(feature = "ec")]
 fn ec_no_durable_status(
     has_reconstructable_nondurable_bucket: bool,
     saw_404: bool,
@@ -3885,13 +3871,22 @@ fn send_ec_fragment_preferences(round: u32) -> bool {
     round > 0
 }
 
-/// Prefs-less round 0 is one durable generation. Reuse the first bucket
-/// key so POST-after-PUT timestamp noise cannot split ndata successes.
-#[cfg(feature = "ec")]
-fn ec_round0_bucket_key(existing: Option<&str>, data_timestamp: &str) -> String {
-    existing
-        .map(str::to_string)
-        .unwrap_or_else(|| version_timestamp_key(data_timestamp))
+/// Prefs-less round 0 joins an existing bucket only when Ec-Etag matches
+/// (POST-after-PUT timestamp noise). A newer overwrite stays its own
+/// generation so `best_bucket` can prefer it.
+fn ec_round0_bucket_key<'a>(
+    existing: impl IntoIterator<Item = (&'a str, &'a str)>,
+    data_timestamp: &str,
+    etag: &str,
+) -> String {
+    if !etag.is_empty() {
+        for (key, bucket_etag) in existing {
+            if ec_etag_compatible(bucket_etag, etag) {
+                return key.to_string();
+            }
+        }
+    }
+    version_timestamp_key(data_timestamp)
 }
 
 /// Stamp piggybacked onto `G6_DIAG utf8-compat … service-complete`.
@@ -4404,6 +4399,70 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn zero_durable_complete_generation_is_404() {
+        // Official test_ec_missing_all_durable_fragments: strip every #d
+        // durable, ndata non-durable 200s must not reconstruct.
+        let buckets = [EcGatherBucketView {
+            key: "000001788840000.00000",
+            durable: false,
+            n_sources: 4,
+        }];
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), true),
+            EcGatherDecision::Miss(404)
+        );
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), false),
+            EcGatherDecision::Miss(404)
+        );
+    }
+
+    #[test]
+    fn newer_durable_handoff_bucket_beats_stale_primary() {
+        // Official test_ec_handoff_overwrite: {new:4, old:1}. Python
+        // best_bucket is the newest durable complete generation.
+        let old = "000001788830000.00000";
+        let new = "000001788830100.00000";
+        let buckets = [
+            EcGatherBucketView {
+                key: old,
+                durable: true,
+                n_sources: 1,
+            },
+            EcGatherBucketView {
+                key: new,
+                durable: true,
+                n_sources: 4,
+            },
+        ];
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), false),
+            EcGatherDecision::Serve(new.to_string())
+        );
+        assert_eq!(
+            ec_round0_bucket_key([(old, "etag-old")], new, "etag-new"),
+            version_timestamp_key(new)
+        );
+        assert_eq!(
+            ec_round0_bucket_key([(old, "etag-old")], "000001788830001.00000", "etag-old"),
+            old
+        );
+    }
+
+    #[test]
+    fn lonely_durable_below_ndata_stays_503() {
+        let buckets = [EcGatherBucketView {
+            key: "000001788830000.00000",
+            durable: true,
+            n_sources: 1,
+        }];
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), true),
+            EcGatherDecision::Miss(503)
+        );
+    }
+
     #[cfg(feature = "ec")]
     #[test]
     fn ec_head_needs_metadata_source_but_get_still_needs_ndata() {
@@ -4533,11 +4592,23 @@ mod tests {
         // Field 4f7a82c: idxs=[0,2,3,4,5] 200s with POST X-Timestamp and
         // PUT data_ts must stay one generation on prefs-less gather.
         let put = version_timestamp_key("1788720311.82508");
-        assert_eq!(ec_round0_bucket_key(None, "1788720311.82508"), put);
         assert_eq!(
-            ec_round0_bucket_key(Some(&put), "000001788720312.00000"),
+            ec_round0_bucket_key(std::iter::empty(), "1788720311.82508", "abc"),
+            put
+        );
+        assert_eq!(
+            ec_round0_bucket_key([(put.as_str(), "abc")], "000001788720312.00000", "abc"),
             put,
             "later POST timestamp must not open a second round-0 bucket"
+        );
+        assert_ne!(
+            ec_round0_bucket_key(
+                [(put.as_str(), "old-etag")],
+                "000001788720399.00000",
+                "new-etag"
+            ),
+            put,
+            "a newer overwrite etag must not join the stale primary bucket"
         );
         let line = format_ec_gather_miss(
             "/a/c/o",
