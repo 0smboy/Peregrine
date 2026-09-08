@@ -1666,7 +1666,7 @@ impl ProxyApp {
                             saw_404,
                         );
                         return super::with_g6_diag(
-                            swob_response(404),
+                            super::swob_404_with_backend_timestamp(latest_404_timestamp),
                             g6_ec_diag(
                                 "tombstone_trumps",
                                 404,
@@ -1714,7 +1714,10 @@ impl ProxyApp {
                             saw_404,
                         );
                         return super::with_g6_diag(
-                            swob_response(status),
+                            super::attach_backend_timestamp(
+                                swob_response(status),
+                                latest_404_timestamp,
+                            ),
                             g6_ec_diag(
                                 miss_reason,
                                 status,
@@ -1763,16 +1766,15 @@ impl ProxyApp {
         // GET still 200s if fragment meta lacked X-Delete-At or a 200
         // slipped through. Re-check reconstructed metadata here.
         if client_get_should_404_expired(&headers, &meta) {
+            let expired_ts = super::source_timestamp(&meta);
+            let expired_ts = if expired_ts.is_truthy() {
+                expired_ts
+            } else {
+                latest_404_timestamp
+            };
             return super::with_g6_diag(
-                swob_response(404),
-                g6_ec_diag(
-                    "expired",
-                    404,
-                    policy_index,
-                    ec.ndata,
-                    &seen_idxs,
-                    n200,
-                ),
+                super::swob_404_with_backend_timestamp(expired_ts),
+                g6_ec_diag("expired", 404, policy_index, ec.ndata, &seen_idxs, n200),
             );
         }
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
@@ -3795,9 +3797,7 @@ fn client_get_should_404_expired(headers: &HeaderKeyDict, meta: &[(String, Strin
         || headers
             .get("X-Backend-Open-Expired")
             .is_some_and(config_true_value)
-        || headers
-            .get("X-Open-Expired")
-            .is_some_and(config_true_value)
+        || headers.get("X-Open-Expired").is_some_and(config_true_value)
     {
         return false;
     }

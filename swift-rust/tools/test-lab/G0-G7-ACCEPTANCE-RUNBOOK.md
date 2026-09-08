@@ -387,6 +387,15 @@ and SLO preserves leftover params. This tip: seed `; s3_etag=` on
 complete; SLO preserve + promote `s3_etag` on Swift JSON listings.
 Proxy only. Leave SSYNC tombstone-over-data alone. Not G6 GREEN.
 
+Field G6 `test.probe.test_object_expirer.TestObjectExpirer.test_expirer_object_split_brain`
+(probe L105, 2026-09-08): after `get_to_final_state()` (object-replicator
+only), GET 404 HTML lacked `x-backend-timestamp` when ENABLED_POLICIES
+drew EC. Object-server expired/tombstone 404s already stamp the header;
+rust EC gather (`tombstone_trumps` / empty-bucket / expired reconstruct)
+returned a bare `swob_response(404)`. Python `best_response` copies the
+winning fragment 404 headers. This tip stamps `X-Backend-Timestamp` on
+those synthesized 404s. Proxy only. Not object-expirer. Not G6 GREEN.
+
 If leftover themes stay red after the 176505e theme replay, check
 environment before another code guess:
 

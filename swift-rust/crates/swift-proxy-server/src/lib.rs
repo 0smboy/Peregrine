@@ -769,6 +769,26 @@ fn finalize_service_g6_diag(mut resp: Response, via: &str, method: &str, path: &
     resp
 }
 
+/// Python EC GET `best_response` on fragment 404s copies the winning
+/// `X-Backend-Timestamp`. A synthesized HTML 404 must do the same so
+/// InternalClient / `get_object_metadata(..., acceptable_statuses=(4,))`
+/// can see the tombstone (probe `test_expirer_object_split_brain`).
+pub(crate) fn swob_404_with_backend_timestamp(ts: Timestamp) -> Response {
+    attach_backend_timestamp(swob_response(404), ts)
+}
+
+pub(crate) fn attach_backend_timestamp(mut resp: Response, ts: Timestamp) -> Response {
+    if resp.status == 404 && ts.is_truthy() {
+        if resp.headers.get("X-Backend-Timestamp").is_none() {
+            resp.headers.set("X-Backend-Timestamp", ts.internal());
+        }
+        if resp.headers.get("X-Timestamp").is_none() {
+            resp.headers.set("X-Timestamp", ts.normal());
+        }
+    }
+    resp
+}
+
 fn swob_response(status: u16) -> Response {
     let explanation = match status {
         404 => "The resource could not be found.",
@@ -6084,7 +6104,7 @@ impl ProxyApp {
                 ),
             );
             return with_g6_diag(
-                swob_response(status),
+                attach_backend_timestamp(swob_response(status), latest_404_timestamp),
                 format!(
                     "reason=sync_ec_gather status={status} ndata={} idxs={idxs:?} \
                      ec=1 policy={policy_index} 200s={n200}",
@@ -9095,6 +9115,27 @@ mod stale_read_and_post_tests {
             ("X-Backend-Sharding-State", "sharded"),
         ]);
         assert!(container_newest_key(&sharded) > container_newest_key(&sharding));
+    }
+
+    #[test]
+    fn test_ec_tombstone_404_carries_backend_timestamp() {
+        // Probe test_expirer_object_split_brain (L105): after expire +
+        // get_to_final_state, GET 404 must expose x-backend-timestamp.
+        // EC gather used to return a bare HTML 404.
+        let ts: Timestamp = "1788834800.12345".parse().unwrap();
+        let resp = swob_404_with_backend_timestamp(ts);
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.headers.get("X-Backend-Timestamp"),
+            Some(ts.internal().as_str())
+        );
+        assert_eq!(resp.headers.get("X-Timestamp"), Some(ts.normal().as_str()));
+        let bare = swob_404_with_backend_timestamp(Timestamp::zero());
+        assert_eq!(bare.status, 404);
+        assert!(bare.headers.get("X-Backend-Timestamp").is_none());
+        let unavailable = attach_backend_timestamp(swob_response(503), ts);
+        assert_eq!(unavailable.status, 503);
+        assert!(unavailable.headers.get("X-Backend-Timestamp").is_none());
     }
 
     #[test]
