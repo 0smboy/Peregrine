@@ -1547,13 +1547,20 @@ fn stamp_next_part_power(headers: &mut HeaderKeyDict, object_ring: &Ring) {
 }
 
 /// Preserve a trusted Swift-internal timestamp (including its offset) when
-/// generating object backend requests. Public pipelines remove or shunt the
-/// client form in gatekeeper; internal clients such as container-reconciler
-/// intentionally supply it. Replacing it with wall-clock time loses Swift's
-/// conflict-ordering semantics.
+/// generating object backend requests.
+///
+/// Public pipelines shunt client `X-Timestamp` → `X-Backend-Inbound-X-Timestamp`
+/// in gatekeeper; raw `X-Timestamp` stays stripped on the public path. Owner
+/// PUTs (tempauth / Internal Client) must still honor that inbound value so a
+/// recreate at `delete_at+1` beats the expirer tombstone stamped at
+/// `delete_at`. Internal clients such as container-reconciler may also supply
+/// `X-Timestamp` directly. Wall-clock is used only when neither header is
+/// present — replacing a requested timestamp with now loses Swift conflict
+/// ordering (field H1: handoff `.data` at wall-clock lost to a newer `.ts`).
 fn object_write_timestamp(req: &Request) -> Timestamp {
     req.headers
         .get("X-Timestamp")
+        .or_else(|| req.headers.get("X-Backend-Inbound-X-Timestamp"))
         .and_then(|raw| raw.parse().ok())
         .unwrap_or_else(Timestamp::now)
 }
@@ -10684,21 +10691,94 @@ mod p1a_wiring_tests {
         ))
     }
 
-    #[test]
-    fn trusted_object_write_timestamp_preserves_internal_offset() {
-        let mut headers = HeaderKeyDict::new();
-        headers.set("X-Timestamp", "1787742045.13120_0000000000000003");
-        let req = Request {
+    fn put_req(headers: HeaderKeyDict) -> Request {
+        Request {
             method: "PUT".to_string(),
             path: "/v1/AUTH_test/container/object".to_string(),
             query_string: String::new(),
             headers,
             body: swift_http::Body::empty(),
-        };
+        }
+    }
 
+    #[test]
+    fn trusted_object_write_timestamp_preserves_internal_offset() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "1787742045.13120_0000000000000003");
         assert_eq!(
-            object_write_timestamp(&req).internal(),
+            object_write_timestamp(&put_req(headers)).internal(),
             "1787742045.13120_0000000000000003"
+        );
+    }
+
+    #[test]
+    fn inbound_object_write_timestamp_after_gatekeeper_shunt() {
+        // Field H1: IC recreate PUT with X-Timestamp=delete_at+1 is shunted
+        // by gatekeeper. The proxy must restore inbound so recreate_ts
+        // beats the expirer tombstone at delete_at. Raw X-Timestamp stays
+        // stripped (gatekeeper public-path contract).
+        const DELETE_AT: &str = "1788864768.00000";
+        const RECREATE: &str = "1788864769.00000";
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", RECREATE);
+        let mut req = put_req(headers);
+
+        use swift_middleware::{Gatekeeper, Middleware};
+        let gk = Gatekeeper::default();
+        assert!(matches!(
+            gk.prepare(&mut req),
+            swift_middleware::MwPrep::Continue
+        ));
+        assert!(
+            req.headers.get("X-Timestamp").is_none(),
+            "gatekeeper must keep raw X-Timestamp stripped on the public path"
+        );
+        assert_eq!(
+            req.headers.get("X-Backend-Inbound-X-Timestamp"),
+            Some(RECREATE)
+        );
+
+        let put_ts = object_write_timestamp(&req);
+        assert_eq!(put_ts.internal(), RECREATE);
+        let tombstone: Timestamp = DELETE_AT.parse().expect("delete_at");
+        assert!(
+            put_ts > tombstone,
+            "recreate_ts {} must beat expirer tombstone {}",
+            put_ts.internal(),
+            tombstone.internal()
+        );
+    }
+
+    #[test]
+    fn inbound_object_write_timestamp_used_when_x_timestamp_absent() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Inbound-X-Timestamp", "1788864769.00000");
+        assert_eq!(
+            object_write_timestamp(&put_req(headers)).internal(),
+            "1788864769.00000"
+        );
+    }
+
+    #[test]
+    fn object_write_timestamp_prefers_x_timestamp_over_inbound() {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Timestamp", "1787742045.13120_0000000000000003");
+        headers.set("X-Backend-Inbound-X-Timestamp", "1000000000.00000");
+        assert_eq!(
+            object_write_timestamp(&put_req(headers)).internal(),
+            "1787742045.13120_0000000000000003"
+        );
+    }
+
+    #[test]
+    fn object_write_timestamp_wall_clock_without_client_or_inbound() {
+        let before = Timestamp::now();
+        let got = object_write_timestamp(&put_req(HeaderKeyDict::new()));
+        let after = Timestamp::now();
+        assert!(
+            got >= before && got <= after,
+            "wall-clock fallback expected, got {}",
+            got.internal()
         );
     }
 
