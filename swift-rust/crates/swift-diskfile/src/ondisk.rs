@@ -484,4 +484,40 @@ mod tests {
             "older .data must be obsolete: {ondisk:?}"
         );
     }
+
+    #[test]
+    fn older_tombstone_does_not_obsolete_newer_recreate_data() {
+        // test_expirer_object_should_not_be_expired: expirer .ts at
+        // T(delete-at) beside a later overwrite .data. Data must stay
+        // selected so SSYNC/GET see the recreate, not a tombstone.
+        let files = [
+            "1893456003.00000.data".to_string(),
+            "1893456002.00000.ts".to_string(),
+        ];
+        let ondisk = get_ondisk_files(
+            &files,
+            Path::new("/tmp/unused"),
+            true,
+            PolicyKind::Replication,
+            None,
+            None,
+        )
+        .expect("older .ts + newer .data is a valid on-disk set");
+        assert_eq!(
+            ondisk.data_info.as_ref().map(|info| info.filename.as_str()),
+            Some("1893456003.00000.data"),
+            "newer recreate .data must stay selected: {ondisk:?}"
+        );
+        assert!(
+            ondisk.ts_info.is_none(),
+            "older expirer .ts must not win: {ondisk:?}"
+        );
+        assert!(
+            ondisk
+                .obsolete
+                .iter()
+                .any(|info| info.filename == "1893456002.00000.ts"),
+            "older .ts must be obsolete: {ondisk:?}"
+        );
+    }
 }

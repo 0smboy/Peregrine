@@ -1170,6 +1170,39 @@ mod tests {
     }
 
     #[test]
+    fn test_suffix_hash_older_tombstone_diverges_from_newer_recreate() {
+        // Inverse of newer-tombstone-vs-older-data: expirer .ts at T(delete-at)
+        // and a later overwrite .data must not compare equal or update()
+        // skips SSYNC and revert can drop the only recreate copy.
+        let root = tmpdir("suffix-old-ts-vs-new-data");
+        let data_suffix = root.join("data").join("abc");
+        let ts_suffix = root.join("ts").join("abc");
+        let hash = "00000000000000000000000000000abc";
+        std::fs::create_dir_all(data_suffix.join(hash)).unwrap();
+        std::fs::create_dir_all(ts_suffix.join(hash)).unwrap();
+        std::fs::write(data_suffix.join(hash).join("1893456003.00000.data"), b"new").unwrap();
+        std::fs::write(ts_suffix.join(hash).join("1893456002.00000.ts"), b"").unwrap();
+        let cfg = CleanupConfig {
+            reclaim_age: 365.0 * 24.0 * 3600.0 * 50.0,
+            ..CleanupConfig::default()
+        };
+        let data_hash = swift_diskfile::hash_suffix_repl(&data_suffix, &cfg)
+            .unwrap()
+            .expect("data suffix");
+        let ts_hash = swift_diskfile::hash_suffix_repl(&ts_suffix, &cfg)
+            .unwrap()
+            .expect("ts suffix");
+        assert_ne!(
+            data_hash, ts_hash,
+            "older tombstone and newer recreate .data must diverge so SSYNC runs"
+        );
+        let local = HashMap::from([("abc".to_string(), Some(ts_hash))]);
+        let remote = HashMap::from([("abc".to_string(), Some(data_hash))]);
+        assert_eq!(divergent_suffixes(&local, &remote), vec!["abc".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn test_hashes_pickle_roundtrip() {
         let value = Value::Dict(vec![(
             Value::Str("abc".to_string()),

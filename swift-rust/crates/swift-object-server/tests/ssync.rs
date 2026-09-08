@@ -14,14 +14,17 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use swift_core::hashing::HashPathConfig;
+use swift_diskfile::{DiskFileConfig, PolicyKind};
 use swift_http::{Body, HeaderKeyDict, InterimResponder, Request, Response};
 use swift_object_server::ssync::{encode_missing, SsyncEvent, SsyncParser};
+use swift_object_server::ssync_sender::{Sender, SenderReport, SsyncJob, SsyncNode, TcpSsyncWire};
 use swift_object_server::{ContainerUpdateMode, ObjectServer, ObjectServerConfig};
 
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
@@ -89,22 +92,105 @@ fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> R
 }
 
 fn put(server: &ObjectServer, object: &str, timestamp: &str, body: &[u8]) {
+    put_with(server, object, timestamp, body, &[]);
+}
+
+fn put_with(
+    server: &ObjectServer,
+    object: &str,
+    timestamp: &str,
+    body: &[u8],
+    extra: &[(&str, &str)],
+) {
     let content_length = body.len().to_string();
+    let mut headers = vec![
+        ("X-Timestamp", timestamp),
+        ("Content-Type", "text/plain"),
+        ("Content-Length", content_length.as_str()),
+    ];
+    headers.extend_from_slice(extra);
     let response = server.handle(request(
         "PUT",
         &format!("/sda1/0/a/c/{object}"),
-        &[
-            ("X-Timestamp", timestamp),
-            ("Content-Type", "text/plain"),
-            ("Content-Length", &content_length),
-        ],
+        &headers,
         body,
     ));
     assert_eq!(response.status, 201, "PUT failed: {response:?}");
 }
 
+fn delete_with(server: &ObjectServer, object: &str, headers: &[(&str, &str)]) -> Response {
+    server.handle(request(
+        "DELETE",
+        &format!("/sda1/0/a/c/{object}"),
+        headers,
+        &[],
+    ))
+}
+
 fn get(server: &ObjectServer, object: &str) -> Response {
     server.handle(request("GET", &format!("/sda1/0/a/c/{object}"), &[], &[]))
+}
+
+fn head(server: &ObjectServer, object: &str) -> Response {
+    server.handle(request("HEAD", &format!("/sda1/0/a/c/{object}"), &[], &[]))
+}
+
+fn spawn_server(devices: &Path) -> std::net::SocketAddr {
+    let server = server(devices, false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = swift_object_server::serve_with_config(
+            listener,
+            server,
+            swift_http::ServerConfig::default(),
+        );
+    });
+    address
+}
+
+fn ssync_job() -> SsyncJob {
+    SsyncJob {
+        device: "sda1".to_string(),
+        partition: 0,
+        policy_index: 0,
+        policy: PolicyKind::Replication,
+        frag_index: None,
+    }
+}
+
+fn run_sender(devices: &Path, address: std::net::SocketAddr) -> SenderReport {
+    let hc = hash_config();
+    let cfg = DiskFileConfig::default();
+    let job = ssync_job();
+    let node = SsyncNode {
+        replication_ip: address.ip().to_string(),
+        replication_port: address.port() as u32,
+        device: "sda1".to_string(),
+        backend_index: None,
+    };
+    let sender = Sender {
+        devices,
+        hash_config: &hc,
+        diskfile_config: &cfg,
+        job: &job,
+        suffixes: None,
+        include_non_durable: false,
+        max_objects: 0,
+        start_after: None,
+        sync_frag_target: None,
+        diskfile_builder: None,
+    };
+    let mut wire = TcpSsyncWire::connect(
+        &node,
+        &job,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("ssync connect");
+    let report = sender.run(&mut wire).expect("ssync run");
+    wire.disconnect();
+    report
 }
 
 fn session(missing: &[String], updates: &[u8]) -> Vec<u8> {
@@ -856,5 +942,191 @@ X-Timestamp: 1788832710.00000\r\n\
         object_files_ending(&tree.root, ".data").is_empty(),
         "newer .ts must clean obsolete .data, leftover {:?}",
         object_files_ending(&tree.root, ".data")
+    );
+}
+
+/// Probe `test_expirer_object_should_not_be_expired`:
+/// `T(created) < T(delete-at) < T(recreate)`. The expirer tombstone is
+/// stamped at delete-at, not wall-clock now. A later overwrite without
+/// `X-Delete-At` must beat that older tombstone after SSYNC.
+const EXPIRE_CREATED: &str = "1893456000.00000";
+const EXPIRE_DELETE_AT: &str = "1893456002.00000";
+const EXPIRE_RECREATE: &str = "1893456003.00000";
+
+fn put_expiring_object(server: &ObjectServer, object: &str) {
+    put_with(
+        server,
+        object,
+        EXPIRE_CREATED,
+        b"",
+        &[("X-Delete-At", "1893456002")],
+    );
+}
+
+fn put_recreate(server: &ObjectServer, object: &str) {
+    put_with(
+        server,
+        object,
+        EXPIRE_RECREATE,
+        b"",
+        &[("X-Object-Meta-Expired", "False")],
+    );
+}
+
+fn expire_object(server: &ObjectServer, object: &str) -> Response {
+    delete_with(
+        server,
+        object,
+        &[
+            ("X-Timestamp", EXPIRE_DELETE_AT),
+            ("X-If-Delete-At", EXPIRE_DELETE_AT),
+        ],
+    )
+}
+
+#[test]
+fn ssync_older_tombstone_is_not_wanted_over_newer_recreate() {
+    let tree = TestTree::new();
+    let server = server(&tree.root, false);
+    put_expiring_object(&server, "revived");
+    put_recreate(&server, "revived");
+    let recreate_head = head(&server, "revived");
+    assert_eq!(recreate_head.status, 200, "{recreate_head:?}");
+    assert!(
+        recreate_head.headers.get("X-Delete-At").is_none(),
+        "recreate PUT must drop X-Delete-At, got {recreate_head:?}"
+    );
+    assert_eq!(
+        recreate_head.headers.get("X-Object-Meta-Expired"),
+        Some("False")
+    );
+
+    let expire = expire_object(&server, "revived");
+    assert!(
+        expire.status == 409 || expire.status == 412,
+        "recreate (newer, no X-Delete-At) must reject expirer DELETE, got {expire:?}"
+    );
+    assert_eq!(head(&server, "revived").status, 200);
+
+    let hash = hash_config()
+        .hash_path("a", Some("c"), Some("revived"))
+        .unwrap();
+    let reply = ssync(
+        &server,
+        &session(&[format!("{hash} {EXPIRE_DELETE_AT}")], &[]),
+    );
+    assert_eq!(reply.status(), 200);
+    let body = String::from_utf8_lossy(reply.wire_body()).into_owned();
+    assert!(
+        !body.contains(&format!("{hash} d")) && !body.contains(&format!("{hash} dm")),
+        "older expirer tombstone must not be wanted over newer recreate: {body}"
+    );
+}
+
+#[test]
+fn ssync_newer_recreate_is_wanted_over_older_expirer_tombstone() {
+    let tree = TestTree::new();
+    let server = server(&tree.root, false);
+    put_expiring_object(&server, "revived");
+    let expired = expire_object(&server, "revived");
+    assert!(
+        (200..300).contains(&expired.status) || expired.status == 404,
+        "expirer DELETE on matching X-Delete-At: {expired:?}"
+    );
+    assert!(
+        (400..500).contains(&head(&server, "revived").status),
+        "primary must be tombstoned before SSYNC"
+    );
+
+    let hash = hash_config()
+        .hash_path("a", Some("c"), Some("revived"))
+        .unwrap();
+    let reply = ssync(
+        &server,
+        &session(&[format!("{hash} {EXPIRE_RECREATE}")], &[]),
+    );
+    assert_eq!(reply.status(), 200);
+    let body = String::from_utf8_lossy(reply.wire_body()).into_owned();
+    assert!(
+        body.contains(&format!("{hash} d")) || body.contains(&format!("{hash} dm")),
+        "newer recreate offer must be wanted over older expirer tombstone: {body}"
+    );
+}
+
+#[test]
+fn ssync_recreate_after_expire_then_replicate_head_200() {
+    // Handoff: original + recreate (no X-Delete-At). Primary: original +
+    // expirer tombstone at delete-at. Replicator revert SSYNCs handoff →
+    // primary then deletes the handoff copy; HEAD must stay 200 on the
+    // primary. The inverse SSYNC must not let the older tombstone win.
+    let handoff = TestTree::new();
+    let primary = TestTree::new();
+    let handoff_server = server(&handoff.root, false);
+    let primary_server = server(&primary.root, false);
+
+    put_expiring_object(&handoff_server, "revived");
+    put_recreate(&handoff_server, "revived");
+    put_expiring_object(&primary_server, "revived");
+    let expired = expire_object(&primary_server, "revived");
+    assert!(
+        (200..300).contains(&expired.status) || expired.status == 404,
+        "expirer DELETE: {expired:?}"
+    );
+
+    let hash = hash_config()
+        .hash_path("a", Some("c"), Some("revived"))
+        .unwrap();
+
+    let older_tombstone = b"DELETE /a/c/revived\r\n\
+X-Timestamp: 1893456002.00000\r\n\
+\r\n";
+    let tombstone_push = ssync(
+        &handoff_server,
+        &session(&[format!("{hash} {EXPIRE_DELETE_AT}")], older_tombstone),
+    );
+    assert_eq!(tombstone_push.status(), 200);
+    assert_eq!(
+        head(&handoff_server, "revived").status,
+        200,
+        "older SSYNC DELETE must not remove the recreate"
+    );
+
+    let handoff_addr = spawn_server(&handoff.root);
+    let tombstone_report = run_sender(&primary.root, handoff_addr);
+    assert!(
+        tombstone_report.send_map.is_empty(),
+        "primary must not push the older expirer tombstone onto the recreate: {tombstone_report:?}"
+    );
+    assert_eq!(
+        head(&server(&handoff.root, false), "revived").status,
+        200,
+        "primary→handoff SSYNC must leave the recreate in place"
+    );
+
+    let primary_addr = spawn_server(&primary.root);
+    let report = run_sender(&handoff.root, primary_addr);
+    assert!(
+        report.can_delete_objs.contains_key(&hash),
+        "handoff recreate must be confirmed on the tombstoned primary: {report:?}"
+    );
+    assert!(
+        !report.send_map.is_empty(),
+        "tombstoned primary must request the newer recreate: {report:?}"
+    );
+
+    let primary_after = server(&primary.root, false);
+    let revived = head(&primary_after, "revived");
+    assert_eq!(
+        revived.status, 200,
+        "recreate-after-expire SSYNC must HEAD 200 on the primary, got {revived:?}"
+    );
+    assert_eq!(
+        revived.headers.get("X-Object-Meta-Expired"),
+        Some("False"),
+        "{revived:?}"
+    );
+    assert!(
+        revived.headers.get("X-Delete-At").is_none(),
+        "replicated recreate must not carry X-Delete-At: {revived:?}"
     );
 }
