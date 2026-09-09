@@ -9270,6 +9270,38 @@ mod pipeline_async_tests {
             _ => Vec::new(),
         };
         assert_eq!(body, b"onetwo");
+        let mut head_ok = HeaderKeyDict::new();
+        head_ok.set("If-Match", &etag);
+        let head_match = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_ok,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_match.status, 200,
+            "official test_dlo_if_match_head on Hyper, got {}",
+            head_match.status
+        );
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-Match", format!("not-{etag}"));
+        let miss_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_head.status, 412,
+            "official test_dlo_if_match_head miss on Hyper, got {}",
+            miss_head.status
+        );
     }
 
     /// Official TestDlo.test_dlo_referer_on_segment_container step 2:
@@ -10696,6 +10728,179 @@ mod pipeline_async_tests {
         assert_eq!(body, b"abb", "assembled Range bytes=2-4 of aaabbb");
     }
 
+    /// Official TestSlo.test_slo_get_ranged_manifest: stored `range` slices
+    /// the backing object. Same object twice is
+    /// test_slo_get_ranged_manifest_repeated_segment.
+    struct SloRangedManifestStub;
+    impl swift_middleware::Middleware for SloRangedManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/ranged-manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "2-4"},
+                        {"name": "/c/s1", "bytes": 2, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "0-1"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-ranged");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaabbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_ranged_manifest_slices_segments_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloRangedManifestStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", "not-ranged");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/ranged-manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_ranged_manifest on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"abbaa",
+            "range 2-4 then 0-1 of aaabbb (repeated segment)"
+        );
+    }
+
+    /// Official TestSlo.test_slo_get_ranged_submanifest: outer references
+    /// a ranged `sub_slo` window of an already-ranged inner assemble.
+    struct SloRangedSubmanifestStub;
+    impl swift_middleware::Middleware for SloRangedSubmanifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/ranged-submanifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/cseg", "bytes": 1, "hash": "4a8a08f09d37b73795649038408b5f33"},
+                        {"name": "/c/ranged-manifest", "bytes": 5, "hash": "inner-ranged", "sub_slo": true},
+                        {"name": "/c/ranged-manifest", "bytes": 5, "hash": "inner-ranged", "range": "1-3", "sub_slo": true},
+                        {"name": "/c/ranged-manifest", "bytes": 5, "hash": "inner-ranged", "range": "3-4", "sub_slo": true},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-ranged-sub");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/ranged-manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 6, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "2-4"},
+                        {"name": "/c/s1", "bytes": 6, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "0-1"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("X-Object-Sysmeta-Slo-Size", "5");
+                    resp.headers.set("Etag", "physical-ranged");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/cseg" {
+                    return stub_object_range(&req, b"c");
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaabbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_ranged_submanifest_slices_nested_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloRangedSubmanifestStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", "not-ranged-sub");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/ranged-submanifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_ranged_submanifest on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"cabbaabbaaa",
+            "c + abbaa + bba + aa (ranged sub_slo of ranged inner)"
+        );
+    }
+
     #[tokio::test]
     async fn slo_etag_is_hash_of_etags_on_hyper_path() {
         let app = Arc::new(ProxyApp::new(
@@ -10847,6 +11052,31 @@ mod pipeline_async_tests {
         assert_eq!(
             etag, "efd4f115d46b3e79ee1392c343b3b433",
             "official test_slo_etag_is_hash_of_etags_submanifests on Hyper"
+        );
+        let mut ranged = HeaderKeyDict::new();
+        ranged.set("Range", "bytes=2-4");
+        let mut slice = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde-submanifest".into(),
+                query_string: String::new(),
+                headers: ranged,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            slice.status, 206,
+            "official test_slo_ranged_submanifest on Hyper, got {}",
+            slice.status
+        );
+        slice.body.materialize(u64::MAX).unwrap();
+        let slice_body = match &slice.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            slice_body, b"abb",
+            "client Range bytes=2-4 of nested aaabbb"
         );
     }
 
@@ -11348,6 +11578,38 @@ mod pipeline_async_tests {
             resp.status, 304,
             "official test_dlo_if_none_match_get on Hyper, got {}",
             resp.status
+        );
+        let mut head_match = HeaderKeyDict::new();
+        head_match.set("If-None-Match", &etag);
+        let head_304 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_match,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_304.status, 304,
+            "official test_dlo_if_none_match_head on Hyper, got {}",
+            head_304.status
+        );
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-None-Match", format!("not-{etag}"));
+        let miss_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_head.status, 200,
+            "official test_dlo_if_none_match_head miss on Hyper, got {}",
+            miss_head.status
         );
     }
 
