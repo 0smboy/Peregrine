@@ -9856,9 +9856,22 @@ mod pipeline_async_tests {
                     if let Some((headers, body)) =
                         dest.lock().unwrap_or_else(|p| p.into_inner()).clone()
                     {
-                        let mut resp = Response::with_body(200, body);
-                        if let Some(ct) = headers.get("Content-Type") {
-                            resp.headers.set("Content-Type", ct);
+                        let mut resp = if req.method == "HEAD" {
+                            Response::new(200)
+                        } else {
+                            Response::with_body(200, body)
+                        };
+                        for key in [
+                            "X-Static-Large-Object",
+                            "Content-Type",
+                            "X-Object-Meta-Test",
+                            "X-Object-Sysmeta-Slo-Etag",
+                            "X-Object-Sysmeta-Slo-Size",
+                            "Etag",
+                        ] {
+                            if let Some(v) = headers.get(key) {
+                                resp.headers.set(key, v);
+                            }
                         }
                         return resp;
                     }
@@ -10009,6 +10022,205 @@ mod pipeline_async_tests {
             "official test_slo_copy_the_manifest GET must be JSON list"
         );
         let _ = put_headers;
+    }
+
+    #[tokio::test]
+    async fn slo_copy_the_manifest_updating_metadata_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        headers.set("Content-Type", "image/jpeg");
+        headers.set("X-Object-Meta-Test", "updated");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_the_manifest_updating_metadata COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&put_body).is_ok(),
+            "remanifest dest must be JSON"
+        );
+        assert_eq!(
+            put_headers.get("X-Object-Meta-Test"),
+            Some("updated"),
+            "COPY request metadata must win"
+        );
+        let ct = put_headers.get("Content-Type").unwrap_or("");
+        assert!(
+            ct.starts_with("image/jpeg"),
+            "official updating_metadata dest PUT Content-Type, got {ct}"
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/copied-abcde".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        assert_eq!(
+            head.headers.get("Content-Type"),
+            Some("image/jpeg"),
+            "official updating_metadata assembled HEAD Content-Type, got {:?}",
+            head.headers.get("Content-Type")
+        );
+        assert_eq!(head.headers.get("X-Object-Meta-Test"), Some("updated"));
+    }
+
+    /// Official TestSlo.test_slo_post_the_manifest_metadata_update: POST
+    /// user-meta must keep X-Static-Large-Object and JSON on
+    /// `?multipart-manifest=get`.
+    struct SloPostManifestStub {
+        meta: std::sync::Mutex<HeaderKeyDict>,
+    }
+    impl swift_middleware::Middleware for SloPostManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path == "/v1/a/c/manifest-post"
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "POST" {
+                    let mut meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+                    for (k, v) in req.headers.iter() {
+                        if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                            meta.set(k, v);
+                        }
+                    }
+                    return Response::new(202);
+                }
+                let manifest = serde_json::json!([
+                    {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                ]);
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(200)
+                } else {
+                    Response::with_body(200, serde_json::to_vec(&manifest).unwrap())
+                };
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Content-Type", "application/octet-stream");
+                resp.headers.set("Etag", "physical-json");
+                let meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+                for (k, v) in meta.iter() {
+                    resp.headers.set(k, v);
+                }
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_post_the_manifest_keeps_slo_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloPostManifestStub {
+                    meta: std::sync::Mutex::new(HeaderKeyDict::new()),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Meta-Post", "update");
+        let post = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/a/c/manifest-post".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            post.status, 202,
+            "official test_slo_post_the_manifest POST on Hyper, got {}",
+            post.status
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-post".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        assert!(
+            head.headers
+                .get("X-Static-Large-Object")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true")),
+            "POST must not drop X-Static-Large-Object, got {:?}",
+            head.headers.get("X-Static-Large-Object")
+        );
+        assert_eq!(head.headers.get("X-Object-Meta-Post"), Some("update"));
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-post".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+            "official test_slo_post_the_manifest GET must stay JSON"
+        );
     }
 
     /// Official TestSlo.test_slo_get_the_manifest / test_slo_head_the_manifest.
