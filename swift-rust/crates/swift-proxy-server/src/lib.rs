@@ -9617,7 +9617,7 @@ mod pipeline_async_tests {
             let dest = Arc::clone(&self.dest);
             Box::pin(async move {
                 if req.path == "/v1/a/c/man" && req.method != "PUT" {
-                    let mut resp = Response::new(200);
+                    let mut resp = Response::with_body(200, b"man1-contents".to_vec());
                     resp.headers.set("X-Object-Manifest", "c/segs/");
                     resp.headers.set("Etag", "physical-manifest");
                     return resp;
@@ -9962,6 +9962,380 @@ mod pipeline_async_tests {
         assert!(
             body.contains("<a href=\"./obj"),
             "limited dir listing still lists objects, got {body}"
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_get_dir_with_iso_expiry: HMAC is
+    /// over the numeric epoch, but listing hrefs must keep the ISO8601
+    /// `temp_url_expires` the client presented (`quote` encodes `:`).
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_iso_expiry_on_hyper() {
+        const KEY: &str = "mykey";
+        const ISO: &str = "2100-01-01T00:00:00Z";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={ISO}&temp_url_prefix="),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_dir_with_iso_expiry on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("temp_url_expires=2100-01-01T00%3A00%3A00Z"),
+            "official test_get_dir_with_iso_expiry href must keep ISO expires, got {body}"
+        );
+        assert!(
+            !body.contains("temp_url_expires=4102444800"),
+            "ISO TempURL listing must not rewrite expires to epoch, got {body}"
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_unauthed: container GET with no
+    /// token and no TempURL is 401 even when listings are on.
+    struct ListingsOnAuthRequiredStub;
+    impl swift_middleware::Middleware for ListingsOnAuthRequiredStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/container")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let authed = req.headers.get("X-Auth-Token").is_some()
+                    || req.headers.get("X-Backend-Authorize-Override") == Some("true");
+                if !authed {
+                    return Response::error(401, "Unauthorized");
+                }
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(204)
+                } else {
+                    Response::with_body(200, b"[]".to_vec())
+                };
+                resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                resp.headers.set("X-Container-Object-Count", "1");
+                resp.headers.set("X-Timestamp", "1000.00000");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_unauthed_container_get_is_401_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec!["mykey".to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsOnAuthRequiredStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 401,
+            "official test_unauthed on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestTempURL.test_PUT_manifest_access: a signed PUT/POST
+    /// carrying `X-Object-Manifest` is 400 in `prepare()` (Hyper never
+    /// calls `handle()`).
+    struct TempurlWriteWouldSucceedStub;
+    impl swift_middleware::Middleware for TempurlWriteWouldSucceedStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "PUT" | "POST")
+                && req.path == "/v1/AUTH_account/container/object"
+        }
+        fn handle_request_async(
+            &self,
+            _req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move { Response::new(201) })
+        }
+    }
+
+    #[tokio::test]
+    async fn tempurl_put_manifest_is_400_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "075253051197618a0ba40c0cb27954ab7774acea82b34cb7ffb6198c64f7e6cb";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu), Arc::new(TempurlWriteWouldSucceedStub)],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Manifest", "some_random_container/foo");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "official test_PUT_manifest_access PUT on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            body, "The header 'X-Object-Manifest' is not allowed in this tempurl",
+            "official test_PUT_manifest_access body, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tempurl_post_manifest_is_400_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "47ba39ae5b07dde742ab515bb632b910eaa9a0b1343acde4face2efda13982a9";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu), Arc::new(TempurlWriteWouldSucceedStub)],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Manifest", "other/foo");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "official test_PUT_manifest_access POST on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            body,
+            "The header 'X-Object-Manifest' is not allowed in this tempurl"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_copy_manifest_keeps_x_object_manifest_on_hyper() {
+        // Official TestDlo.test_copy_manifest: COPY ?multipart-manifest=get
+        // remanifests. Dest PUT must keep X-Object-Manifest and the raw
+        // manifest bytes (not the assembled segments).
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_copy_manifest COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(
+            put_body, b"man1-contents",
+            "official test_copy_manifest must persist raw manifest bytes"
+        );
+        assert_eq!(
+            put_headers.get("X-Object-Manifest"),
+            Some("c/segs/"),
+            "official test_copy_manifest dest must keep X-Object-Manifest"
+        );
+    }
+
+    /// Official listing_formats test_GET_HEAD_content_type: GET
+    /// `?format=xml` stamps application/xml on a JSON container listing.
+    struct ListingJsonArrayStub;
+    impl swift_middleware::Middleware for ListingJsonArrayStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD") && req.path == "/v1/a/c"
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("Content-Type", "text/plain; charset=utf-8");
+                    return resp;
+                }
+                let listing = serde_json::json!([
+                    {"name": "o", "bytes": 1, "hash": "x", "content_type": "text/plain",
+                     "last_modified": "2010-01-01T00:00:00.000000"}
+                ]);
+                let mut resp = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                resp.headers.set("Content-Type", "application/json");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_formats_get_xml_content_type_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::ListingFormats),
+                Arc::new(ListingJsonArrayStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c".into(),
+                query_string: "format=xml".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/xml; charset=utf-8"),
+            "official test_GET_HEAD_content_type GET xml on Hyper"
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("<object>") && body.contains("<name>o</name>"),
+            "GET ?format=xml must convert the JSON listing, got {body}"
         );
     }
 
