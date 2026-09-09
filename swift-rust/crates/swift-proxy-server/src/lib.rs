@@ -3990,6 +3990,11 @@ impl ProxyApp {
                 resp
             }
             "PUT" | "POST" | "DELETE" => {
+                if matches!(req.method.as_str(), "PUT" | "POST") {
+                    if let Some(denied) = check_container_name_length(container) {
+                        return denied;
+                    }
+                }
                 // account existence / autocreate
                 let Ok((account_part, _)) = self.account_ring.get_nodes(account, None, None) else {
                     return swob_response(503);
@@ -6674,14 +6679,28 @@ fn constraint_plain(status: u16, body: &str) -> Response {
     resp
 }
 
+/// Python container PUT: `Container name length of N longer than M`.
+pub(crate) fn check_container_name_length(container: &str) -> Option<Response> {
+    if container.len() as i64 > swift_core::constraints::MAX_CONTAINER_NAME_LENGTH {
+        Some(constraint_plain(
+            400,
+            &format!(
+                "Container name length of {} longer than {}",
+                container.len(),
+                swift_core::constraints::MAX_CONTAINER_NAME_LENGTH
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Python `constrain_req_limit` / `validate_container_params`: listing
 /// `limit=` above the listing max is 412 `Maximum limit is N`.
 /// Account GET uses `ACCOUNT_LISTING_LIMIT`; container GET uses
 /// `CONTAINER_LISTING_LIMIT`. IsolatedIdentity Hyper used to skip the
 /// account check (`account_get_head_async`), so official
 /// `TestAccount.testListingLimit` over-limit was not 412.
-/// (probe test_sharding_listing L583). Must run in the proxy — sharded
-/// fan-out never forwards the oversized limit to the container-server.
 pub(crate) fn constrain_listing_limit(req: &Request) -> Result<usize, Response> {
     constrain_listing_limit_max(req, swift_core::constraints::CONTAINER_LISTING_LIMIT)
 }
@@ -9169,6 +9188,195 @@ mod pipeline_async_tests {
             "official testListingLimit at-limit must not 412, got {}",
             at_limit.status
         );
+    }
+
+    async fn container_func_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        (svc, backend)
+    }
+
+    async fn listing_plain_names(svc: &ProxyAsyncService, path: &str, query: &str) -> Vec<String> {
+        let listed = file_hyper_call(svc, "GET", path, query, &[], Vec::new()).await;
+        assert_eq!(
+            listed.status, 200,
+            "listing {path}?{query} got {}",
+            listed.status
+        );
+        let body = listed.body.collect_async().await.expect("listing body");
+        String::from_utf8_lossy(&body)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Official TestContainer.testContainerNameLimit.
+    #[tokio::test]
+    async fn container_name_limit_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let limit = swift_core::constraints::MAX_CONTAINER_NAME_LENGTH as usize;
+        for n in [limit - 1, limit] {
+            let name = "a".repeat(n);
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/{name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testContainerNameLimit len={n} on Hyper, got {}",
+                put.status
+            );
+        }
+        for n in [limit + 1, limit + 10] {
+            let name = "a".repeat(n);
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/{name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 400,
+                "official testContainerNameLimit over-limit len={n} on Hyper, got {}",
+                put.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestContainer.testListDelimiter / testListDelimiterAndPrefix /
+    /// testLeadingDelimiter.
+    #[tokio::test]
+    async fn container_list_delimiter_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/delim", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for name in ["test", "test-bar", "test-foo"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/delim/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "PUT {name}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-"),
+            vec!["test".to_string(), "test-".to_string()]
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-&reverse=yes"),
+            vec!["test-".to_string(), "test".to_string()]
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/pre", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for name in ["bar", "bazar"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/pre/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/pre", "delimiter=a&prefix=ba"),
+            vec!["bar".to_string(), "baza".to_string()]
+        );
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/pre",
+                "delimiter=a&prefix=ba&reverse=yes"
+            ),
+            vec!["baza".to_string(), "bar".to_string()]
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/lead", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for path in [
+            "/v1/AUTH_test/lead/test",
+            "/v1/AUTH_test/lead//test/bar",
+            "/v1/AUTH_test/lead//test/bar/foo",
+        ] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    path,
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "official testLeadingDelimiter PUT {path}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/lead", "delimiter=/"),
+            vec!["/".to_string(), "test".to_string()]
+        );
+        backend.abort();
     }
 
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
@@ -14654,6 +14862,165 @@ mod pipeline_async_tests {
                         return;
                     }
                     let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    fn listing_with_delimiter(
+        names: &[String],
+        prefix: &str,
+        delimiter: &str,
+        reverse: bool,
+    ) -> Vec<serde_json::Value> {
+        let mut filtered: Vec<&String> = names.iter().filter(|n| n.starts_with(prefix)).collect();
+        filtered.sort();
+        if reverse {
+            filtered.reverse();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut rows = Vec::new();
+        for name in filtered {
+            if !delimiter.is_empty() {
+                let rest = &name[prefix.len()..];
+                if let Some(idx) = rest.find(delimiter) {
+                    let subdir = format!("{}{}{}", prefix, &rest[..idx], delimiter);
+                    if seen.insert(subdir.clone()) {
+                        rows.push(serde_json::json!({"subdir": subdir}));
+                    }
+                    continue;
+                }
+            }
+            rows.push(serde_json::json!({
+                "name": name,
+                "bytes": 0,
+                "hash": "x",
+                "content_type": "text/plain",
+                "last_modified": "2010-01-01T00:00:00.000000",
+            }));
+        }
+        rows
+    }
+
+    async fn spawn_container_func_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let containers = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Vec<String>,
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let containers = Arc::clone(&containers);
+                let objects = Arc::clone(&objects);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, _body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (raw_logical, query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_get = first.starts_with("GET ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    let qparam = |key: &str| -> String {
+                        query
+                            .split('&')
+                            .find_map(|part| part.strip_prefix(&format!("{key}=")))
+                            .map(swift_http::unquote)
+                            .unwrap_or_default()
+                    };
+                    if logical == "/AUTH_test" {
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let rest = logical.trim_start_matches("/AUTH_test/");
+                    if let Some((container, object)) = rest.split_once('/') {
+                        if is_put {
+                            containers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(container.to_string());
+                            objects
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .entry(container.to_string())
+                                .or_default()
+                                .push(object.to_string());
+                            write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                            return;
+                        }
+                        write_backend_http_status(&mut stream, 200, &[], b"x").await;
+                        return;
+                    }
+                    let container = rest.to_string();
+                    if shard {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_put {
+                        containers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(container);
+                        write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        return;
+                    }
+                    let exists = containers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .contains(&container);
+                    if !exists {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_head {
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if is_get {
+                        let names = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_default();
+                        let reverse = matches!(
+                            qparam("reverse").to_ascii_lowercase().as_str(),
+                            "yes" | "true" | "1" | "on"
+                        );
+                        let rows = listing_with_delimiter(
+                            &names,
+                            &qparam("prefix"),
+                            &qparam("delimiter"),
+                            reverse,
+                        );
+                        let payload = serde_json::to_vec(&rows).unwrap();
+                        write_backend_http(
+                            &mut stream,
+                            &[("Content-Type", "application/json")],
+                            &payload,
+                        )
+                        .await;
+                        return;
+                    }
+                    write_backend_http_status(&mut stream, 204, &[], &[]).await;
                 });
             }
         });

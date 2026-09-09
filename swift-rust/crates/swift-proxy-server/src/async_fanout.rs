@@ -2754,6 +2754,9 @@ impl ProxyApp {
         account: &str,
         container: &str,
     ) -> Response {
+        if let Some(denied) = super::check_container_name_length(container) {
+            return denied;
+        }
         super::scrub_container_write_owner_headers(&mut req);
         if let Some(denied) = super::deny_non_owner_container_versioning(&req) {
             return denied;
