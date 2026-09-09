@@ -9504,6 +9504,158 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestSlo.test_slo_referer_on_segment_container step 1 and
+    /// TestDlo.test_dlo_referer_on_segment_container step 1: a foreign
+    /// TempAuth token plus Referer is 403 until the container read ACL
+    /// allows `.r:*.example.com`. authorize_async must run on Hyper.
+    async fn foreign_referer_token(svc: &ProxyAsyncService) -> String {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-User", "other:tester3");
+        headers.set("X-Auth-Key", "otherpass");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/auth/v1.0".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200, "tester3 token");
+        resp.headers.get("X-Auth-Token").unwrap().to_string()
+    }
+
+    fn seed_container_acl(app: &ProxyApp, account: &str, container: &str, acl: Option<&str>) {
+        app.info_cache.set_container(
+            format!("{account}/{container}"),
+            ContainerInfo {
+                status: 204,
+                read_acl: acl.map(str::to_string),
+                ..Default::default()
+            },
+            60.0,
+        );
+        app.info_cache.set_account(
+            account.to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_referer_foreign_token_is_403_until_acl_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c2", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Slo::new())],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", &token);
+        headers.set("Referer", "http://blah.example.com");
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 403,
+            "official test_slo_referer step 1 on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
+        let after_acl = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            after_acl.status, 403,
+            "official test_slo_referer after container ACL must pass authorize, got {}",
+            after_acl.status
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_referer_foreign_token_is_403_until_acl_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+            ],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", &token);
+        headers.set("Referer", "http://blah.example.com");
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 403,
+            "official test_dlo_referer step 1 on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
+        let after_acl = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            after_acl.status, 403,
+            "official test_dlo_referer after container ACL must pass authorize, got {}",
+            after_acl.status
+        );
+    }
+
     /// Object-server apply_conditional on the physical SLO JSON ETag.
     /// Official TestSlo.test_slo_if_match_get uses the assembled SLO ETag.
     struct SloIfMatchObjectServerStub;
