@@ -9223,6 +9223,9 @@ mod pipeline_async_tests {
 
     async fn listing_plain_names(svc: &ProxyAsyncService, path: &str, query: &str) -> Vec<String> {
         let listed = file_hyper_call(svc, "GET", path, query, &[], Vec::new()).await;
+        if listed.status == 204 {
+            return Vec::new();
+        }
         assert_eq!(
             listed.status, 200,
             "listing {path}?{query} got {}",
@@ -9391,6 +9394,95 @@ mod pipeline_async_tests {
         assert_eq!(
             listing_plain_names(&svc, "/v1/AUTH_test/lead", "delimiter=/").await,
             vec!["/".to_string(), "test".to_string()]
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.testFileListingLimitMarkerPrefix /
+    /// testLastFileMarker / testContainerFileListWithLimit.
+    #[tokio::test]
+    async fn container_list_marker_limit_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/marks", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let files: Vec<String> = (0..10).map(|i| format!("f{i:02}")).collect();
+        for name in &files {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/marks/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "PUT {name}"
+            );
+        }
+        for i in 0..files.len() {
+            let marker = &files[i];
+            for j in 1..(files.len() - i) {
+                let q = format!("marker={marker}&limit={j}");
+                assert_eq!(
+                    listing_plain_names(&svc, "/v1/AUTH_test/marks", &q).await,
+                    files[i + 1..i + j + 1],
+                    "official testFileListingLimitMarkerPrefix {q}"
+                );
+            }
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/marks", &format!("marker={marker}")).await,
+                files[i + 1..],
+                "official testFileListingLimitMarkerPrefix marker={marker}"
+            );
+            assert_eq!(
+                listing_plain_names(
+                    &svc,
+                    "/v1/AUTH_test/marks",
+                    &format!("marker={marker}&prefix={marker}")
+                )
+                .await,
+                Vec::<String>::new(),
+                "official testFileListingLimitMarkerPrefix marker+prefix={marker}"
+            );
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/marks", &format!("prefix={marker}")).await,
+                vec![marker.clone()],
+                "official testFileListingLimitMarkerPrefix prefix={marker}"
+            );
+        }
+        let limited = listing_plain_names(&svc, "/v1/AUTH_test/marks", "limit=2").await;
+        assert_eq!(
+            limited,
+            files[..2],
+            "official testContainerFileListWithLimit on Hyper"
+        );
+        let last = files.last().unwrap();
+        let past =
+            listing_plain_names(&svc, "/v1/AUTH_test/marks", &format!("marker={last}")).await;
+        assert!(
+            past.is_empty(),
+            "official testLastFileMarker plaintext on Hyper, got {past:?}"
+        );
+        let json_past = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/marks",
+            &format!("format=json&marker={last}"),
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            json_past.status, 200,
+            "official testLastFileMarker json empty is 200, got {}",
+            json_past.status
         );
         backend.abort();
     }
@@ -14980,9 +15072,30 @@ mod pipeline_async_tests {
         prefix: &str,
         delimiter: &str,
         reverse: bool,
+        marker: &str,
+        end_marker: &str,
+        limit: Option<usize>,
     ) -> Vec<serde_json::Value> {
         let mut filtered: Vec<&String> = names.iter().filter(|n| n.starts_with(prefix)).collect();
         filtered.sort();
+        if !marker.is_empty() {
+            filtered.retain(|n| {
+                if reverse {
+                    n.as_str() < marker
+                } else {
+                    n.as_str() > marker
+                }
+            });
+        }
+        if !end_marker.is_empty() {
+            filtered.retain(|n| {
+                if reverse {
+                    n.as_str() > end_marker
+                } else {
+                    n.as_str() < end_marker
+                }
+            });
+        }
         if reverse {
             filtered.reverse();
         }
@@ -15006,6 +15119,9 @@ mod pipeline_async_tests {
                 "content_type": "text/plain",
                 "last_modified": "2010-01-01T00:00:00.000000",
             }));
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
         }
         rows
     }
@@ -15117,6 +15233,9 @@ mod pipeline_async_tests {
                             &qparam("prefix"),
                             &qparam("delimiter"),
                             reverse,
+                            &qparam("marker"),
+                            &qparam("end_marker"),
+                            qparam("limit").parse().ok(),
                         );
                         let payload = serde_json::to_vec(&rows).unwrap();
                         write_backend_http(
