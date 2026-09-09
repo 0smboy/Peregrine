@@ -11537,29 +11537,27 @@ mod pipeline_async_tests {
             })
             .await;
         assert_eq!(get.status, 200, "version multipart-manifest=get");
-        get.body.materialize(u64::MAX).unwrap();
-        let got = match &get.body {
-            swift_http::Body::Buffered(b) => b.clone(),
-            _ => Vec::new(),
-        };
+        let got = get.body.collect_async().await.expect("version JSON body");
         let listing: serde_json::Value = serde_json::from_slice(&got).expect("version JSON");
         assert_eq!(listing[0]["name"], "/c/seg_a");
 
-        let mut assembled = svc
+        let mut ranged = HeaderKeyDict::new();
+        ranged.set("If-None-Match", "not-version");
+        let assembled = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: version_path,
                 query_string: String::new(),
-                headers: HeaderKeyDict::new(),
+                headers: ranged,
                 body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
         assert_eq!(assembled.status, 200, "version assembled GET");
-        assembled.body.materialize(u64::MAX).unwrap();
-        let assembled_body = match &assembled.body {
-            swift_http::Body::Buffered(b) => b.clone(),
-            _ => Vec::new(),
-        };
+        let assembled_body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("version assembled body");
         assert_eq!(assembled_body, b"aaa");
 
         assert_eq!(
@@ -11575,20 +11573,22 @@ mod pipeline_async_tests {
             204,
             "DELETE current restores the archived SLO"
         );
-        let mut restored = svc
+        let mut restored_hdrs = HeaderKeyDict::new();
+        restored_hdrs.set("If-None-Match", "not-restored");
+        let restored = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/AUTH_test/c/my-slo-manifest".into(),
                 query_string: String::new(),
-                headers: HeaderKeyDict::new(),
+                headers: restored_hdrs,
                 body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
-        restored.body.materialize(u64::MAX).unwrap();
-        let restored_body = match &restored.body {
-            swift_http::Body::Buffered(b) => b.clone(),
-            _ => Vec::new(),
-        };
+        let restored_body = restored
+            .body
+            .collect_async()
+            .await
+            .expect("restored assembled body");
         assert_eq!(
             restored_body, b"aaa",
             "official test_slo_manifest_version restore on Hyper"
