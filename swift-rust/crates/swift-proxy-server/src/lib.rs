@@ -10339,6 +10339,136 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official test_versioning_check_acl: versions container is public
+    /// read, but a foreign token must not DELETE/pop the source object.
+    struct VersioningCheckAclStub {
+        current: Arc<std::sync::Mutex<Vec<u8>>>,
+        archive_deletes: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningCheckAclStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let current = Arc::clone(&self.current);
+            let archive_deletes = Arc::clone(&self.archive_deletes);
+            Box::pin(async move {
+                if req
+                    .headers
+                    .get(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+                    == Some("true")
+                {
+                    if req.headers.get("X-Auth-Token") == Some("token2") {
+                        return Response::error(403, "Forbidden");
+                    }
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.path == "/v1/AUTH_test/c/obj" {
+                    if req.method == "GET" || req.method == "HEAD" {
+                        let body = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let mut resp = if req.method == "HEAD" {
+                            Response::new(200)
+                        } else {
+                            Response::with_body(200, body.clone())
+                        };
+                        resp.headers.set("Content-Length", body.len().to_string());
+                        resp.headers.set("X-Timestamp", "1751500001.00000");
+                        return resp;
+                    }
+                    if req.method == "PUT" {
+                        let body = match req.body {
+                            swift_http::Body::Buffered(b) => b,
+                            _ => Vec::new(),
+                        };
+                        *current.lock().unwrap_or_else(|p| p.into_inner()) = body;
+                        return Response::new(201);
+                    }
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/versions" {
+                    let listing = serde_json::json!([
+                        {"name": "003obj/1751500000.00000", "bytes": 5,
+                         "hash": "x", "content_type": "text/plain",
+                         "last_modified": "2010-01-01T00:00:00.000000"}
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.method == "DELETE" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    *archive_deletes.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    return Response::new(204);
+                }
+                if req.method == "GET" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    return Response::with_body(200, b"aaaaa".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_check_acl_foreign_token_delete_is_denied_on_hyper() {
+        let current = Arc::new(std::sync::Mutex::new(b"bbbbb".to_vec()));
+        let archive_deletes = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningCheckAclStub {
+                    current: Arc::clone(&current),
+                    archive_deletes: Arc::clone(&archive_deletes),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", "token2");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "official test_versioning_check_acl foreign DELETE on Hyper, got {}",
+            resp.status
+        );
+        let body = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            body, b"bbbbb",
+            "foreign DELETE must not pop/restore the versioned object"
+        );
+        let deleted = *archive_deletes.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            deleted, 0,
+            "foreign DELETE must not consume the versions archive"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
