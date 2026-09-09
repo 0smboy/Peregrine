@@ -1574,7 +1574,15 @@ impl VersionedWrites {
             // Hyper never calls sync `handle_put`. Legacy stack/history
             // copy-current has to run here. First PUT: GET current 404
             // → pass through, do not archive.
+            // Official test_versioning_container_acl: authorize the client
+            // PUT before make_pre_authed_request archive, or a denied user3
+            // overwrite still copies current into versions-location.
             if let Some(cfg) = self.read_version_cfg(&cinfo) {
+                let authorized =
+                    next(empty_async_request(Self::modern_authorization_probe(&req))).await;
+                if !(200..300).contains(&authorized.status) {
+                    return authorized;
+                }
                 if let Err(resp) = self
                     .copy_current_legacy_streaming(
                         &version,
@@ -3979,6 +3987,55 @@ mod tests {
             "archive PUT must be pre-authed: {calls:?}"
         );
         assert_eq!(archive.2.get("X-Backend-Source"), Some("VW"));
+    }
+
+    #[tokio::test]
+    async fn test_denied_put_does_not_archive_before_authorize() {
+        // Official test_versioning_container_acl user3 write: Hyper legacy
+        // PUT must authorize before copy-current.
+        type Call = (String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((req.method.clone(), req.path.clone()));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::error(403, "Forbidden");
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                Response::new(201)
+            })
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "5");
+        headers.set("X-Auth-Token", "user3");
+        let req = AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(b"xxxxx".to_vec(), 1024),
+        };
+        let vw = VersionedWrites::new();
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 403);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p)| !(m == "PUT" && p.contains("/versions/"))),
+            "denied PUT must not archive: {calls:?}"
+        );
     }
 
     fn intercept_legacy_backend(

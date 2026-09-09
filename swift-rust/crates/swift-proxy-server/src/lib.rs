@@ -15498,7 +15498,8 @@ mod pipeline_async_tests {
                         return;
                     }
                     let first = text.lines().next().unwrap_or("");
-                    let (logical, query) = backend_logical_target(first);
+                    let (raw_logical, query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
                     let is_head = first.starts_with("HEAD ");
                     let is_put = first.starts_with("PUT ");
                     let is_post = first.starts_with("POST ");
@@ -15697,7 +15698,7 @@ mod pipeline_async_tests {
         let call = |method: &'static str,
                     path: &'static str,
                     token: String,
-                    extra: Vec<(&str, &str)>,
+                    extra: Vec<(&'static str, &'static str)>,
                     body: Vec<u8>,
                     query: &'static str| {
             let svc = &svc;
@@ -15879,11 +15880,12 @@ mod pipeline_async_tests {
             1,
             "official test_versioning_container_acl object_count must be 1, got {rows:?}"
         );
-        let archive_name = rows[0]
-            .get("name")
-            .and_then(|v| v.as_str())
-            .expect("archive name")
-            .to_string();
+        let archive_name = swift_http::unquote(
+            rows[0]
+                .get("name")
+                .and_then(|v| v.as_str())
+                .expect("archive name"),
+        );
         let archive_path = format!("/v1/AUTH_test/versions/{archive_name}");
         let owner_archive = {
             let mut headers = HeaderKeyDict::new();
