@@ -128,6 +128,9 @@ fn manifest_object_delete_query(req: &Request) -> String {
 
 fn slo_override(req: &Request) -> bool {
     config_true_value(req.headers.get("X-Backend-Slo-Override").unwrap_or(""))
+        || req
+            .headers
+            .contains_key(crate::versioned_writes::AUTHORIZE_ONLY_HEADER)
 }
 
 /// IsolatedIdentity `versioned_writes._get_source_object` / `_put_versioned_obj`

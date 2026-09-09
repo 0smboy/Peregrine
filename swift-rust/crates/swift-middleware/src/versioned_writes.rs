@@ -1171,6 +1171,7 @@ impl VersionedWrites {
         };
         authorize.headers.remove("Content-Length");
         authorize.headers.remove("Transfer-Encoding");
+        authorize.query_string.clear();
         authorize.headers.set(AUTHORIZE_ONLY_HEADER, "true");
         authorize
     }

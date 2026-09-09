@@ -13072,6 +13072,13 @@ mod pipeline_async_tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
             let store = Arc::clone(&self.store);
             Box::pin(async move {
+                if req
+                    .headers
+                    .get(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+                    == Some("true")
+                {
+                    return Response::new(204);
+                }
                 if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
                     let mut resp = Response::new(204);
                     resp.headers
