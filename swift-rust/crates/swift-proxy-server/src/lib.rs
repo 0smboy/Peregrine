@@ -9714,8 +9714,23 @@ mod pipeline_async_tests {
         extra: &[(&str, &str)],
         body: &[u8],
     ) {
+        write_backend_http_status(stream, 200, extra, body).await;
+    }
+
+    async fn write_backend_http_status(
+        stream: &mut tokio::net::TcpStream,
+        status: u16,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) {
+        let reason = match status {
+            201 => "Created",
+            204 => "No Content",
+            404 => "Not Found",
+            _ => "OK",
+        };
         let mut hdr = format!(
-            "HTTP/1.1 200 OK\r\nX-Timestamp: 1000.00000\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "HTTP/1.1 {status} {reason}\r\nX-Timestamp: 1000.00000\r\nContent-Length: {}\r\nConnection: close\r\n",
             body.len()
         );
         for (k, v) in extra {
@@ -9727,6 +9742,44 @@ mod pipeline_async_tests {
             let _ = stream.write_all(body).await;
         }
         let _ = stream.flush().await;
+    }
+
+    async fn read_backend_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut head = Vec::new();
+        let mut tmp = [0u8; 512];
+        loop {
+            let n = match stream.read(&mut tmp).await {
+                Ok(0) | Err(_) => return (String::new(), Vec::new()),
+                Ok(n) => n,
+            };
+            head.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_end = pos + 4;
+                let header_text = String::from_utf8_lossy(&head[..header_end]).into_owned();
+                let cl = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = head[header_end..].to_vec();
+                while body.len() < cl {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(cl);
+                return (header_text, body);
+            }
+            if head.len() > 64 * 1024 {
+                return (String::new(), Vec::new());
+            }
+        }
     }
 
     /// Path-dispatching object/container backend for official referer step 3.
@@ -10069,6 +10122,99 @@ mod pipeline_async_tests {
         (port, handle)
     }
 
+    /// Regular-object backend for official TestTempurl.test_GET / test_PUT
+    /// / test_HEAD / test_different_object. No intercepting stub — authorize
+    /// override must reach the app.
+    async fn spawn_plain_object_tempurl_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+            (
+                "/AUTH_account/container/object".to_string(),
+                b"obj contents".to_vec(),
+            ),
+            (
+                "/AUTH_account/container/other".to_string(),
+                b"other obj contents".to_vec(),
+            ),
+        ])));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    if is_put && logical.starts_with("/AUTH_account/container/") {
+                        store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical, body);
+                        write_backend_http_status(
+                            &mut stream,
+                            201,
+                            &[("ETag", "\"put-etag\"")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let stored = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some(obj) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        write_backend_http(&mut stream, &[], send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    fn official_tempurl_hyper_svc(app: Arc<ProxyApp>, keys: Vec<String>) -> ProxyAsyncService {
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(move |_a, _c| keys.clone()),
+        ));
+        ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        }
+    }
+
+    async fn official_tempurl_hyper_app() -> (Arc<ProxyApp>, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_plain_object_tempurl_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_account", "container", None);
+        (app, backend)
+    }
+
     async fn auth_token(svc: &ProxyAsyncService, user: &str, key: &str) -> String {
         let mut headers = HeaderKeyDict::new();
         headers.set("X-Auth-User", user);
@@ -10238,6 +10384,228 @@ mod pipeline_async_tests {
                 .get("X-Container-Meta-Temp-Url-Key-2")
                 .is_none(),
             "official test_tempurl_keys_hidden_from_acl_readonly leaked key-2"
+        );
+        backend.abort();
+    }
+
+    /// Official TestTempurl.test_GET / test_GET_with_key_2: a signed GET of
+    /// a regular object returns the body, and the same GET TempURL also
+    /// authorizes HEAD. Key-2 is a second account Temp-URL key.
+    #[tokio::test]
+    async fn tempurl_get_and_head_and_key2_on_hyper() {
+        const KEY: &str = "mykey";
+        const KEY2: &str = "otherkey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        const SIG_GET_KEY2: &str =
+            "e0e563761d385fd5fb26cc47c932343e2cccb28da6597a7872fdc43fd1de590e";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let svc = official_tempurl_hyper_svc(app, vec![KEY.to_string(), KEY2.to_string()]);
+        let qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestTempurl.test_GET on Hyper, got {} {:?}",
+            got.status, got.reason
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestTempurl.test_GET body");
+        assert_eq!(body, b"obj contents", "official TestTempurl.test_GET body");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestTempurl.test_GET HEAD on same TempURL, got {}",
+            head.status
+        );
+        let key2 = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG_GET_KEY2}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            key2.status, 200,
+            "official TestTempurl.test_GET_with_key_2 on Hyper, got {}",
+            key2.status
+        );
+        let key2_body = key2
+            .body
+            .collect_async()
+            .await
+            .expect("official TestTempurl.test_GET_with_key_2 body");
+        assert_eq!(key2_body, b"obj contents");
+        backend.abort();
+    }
+
+    /// Official TestTempurl.test_HEAD / test_different_object /
+    /// test_changing_expires: HEAD-only sig allows HEAD; GET with that sig
+    /// is 401; a GET sig for `object` does not authorize `other`; mutating
+    /// expires invalidates the HMAC.
+    #[tokio::test]
+    async fn tempurl_head_scope_and_expires_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        const SIG_HEAD: &str = "22036d1f61977422e6422ac9f9580781a8fb9b457768c27a93374f407ca94851";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let svc = official_tempurl_hyper_svc(app, vec![KEY.to_string()]);
+        let head_qs = format!("temp_url_sig={SIG_HEAD}&temp_url_expires={EXPIRES}");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestTempurl.test_HEAD on Hyper, got {}",
+            head.status
+        );
+        let get_with_head = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            get_with_head.status, 401,
+            "official TestTempurl.test_HEAD GET with HEAD sig must 401, got {}",
+            get_with_head.status
+        );
+        let get_qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let other = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/other".into(),
+                query_string: get_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            other.status, 401,
+            "official TestTempurl.test_different_object on Hyper, got {}",
+            other.status
+        );
+        let put_other = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/other".into(),
+                query_string: get_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(b"new contents".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put_other.status, 401,
+            "official TestTempurl.test_HEAD PUT other object must 401, got {}",
+            put_other.status
+        );
+        let bad_expires = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG_GET}&temp_url_expires=4102444801"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_expires.status, 401,
+            "official TestTempurl.test_changing_expires on Hyper, got {}",
+            bad_expires.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestTempurl.test_PUT: a PUT TempURL writes the object and
+    /// the same PUT sig authorizes HEAD. GET uses a GET sig of the new name.
+    #[tokio::test]
+    async fn tempurl_put_then_head_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_PUT: &str = "d340717b5dff896550ef70a3dcfb90136f11e783be4259d921d2c32fa15b3008";
+        const SIG_GET: &str = "4b4c6b6bca8afdcbdc5f8ee87a4f037471b871c99a63c212c16f68132248bd55";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let svc = official_tempurl_hyper_svc(app, vec![KEY.to_string()]);
+        let put_qs = format!("temp_url_sig={SIG_PUT}&temp_url_expires={EXPIRES}");
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("Content-Type", "application/octet-stream");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs.clone(),
+                headers: put_headers,
+                body: IncomingBody::from_bytes(b"new obj contents".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestTempurl.test_PUT on Hyper, got {} {:?}",
+            put.status, put.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestTempurl.test_PUT read-after-write on Hyper, got {}",
+            got.status
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestTempurl.test_PUT body");
+        assert_eq!(body, b"new obj contents");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestTempurl.test_PUT HEAD on PUT TempURL, got {}",
+            head.status
         );
         backend.abort();
     }
@@ -14166,6 +14534,160 @@ mod pipeline_async_tests {
             "owner versions-location POST must pass the owner gate, got {} {:?}",
             resp.status, resp.reason
         );
+    }
+
+    /// Official TestObjectVersioning.test_clear_version_option: owner POST
+    /// `X-Versions-Location: ''` must clear the exposed location; a later
+    /// POST restores it. Must hit VersionedWrites.prepare + finish on Hyper
+    /// (no stub that skips expose_versions_on_response).
+    async fn spawn_versioning_clear_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location = Arc::new(std::sync::Mutex::new(Some("versions".to_string())));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let location = Arc::clone(&location);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, _body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    if logical != "/AUTH_test/c"
+                        || text
+                            .to_ascii_lowercase()
+                            .contains("x-backend-record-type: shard")
+                    {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if first.starts_with("POST ") || first.starts_with("PUT ") {
+                        let mut stored = None;
+                        for line in text.lines() {
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name
+                                    .eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Location")
+                                {
+                                    let v = value.trim();
+                                    stored = if v.is_empty() {
+                                        None
+                                    } else {
+                                        Some(v.to_string())
+                                    };
+                                }
+                            }
+                        }
+                        *location.lock().unwrap_or_else(|p| p.into_inner()) = stored;
+                    }
+                    let extra = match location
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_deref()
+                    {
+                        Some(loc) => vec![
+                            ("X-Container-Sysmeta-Versions-Location", loc.to_string()),
+                            ("X-Container-Sysmeta-Versions-Mode", "stack".to_string()),
+                        ],
+                        None => Vec::new(),
+                    };
+                    let extra_ref: Vec<(&str, &str)> =
+                        extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    write_backend_http_status(&mut stream, 204, &extra_ref, &[]).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn versioning_clear_version_option_on_hyper() {
+        let (port, backend) = spawn_versioning_clear_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::VersionedWrites::new())],
+        };
+        let head = || async {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Backend-Swift-Owner", "true");
+            svc.call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        let post_location = |value: &str| {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Backend-Swift-Owner", "true");
+            headers.set("X-Versions-Location", value);
+            svc.call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        let sanity = head().await;
+        assert!(
+            (200..300).contains(&sanity.status),
+            "official test_clear_version_option sanity HEAD on Hyper, got {}",
+            sanity.status
+        );
+        assert_eq!(
+            sanity.headers.get("X-Versions-Location"),
+            Some("versions"),
+            "official test_clear_version_option sanity location"
+        );
+        let cleared = post_location("").await;
+        assert!(
+            (200..300).contains(&cleared.status),
+            "official test_clear_version_option clear POST on Hyper, got {} {:?}",
+            cleared.status,
+            cleared.reason
+        );
+        let after_clear = head().await;
+        assert!(
+            after_clear.headers.get("X-Versions-Location").is_none(),
+            "official test_clear_version_option must hide location after empty POST, got {:?}",
+            after_clear.headers.get("X-Versions-Location")
+        );
+        let restored = post_location("versions").await;
+        assert!(
+            (200..300).contains(&restored.status),
+            "official test_clear_version_option restore POST on Hyper, got {} {:?}",
+            restored.status,
+            restored.reason
+        );
+        let after_restore = head().await;
+        assert_eq!(
+            after_restore.headers.get("X-Versions-Location"),
+            Some("versions"),
+            "official test_clear_version_option restore location"
+        );
+        backend.abort();
     }
 
     /// Official IsolatedIdentity `update_metadata` + Python `clean_acl`:
