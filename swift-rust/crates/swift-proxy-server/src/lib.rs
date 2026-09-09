@@ -9765,6 +9765,13 @@ mod pipeline_async_tests {
                             .and_then(|v| v.trim().parse::<usize>().ok())
                     })
                     .unwrap_or(0);
+                if header_text
+                    .to_ascii_lowercase()
+                    .contains("expect: 100-continue")
+                {
+                    let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                    let _ = stream.flush().await;
+                }
                 let mut body = head[header_end..].to_vec();
                 while body.len() < cl {
                     let n = match stream.read(&mut tmp).await {
