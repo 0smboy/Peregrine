@@ -10845,7 +10845,7 @@ mod pipeline_async_tests {
             "official manifest-db PUT with null etag/size"
         );
 
-        let mut got = svc
+        let got = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/a/c/manifest-db".into(),
@@ -10879,7 +10879,7 @@ mod pipeline_async_tests {
         assert_eq!(arr[1]["hash"], "08f8e0260c64418510cefb2b06eee5cd");
         assert_eq!(arr[1]["name"], "/c/seg_b");
 
-        let mut raw = svc
+        let raw = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/a/c/manifest-db".into(),
