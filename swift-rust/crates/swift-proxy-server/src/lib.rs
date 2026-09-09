@@ -9597,6 +9597,96 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestObjectVersioning overwrite: a non-DLO PUT must archive
+    /// the current object into versions-location on the Hyper stream path.
+    struct VersioningOverwriteStub {
+        archive_puts: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningOverwriteStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let archive_puts = Arc::clone(&self.archive_puts);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    let mut resp = Response::with_body(200, b"aaaaa".to_vec());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp.headers.set("Content-Length", "5");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    *archive_puts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    return Response::new(201);
+                }
+                if req.method == "PUT" && req.path == "/v1/AUTH_test/c/obj" {
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_overwrite_archives_current_on_hyper() {
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningOverwriteStub {
+                    archive_puts: Arc::clone(&archive_puts),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "5");
+        headers.set("Content-Type", "text/plain");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(b"bbbbb".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "versioned overwrite PUT on Hyper must 201, got {}",
+            resp.status
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 1,
+            "official versioning overwrite must archive current on Hyper"
+        );
+    }
+
     /// Official TestDlo.test_copy: COPY a DLO manifest must PUT the
     /// assembled bytes and must not persist `X-Object-Manifest`.
     struct DloCopyAssembleStub {
