@@ -15963,10 +15963,12 @@ mod pipeline_async_tests {
                                 .entry(container.to_string())
                                 .or_default()
                                 .push(object.to_string());
-                            let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
-                            let entry = st.entry(container.to_string()).or_insert((0, 0));
-                            entry.0 += 1;
-                            entry.1 += body.len() as u64;
+                            {
+                                let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+                                let entry = st.entry(container.to_string()).or_insert((0, 0));
+                                entry.0 += 1;
+                                entry.1 += body.len() as u64;
+                            }
                             write_backend_http_status(&mut stream, 201, &[], &[]).await;
                             return;
                         }
