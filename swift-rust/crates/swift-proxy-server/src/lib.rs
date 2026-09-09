@@ -10093,6 +10093,162 @@ mod pipeline_async_tests {
             "official testSlashInName unquoted slash is object PUT to a missing container, got {}",
             slash.status
         );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/no-such-del",
+                "",
+                &[],
+                Vec::new()
+            )
+            .await
+            .status,
+            404,
+            "official testDeleteOnContainerThatDoesNotExist"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "HEAD",
+                "/v1/AUTH_test/no-such-info",
+                "",
+                &[],
+                Vec::new()
+            )
+            .await
+            .status,
+            404,
+            "official testContainerInfoOnContainerThatDoesNotExist"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/created", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "")
+                .await
+                .iter()
+                .any(|n| n == "created"),
+            "official testCreate must list the new container"
+        );
+        let utf8_name = "héllo-容器";
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/{utf8_name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official testUtf8Container valid name"
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "")
+                .await
+                .iter()
+                .any(|n| n == utf8_name),
+            "official testUtf8Container listed"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                &format!("/v1/AUTH_test/{utf8_name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official testUtf8Container empty listing"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                &format!("/v1/AUTH_test/{utf8_name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official testUtf8Container delete"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/info-c", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for i in 0..3 {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/info-c/o{i}"),
+                    "",
+                    &[("Content-Length", "4")],
+                    b"abcd".to_vec(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        let info = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/info-c", "", &[], Vec::new()).await;
+        assert_eq!(
+            info.status, 204,
+            "official testContainerInfo on Hyper, got {}",
+            info.status
+        );
+        assert_eq!(
+            info.headers
+                .get("X-Container-Object-Count")
+                .or_else(|| info.headers.get("x-container-object-count")),
+            Some("3"),
+            "official testContainerInfo object_count {:?}",
+            info.headers
+        );
+        assert_eq!(
+            info.headers
+                .get("X-Container-Bytes-Used")
+                .or_else(|| info.headers.get("x-container-bytes-used")),
+            Some("12"),
+            "official testContainerInfo bytes_used {:?}",
+            info.headers
+        );
+        let version_only = file_hyper_call(&svc, "PUT", "/v1", "", &[], Vec::new()).await;
+        assert_eq!(
+            version_only.status, 412,
+            "official testVersionOnlyPath on Hyper, got {}",
+            version_only.status
+        );
+        let body = version_only
+            .body
+            .collect_async()
+            .await
+            .expect("Bad URL body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Bad URL"),
+            "official testVersionOnlyPath body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let invalid = file_hyper_call(&svc, "GET", "//v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(
+            invalid.status, 404,
+            "official testInvalidPath on Hyper, got {}",
+            invalid.status
+        );
         backend.abort();
     }
 
@@ -15397,7 +15553,21 @@ mod pipeline_async_tests {
                             return;
                         }
                         if is_head {
-                            write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                            let (count_s, bytes_s) = {
+                                let g = listings.lock().unwrap_or_else(|p| p.into_inner());
+                                let bytes: u64 = g.values().map(|(b, _, _)| *b).sum();
+                                (g.len().to_string(), bytes.to_string())
+                            };
+                            write_backend_http_status(
+                                &mut stream,
+                                204,
+                                &[
+                                    ("X-Container-Object-Count", count_s.as_str()),
+                                    ("X-Container-Bytes-Used", bytes_s.as_str()),
+                                ],
+                                &[],
+                            )
+                            .await;
                             return;
                         }
                         if is_get {
@@ -16020,7 +16190,31 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_head {
-                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        let (count_s, bytes_s) = {
+                            let count = objects
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&container)
+                                .map(|v| v.len())
+                                .unwrap_or(0);
+                            let bytes = stats
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&container)
+                                .map(|(_, b)| *b)
+                                .unwrap_or(0);
+                            (count.to_string(), bytes.to_string())
+                        };
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[
+                                ("X-Container-Object-Count", count_s.as_str()),
+                                ("X-Container-Bytes-Used", bytes_s.as_str()),
+                            ],
+                            &[],
+                        )
+                        .await;
                         return;
                     }
                     if is_get {
@@ -18572,6 +18766,280 @@ mod pipeline_async_tests {
                 }
             }
         }
+        backend.abort();
+    }
+
+    /// Official TestFile.testFileCreate / testHead / testEtagResponse /
+    /// testGetContentType / testDeleteOfFileThatDoesNotExist /
+    /// testHeadOnFileThatDoesNotExist / testGetOnFileThatDoesNotExist /
+    /// testPostOnFileThatDoesNotExist.
+    #[tokio::test]
+    async fn file_create_head_etag_and_missing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let data = b"hello-file".to_vec();
+        use md5::{Digest, Md5};
+        let expect_etag = format!("{:x}", Md5::digest(&data));
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/created",
+            "",
+            &[
+                ("Content-Length", "10"),
+                ("Content-Type", "application/x-created"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official testFileCreate PUT on Hyper, got {}",
+            put.status
+        );
+        assert_eq!(
+            put.headers
+                .get("ETag")
+                .or_else(|| put.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str()),
+            "official testEtagResponse"
+        );
+        let got =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/created", "", &[], Vec::new()).await;
+        assert_eq!(
+            got.status, 200,
+            "official testFileCreate GET, got {}",
+            got.status
+        );
+        assert_eq!(got.body.collect_async().await.expect("GET body"), data);
+        assert_eq!(
+            got.headers
+                .get("Content-Type")
+                .or_else(|| got.headers.get("content-type")),
+            Some("application/x-created"),
+            "official testGetContentType"
+        );
+        let head =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/created", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official testHead on Hyper, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers
+                .get("Content-Length")
+                .or_else(|| head.headers.get("content-length")),
+            Some("10")
+        );
+        assert_eq!(
+            head.headers
+                .get("ETag")
+                .or_else(|| head.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str())
+        );
+        assert_eq!(
+            head.headers
+                .get("Content-Type")
+                .or_else(|| head.headers.get("content-type")),
+            Some("application/x-created")
+        );
+        assert!(
+            head.headers
+                .get("Last-Modified")
+                .or_else(|| head.headers.get("last-modified"))
+                .is_some(),
+            "official testHead last_modified"
+        );
+        let listed = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c", "", &[], Vec::new()).await;
+        assert_eq!(listed.status, 204);
+        assert_eq!(
+            listed
+                .headers
+                .get("X-Container-Object-Count")
+                .or_else(|| listed.headers.get("x-container-object-count")),
+            Some("1"),
+            "official testContainerInfo via file listing stub {:?}",
+            listed.headers
+        );
+        for method in ["GET", "HEAD", "DELETE", "POST"] {
+            let resp = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/missing-obj",
+                "",
+                &[("X-Object-Meta-Field", "Value")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.status, 404,
+                "official missing-object {method} in existing container, got {}",
+                resp.status
+            );
+            let other = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/nope/obj",
+                "",
+                &[("X-Object-Meta-Field", "Value")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                other.status, 404,
+                "official missing-object {method} in missing container, got {}",
+                other.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testRangedGets (replica leftover forwards Range).
+    #[tokio::test]
+    async fn file_ranged_gets_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let file_length = 1000usize;
+        let data: Vec<u8> = (0..file_length).map(|i| (i % 251) as u8).collect();
+        use md5::{Digest, Md5};
+        let etag = format!("{:x}", Md5::digest(&data));
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Content-Length", "1000"), ("Content-Type", "text/plain")],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let range_size = file_length / 10;
+        for i in (0..file_length).step_by(range_size) {
+            let end = (i + range_size - 1).min(file_length - 1);
+            let range = format!("bytes={i}-{end}");
+            let got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged-single",
+                "",
+                &[("Range", range.as_str())],
+                Vec::new(),
+            )
+            .await;
+            let body = got.body.collect_async().await.expect("ranged body");
+            assert_eq!(
+                body,
+                &data[i..=end],
+                "official testRangedGets {range} status {}",
+                got.status
+            );
+            let suffix = format!("bytes=-{i}");
+            let suf = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged-single",
+                "",
+                &[("Range", suffix.as_str())],
+                Vec::new(),
+            )
+            .await;
+            if i == 0 {
+                assert_eq!(
+                    suf.status, 416,
+                    "official testRangedGets bytes=-0 on Hyper, got {}",
+                    suf.status
+                );
+                assert_eq!(
+                    suf.headers
+                        .get("ETag")
+                        .or_else(|| suf.headers.get("Etag"))
+                        .map(|s| s.trim_matches('"')),
+                    Some(etag.as_str())
+                );
+                assert_eq!(
+                    suf.headers
+                        .get("Accept-Ranges")
+                        .or_else(|| suf.headers.get("accept-ranges"))
+                        .map(|s| s.to_ascii_lowercase()),
+                    Some("bytes".to_string())
+                );
+            } else {
+                let body = suf.body.collect_async().await.expect("suffix body");
+                assert_eq!(
+                    body,
+                    &data[file_length - i..],
+                    "official testRangedGets {suffix}"
+                );
+            }
+            let open = format!("bytes={i}-");
+            let open_got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged-single",
+                "",
+                &[("Range", open.as_str())],
+                Vec::new(),
+            )
+            .await;
+            let body = open_got.body.collect_async().await.expect("open range");
+            assert_eq!(body, &data[i..], "official testRangedGets {open}");
+        }
+        let past = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "bytes=2000-3000")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            past.status, 416,
+            "official testRangedGets past-end on Hyper, got {}",
+            past.status
+        );
+        let overlap = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "bytes=900-3000")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            overlap.body.collect_async().await.expect("overlap"),
+            &data[900..]
+        );
+        let no_unit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "0-4")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            no_unit.body.collect_async().await.expect("no unit"),
+            data,
+            "official testRangedGets Range 0-4 must return the full object"
+        );
+        let huge_suffix = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "bytes=-1010")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            huge_suffix.body.collect_async().await.expect("huge suffix"),
+            data,
+            "official testRangedGets suffix longer than object"
+        );
         backend.abort();
     }
 
