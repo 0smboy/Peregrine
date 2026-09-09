@@ -14574,6 +14574,13 @@ mod pipeline_async_tests {
             let store = Arc::clone(&self.store);
             Box::pin(async move {
                 if req.method == "PUT" {
+                    // Official testCopy404s / testCopyFromHeader404s: a
+                    // missing destination container must 404, not autocreate.
+                    if !req.path.starts_with("/v1/AUTH_test/c/")
+                        && !req.path.starts_with("/v1/AUTH_test/dstc/")
+                    {
+                        return Response::new(404);
+                    }
                     let headers = req.headers.clone();
                     let body = match req.body.materialize(u64::MAX) {
                         Ok(bytes) => bytes.to_vec(),
@@ -14833,6 +14840,125 @@ mod pipeline_async_tests {
             Some("AUTH_test"),
         )
         .await;
+    }
+
+    /// Official TestFile.testCopy404s / testCopyFromHeader404s: missing
+    /// source container/object and missing dest container must 404 on Hyper
+    /// COPY and X-Copy-From (handle_request_async, not Copy::handle).
+    #[tokio::test]
+    async fn file_copy_and_copy_from_404s_on_hyper() {
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "text/plain");
+        source.set("Content-Length", "4");
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            "/v1/AUTH_test/c/src".into(),
+            (source, b"src!".to_vec()),
+        )])));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(FileCopyEncodedStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        for dest in ["/c/out", "c/out", "/dstc/out"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("Destination", dest);
+            let missing_cont = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/nosrc/src".into(),
+                    query_string: String::new(),
+                    headers: headers.clone(),
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                missing_cont.status, 404,
+                "official testCopy404s missing source container {dest}, got {}",
+                missing_cont.status
+            );
+            let mut headers = HeaderKeyDict::new();
+            headers.set("Destination", dest);
+            let missing_obj = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/c/missing".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                missing_obj.status, 404,
+                "official testCopy404s missing source object {dest}, got {}",
+                missing_obj.status
+            );
+        }
+        for dest in ["/nope/out", "nope/out"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("Destination", dest);
+            let missing_dest = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/c/src".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                missing_dest.status, 404,
+                "official testCopy404s missing dest container {dest}, got {}",
+                missing_dest.status
+            );
+        }
+        for copy_from in ["/nosrc/src", "nosrc/src", "/c/missing", "c/missing"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Copy-From", copy_from);
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/c/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                resp.status, 404,
+                "official testCopyFromHeader404s missing source {copy_from}, got {}",
+                resp.status
+            );
+        }
+        for copy_from in ["/c/src", "c/src"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Copy-From", copy_from);
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/nope/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                resp.status, 404,
+                "official testCopyFromHeader404s missing dest {copy_from}, got {}",
+                resp.status
+            );
+        }
     }
 
     /// Official test_versioning_check_acl: versions container is public
