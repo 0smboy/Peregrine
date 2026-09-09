@@ -9935,10 +9935,7 @@ mod pipeline_async_tests {
             "official testAccountHead container_count, headers {:?}",
             head.headers
         );
-        for field in [
-            "X-Account-Object-Count",
-            "X-Account-Bytes-Used",
-        ] {
+        for field in ["X-Account-Object-Count", "X-Account-Bytes-Used"] {
             let v: i64 = head
                 .headers
                 .get(field)
@@ -10002,13 +9999,15 @@ mod pipeline_async_tests {
             "official testCreateOnExisting first PUT, got {}",
             first.status
         );
-        let second = file_hyper_call(&svc, "PUT", "/v1/AUTH_test/exists", "", &[], Vec::new()).await;
+        let second =
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/exists", "", &[], Vec::new()).await;
         assert_eq!(
             second.status, 202,
             "official testCreateOnExisting second PUT, got {}",
             second.status
         );
-        let empty = file_hyper_call(&svc, "PUT", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
+        let empty =
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
         assert_eq!(empty.status, 201);
         let deleted =
             file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
@@ -15871,10 +15870,7 @@ mod pipeline_async_tests {
                             .unwrap_or_default()
                     };
                     let account_counts = || {
-                        let n = containers
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .len();
+                        let n = containers.lock().unwrap_or_else(|p| p.into_inner()).len();
                         let (objects_n, bytes_n) = stats
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -15906,16 +15902,16 @@ mod pipeline_async_tests {
                                 qparam("limit").parse().ok(),
                                 path.as_deref(),
                             );
-                            let stats_g = stats.lock().unwrap_or_else(|p| p.into_inner());
-                            for row in rows.iter_mut() {
-                                if let Some(name) = row
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string)
-                                {
-                                    if let Some(&(count, bytes)) = stats_g.get(&name) {
-                                        row["count"] = serde_json::json!(count);
-                                        row["bytes"] = serde_json::json!(bytes);
+                            {
+                                let stats_g = stats.lock().unwrap_or_else(|p| p.into_inner());
+                                for row in rows.iter_mut() {
+                                    if let Some(name) =
+                                        row.get("name").and_then(|v| v.as_str()).map(str::to_string)
+                                    {
+                                        if let Some(&(count, bytes)) = stats_g.get(&name) {
+                                            row["count"] = serde_json::json!(count);
+                                            row["bytes"] = serde_json::json!(bytes);
+                                        }
                                     }
                                 }
                             }
@@ -17895,14 +17891,7 @@ mod pipeline_async_tests {
         let mon = parts[2];
         let year2 = parts[3].get(2..).unwrap_or(parts[3]);
         let time = parts[4];
-        format!(
-            "{}, {}-{}-{} {} GMT",
-            dow_long(dow),
-            day,
-            mon,
-            year2,
-            time
-        )
+        format!("{}, {}-{}-{} {} GMT", dow_long(dow), day, mon, year2, time)
     }
 
     fn imf_to_asctime(imf: &str) -> String {
@@ -17953,7 +17942,7 @@ mod pipeline_async_tests {
                 method,
                 "/v1/AUTH_test/c/ims",
                 "",
-                &[("If-Modified-Since", time_old)],
+                &[("If-Modified-Since", time_old.as_str())],
                 Vec::new(),
             )
             .await;
@@ -17967,7 +17956,7 @@ mod pipeline_async_tests {
                 method,
                 "/v1/AUTH_test/c/ims",
                 "",
-                &[("If-Modified-Since", time_new)],
+                &[("If-Modified-Since", time_new.as_str())],
                 Vec::new(),
             )
             .await;
@@ -17998,7 +17987,7 @@ mod pipeline_async_tests {
                 method,
                 "/v1/AUTH_test/c/ims",
                 "",
-                &[("If-Unmodified-Since", time_new)],
+                &[("If-Unmodified-Since", time_new.as_str())],
                 Vec::new(),
             )
             .await;
@@ -18012,7 +18001,7 @@ mod pipeline_async_tests {
                 method,
                 "/v1/AUTH_test/c/ims",
                 "",
-                &[("If-Unmodified-Since", time_old_rfc850)],
+                &[("If-Unmodified-Since", time_old_rfc850.as_str())],
                 Vec::new(),
             )
             .await;
@@ -18035,7 +18024,10 @@ mod pipeline_async_tests {
             "GET",
             "/v1/AUTH_test/c/ims",
             "",
-            &[("If-Match", &etag), ("If-Unmodified-Since", time_new)],
+            &[
+                ("If-Match", &etag),
+                ("If-Unmodified-Since", time_new.as_str()),
+            ],
             Vec::new(),
         )
         .await;
@@ -18049,7 +18041,10 @@ mod pipeline_async_tests {
             "GET",
             "/v1/AUTH_test/c/ims",
             "",
-            &[("If-Match", "bogus"), ("If-Unmodified-Since", time_new)],
+            &[
+                ("If-Match", "bogus"),
+                ("If-Unmodified-Since", time_new.as_str()),
+            ],
             Vec::new(),
         )
         .await;
@@ -18065,7 +18060,7 @@ mod pipeline_async_tests {
             "",
             &[
                 ("If-Match", &etag),
-                ("If-Unmodified-Since", time_old_asctime),
+                ("If-Unmodified-Since", time_old_asctime.as_str()),
             ],
             Vec::new(),
         )
@@ -18363,7 +18358,10 @@ mod pipeline_async_tests {
                 "PUT",
                 "/v1/AUTH_test/c/toobig",
                 "",
-                &[("Content-Length", cl.as_str()), ("Content-Type", "text/plain")],
+                &[
+                    ("Content-Length", cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
                 Vec::new(),
             )
             .await;
@@ -18407,7 +18405,10 @@ mod pipeline_async_tests {
             got.status
         );
         let empty = got.body.collect_async().await.expect("zero-byte body");
-        assert!(empty.is_empty(), "official testZeroByteFile body must be empty");
+        assert!(
+            empty.is_empty(),
+            "official testZeroByteFile body must be empty"
+        );
 
         let mut last = Vec::new();
         for i in 1..=10u8 {
@@ -18418,7 +18419,10 @@ mod pipeline_async_tests {
                 "PUT",
                 "/v1/AUTH_test/c/stack",
                 "",
-                &[("Content-Length", cl.as_str()), ("Content-Type", "text/plain")],
+                &[
+                    ("Content-Length", cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
                 last.clone(),
             )
             .await;
@@ -18456,13 +18460,15 @@ mod pipeline_async_tests {
             "official testChunkedPut on Hyper, got {}",
             chunked.status
         );
-        let read = file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
+        let read =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
         assert_eq!(
             read.body.collect_async().await.expect("chunked GET"),
             data,
             "official testChunkedPut body"
         );
-        let info = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
+        let info =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
         assert_eq!(
             info.headers
                 .get("ETag")
@@ -18543,7 +18549,10 @@ mod pipeline_async_tests {
                         .iter()
                         .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(name))
                         .unwrap_or_else(|| panic!("missing {name} in json listing"));
-                    assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(bytes as u64));
+                    assert_eq!(
+                        row.get("bytes").and_then(|v| v.as_u64()),
+                        Some(bytes as u64)
+                    );
                     assert_eq!(row.get("content_type").and_then(|v| v.as_str()), Some(ct));
                     assert_eq!(
                         row.get("hash").and_then(|v| v.as_str()),
