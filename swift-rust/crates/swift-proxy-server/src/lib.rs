@@ -9221,6 +9221,52 @@ mod pipeline_async_tests {
         (svc, backend)
     }
 
+    fn xml_listing_names(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = text;
+        loop {
+            let sub = rest.find("<subdir name=\"");
+            let nm = rest.find("<name>");
+            match (sub, nm) {
+                (Some(s), Some(n)) if s < n => {
+                    let after = &rest[s + "<subdir name=\"".len()..];
+                    let end = after.find('"').unwrap_or(0);
+                    names.push(after[..end].to_string());
+                    rest = &after[end..];
+                    if let Some(close) = rest.find("</subdir>") {
+                        rest = &rest[close + "</subdir>".len()..];
+                    } else if let Some(close) = rest.find("/>") {
+                        rest = &rest[close + 2..];
+                    } else {
+                        break;
+                    }
+                }
+                (Some(s), None) => {
+                    let after = &rest[s + "<subdir name=\"".len()..];
+                    let end = after.find('"').unwrap_or(0);
+                    names.push(after[..end].to_string());
+                    rest = &after[end..];
+                    if let Some(close) = rest.find("/>") {
+                        rest = &rest[close + 2..];
+                    } else {
+                        break;
+                    }
+                }
+                (_, Some(n)) => {
+                    let after = &rest[n + "<name>".len()..];
+                    if let Some(end) = after.find("</name>") {
+                        names.push(after[..end].to_string());
+                        rest = &after[end + "</name>".len()..];
+                    } else {
+                        break;
+                    }
+                }
+                (None, None) => break,
+            }
+        }
+        names
+    }
+
     async fn listing_plain_names(svc: &ProxyAsyncService, path: &str, query: &str) -> Vec<String> {
         let listed = file_hyper_call(svc, "GET", path, query, &[], Vec::new()).await;
         if listed.status == 204 {
@@ -9246,6 +9292,9 @@ mod pipeline_async_tests {
                         .map(str::to_string)
                 })
                 .collect();
+        }
+        if trimmed.starts_with("<?xml") || trimmed.starts_with('<') {
+            return xml_listing_names(trimmed);
         }
         trimmed
             .lines()
@@ -9470,20 +9519,51 @@ mod pipeline_async_tests {
             past.is_empty(),
             "official testLastFileMarker plaintext on Hyper, got {past:?}"
         );
-        let json_past = file_hyper_call(
-            &svc,
-            "GET",
-            "/v1/AUTH_test/marks",
-            &format!("format=json&marker={last}"),
-            &[],
-            Vec::new(),
-        )
-        .await;
-        assert_eq!(
-            json_past.status, 200,
-            "official testLastFileMarker json empty is 200, got {}",
-            json_past.status
-        );
+        for format_type in ["json", "xml"] {
+            let past = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/marks",
+                &format!("format={format_type}&marker={last}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                past.status, 200,
+                "official testLastFileMarker {format_type} empty is 200, got {}",
+                past.status
+            );
+            assert!(
+                listing_plain_names(
+                    &svc,
+                    "/v1/AUTH_test/marks",
+                    &format!("format={format_type}&marker={last}")
+                )
+                .await
+                .is_empty(),
+                "official testLastFileMarker {format_type} names empty"
+            );
+            for marker in ["0", "A", "f04", "z"] {
+                let listed = listing_plain_names(
+                    &svc,
+                    "/v1/AUTH_test/marks",
+                    &format!("format={format_type}&marker={marker}&limit=3"),
+                )
+                .await;
+                assert!(
+                    listed.len() <= 3,
+                    "official testMarkerLimitFileList {format_type} {marker} len {}",
+                    listed.len()
+                );
+                if let Some(first) = listed.first() {
+                    assert!(
+                        first.as_str() > marker,
+                        "official testMarkerLimitFileList {format_type} first {first} vs {marker}"
+                    );
+                }
+            }
+        }
         backend.abort();
     }
 
@@ -9987,6 +10067,90 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.testContainerListing / testMarkerLimitContainerList
+    /// / testLastContainerMarker across plaintext, json, and xml.
+    #[tokio::test]
+    async fn account_container_listing_and_marker_limit_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let mut expected: Vec<String> = (0..8).map(|i| format!("acct{i}")).collect();
+        expected.sort();
+        for name in &expected {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201,
+                "PUT container {name}"
+            );
+        }
+        for format_type in ["", "json", "xml"] {
+            let query = if format_type.is_empty() {
+                String::new()
+            } else {
+                format!("format={format_type}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &query).await,
+                expected,
+                "official testContainerListing format={format_type:?}"
+            );
+            for marker in ["0", "A", "acct3", "z"] {
+                let q = if query.is_empty() {
+                    format!("marker={marker}&limit=3")
+                } else {
+                    format!("{query}&marker={marker}&limit=3")
+                };
+                let listed = listing_plain_names(&svc, "/v1/AUTH_test", &q).await;
+                assert!(
+                    listed.len() <= 3,
+                    "official testMarkerLimitContainerList {format_type} {marker} len {}",
+                    listed.len()
+                );
+                if let Some(first) = listed.first() {
+                    assert!(
+                        first.as_str() > marker,
+                        "official testMarkerLimitContainerList first {first} vs {marker}"
+                    );
+                }
+            }
+            let last = expected.last().expect("account names");
+            let past_q = if query.is_empty() {
+                format!("marker={last}")
+            } else {
+                format!("{query}&marker={last}")
+            };
+            let past =
+                file_hyper_call(&svc, "GET", "/v1/AUTH_test", &past_q, &[], Vec::new()).await;
+            if format_type.is_empty() {
+                assert!(
+                    past.status == 204 || past.status == 200,
+                    "official testLastContainerMarker plaintext, got {}",
+                    past.status
+                );
+            } else {
+                assert_eq!(
+                    past.status, 200,
+                    "official testLastContainerMarker {format_type} empty is 200, got {}",
+                    past.status
+                );
+            }
+            assert!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &past_q)
+                    .await
+                    .is_empty(),
+                "official testLastContainerMarker {format_type:?} names empty"
+            );
+        }
+        backend.abort();
+    }
+
     /// Official TestContainer.testCreateOnExisting / testDelete /
     /// testDeleteOnContainerWithFiles / testFileCreateInContainerThatDoesNotExist
     /// / testContainerFileListOnContainerThatDoesNotExist / testSlashInName.
@@ -10416,8 +10580,8 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
-    /// Official TestContainer.testContainerJsonFileList: listing hash /
-    /// content_type / bytes match HEAD info.
+    /// Official TestContainer.testContainerJsonFileList /
+    /// testContainerXmlFileList: listing hash / content_type / bytes match HEAD.
     #[tokio::test]
     async fn container_json_file_list_matches_head_on_hyper() {
         let (svc, backend) = file_listing_hyper_svc().await;
@@ -10483,6 +10647,44 @@ mod pipeline_async_tests {
                 Some(ct.as_str())
             );
             assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(*bytes));
+        }
+        let xml = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=xml",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            xml.status, 200,
+            "official testContainerXmlFileList on Hyper, got {}",
+            xml.status
+        );
+        let xml_body = xml.body.collect_async().await.expect("xml listing");
+        let xml_text = String::from_utf8_lossy(&xml_body);
+        for (name, (etag, ct, bytes)) in &expect {
+            assert!(
+                xml_text.contains(&format!("<name>{name}</name>")),
+                "official testContainerXmlFileList missing name {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains(&format!("<hash>{etag}</hash>")),
+                "official testContainerXmlFileList hash {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains(&format!("<bytes>{bytes}</bytes>")),
+                "official testContainerXmlFileList bytes {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains(&format!("<content_type>{ct}</content_type>")),
+                "official testContainerXmlFileList content_type {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains("<last_modified>"),
+                "official testContainerXmlFileList last_modified {name}: {xml_text}"
+            );
         }
         backend.abort();
     }
@@ -15921,9 +16123,24 @@ mod pipeline_async_tests {
                                         }
                                     }
                                 }
+                                // IsolatedIdentity object-server POST replaces
+                                // the whole .meta user set (official
+                                // testMetadataOnPost). Merge left stale keys.
+                                let stale: Vec<String> = headers
+                                    .iter()
+                                    .filter(|(k, _)| {
+                                        k.to_ascii_lowercase().starts_with("x-object-meta-")
+                                    })
+                                    .map(|(k, _)| k.to_string())
+                                    .collect();
+                                for k in stale {
+                                    headers.remove(&k);
+                                }
                                 for line in text.lines() {
                                     if let Some((k, v)) = line.split_once(':') {
-                                        if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                                        if k.to_ascii_lowercase().starts_with("x-object-meta-")
+                                            && k.len() > "x-object-meta-".len()
+                                        {
                                             headers.set(k.trim(), v.trim());
                                         }
                                     }
@@ -17961,6 +18178,135 @@ mod pipeline_async_tests {
             post_over.status, 400,
             "official testMetadataNumberLimit over-limit POST on Hyper, got {}",
             post_over.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testMetadataOnPut / testMetadataOnPost: PUT metas
+    /// survive HEAD; IsolatedIdentity object-server POST replaces the set.
+    #[tokio::test]
+    async fn file_metadata_on_put_and_post_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+                ("X-Object-Meta-Color", "blue"),
+                ("X-Object-Meta-Flavor", "mint"),
+            ],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official testMetadataOnPut PUT on Hyper, got {}",
+            put.status
+        );
+        let head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official testMetadataOnPut HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers.get("X-Object-Meta-Color"),
+            Some("blue"),
+            "official testMetadataOnPut Color {:?}",
+            head.headers
+        );
+        assert_eq!(
+            head.headers.get("X-Object-Meta-Flavor"),
+            Some("mint"),
+            "official testMetadataOnPut Flavor {:?}",
+            head.headers
+        );
+        let post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[("X-Object-Meta-Size", "large")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            post.status == 202 || post.status == 201,
+            "official testMetadataOnPost first POST, got {}",
+            post.status
+        );
+        let after = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            after.headers.get("X-Object-Meta-Size"),
+            Some("large"),
+            "official testMetadataOnPost Size {:?}",
+            after.headers
+        );
+        assert_eq!(
+            after.headers.get("X-Object-Meta-Color"),
+            None,
+            "official testMetadataOnPost must drop Color, headers {:?}",
+            after.headers
+        );
+        assert_eq!(
+            after.headers.get("X-Object-Meta-Flavor"),
+            None,
+            "official testMetadataOnPost must drop Flavor, headers {:?}",
+            after.headers
+        );
+        let post2 = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[("X-Object-Meta-Color", "red")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            post2.status == 202 || post2.status == 201,
+            "official testMetadataOnPost second POST, got {}",
+            post2.status
+        );
+        let after2 = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            after2.headers.get("X-Object-Meta-Color"),
+            Some("red"),
+            "official testMetadataOnPost second Color {:?}",
+            after2.headers
+        );
+        assert_eq!(
+            after2.headers.get("X-Object-Meta-Size"),
+            None,
+            "official testMetadataOnPost must drop Size, headers {:?}",
+            after2.headers
         );
         backend.abort();
     }
