@@ -9776,6 +9776,17 @@ mod pipeline_async_tests {
                         extra = vec![("X-Object-Manifest", "c2/segs/")];
                         body = b"mancont2-contents";
                     } else if logical == "/AUTH_test/c2" {
+                        // Container HEAD 200 would make maybe_sharded treat
+                        // the object listing JSON as shard ranges and fold
+                        // to an empty listing. 404 the probe; GET lists.
+                        if is_head
+                            || text
+                                .to_ascii_lowercase()
+                                .contains("x-backend-record-type: shard")
+                        {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
                         extra = vec![("Content-Type", "application/json")];
                         body = br#"[{"name":"segs/1","bytes":10,"hash":"x","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"},{"name":"segs/2","bytes":10,"hash":"y","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"}]"#;
                     } else if logical == "/AUTH_test/c2/segs/1" {
@@ -9848,7 +9859,7 @@ mod pipeline_async_tests {
             denied.status
         );
         seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
-        let mut assembled = svc
+        let assembled = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/AUTH_test/c2/manifest-abcde".into(),
@@ -9920,7 +9931,7 @@ mod pipeline_async_tests {
             denied.status
         );
         seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
-        let mut assembled = svc
+        let assembled = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/AUTH_test/c/mancont2".into(),
