@@ -14311,33 +14311,37 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_post {
-                        let mut guard = objects.lock().unwrap_or_else(|p| p.into_inner());
-                        let Some((headers, stored_body)) = guard.get_mut(&logical) else {
-                            drop(guard);
+                        let found = {
+                            let mut guard = objects.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some((headers, _)) = guard.get_mut(&logical) {
+                                if let Some(ct) = header("Content-Type") {
+                                    headers.set("Content-Type", &ct);
+                                    if has_cu {
+                                        if let Some(row) = listings
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .get_mut(&name)
+                                        {
+                                            row.2 = ct;
+                                        }
+                                    }
+                                }
+                                for line in text.lines() {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                                            headers.set(k.trim(), v.trim());
+                                        }
+                                    }
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if !found {
                             let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                             return;
-                        };
-                        if let Some(ct) = header("Content-Type") {
-                            headers.set("Content-Type", &ct);
-                            if has_cu {
-                                if let Some(row) = listings
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .get_mut(&name)
-                                {
-                                    row.2 = ct;
-                                }
-                            }
                         }
-                        for line in text.lines() {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.to_ascii_lowercase().starts_with("x-object-meta-") {
-                                    headers.set(k.trim(), v.trim());
-                                }
-                            }
-                        }
-                        let _ = stored_body;
-                        drop(guard);
                         write_backend_http_status(&mut stream, 202, &[], &[]).await;
                         return;
                     }
