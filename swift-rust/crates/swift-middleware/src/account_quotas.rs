@@ -35,12 +35,19 @@
 //! parsed exactly as `headers_to_account_info` / `headers_to_container_info`
 //! would parse a backend HEAD.
 //!
+//! Hyper path: account `POST`/`PUT` is a control-plane intercept
+//! (`intercepts_request` + `handle_request_async`) so production serve
+//! (`prepare` → app, never `handle`) still 403s a non-reseller quota set.
+//! `finish` exposes stored `X-Account-Sysmeta-*` quotas on GET/HEAD.
+//! Object `PUT` enforcement stays in sync `handle` and is not intercepted
+//! (that would materialize the object body).
+//!
 //! Deferrals (faithful in behaviour, different in mechanism):
-//! - `reseller_request` is sourced from the `X-Backend-Reseller-Request`
-//!   request header (coerced by `config_true_value`) rather than the WSGI
-//!   `environ['reseller_request']` flag. This mirrors `read_only`'s header
-//!   stand-in; `gatekeeper` forbids clients from forging any `X-Backend-*`
-//!   header, so the boundary is preserved.
+//! - `reseller_request` is sourced from `X-Backend-Reseller-Request`
+//!   (`config_true_value`) or `.reseller_admin` in `X-Backend-Remote-User`
+//!   (TempAuth/Keystone stamp after `prepare`), standing in for WSGI
+//!   `environ['reseller_request']`. `gatekeeper` forbids clients from
+//!   forging any `X-Backend-*` header, so the boundary is preserved.
 //! - `quota_exceeded`'s `swift.authorize` delayed-denial wrapping (which lets
 //!   a container-ACL check run first) is not ported: there is no authorize
 //!   hook in this pipeline, so an over-quota write is rejected immediately
@@ -55,12 +62,15 @@
 //!   `0` (`request.content_length or 0`).
 //! - `filter_factory` / `register_swift_info` are not ported.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use swift_core::config::config_true_value;
 use swift_core::storage_policy::StoragePolicyCollection;
 
 use swift_http::{split_path, Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 /// Account quota middleware. Holds the cluster's storage policies (Swift's
 /// global `POLICIES`) so per-policy usage headers, which are keyed by policy
@@ -74,14 +84,62 @@ impl AccountQuotas {
         AccountQuotas { policies }
     }
 
-    /// Whether this is a reseller request. See the module deferral note: the
-    /// value is taken from the backend header `X-Backend-Reseller-Request`
-    /// rather than `environ['reseller_request']`.
+    /// Whether this is a reseller request. See the module deferral note:
+    /// `X-Backend-Reseller-Request` (TempAuth/Keystone stamp) or
+    /// `.reseller_admin` in `X-Backend-Remote-User`. Regular `.admin`
+    /// account owners are not resellers and cannot set quotas.
     fn is_reseller(&self, req: &Request) -> bool {
-        req.headers
+        if req
+            .headers
             .get("X-Backend-Reseller-Request")
-            .map(config_true_value)
-            .unwrap_or(false)
+            .is_some_and(config_true_value)
+        {
+            return true;
+        }
+        req.headers
+            .get("X-Backend-Remote-User")
+            .unwrap_or("")
+            .split(',')
+            .any(|g| g.trim() == ".reseller_admin")
+    }
+
+    /// Account-level path (`/v1/<account>`), not container or object.
+    fn is_account_request(req: &Request) -> bool {
+        match split_path(&req.path, 2, 4, true) {
+            Ok(parts) => {
+                !parts[1].as_deref().unwrap_or("").is_empty()
+                    && parts[2].as_deref().unwrap_or("").is_empty()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Copy deprecated `X-Account-Meta-Quota-Bytes` onto the modern
+    /// `X-Account-Quota-Bytes` header when the modern header is absent.
+    fn migrate_legacy_quota_headers(req: &mut Request) {
+        for (legacy, modern) in [
+            ("X-Account-Meta-Quota-Bytes", "X-Account-Quota-Bytes"),
+            (
+                "X-Remove-Account-Meta-Quota-Bytes",
+                "X-Remove-Account-Quota-Bytes",
+            ),
+        ] {
+            if let Some(value) = req.headers.get(legacy).map(str::to_string) {
+                let modern_falsy = req.headers.get(modern).is_none_or(str::is_empty);
+                if modern_falsy {
+                    req.headers.set(modern, value);
+                }
+            }
+        }
+    }
+
+    /// On account `POST`/`PUT`, migrate legacy headers and reject or
+    /// rewrite quota-set headers. `Err` is `400`/`403`.
+    fn prepare_account_write(&self, req: &mut Request) -> Result<(), Response> {
+        Self::migrate_legacy_quota_headers(req);
+        self.validate_and_translate_quotas(req, "Quota-Bytes")?;
+        self.validate_and_translate_quotas(req, "Quota-Count")?;
+        Ok(())
     }
 
     /// `413 Request Entity Too Large` with swob's `body=...` shape: the body
@@ -98,35 +156,25 @@ impl AccountQuotas {
     /// `X-Account-Sysmeta-*` quotas as public `X-Account-*` headers.
     fn handle_account(&self, mut req: Request, next: &NextFn) -> Response {
         if req.method == "POST" || req.method == "PUT" {
-            // Support old meta format: copy `X-Account-Meta-Quota-Bytes`
-            // (and its X-Remove twin) into the modern header when the modern
-            // header is not already set.
-            for (legacy, modern) in [
-                ("X-Account-Meta-Quota-Bytes", "X-Account-Quota-Bytes"),
-                (
-                    "X-Remove-Account-Meta-Quota-Bytes",
-                    "X-Remove-Account-Quota-Bytes",
-                ),
-            ] {
-                if let Some(value) = req.headers.get(legacy).map(str::to_string) {
-                    let modern_falsy = req.headers.get(modern).is_none_or(str::is_empty);
-                    if modern_falsy {
-                        req.headers.set(modern, value);
-                    }
-                }
-            }
-            if let Err(resp) = self.validate_and_translate_quotas(&mut req, "Quota-Bytes") {
-                return resp;
-            }
-            if let Err(resp) = self.validate_and_translate_quotas(&mut req, "Quota-Count") {
+            if let Err(resp) = self.prepare_account_write(&mut req) {
                 return resp;
             }
         }
+        self.expose_quotas(next(req))
+    }
 
-        let mut resp = next(req);
+    async fn handle_account_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        if req.method == "POST" || req.method == "PUT" {
+            if let Err(resp) = self.prepare_account_write(&mut req) {
+                return resp;
+            }
+        }
+        self.expose_quotas(next(req).await)
+    }
 
-        // Non-resellers can't update quotas, but they *can* see them. Global
-        // quotas first.
+    /// Non-resellers can't update quotas, but they *can* see them. Global
+    /// quotas first; per-policy sysmeta is keyed by index and exposed by name.
+    fn expose_quotas(&self, mut resp: Response) -> Response {
         for postfix in ["Quota-Bytes", "Quota-Count"] {
             let value = resp
                 .headers
@@ -137,7 +185,6 @@ impl AccountQuotas {
                 resp.headers.set(&format!("X-Account-{postfix}"), value);
             }
         }
-        // Per-policy quotas: sysmeta keyed by index, exposed keyed by name.
         for policy in self.policies.iter() {
             for infix in ["Quota-Bytes-Policy", "Quota-Count-Policy"] {
                 let value = resp
@@ -276,6 +323,34 @@ fn header_int(resp: &Response, name: &str, default: i64) -> i64 {
 }
 
 impl Middleware for AccountQuotas {
+    /// Account POST/PUT only. Object PUT is not intercepted: Hyper would
+    /// materialize the body up to `MAX_CONTROL_BODY`.
+    fn intercepts_request(&self, req: &Request) -> bool {
+        matches!(req.method.as_str(), "POST" | "PUT") && Self::is_account_request(req)
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if Self::is_account_request(&req) {
+                self.handle_account_async(req, next).await
+            } else {
+                next(req).await
+            }
+        })
+    }
+
+    fn finish(&self, req: &Request, resp: Response) -> Response {
+        if Self::is_account_request(req) {
+            self.expose_quotas(resp)
+        } else {
+            resp
+        }
+    }
+
     fn handle(&self, req: Request, next: &NextFn) -> Response {
         // split_path(2, 4, rest_with_last=True); a ValueError just passes the
         // request through untouched.
@@ -824,5 +899,168 @@ mod tests {
             &[("X-Account-Meta-Quota-Bytes", "99999")],
         );
         assert_passthrough(&run(req, next));
+    }
+
+    fn async_backend(status: u16) -> crate::AsyncNextFn {
+        Arc::new(move |_req: Request| Box::pin(async move { Response::new(status) }))
+    }
+
+    async fn run_hyper(req: Request) -> Response {
+        let mut resp = mw().handle_request_async(req, async_backend(204)).await;
+        resp.body.materialize(u64::MAX).unwrap();
+        resp
+    }
+
+    // ---- Hyper path (Field H1: user_cannot_* was 204 because handle()
+    // never ran). Six shapes match TestAccountQuotas.user_cannot_*.
+
+    #[test]
+    fn hyper_intercepts_account_post_put_only() {
+        let aq = mw();
+        assert!(aq.intercepts_request(&mk("POST", "/v1/a", &[])));
+        assert!(aq.intercepts_request(&mk("PUT", "/v1/a", &[])));
+        assert!(!aq.intercepts_request(&mk("GET", "/v1/a", &[])));
+        assert!(!aq.intercepts_request(&mk("HEAD", "/v1/a", &[])));
+        assert!(!aq.intercepts_request(&mk("POST", "/v1/a/c", &[])));
+        assert!(
+            !aq.intercepts_request(&mk("PUT", "/v1/a/c/o", &[])),
+            "object PUT must not intercept (would materialize the body)"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_cannot_set_quota_bytes() {
+        let r = run_hyper(mk("POST", "/v1/a", &[("X-Account-Quota-Bytes", "5000")])).await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn user_cannot_set_quota_count() {
+        let r = run_hyper(mk("POST", "/v1/a", &[("X-Account-Quota-Count", "10")])).await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn user_cannot_set_quota_bytes_policy() {
+        let r = run_hyper(mk(
+            "POST",
+            "/v1/a",
+            &[("X-Account-Quota-Bytes-Policy-Unu", "100")],
+        ))
+        .await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn user_cannot_set_quota_count_policy() {
+        let r = run_hyper(mk(
+            "POST",
+            "/v1/a",
+            &[("X-Account-Quota-Count-Policy-Nulo", "5")],
+        ))
+        .await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn user_cannot_set_legacy_quota_bytes() {
+        // Live curl stored this as user-meta because Hyper skipped handle().
+        let r = run_hyper(mk(
+            "POST",
+            "/v1/a",
+            &[("X-Account-Meta-Quota-Bytes", "99999")],
+        ))
+        .await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn user_cannot_remove_quota_bytes() {
+        let r = run_hyper(mk(
+            "POST",
+            "/v1/a",
+            &[("X-Remove-Account-Quota-Bytes", "True")],
+        ))
+        .await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn hyper_reseller_header_can_set_quota() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen2 = seen.clone();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let hdr = req
+                .headers
+                .get("X-Account-Sysmeta-Quota-Bytes")
+                .map(str::to_string);
+            *seen2.lock().unwrap() = hdr;
+            Box::pin(async { Response::new(204) })
+        });
+        let req = mk(
+            "POST",
+            "/v1/a",
+            &[
+                ("X-Backend-Reseller-Request", "true"),
+                ("X-Account-Quota-Bytes", "5000"),
+            ],
+        );
+        let r = mw().handle_request_async(req, next).await;
+        assert_eq!(r.status, 204);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("5000"));
+    }
+
+    #[tokio::test]
+    async fn hyper_reseller_admin_remote_user_can_set_quota() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen2 = seen.clone();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let hdr = req
+                .headers
+                .get("X-Account-Sysmeta-Quota-Bytes")
+                .map(str::to_string);
+            *seen2.lock().unwrap() = hdr;
+            Box::pin(async { Response::new(204) })
+        });
+        let req = mk(
+            "POST",
+            "/v1/a",
+            &[
+                ("X-Backend-Remote-User", "test:admin,.reseller_admin"),
+                ("X-Account-Quota-Bytes", "42"),
+            ],
+        );
+        let r = mw().handle_request_async(req, next).await;
+        assert_eq!(r.status, 204);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn hyper_account_admin_remote_user_cannot_set_quota() {
+        // .admin owns the account but is not reseller_admin.
+        let r = run_hyper(mk(
+            "POST",
+            "/v1/a",
+            &[
+                ("X-Backend-Remote-User", "test:tester,AUTH_test"),
+                ("X-Account-Quota-Bytes", "5000"),
+            ],
+        ))
+        .await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[test]
+    fn finish_exposes_sysmeta_quotas_on_account_get() {
+        let mut resp = Response::new(200);
+        resp.headers.set("X-Account-Sysmeta-Quota-Bytes", "1000");
+        resp.headers
+            .set("X-Account-Sysmeta-Quota-Bytes-Policy-1", "10");
+        let out = mw().finish(&mk("GET", "/v1/a", &[]), resp);
+        assert_eq!(out.headers.get("X-Account-Quota-Bytes"), Some("1000"));
+        assert_eq!(
+            out.headers.get("X-Account-Quota-Bytes-Policy-Unu"),
+            Some("10")
+        );
     }
 }
