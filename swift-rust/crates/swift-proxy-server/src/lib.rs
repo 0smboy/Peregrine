@@ -9730,6 +9730,129 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.testListDelimiter / testLastContainerMarker /
+    /// TestAccountSorting reverse + marker leftovers.
+    #[tokio::test]
+    async fn account_list_delimiter_and_sorting_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        for name in ["test", "test-bar", "test-foo"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201,
+                "PUT container {name}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "delimiter=-").await,
+            vec!["test".to_string(), "test-".to_string()],
+            "official testListDelimiter account"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "delimiter=-&reverse=yes").await,
+            vec!["test-".to_string(), "test".to_string()],
+            "official testListDelimiter account reverse"
+        );
+        for name in ["bar", "bazar"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "delimiter=a&prefix=ba").await,
+            vec!["bar".to_string(), "baza".to_string()],
+            "official testListDelimiterAndPrefix account"
+        );
+        let last = listing_plain_names(&svc, "/v1/AUTH_test", "").await;
+        let last_name = last.last().expect("account listing");
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test", &format!("marker={last_name}"))
+                .await
+                .is_empty(),
+            "official testLastContainerMarker plaintext"
+        );
+
+        for name in ["a1", "a2", "A3", "b1", "B2", "a10", "b10", "zz"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        let items = [
+            "test", "test-bar", "test-foo", "bar", "bazar", "a1", "a2", "A3", "b1", "B2", "a10",
+            "b10", "zz",
+        ];
+        let mut forward: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        forward.sort();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        for rev in ["true", "1", "yes", "on", "t", "y"] {
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &format!("reverse={rev}")).await,
+                reversed,
+                "official testAccountContainerListSortingReverse reverse={rev}"
+            );
+        }
+        for off in ["false", "no", "off", "", "garbage"] {
+            let q = if off.is_empty() {
+                "reverse=".to_string()
+            } else {
+                format!("reverse={off}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &q).await,
+                forward,
+                "official testAccountContainerListSorting reverse={off:?}"
+            );
+        }
+        let mut pref: Vec<String> = items
+            .iter()
+            .filter(|c| c.starts_with('a'))
+            .map(|s| (*s).to_string())
+            .collect();
+        pref.sort();
+        pref.reverse();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&prefix=a").await,
+            pref,
+            "official testAccountContainerListSortingByPrefix"
+        );
+        let empty =
+            listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&marker=B&end_marker=b1").await;
+        assert!(
+            empty.is_empty(),
+            "official testAccountContainerListSortingByReversedMarkers, got {empty:?}"
+        );
+        backend.abort();
+    }
+
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
     /// because HMAC lived only in `handle()`, which Hyper never calls.
     /// `prepare` must stamp `X-Backend-Authorize-Override` so
@@ -15447,6 +15570,37 @@ mod pipeline_async_tests {
                             .unwrap_or_default()
                     };
                     if logical == "/AUTH_test" {
+                        if is_get {
+                            let names: Vec<String> = containers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .cloned()
+                                .collect();
+                            let reverse = swift_core::config::config_true_value(&qparam("reverse"));
+                            let path = params
+                                .iter()
+                                .find(|(k, _)| k == "path")
+                                .map(|(_, v)| v.clone());
+                            let rows = listing_with_delimiter(
+                                &names,
+                                &qparam("prefix"),
+                                &qparam("delimiter"),
+                                reverse,
+                                &qparam("marker"),
+                                &qparam("end_marker"),
+                                qparam("limit").parse().ok(),
+                                path.as_deref(),
+                            );
+                            let payload = serde_json::to_vec(&rows).unwrap();
+                            write_backend_http(
+                                &mut stream,
+                                &[("Content-Type", "application/json")],
+                                &payload,
+                            )
+                            .await;
+                            return;
+                        }
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
                     }
