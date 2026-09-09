@@ -9815,14 +9815,14 @@ mod pipeline_async_tests {
     /// bytes. Dest GET `?multipart-manifest=get` then returns that body
     /// (not a JSON remanifest).
     struct SloCopyAssembleStub {
-        dest: Arc<std::sync::Mutex<Option<(HeaderKeyDict, Vec<u8>)>>>,
+        dest: Arc<std::sync::Mutex<Option<(String, HeaderKeyDict, Vec<u8>)>>>,
     }
     impl swift_middleware::Middleware for SloCopyAssembleStub {
         fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
             next(req)
         }
         fn intercepts_request(&self, req: &Request) -> bool {
-            req.path.starts_with("/v1/a/")
+            req.path.starts_with("/v1/a")
         }
         fn handle_request_async(
             &self,
@@ -9843,17 +9843,18 @@ mod pipeline_async_tests {
                 if req.path == "/v1/a/c/s1" {
                     return Response::with_body(200, b"one".to_vec());
                 }
-                if req.method == "PUT" && req.path == "/v1/a/c/copied-abcde" {
+                if req.method == "PUT" && req.path.ends_with("/c/copied-abcde") {
                     let headers = req.headers.clone();
                     let body = match req.body.materialize(u64::MAX) {
                         Ok(b) => b.to_vec(),
                         Err(_) => Vec::new(),
                     };
-                    *dest.lock().unwrap_or_else(|p| p.into_inner()) = Some((headers, body));
+                    *dest.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some((req.path.clone(), headers, body));
                     return Response::new(201);
                 }
-                if req.path == "/v1/a/c/copied-abcde" {
-                    if let Some((headers, body)) =
+                if req.path.ends_with("/c/copied-abcde") {
+                    if let Some((_path, headers, body)) =
                         dest.lock().unwrap_or_else(|p| p.into_inner()).clone()
                     {
                         let mut resp = if req.method == "HEAD" {
@@ -9918,7 +9919,7 @@ mod pipeline_async_tests {
             "official test_slo_copy COPY on Hyper, got {}",
             resp.status
         );
-        let (put_headers, put_body) = dest
+        let (_put_path, put_headers, put_body) = dest
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -9986,7 +9987,7 @@ mod pipeline_async_tests {
             "official test_slo_copy_the_manifest COPY on Hyper, got {}",
             resp.status
         );
-        let (put_headers, put_body) = dest
+        let (_put_path, put_headers, put_body) = dest
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -10063,7 +10064,7 @@ mod pipeline_async_tests {
             "official test_slo_copy_the_manifest_updating_metadata COPY on Hyper, got {}",
             resp.status
         );
-        let (put_headers, put_body) = dest
+        let (_put_path, put_headers, put_body) = dest
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -10099,6 +10100,79 @@ mod pipeline_async_tests {
             head.headers.get("Content-Type")
         );
         assert_eq!(head.headers.get("X-Object-Meta-Test"), Some("updated"));
+    }
+
+    #[tokio::test]
+    async fn slo_copy_account_destination_account_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        headers.set("Destination-Account", "a2");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_account COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_path, put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(
+            put_path, "/v1/a2/c/copied-abcde",
+            "Destination-Account must rewrite dest PUT path"
+        );
+        assert_eq!(
+            put_body, b"one",
+            "cross-account COPY must persist assembled SLO"
+        );
+        assert!(put_headers.get("X-Static-Large-Object").is_none());
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a2/c/copied-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"one",
+            "official test_slo_copy_account dest multipart-manifest=get is assembled"
+        );
     }
 
     /// Official TestSlo.test_slo_post_the_manifest_metadata_update: POST
@@ -10320,6 +10394,67 @@ mod pipeline_async_tests {
             "official test_slo_head_the_manifest on Hyper, got {:?}",
             head.headers.get("Content-Type")
         );
+    }
+
+    #[tokio::test]
+    async fn slo_get_raw_the_manifest_is_client_shaped_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get&format=raw".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_raw_the_manifest on Hyper, got {}",
+            resp.status
+        );
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/octet-stream"),
+            "official test_slo_get_raw_the_manifest keeps object Content-Type, got {:?}",
+            resp.headers.get("Content-Type")
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("raw manifest JSON");
+        let arr = value.as_array().expect("raw manifest list");
+        assert_eq!(arr.len(), 2);
+        let keys: std::collections::BTreeSet<_> = arr[0]
+            .as_object()
+            .expect("raw segment")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["etag", "path", "size_bytes"].into_iter().collect(),
+            "official test_slo_get_raw_the_manifest keys"
+        );
+        assert_eq!(arr[0]["path"], "/c/s1");
+        assert_eq!(arr[0]["size_bytes"], 3);
+        assert_eq!(arr[0]["etag"], "c4ca4238a0b923820dcc509a6f75849b");
     }
 
     #[tokio::test]
