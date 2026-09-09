@@ -130,6 +130,14 @@ fn slo_override(req: &Request) -> bool {
     config_true_value(req.headers.get("X-Backend-Slo-Override").unwrap_or(""))
 }
 
+/// IsolatedIdentity `versioned_writes._get_source_object` / `_put_versioned_obj`
+/// (swift.source=`VW`). Official `test_slo_manifest_version` archives the
+/// stored SLO JSON, not the assembled bytes. Hyper `reassemble_async` would
+/// otherwise expand the captured GET before VW PUTs the version.
+fn is_versioned_writes_source(req: &Request) -> bool {
+    req.headers.get("X-Backend-Source") == Some("VW")
+}
+
 /// One entry in a validated SLO manifest, as far as the Etag/size calculation
 /// is concerned.
 #[derive(Debug, Clone, PartialEq)]
@@ -1435,6 +1443,9 @@ fn slo_subreq(orig: &Request, path: String, range: Option<&str>) -> Request {
 
 impl Slo {
     fn handle_get_head(&self, mut req: Request, next: &NextFn) -> Response {
+        if is_versioned_writes_source(&req) {
+            return next(req);
+        }
         ignore_range(&mut req.headers, SLO_HEADER);
         let orig = req.clone_head();
         // Backend ETag is the physical JSON; evaluate If-* against the SLO
@@ -1750,6 +1761,9 @@ impl Slo {
     }
 
     async fn handle_get_head_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        if is_versioned_writes_source(&req) {
+            return next(req).await;
+        }
         ignore_range(&mut req.headers, SLO_HEADER);
         let orig = req.clone_head();
         strip_conditionals(&mut req.headers);
@@ -3868,6 +3882,9 @@ impl Middleware for Slo {
             if slo_override(&req) {
                 return next(req).await;
             }
+            if is_versioned_writes_source(&req) {
+                return next(req).await;
+            }
             if split_path(&req.path, 4, 4, true).is_err() {
                 if req.method == "GET" && split_path(&req.path, 3, 3, false).is_ok() {
                     let mut resp = next(req).await;
@@ -3921,6 +3938,9 @@ impl Middleware for Slo {
         }
         // GET/HEAD reassembles unless ?multipart-manifest=get asked for raw.
         if is_get_head {
+            if is_versioned_writes_source(&req) {
+                return next(req);
+            }
             return self.handle_get_head(req, next);
         }
         next(req)
@@ -4568,6 +4588,34 @@ mod tests {
         let err = reader.read_to_end(&mut out).unwrap_err();
         assert!(err.to_string().contains("/v1/a/c/missing"), "{err}");
         assert_eq!(out, b"one");
+    }
+
+    #[test]
+    fn test_vw_source_get_keeps_stored_manifest_json() {
+        // Official test_slo_manifest_version: versioned_writes copy-current
+        // must archive the stored JSON, not assembled bytes.
+        let manifest = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/s1", "bytes": 3, "hash": "abc"},
+        ]))
+        .unwrap();
+        let expected = manifest.clone();
+        let be: NextFn = Arc::new(move |_req: Request| {
+            let mut resp = Response::with_body(200, manifest.clone());
+            resp.headers.set("X-Static-Large-Object", "True");
+            resp
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Source", "VW");
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), expected);
     }
 
     #[test]

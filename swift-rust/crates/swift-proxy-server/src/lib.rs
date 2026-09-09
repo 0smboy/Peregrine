@@ -11323,6 +11323,278 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestSloWithVersioning.test_slo_manifest_version.
+    struct SloManifestVersionStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for SloManifestVersionStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/versions" {
+                    return Response::new(204);
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/versions" {
+                    let prefix = req
+                        .query_string
+                        .split('&')
+                        .find_map(|part| part.strip_prefix("prefix="))
+                        .unwrap_or("");
+                    let prefix = swift_http::unquote(prefix);
+                    let mut names: Vec<String> = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .keys()
+                        .filter_map(|path| path.strip_prefix("/v1/AUTH_test/versions/"))
+                        .filter(|name| prefix.is_empty() || name.starts_with(&prefix))
+                        .map(str::to_string)
+                        .collect();
+                    names.sort();
+                    names.reverse();
+                    let listing: Vec<serde_json::Value> = names
+                        .into_iter()
+                        .map(|name| {
+                            serde_json::json!({
+                                "name": name,
+                                "bytes": 1,
+                                "hash": "x",
+                                "content_type": "application/octet-stream",
+                            })
+                        })
+                        .collect();
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(b) => b,
+                        Err(_) => Vec::new(),
+                    };
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    return resp;
+                }
+                if req.method == "DELETE" {
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&req.path);
+                    return Response::new(204);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_manifest_version_archives_slo_on_hyper_path() {
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestVersionStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        let mut seg_a = HeaderKeyDict::new();
+        seg_a.set("Etag", "47bce5c74f589f4867dbd57e9ca9f808");
+        seg_a.set("Content-Length", "3");
+        store
+            .lock()
+            .unwrap()
+            .insert("/v1/AUTH_test/c/seg_a".into(), (seg_a, b"aaa".to_vec()));
+        let mut seg_b = HeaderKeyDict::new();
+        seg_b.set("Etag", "08f8e0260c6441850a3e202c8d8c4a70");
+        seg_b.set("Content-Length", "3");
+        store
+            .lock()
+            .unwrap()
+            .insert("/v1/AUTH_test/c/seg_b".into(), (seg_b, b"bbb".to_vec()));
+
+        let first = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": serde_json::Value::Null,
+            "size_bytes": serde_json::Value::Null
+        }]))
+        .unwrap();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", first.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers,
+                body: IncomingBody::from_bytes(first, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "first SLO PUT"
+        );
+
+        let second = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_b",
+            "etag": serde_json::Value::Null,
+            "size_bytes": serde_json::Value::Null
+        }]))
+        .unwrap();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", second.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers,
+                body: IncomingBody::from_bytes(second, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "second SLO PUT must archive the previous manifest"
+        );
+
+        let archived: Vec<String> = store
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|p| p.starts_with("/v1/AUTH_test/versions/"))
+            .cloned()
+            .collect();
+        assert_eq!(archived.len(), 1, "exactly one archived SLO: {archived:?}");
+        let version_path = archived[0].clone();
+        let (ver_headers, ver_body) = store.lock().unwrap().get(&version_path).unwrap().clone();
+        assert!(
+            ver_headers
+                .get("X-Static-Large-Object")
+                .is_some_and(config_true_value),
+            "archived version must stay an SLO, headers={ver_headers:?}"
+        );
+        let ver_json: serde_json::Value = serde_json::from_slice(&ver_body).unwrap_or_default();
+        assert!(
+            ver_json.is_array(),
+            "archived body must be stored manifest JSON, got {}",
+            String::from_utf8_lossy(&ver_body)
+        );
+
+        let mut get = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: version_path.clone(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(get.status, 200, "version multipart-manifest=get");
+        get.body.materialize(u64::MAX).unwrap();
+        let got = match &get.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        let listing: serde_json::Value = serde_json::from_slice(&got).expect("version JSON");
+        assert_eq!(listing[0]["name"], "/c/seg_a");
+
+        let mut assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: version_path,
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(assembled.status, 200, "version assembled GET");
+        assembled.body.materialize(u64::MAX).unwrap();
+        let assembled_body = match &assembled.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(assembled_body, b"aaa");
+
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+            .status,
+            204,
+            "DELETE current restores the archived SLO"
+        );
+        let mut restored = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        restored.body.materialize(u64::MAX).unwrap();
+        let restored_body = match &restored.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            restored_body, b"aaa",
+            "official test_slo_manifest_version restore on Hyper"
+        );
+    }
+
     /// Official TestDlo.test_copy: COPY a DLO manifest must PUT the
     /// assembled bytes and must not persist `X-Object-Manifest`.
     struct DloCopyAssembleStub {

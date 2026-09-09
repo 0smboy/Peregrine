@@ -453,6 +453,29 @@ fn put_has_version_id(query: &str) -> bool {
 /// Do not clone the incoming PUT's X-Symlink-Target / body headers onto the
 /// GET — that makes symlink middleware follow the *new* target (or the
 /// stored target) and archives md5(target) instead of md5('').
+/// Python `_put_versioned_obj`: `Content-Type += '; swift_bytes=' + slo_size`.
+fn stamp_slo_swift_bytes(headers: &mut swift_http::HeaderKeyDict) {
+    let Some(slo_size) = headers
+        .get("X-Object-Sysmeta-Slo-Size")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let ct = headers
+        .get("Content-Type")
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    if ct
+        .split(';')
+        .any(|part| part.trim().starts_with("swift_bytes="))
+    {
+        return;
+    }
+    headers.set("Content-Type", format!("{ct}; swift_bytes={slo_size}"));
+}
+
 fn legacy_source_get(path: &str, from: &swift_http::HeaderKeyDict) -> Request {
     let mut get = Request {
         method: "GET".to_string(),
@@ -1240,6 +1263,9 @@ impl VersionedWrites {
         if let Some(length) = content_length {
             archive_headers.set("Content-Length", length.to_string());
         }
+        // Python `_put_versioned_obj`: SLO archive/restore keeps sysmeta and
+        // stamps `swift_bytes=` from `X-Object-Sysmeta-Slo-Size`.
+        stamp_slo_swift_bytes(&mut archive_headers);
         // Object ETag must be md5 of the archived bytes. A followed GET
         // would copy the target ETag; drop it so the object server hashes
         // the (symlink) body.
@@ -1294,6 +1320,7 @@ impl VersionedWrites {
         if let Some(length) = content_length {
             put_headers.set("Content-Length", length.to_string());
         }
+        stamp_slo_swift_bytes(&mut put_headers);
         let put_path = format!("/{version}/{account}/{container}/{object}");
         let copied = next(AsyncRequest {
             method: "PUT".to_string(),
