@@ -11527,7 +11527,7 @@ mod pipeline_async_tests {
             String::from_utf8_lossy(&ver_body)
         );
 
-        let mut get = svc
+        let get = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: version_path.clone(),
