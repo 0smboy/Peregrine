@@ -10469,6 +10469,125 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Container-only TempURL keys (IsolatedIdentity TestContainerTempurl).
+    struct ContainerOnlyTempUrlKeys(Vec<String>);
+    impl swift_middleware::KeyProvider for ContainerOnlyTempUrlKeys {
+        fn keys_for(&self, _account: &str, _container: &str) -> Vec<String> {
+            self.0.clone()
+        }
+        fn scoped_keys_for(
+            &self,
+            _account: &str,
+            _container: &str,
+        ) -> swift_middleware::ScopedTempUrlKeys {
+            swift_middleware::ScopedTempUrlKeys {
+                account: Vec::new(),
+                container: self.0.clone(),
+            }
+        }
+    }
+
+    /// Official TestContainerTempurl.test_GET_DLO_outside_container: listing
+    /// a foreign segment container under a container-key TempURL is 401.
+    struct DloOutsideContainerStub {
+        foreign_listings: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for DloOutsideContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let foreign_listings = Arc::clone(&self.foreign_listings);
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/container/object" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "other/segs/");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.path == "/v1/AUTH_account/other" {
+                    *foreign_listings.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    let listing = serde_json::json!([
+                        {"name": "segs/1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"}
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/AUTH_account/other/segs/1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn container_tempurl_dlo_outside_container_is_401_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let foreign_listings = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloOutsideContainerStub {
+                    foreign_listings: Arc::clone(&foreign_listings),
+                }),
+            ],
+        };
+        for method in ["GET", "HEAD"] {
+            let mut resp = svc
+                .call(AsyncRequest {
+                    method: method.into(),
+                    path: "/v1/AUTH_account/container/object".into(),
+                    query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                    headers: HeaderKeyDict::new(),
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                resp.status, 401,
+                "official test_GET_DLO_outside_container {method} on Hyper, got {}",
+                resp.status
+            );
+            resp.body.materialize(u64::MAX).unwrap();
+            let body = match &resp.body {
+                swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+                _ => String::new(),
+            };
+            if method == "GET" {
+                assert!(
+                    body.contains("Temp URL invalid"),
+                    "container-scope DLO {method} 401 body, got {body:?}"
+                );
+            }
+        }
+        let listed = *foreign_listings.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            listed, 0,
+            "must not list the foreign segment container, listings={listed}"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
