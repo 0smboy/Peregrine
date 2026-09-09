@@ -9601,6 +9601,135 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainerPaths.testStructure (normalized_urls off).
+    #[tokio::test]
+    async fn container_list_path_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/paths", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let files = [
+            "/file1",
+            "/file A",
+            "/dir1/",
+            "/dir2/",
+            "/dir1/file2",
+            "/dir1/subdir1/",
+            "/dir1/subdir2/",
+            "/dir1/subdir1/file2",
+            "/dir1/subdir1/file3",
+            "/dir1/subdir1/file4",
+            "/dir1/subdir1/subsubdir1/",
+            "/dir1/subdir1/subsubdir1/file5",
+            "/dir1/subdir1/subsubdir1/file6",
+            "/dir1/subdir1/subsubdir1/file7",
+            "/dir1/subdir1/subsubdir1/file8",
+            "/dir1/subdir1/subsubdir2/",
+            "/dir1/subdir1/subsubdir2/file9",
+            "/dir1/subdir1/subsubdir2/file0",
+            "file1",
+            "dir1/",
+            "dir2/",
+            "dir1/file2",
+            "dir1/subdir1/",
+            "dir1/subdir2/",
+            "dir1/subdir1/file2",
+            "dir1/subdir1/file3",
+            "dir1/subdir1/file4",
+            "dir1/subdir1/subsubdir1/",
+            "dir1/subdir1/subsubdir1/file5",
+            "dir1/subdir1/subsubdir1/file6",
+            "dir1/subdir1/subsubdir1/file7",
+            "dir1/subdir1/subsubdir1/file8",
+            "dir1/subdir1/subsubdir2/",
+            "dir1/subdir1/subsubdir2/file9",
+            "dir1/subdir1/subsubdir2/file0",
+            "dir1/subdir with spaces/",
+            "dir1/subdir with spaces/file B",
+            "dir1/subdir+with{whatever/",
+            "dir1/subdir+with{whatever/file D",
+        ];
+        for name in files {
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/paths/{name}"),
+                "",
+                &[("Content-Length", "1")],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(put.status, 201, "PUT {name:?} got {}", put.status);
+        }
+        let mut expect = |mut names: Vec<&str>| -> Vec<String> {
+            names.sort();
+            names.into_iter().map(str::to_string).collect()
+        };
+        let qpath = |p: &str| format!("path={}", p.replace(' ', "%20"));
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/")).await,
+            expect(vec!["/dir1/", "/dir2/", "/file1", "/file A"]),
+            "official testStructure path=/"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1")).await,
+            expect(vec!["/dir1/file2", "/dir1/subdir1/", "/dir1/subdir2/"]),
+            "official testStructure path=/dir1"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1/")).await,
+            expect(vec!["/dir1/file2", "/dir1/subdir1/", "/dir1/subdir2/"]),
+            "official testStructure path=/dir1/"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("")).await,
+            expect(vec!["file1", "dir1/", "dir2/"]),
+            "official testStructure path="
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("dir1")).await,
+            expect(vec![
+                "dir1/file2",
+                "dir1/subdir1/",
+                "dir1/subdir2/",
+                "dir1/subdir with spaces/",
+                "dir1/subdir+with{whatever/",
+            ]),
+            "official testStructure path=dir1"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("dir1/subdir1")).await,
+            expect(vec![
+                "dir1/subdir1/file4",
+                "dir1/subdir1/subsubdir2/",
+                "dir1/subdir1/file2",
+                "dir1/subdir1/file3",
+                "dir1/subdir1/subsubdir1/",
+            ]),
+            "official testStructure path=dir1/subdir1"
+        );
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/paths",
+                &qpath("dir1/subdir with spaces/")
+            )
+            .await,
+            expect(vec!["dir1/subdir with spaces/file B"]),
+            "official testStructure path=dir1/subdir with spaces/"
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1/subdir2"))
+                .await
+                .is_empty(),
+            "official testStructure path=/dir1/subdir2 empty"
+        );
+        backend.abort();
+    }
+
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
     /// because HMAC lived only in `handle()`, which Hyper never calls.
     /// `prepare` must stamp `X-Backend-Authorize-Override` so
@@ -15189,7 +15318,23 @@ mod pipeline_async_tests {
         marker: &str,
         end_marker: &str,
         limit: Option<usize>,
+        path: Option<&str>,
     ) -> Vec<serde_json::Value> {
+        let (prefix_owned, delimiter_owned, path_eq, path_mode) = match path {
+            Some(p) if p.is_empty() => (String::new(), "/".to_string(), String::new(), true),
+            Some(p) => {
+                let stripped = format!("{}/", p.trim_end_matches('/'));
+                (stripped.clone(), "/".to_string(), stripped, true)
+            }
+            None => (
+                prefix.to_string(),
+                delimiter.to_string(),
+                String::new(),
+                false,
+            ),
+        };
+        let prefix = prefix_owned.as_str();
+        let delimiter = delimiter_owned.as_str();
         let mut filtered: Vec<&String> = names.iter().filter(|n| n.starts_with(prefix)).collect();
         filtered.sort();
         if !marker.is_empty() {
@@ -15216,6 +15361,27 @@ mod pipeline_async_tests {
         let mut seen = std::collections::BTreeSet::new();
         let mut rows = Vec::new();
         for name in filtered {
+            if path_mode {
+                if name.as_str() == path_eq {
+                    continue;
+                }
+                if !delimiter.is_empty() {
+                    let rest = &name[prefix.len()..];
+                    if let Some(idx) = rest.find(delimiter) {
+                        if name.len() > prefix.len() + idx + delimiter.len() {
+                            continue;
+                        }
+                    }
+                }
+                rows.push(serde_json::json!({
+                    "name": name,
+                    "bytes": 0,
+                    "hash": "x",
+                    "content_type": "text/plain",
+                    "last_modified": "2010-01-01T00:00:00.000000",
+                }));
+                continue;
+            }
             if !delimiter.is_empty() {
                 let rest = &name[prefix.len()..];
                 if let Some(idx) = rest.find(delimiter) {
@@ -15339,6 +15505,9 @@ mod pipeline_async_tests {
                             .cloned()
                             .unwrap_or_default();
                         let reverse = swift_core::config::config_true_value(&qparam("reverse"));
+                        let path = query
+                            .split('&')
+                            .find_map(|part| part.strip_prefix("path=").map(swift_http::unquote));
                         let rows = listing_with_delimiter(
                             &names,
                             &qparam("prefix"),
@@ -15347,6 +15516,7 @@ mod pipeline_async_tests {
                             &qparam("marker"),
                             &qparam("end_marker"),
                             qparam("limit").parse().ok(),
+                            path.as_deref(),
                         );
                         let payload = serde_json::to_vec(&rows).unwrap();
                         write_backend_http(
