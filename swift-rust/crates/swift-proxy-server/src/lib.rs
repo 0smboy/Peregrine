@@ -10942,6 +10942,118 @@ mod pipeline_async_tests {
         );
     }
 
+    #[tokio::test]
+    async fn slo_get_simple_manifest_assembles_without_conditionals_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_simple_manifest on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("unconditional SLO GET body");
+        assert_eq!(body, b"aaabbb");
+    }
+
+    /// Official TestSlo.test_slo_container_listing: listing `bytes` is the
+    /// assembled size (`swift_bytes`), `hash` is the physical manifest etag.
+    struct SloContainerListingStub;
+    impl swift_middleware::Middleware for SloContainerListingStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.method == "GET" && req.path == "/v1/a/c"
+        }
+        fn handle_request_async(
+            &self,
+            _req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let listing = serde_json::json!([{
+                    "name": "manifest-a",
+                    "bytes": 1,
+                    "hash": "c4ca4238a0b923820dcc509a6f75849b; slo_etag=slohash",
+                    "content_type": "application/octet-stream;swift_bytes=3",
+                }]);
+                let mut resp = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                resp.headers
+                    .set("Content-Type", "application/json; charset=utf-8");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_container_listing_uses_slo_size_and_manifest_etag_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloContainerListingStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c".into(),
+                query_string: "format=json".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200);
+        let body = resp.body.collect_async().await.expect("listing body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("listing JSON");
+        assert_eq!(
+            v[0]["bytes"], 3,
+            "official test_slo_container_listing bytes=assembled"
+        );
+        assert_eq!(
+            v[0]["hash"], "c4ca4238a0b923820dcc509a6f75849b",
+            "official test_slo_container_listing hash=manifest-get etag"
+        );
+        assert_eq!(
+            v[0]["content_type"], "application/octet-stream",
+            "listing must strip swift_bytes"
+        );
+    }
+
     /// Official TestSlo.test_slo_get_nested_manifest /
     /// test_slo_etag_is_hash_of_etags_submanifests.
     struct SloNestedManifestStub;
