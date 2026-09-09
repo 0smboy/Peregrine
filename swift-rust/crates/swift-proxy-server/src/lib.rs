@@ -8930,6 +8930,171 @@ mod pipeline_async_tests {
             "bad HMAC on Hyper path must use TempURL 401 body, got {body:?}"
         );
     }
+
+    fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
+        let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
+                    [storage-policy:1]\nname = unu\n";
+        swift_core::storage_policy::parse_storage_policies(
+            &swift_core::config::SwiftConfig::parse_lenient(conf, &[], false).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Field H1: Hyper used to skip AccountQuotas.handle(), so account POST
+    /// of X-Account-Quota-Bytes returned 204. intercepts_request must run.
+    #[tokio::test]
+    async fn account_quotas_hyper_path_user_cannot_set_quota_bytes() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig::default(),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::AccountQuotas::new(
+                account_quota_policies(),
+            ))],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Account-Quota-Bytes", "5000");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "non-reseller quota set on Hyper path must be 403, got {} {:?}",
+            resp.status, resp.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn account_quotas_hyper_path_user_cannot_set_legacy_quota_bytes() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig::default(),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::AccountQuotas::new(
+                account_quota_policies(),
+            ))],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Account-Meta-Quota-Bytes", "99999");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "legacy quota meta on Hyper path must be 403, got {}",
+            resp.status
+        );
+    }
+
+    #[tokio::test]
+    async fn account_quotas_hyper_path_reseller_can_set_after_tempauth() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test", "reseller", "reselling", &[".reseller_admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::AccountQuotas::new(account_quota_policies())),
+                Arc::new(ta),
+            ],
+        };
+
+        let token = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-User", "test:reseller");
+            headers.set("X-Auth-Key", "reselling");
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "GET".into(),
+                    path: "/auth/v1.0".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(resp.status, 200);
+            resp.headers.get("X-Auth-Token").unwrap().to_string()
+        };
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", &token);
+        headers.set("X-Account-Quota-Bytes", "5000");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 403,
+            "reseller must pass AccountQuotas on Hyper (got {} {:?})",
+            resp.status, resp.reason
+        );
+
+        let tester_token = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-User", "test:tester");
+            headers.set("X-Auth-Key", "testing");
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "GET".into(),
+                    path: "/auth/v1.0".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            resp.headers.get("X-Auth-Token").unwrap().to_string()
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", &tester_token);
+        headers.set("X-Account-Quota-Bytes", "5000");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            ".admin tester must still be 403 on Hyper, got {}",
+            resp.status
+        );
+    }
 }
 
 #[cfg(test)]

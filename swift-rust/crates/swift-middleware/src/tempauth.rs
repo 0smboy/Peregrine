@@ -500,6 +500,14 @@ impl Middleware for TempAuth {
             }
         }
         req.headers.set("X-Backend-Remote-User", groups.join(","));
+        // Python TempAuth sets environ['reseller_request'] for .reseller_admin.
+        // AccountQuotas (and the proxy) read X-Backend-Reseller-Request after
+        // this prepare phase; without the stamp, reseller set is 403'd.
+        if groups.iter().any(|g| g == ".reseller_admin") {
+            req.headers.set("X-Backend-Reseller-Request", "true");
+        } else {
+            req.headers.remove("X-Backend-Reseller-Request");
+        }
         MwPrep::Continue
     }
 
@@ -562,6 +570,22 @@ mod tests {
             *s2.lock().unwrap() = r
                 .headers
                 .get("X-Backend-Remote-User")
+                .map(|s| s.to_string());
+            Response::new(204)
+        });
+        (seen, app)
+    }
+
+    fn recording_reseller_app() -> (
+        Arc<Mutex<Option<String>>>,
+        Arc<dyn Fn(Request) -> Response + Send + Sync>,
+    ) {
+        let seen = Arc::new(Mutex::new(None));
+        let s2 = seen.clone();
+        let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(move |r: Request| {
+            *s2.lock().unwrap() = r
+                .headers
+                .get("X-Backend-Reseller-Request")
                 .map(|s| s.to_string());
             Response::new(204)
         });
@@ -897,6 +921,81 @@ mod tests {
                 .unwrap()
                 .status,
             403
+        );
+    }
+
+    #[test]
+    fn test_prepare_stamps_reseller_request_for_reseller_admin() {
+        let mut ta = TempAuth::new("http://h:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test", "reseller", "reselling", &[".reseller_admin"]);
+
+        let token_admin = {
+            let resp = ta.handle(
+                mk(
+                    "GET",
+                    "/auth/v1.0",
+                    &[("X-Auth-User", "test:tester"), ("X-Auth-Key", "testing")],
+                ),
+                &(std::sync::Arc::new(|_r| Response::new(500)) as crate::NextFn),
+            );
+            resp.headers.get("X-Auth-Token").unwrap().to_string()
+        };
+        let token_reseller = {
+            let resp = ta.handle(
+                mk(
+                    "GET",
+                    "/auth/v1.0",
+                    &[("X-Auth-User", "test:reseller"), ("X-Auth-Key", "reselling")],
+                ),
+                &(std::sync::Arc::new(|_r| Response::new(500)) as crate::NextFn),
+            );
+            resp.headers.get("X-Auth-Token").unwrap().to_string()
+        };
+
+        let (seen, app) = recording_reseller_app();
+        ta.handle(
+            mk("POST", "/v1/AUTH_test", &[("X-Auth-Token", &token_admin)]),
+            &app,
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            None,
+            ".admin must not stamp X-Backend-Reseller-Request"
+        );
+
+        let (seen, app) = recording_reseller_app();
+        ta.handle(
+            mk(
+                "POST",
+                "/v1/AUTH_test",
+                &[("X-Auth-Token", &token_reseller)],
+            ),
+            &app,
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("true"),
+            ".reseller_admin must stamp X-Backend-Reseller-Request"
+        );
+
+        // Forged inbound stamp is dropped for a non-reseller.
+        let (seen, app) = recording_reseller_app();
+        ta.handle(
+            mk(
+                "POST",
+                "/v1/AUTH_test",
+                &[
+                    ("X-Auth-Token", &token_admin),
+                    ("X-Backend-Reseller-Request", "true"),
+                ],
+            ),
+            &app,
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            None,
+            "forged reseller stamp must be cleared for .admin"
         );
     }
 }
