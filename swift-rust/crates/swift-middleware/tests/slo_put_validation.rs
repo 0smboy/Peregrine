@@ -445,6 +445,68 @@ fn wrong_size_is_rejected() {
 }
 
 #[test]
+fn missing_etag_key_is_400_null_etag_is_201() {
+    let (missing, writes) = run_manifest_put(
+        json!([{"path": "/c/segment", "size_bytes": 3}]),
+        vec![("/v1/a/c/segment", head_response("actual", 3))],
+    );
+    assert_eq!(missing.status, 400, "official test_slo_missing_etag");
+    assert!(
+        body_string(&missing).contains("missing keys \"etag\""),
+        "{}",
+        body_string(&missing)
+    );
+    assert!(writes.is_empty());
+
+    let (ok, writes) = run_manifest_put(
+        json!([{"path": "/c/segment", "etag": serde_json::Value::Null, "size_bytes": 3}]),
+        vec![("/v1/a/c/segment", head_response("actual", 3))],
+    );
+    assert_eq!(ok.status, 201, "official test_slo_unspecified_etag");
+    assert_eq!(writes.len(), 1);
+}
+
+#[test]
+fn missing_size_key_is_400_null_size_is_201() {
+    let (missing, writes) = run_manifest_put(
+        json!([{"path": "/c/segment", "etag": "actual"}]),
+        vec![("/v1/a/c/segment", head_response("actual", 3))],
+    );
+    assert_eq!(missing.status, 400, "official test_slo_missing_size");
+    assert!(
+        body_string(&missing).contains("missing keys \"size_bytes\""),
+        "{}",
+        body_string(&missing)
+    );
+    assert!(writes.is_empty());
+
+    let (ok, writes) = run_manifest_put(
+        json!([{"path": "/c/segment", "etag": "actual", "size_bytes": serde_json::Value::Null}]),
+        vec![("/v1/a/c/segment", head_response("actual", 3))],
+    );
+    assert_eq!(ok.status, 201, "official test_slo_unspecified_size");
+    assert_eq!(writes.len(), 1);
+}
+
+#[test]
+fn manifest_must_not_include_itself() {
+    let (response, writes) = run_manifest_put(
+        json!([{"path": "/c/manifest", "etag": "actual", "size_bytes": 3}]),
+        vec![("/v1/a/c/segment", head_response("actual", 3))],
+    );
+    assert_eq!(
+        response.status, 400,
+        "official test_slo_overwrite_segment_with_manifest"
+    );
+    assert!(
+        body_string(&response).contains("manifest must not include itself"),
+        "{}",
+        body_string(&response)
+    );
+    assert!(writes.is_empty());
+}
+
+#[test]
 fn path_must_identify_a_container_and_object() {
     let (response, writes) = run_manifest_put(
         json!([{"path": "object-only", "etag": "actual", "size_bytes": 3}]),

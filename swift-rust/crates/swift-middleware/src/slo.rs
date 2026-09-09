@@ -3192,6 +3192,21 @@ fn validate_put_entries(
             errors.push(format!("Index {i}: extraneous keys {}", extras.join(", ")));
             continue;
         }
+        // IsolatedIdentity Swift 2.9: keys are required, values may be null
+        // (official test_slo_missing_etag / test_slo_unspecified_etag).
+        let missing: Vec<&str> = ["etag", "path", "size_bytes"]
+            .into_iter()
+            .filter(|key| !e.contains_key(*key))
+            .collect();
+        if !missing.is_empty() {
+            let listed = missing
+                .iter()
+                .map(|key| format!("\"{key}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            errors.push(format!("Index {i}: missing keys {listed}"));
+            continue;
+        }
         has_object_backed = true;
         let stripped_path = path.trim_matches('/');
         let valid_path = stripped_path

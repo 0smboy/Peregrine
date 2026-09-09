@@ -10297,6 +10297,157 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestSlo PUT validation: segment HEAD etag/size, required keys,
+    /// and no self-segment (IsolatedIdentity Swift 2.9).
+    struct SloPutValidationStub;
+    impl swift_middleware::Middleware for SloPutValidationStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_a" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "actual");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.method == "PUT" {
+                    let _ = req.body.materialize(u64::MAX);
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    async fn slo_put_manifest_on_hyper(path: &str, body: Vec<u8>) -> Response {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloPutValidationStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", body.len().to_string());
+        svc.call(AsyncRequest {
+            method: "PUT".into(),
+            path: path.into(),
+            query_string: "multipart-manifest=put".into(),
+            headers,
+            body: IncomingBody::from_bytes(body, u64::MAX),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn slo_put_validation_official_matrix_on_hyper_path() {
+        let etag_mismatch = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "not it",
+            "size_bytes": 3
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-bad-etag", etag_mismatch)
+                .await
+                .status,
+            400,
+            "official test_slo_etag_mismatch"
+        );
+        let size_mismatch = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "actual",
+            "size_bytes": 2
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-bad-size", size_mismatch)
+                .await
+                .status,
+            400,
+            "official test_slo_size_mismatch"
+        );
+        let missing_etag = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "size_bytes": 3
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-missing-etag", missing_etag)
+                .await
+                .status,
+            400,
+            "official test_slo_missing_etag"
+        );
+        let missing_size = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "actual"
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-missing-size", missing_size)
+                .await
+                .status,
+            400,
+            "official test_slo_missing_size"
+        );
+        let null_etag = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": serde_json::Value::Null,
+            "size_bytes": 3
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-unspecified-etag", null_etag)
+                .await
+                .status,
+            201,
+            "official test_slo_unspecified_etag"
+        );
+        let null_size = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "actual",
+            "size_bytes": serde_json::Value::Null
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-unspecified-size", null_size)
+                .await
+                .status,
+            201,
+            "official test_slo_unspecified_size"
+        );
+        let self_seg = serde_json::to_vec(&serde_json::json!([
+            {"path": "/c/seg_a", "etag": "actual", "size_bytes": 3},
+            {"path": "/c/seg_b", "etag": "actual", "size_bytes": 3}
+        ]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/seg_b", self_seg)
+                .await
+                .status,
+            400,
+            "official test_slo_overwrite_segment_with_manifest"
+        );
+    }
+
     /// Official TestSlo.test_slo_get_the_manifest / test_slo_head_the_manifest.
     struct SloManifestGetStub;
     impl swift_middleware::Middleware for SloManifestGetStub {
