@@ -8218,6 +8218,16 @@ const SWIFT_OWNER_HEADERS: &[&str] = &[
     "X-Account-Access-Control",
 ];
 
+/// Python container-server translates `X-Remove-Container-*` into an empty
+/// ACL/meta write. IsolatedIdentity account-RW can POST those remove keys
+/// even after the matching `swift_owner_headers` values are popped.
+fn owner_remove_header(name: &str) -> String {
+    match name.strip_prefix("X-") {
+        Some(rest) => format!("X-Remove-{rest}"),
+        None => format!("X-Remove-{name}"),
+    }
+}
+
 /// Strip privileged account/container headers for non-owners (Python
 /// `swift_owner_headers`).
 fn strip_owner_headers(resp: &mut Response, swift_owner: bool) {
@@ -8238,6 +8248,7 @@ fn scrub_owner_request_headers(req: &mut Request, swift_owner: bool) {
     }
     for name in SWIFT_OWNER_HEADERS {
         req.headers.remove(name);
+        req.headers.remove(&owner_remove_header(name));
     }
 }
 
@@ -9102,6 +9113,76 @@ mod pipeline_async_tests {
             resp.status, 403,
             "owner versions-location POST must pass the owner gate, got {} {:?}",
             resp.status, resp.reason
+        );
+    }
+
+    /// IsolatedIdentity Hyper never calls `NameCheck::handle()`. Forbidden
+    /// characters must 400 from `prepare()`.
+    #[tokio::test]
+    async fn name_check_hyper_path_rejects_forbidden_character() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::NameCheck::default())],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/foo\"bar".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("forbidden chars"),
+            "name_check Hyper 400 body must match handle(), got {body:?}"
+        );
+    }
+
+    /// IsolatedIdentity Hyper never calls `Crossdomain::handle()`.
+    #[tokio::test]
+    async fn crossdomain_hyper_path_serves_policy_xml() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::Crossdomain::default())],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/crossdomain.xml".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("<cross-domain-policy>"),
+            "crossdomain Hyper body must be the policy document, got {body:?}"
         );
     }
 
@@ -11615,6 +11696,47 @@ mod p1a_wiring_tests {
         assert!(req.headers.get("X-Container-Read").is_none());
         assert!(req.headers.get("X-Container-Write").is_none());
         assert!(req.headers.get("X-Container-Sync-Key").is_none());
+    }
+
+    /// IsolatedIdentity leftover: account-RW POST `X-Remove-Container-Read`
+    /// used to reach the container server and clear the ACL after the
+    /// matching `X-Container-Read` was already popped.
+    #[test]
+    fn non_owner_container_put_post_cannot_remove_privileged_headers() {
+        for method in ["PUT", "POST"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Remove-Container-Read", "x");
+            headers.set("X-Remove-Container-Write", "x");
+            headers.set("X-Remove-Container-Sync-Key", "x");
+            headers.set("X-Remove-Container-Sync-To", "x");
+            headers.set("X-Remove-Container-Meta-Temp-Url-Key", "x");
+            headers.set("X-Remove-Container-Meta-Color", "x");
+            let mut req = Request {
+                method: method.into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::Body::empty(),
+            };
+            scrub_container_write_owner_headers(&mut req);
+            for name in [
+                "X-Remove-Container-Read",
+                "X-Remove-Container-Write",
+                "X-Remove-Container-Sync-Key",
+                "X-Remove-Container-Sync-To",
+                "X-Remove-Container-Meta-Temp-Url-Key",
+            ] {
+                assert!(
+                    req.headers.get(name).is_none(),
+                    "{method} !swift_owner left {name}"
+                );
+            }
+            assert_eq!(
+                req.headers.get("X-Remove-Container-Meta-Color"),
+                Some("x"),
+                "{method} must keep unprivileged X-Remove-Container-Meta-*"
+            );
+        }
     }
 
     /// Official test_versioning_container_acl: account2 / account-RW
