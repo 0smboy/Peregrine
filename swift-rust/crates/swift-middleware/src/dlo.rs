@@ -784,6 +784,11 @@ impl DynamicLargeObject {
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
 
+        let list_path = format!("/{version}/{account}/{container}");
+        if !crate::tempurl_path_in_scope(req, &list_path) {
+            return crate::tempurl_out_of_scope(&req.method);
+        }
+
         let segments = match self
             .get_container_listing(req, &version, &account, container, obj_prefix, next)
         {
@@ -985,6 +990,10 @@ impl DynamicLargeObject {
         };
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
+        let list_path = format!("/{version}/{account}/{container}");
+        if !crate::tempurl_path_in_scope(&orig, &list_path) {
+            return crate::tempurl_out_of_scope(&orig.method);
+        }
         let list_req = listing_subrequest(&orig, &version, &account, container, obj_prefix, None);
         let mut list_resp = next(list_req).await;
         if !(200..300).contains(&list_resp.status) {
@@ -1359,6 +1368,63 @@ mod tests {
         assert_eq!(body_of(&mut resp), b"onetwothree");
         assert_eq!(resp.headers.get("Content-Type"), Some("text/jibberish"));
         assert_eq!(resp.headers.get("Content-Length"), Some("11"));
+    }
+
+    /// Official TestContainerTempurl.test_GET_DLO_outside_container: a
+    /// container-scoped TempURL must 401 before listing another container.
+    #[test]
+    fn test_container_tempurl_dlo_outside_container_is_401() {
+        let dlo = DynamicLargeObject::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let listing = listing_json(&[("segs/1", 3, &md5_hex(b"one"))]);
+        let be: NextFn = Arc::new(move |req: Request| {
+            log2.lock()
+                .unwrap()
+                .push((req.method.clone(), req.path.clone()));
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                return manifest_response("other/segs/");
+            }
+            if req.path == "/v1/a/other" {
+                return Response::with_body(200, listing.clone());
+            }
+            Response::new(404)
+        });
+        let mut req = get_req("/v1/a/c/manifest", None);
+        req.headers
+            .set(crate::TEMPURL_ALLOWED_PREFIX_HEADER, "/v1/a/c");
+        let mut resp = dlo.handle(req, &be);
+        assert_eq!(resp.status, 401);
+        assert!(
+            String::from_utf8_lossy(&body_of(&mut resp)).contains("Temp URL invalid"),
+            "container-scope DLO must use TempURL 401 body"
+        );
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.iter().all(|(_, path)| path != "/v1/a/other"),
+            "must not list the foreign container, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_account_tempurl_dlo_outside_container_still_assembles() {
+        let dlo = DynamicLargeObject::new();
+        let listing = listing_json(&[("segs/1", 3, &md5_hex(b"one"))]);
+        let be: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                return manifest_response("other/segs/");
+            }
+            if req.path == "/v1/a/other" {
+                return Response::with_body(200, listing.clone());
+            }
+            if req.path == "/v1/a/other/segs/1" {
+                return Response::with_body(200, b"one".to_vec());
+            }
+            Response::new(404)
+        });
+        let mut resp = dlo.handle(get_req("/v1/a/c/manifest", None), &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), b"one");
     }
 
     #[test]

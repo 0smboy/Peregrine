@@ -5118,11 +5118,26 @@ impl ProxyApp {
     /// backend is visible to TempURL validation on another without waiting
     /// for a stale per-process TTL.
     pub fn temp_url_keys(&self, account: &str, container: &str) -> Vec<String> {
-        let mut keys = self.account_info(account).temp_url_keys;
-        if !container.is_empty() {
-            keys.extend(self.container_info(account, container).temp_url_keys);
-        }
+        let scoped = self.temp_url_keys_scoped(account, container);
+        let mut keys = scoped.account;
+        keys.extend(scoped.container);
         keys
+    }
+
+    /// Account vs container Temp-URL keys (Python `_get_keys` scopes).
+    pub fn temp_url_keys_scoped(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> swift_middleware::ScopedTempUrlKeys {
+        swift_middleware::ScopedTempUrlKeys {
+            account: self.account_info(account).temp_url_keys,
+            container: if container.is_empty() {
+                Vec::new()
+            } else {
+                self.container_info(account, container).temp_url_keys
+            },
+        }
     }
 
     /// `get_container_info`-lite: the container's storage-policy index only.

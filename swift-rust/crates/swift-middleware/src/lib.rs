@@ -139,7 +139,10 @@ pub use slo::{
 pub use staticweb::{build_listing_html, html_escape, human_readable, ListingItem, StaticWeb};
 pub use symlink::Symlink;
 pub use tempauth::{TempAuth, UserRecord};
-pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};
+pub use tempurl::{
+    tempurl_out_of_scope, tempurl_path_in_scope, ClosureKeyProvider, KeyProvider,
+    ScopedTempUrlKeys, TempUrl, TEMPURL_ALLOWED_PREFIX_HEADER,
+};
 pub use versioned_writes::{
     versions_object_name, VersionedWrites,
     AUTHORIZE_ONLY_HEADER as VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,
