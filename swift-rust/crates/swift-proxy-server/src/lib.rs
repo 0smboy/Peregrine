@@ -9444,6 +9444,345 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Object-server apply_conditional on the physical SLO JSON ETag.
+    /// Official TestSlo.test_slo_if_match_get uses the assembled SLO ETag.
+    struct SloIfMatchObjectServerStub;
+    impl swift_middleware::Middleware for SloIfMatchObjectServerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if (req.method == "GET" || req.method == "HEAD")
+                    && req.path == "/v1/a/c/manifest"
+                    && (req.headers.get("If-Match").is_some()
+                        || req.headers.get("If-None-Match").is_some())
+                {
+                    return Response::error(412, "Precondition Failed");
+                }
+                if req.path == "/v1/a/c/manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-json");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_if_match_assembled_etag_is_200_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head.status, 200,
+            "HEAD SLO must assemble, got {}",
+            head.status
+        );
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled SLO Etag")
+            .to_string();
+        assert_ne!(etag, "physical-json", "must not leak physical JSON etag");
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-Match", &etag);
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_if_match_get on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"one");
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-Match", format!("not-{etag}"));
+        let miss_resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_resp.status, 412,
+            "official test_slo_if_match_get miss on Hyper, got {}",
+            miss_resp.status
+        );
+        let mut head_ok = HeaderKeyDict::new();
+        head_ok.set("If-Match", &etag);
+        let head_match = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_ok,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_match.status, 200,
+            "official test_slo_if_match_head on Hyper, got {}",
+            head_match.status
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_if_none_match_assembled_etag_is_304_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled SLO Etag")
+            .to_string();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", &etag);
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 304,
+            "official test_slo_if_none_match_get on Hyper, got {}",
+            resp.status
+        );
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-None-Match", format!("not-{etag}"));
+        let mut miss_resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_resp.status, 200,
+            "official test_slo_if_none_match_get miss on Hyper, got {}",
+            miss_resp.status
+        );
+        miss_resp.body.materialize(u64::MAX).unwrap();
+        let body = match &miss_resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"one");
+        let mut head_inm = HeaderKeyDict::new();
+        head_inm.set("If-None-Match", &etag);
+        let head_304 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_inm,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_304.status, 304,
+            "official test_slo_if_none_match_head on Hyper, got {}",
+            head_304.status
+        );
+    }
+
+    /// Official TestSlo.test_slo_if_none_match_put: non-`*` is 400;
+    /// first `*` creates; second `*` is object-server 412.
+    struct SloIfNoneMatchPutStub {
+        created: std::sync::Mutex<bool>,
+    }
+    impl swift_middleware::Middleware for SloIfNoneMatchPutStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_a" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "e");
+                    resp.headers.set("Content-Length", "1");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path == "/v1/a/c/manifest-if-none-match" {
+                    let _ = req.body.materialize(u64::MAX);
+                    if req.headers.get("If-None-Match") == Some("*") {
+                        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+                        if *created {
+                            return Response::error(412, "Precondition Failed");
+                        }
+                        *created = true;
+                    }
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_if_none_match_put_is_400_then_201_then_412_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloIfNoneMatchPutStub {
+                    created: std::sync::Mutex::new(false),
+                }),
+            ],
+        };
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "size_bytes": 1,
+            "etag": serde_json::Value::Null,
+            "path": "/c/seg_a"
+        }]))
+        .unwrap();
+        let mut bad = HeaderKeyDict::new();
+        bad.set("If-None-Match", "\"not-star\"");
+        bad.set("Content-Length", manifest.len().to_string());
+        let bad_resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-if-none-match".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: bad,
+                body: IncomingBody::from_bytes(manifest.clone(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_resp.status, 400,
+            "official test_slo_if_none_match_put not-star on Hyper, got {}",
+            bad_resp.status
+        );
+        let mut first = HeaderKeyDict::new();
+        first.set("If-None-Match", "*");
+        first.set("Content-Length", manifest.len().to_string());
+        let first_resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-if-none-match".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: first,
+                body: IncomingBody::from_bytes(manifest.clone(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            first_resp.status, 201,
+            "official test_slo_if_none_match_put first * on Hyper, got {}",
+            first_resp.status
+        );
+        let mut second = HeaderKeyDict::new();
+        second.set("If-None-Match", "*");
+        second.set("Content-Length", manifest.len().to_string());
+        let second_resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-if-none-match".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: second,
+                body: IncomingBody::from_bytes(manifest, u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            second_resp.status, 412,
+            "official test_slo_if_none_match_put second * on Hyper, got {}",
+            second_resp.status
+        );
+    }
+
     /// Official listing_formats test_GET_HEAD_content_type: HEAD
     /// `?format=json` must stamp application/json even when the backend
     /// HEAD is a 204 text/plain.
