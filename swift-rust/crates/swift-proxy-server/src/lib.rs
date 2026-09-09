@@ -9550,11 +9550,22 @@ mod pipeline_async_tests {
     }
 
     fn seed_container_acl(app: &ProxyApp, account: &str, container: &str, acl: Option<&str>) {
+        seed_container_rw(app, account, container, acl, None);
+    }
+
+    fn seed_container_rw(
+        app: &ProxyApp,
+        account: &str,
+        container: &str,
+        read_acl: Option<&str>,
+        write_acl: Option<&str>,
+    ) {
         app.info_cache.set_container(
             format!("{account}/{container}"),
             ContainerInfo {
                 status: 204,
-                read_acl: acl.map(str::to_string),
+                read_acl: read_acl.map(str::to_string),
+                write_acl: write_acl.map(str::to_string),
                 ..Default::default()
             },
             60.0,
@@ -15458,6 +15469,547 @@ mod pipeline_async_tests {
             "owner versions-location POST must pass the owner gate, got {} {:?}",
             resp.status, resp.reason
         );
+    }
+
+    /// Official `test_versioning_container_acl` write path on Hyper.
+    /// Account2 has source write ACL; versions is `X-Container-Write: ''`.
+    /// Must hit `authorize_async` (no intercepting stub): ACL writer
+    /// overwrite archives, source DELETE restores, writer cannot
+    /// GET/DELETE versions objects, user3 cannot write/delete source.
+    async fn spawn_versioning_container_acl_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (HeaderKeyDict, Vec<u8>),
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let location = Arc::clone(&location);
+                let objects = Arc::clone(&objects);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_post = first.starts_with("POST ");
+                    let is_get = first.starts_with("GET ");
+                    let is_delete = first.starts_with("DELETE ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    let header = |want: &str| -> Option<String> {
+                        text.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case(want).then(|| v.trim().to_string())
+                            })
+                        })
+                    };
+                    if shard && !logical.contains("/obj") && !logical.contains("/versions/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if logical == "/AUTH_test" {
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if logical == "/AUTH_test/c" {
+                        if is_post || is_put {
+                            if let Some(v) = header("X-Container-Sysmeta-Versions-Location") {
+                                *location.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    if v.is_empty() { None } else { Some(v) };
+                            }
+                        }
+                        let loc = location.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let mut extra: Vec<(String, String)> =
+                            vec![("X-Container-Write".into(), "test2:tester2".into())];
+                        if let Some(loc) = loc {
+                            extra.push(("X-Container-Sysmeta-Versions-Location".into(), loc));
+                            extra
+                                .push(("X-Container-Sysmeta-Versions-Mode".into(), "stack".into()));
+                        }
+                        let extra_ref: Vec<(&str, &str)> = extra
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        write_backend_http_status(&mut stream, 204, &extra_ref, &[]).await;
+                        return;
+                    }
+                    if logical == "/AUTH_test/versions" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        if is_get {
+                            let prefix = query
+                                .split('&')
+                                .find_map(|part| part.strip_prefix("prefix="))
+                                .unwrap_or("");
+                            let prefix = swift_http::unquote(prefix);
+                            let mut names: Vec<(String, usize)> = objects
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .filter_map(|(path, (_, body))| {
+                                    path.strip_prefix("/AUTH_test/versions/")
+                                        .filter(|name| {
+                                            prefix.is_empty() || name.starts_with(&prefix)
+                                        })
+                                        .map(|name| (name.to_string(), body.len()))
+                                })
+                                .collect();
+                            names.sort_by(|a, b| a.0.cmp(&b.0));
+                            if query.contains("reverse=on") {
+                                names.reverse();
+                            }
+                            let rows: Vec<serde_json::Value> = names
+                                .into_iter()
+                                .map(|(name, bytes)| {
+                                    serde_json::json!({
+                                        "name": name,
+                                        "bytes": bytes,
+                                        "hash": "x",
+                                        "content_type": "text/plain",
+                                        "last_modified": "2010-01-01T00:00:00.000000",
+                                    })
+                                })
+                                .collect();
+                            let payload = serde_json::to_vec(&rows).unwrap();
+                            write_backend_http(
+                                &mut stream,
+                                &[("Content-Type", "application/json")],
+                                &payload,
+                            )
+                            .await;
+                            return;
+                        }
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[("X-Container-Write", "")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/c/")
+                        && !logical.starts_with("/AUTH_test/versions/")
+                    {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_put {
+                        let mut stored = HeaderKeyDict::new();
+                        stored.set(
+                            "Content-Type",
+                            header("Content-Type").unwrap_or_else(|| "text/plain".into()),
+                        );
+                        stored.set("Content-Length", body.len().to_string());
+                        stored.set(
+                            "X-Timestamp",
+                            header("X-Timestamp").unwrap_or_else(|| "1000.00000".into()),
+                        );
+                        objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical, (stored, body));
+                        write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        return;
+                    }
+                    if is_delete {
+                        let removed = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&logical)
+                            .is_some();
+                        write_backend_http_status(
+                            &mut stream,
+                            if removed { 204 } else { 404 },
+                            &[],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let stored = objects
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some((headers, obj)) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        let extra: Vec<(&str, String)> =
+                            headers.iter().map(|(k, v)| (k, v.to_string())).collect();
+                        let extra_ref: Vec<(&str, &str)> =
+                            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                        write_backend_http(&mut stream, &extra_ref, send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn versioning_container_acl_writer_overwrite_and_restore_on_hyper() {
+        let (port, backend) = spawn_versioning_container_acl_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", None, Some("test2:tester2"));
+        seed_container_rw(&app, "AUTH_test", "versions", None, Some(""));
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::VersionedWrites::new()),
+            ],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let writer = auth_token(&svc, "test2:tester2", "testing2").await;
+        let user3 = auth_token(&svc, "other:tester3", "otherpass").await;
+        let call = |method: &'static str,
+                    path: &'static str,
+                    token: String,
+                    extra: Vec<(&str, &str)>,
+                    body: Vec<u8>,
+                    query: &'static str| {
+            let svc = &svc;
+            async move {
+                let mut headers = HeaderKeyDict::new();
+                headers.set("X-Auth-Token", &token);
+                if !body.is_empty() {
+                    headers.set("Content-Length", body.len().to_string());
+                    headers.set("Content-Type", "text/plain");
+                }
+                for (k, v) in extra {
+                    headers.set(k, v);
+                }
+                svc.call(AsyncRequest {
+                    method: method.into(),
+                    path: path.into(),
+                    query_string: query.into(),
+                    headers,
+                    body: IncomingBody::from_bytes(body, u64::MAX),
+                })
+                .await
+            }
+        };
+
+        let denied_versions = call(
+            "PUT",
+            "/v1/AUTH_test/versions/should-fail",
+            writer.clone(),
+            vec![],
+            b"should fail".to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            denied_versions.status, 403,
+            "official test_versioning_container_acl versions write denied, got {}",
+            denied_versions.status
+        );
+
+        let denied_loc = call(
+            "POST",
+            "/v1/AUTH_test/c",
+            writer.clone(),
+            vec![("X-Versions-Location", "versions")],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            denied_loc.status, 403,
+            "official test_versioning_container_acl account2 cannot set location, got {}",
+            denied_loc.status
+        );
+
+        let both = call(
+            "POST",
+            "/v1/AUTH_test/c",
+            owner.clone(),
+            vec![
+                ("X-Remove-Versions-Location", "versions"),
+                ("X-Versions-Location", "versions"),
+            ],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&both.status),
+            "official test_versioning_container_acl location wins over remove, got {} {:?}",
+            both.status,
+            both.reason
+        );
+        let after = call(
+            "HEAD",
+            "/v1/AUTH_test/c",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            after.headers.get("X-Versions-Location"),
+            Some("versions"),
+            "official test_versioning_container_acl owner POST must persist location"
+        );
+
+        const FIRST: &[u8] = b"never argue with the data";
+        const SECOND: &[u8] = b"we don't have no beer, just tequila";
+        let first_put = call(
+            "PUT",
+            "/v1/AUTH_test/c/obj",
+            writer.clone(),
+            vec![],
+            FIRST.to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            first_put.status, 201,
+            "official test_versioning_container_acl first ACL-writer PUT, got {} {:?}",
+            first_put.status, first_put.reason
+        );
+        let first_get = call(
+            "GET",
+            "/v1/AUTH_test/c/obj",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            first_get
+                .body
+                .collect_async()
+                .await
+                .expect("first GET body"),
+            FIRST
+        );
+
+        let second_put = call(
+            "PUT",
+            "/v1/AUTH_test/c/obj",
+            writer.clone(),
+            vec![],
+            SECOND.to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            second_put.status, 201,
+            "official test_versioning_container_acl ACL-writer overwrite, got {} {:?}",
+            second_put.status, second_put.reason
+        );
+        let second_get = call(
+            "GET",
+            "/v1/AUTH_test/c/obj",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            second_get
+                .body
+                .collect_async()
+                .await
+                .expect("second GET body"),
+            SECOND,
+            "ACL writer overwrite must replace the source object"
+        );
+
+        let listing = call(
+            "GET",
+            "/v1/AUTH_test/versions",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "format=json",
+        )
+        .await;
+        assert_eq!(
+            listing.status, 200,
+            "official test_versioning_container_acl versions listing, got {}",
+            listing.status
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &listing
+                .body
+                .collect_async()
+                .await
+                .expect("versions listing"),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "official test_versioning_container_acl object_count must be 1, got {rows:?}"
+        );
+        let archive_name = rows[0]
+            .get("name")
+            .and_then(|v| v.as_str())
+            .expect("archive name")
+            .to_string();
+        let archive_path = format!("/v1/AUTH_test/versions/{archive_name}");
+        let owner_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: archive_path.clone(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            owner_archive
+                .body
+                .collect_async()
+                .await
+                .expect("archive body"),
+            FIRST,
+            "archived object must be the first ACL-writer PUT"
+        );
+
+        let user3_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &user3);
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: archive_path.clone(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            user3_archive.status, 403,
+            "official test_versioning_container_acl user3 cannot read versions, got {}",
+            user3_archive.status
+        );
+        let user3_write = call(
+            "PUT",
+            "/v1/AUTH_test/c/obj",
+            user3.clone(),
+            vec![],
+            b"some random user trying to write data".to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            user3_write.status, 403,
+            "official test_versioning_container_acl user3 cannot write source, got {}",
+            user3_write.status
+        );
+        let user3_delete = call(
+            "DELETE",
+            "/v1/AUTH_test/c/obj",
+            user3,
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            user3_delete.status, 403,
+            "official test_versioning_container_acl user3 cannot delete source, got {}",
+            user3_delete.status
+        );
+
+        let writer_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &writer);
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: archive_path.clone(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            writer_archive.status, 403,
+            "official test_versioning_container_acl account2 cannot read versions, got {}",
+            writer_archive.status
+        );
+        let writer_del_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &writer);
+            svc.call(AsyncRequest {
+                method: "DELETE".into(),
+                path: archive_path,
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            writer_del_archive.status, 403,
+            "official test_versioning_container_acl account2 cannot delete versions, got {}",
+            writer_del_archive.status
+        );
+
+        let writer_del_source = call(
+            "DELETE",
+            "/v1/AUTH_test/c/obj",
+            writer.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&writer_del_source.status),
+            "official test_versioning_container_acl account2 can DELETE source, got {} {:?}",
+            writer_del_source.status,
+            writer_del_source.reason
+        );
+        let restored = call("GET", "/v1/AUTH_test/c/obj", owner, vec![], Vec::new(), "").await;
+        assert_eq!(
+            restored.body.collect_async().await.expect("restored body"),
+            FIRST,
+            "ACL writer DELETE must restore the archived first PUT"
+        );
+        backend.abort();
     }
 
     /// Official TestObjectVersioning.test_clear_version_option: owner POST
