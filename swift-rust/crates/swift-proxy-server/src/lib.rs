@@ -10559,6 +10559,7 @@ mod pipeline_async_tests {
         let put_qs = format!("temp_url_sig={SIG_PUT}&temp_url_expires={EXPIRES}");
         let mut put_headers = HeaderKeyDict::new();
         put_headers.set("Content-Type", "application/octet-stream");
+        put_headers.set("Content-Length", "16");
         let put = svc
             .call(AsyncRequest {
                 method: "PUT".into(),
