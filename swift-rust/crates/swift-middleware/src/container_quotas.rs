@@ -33,6 +33,17 @@
 //! object `PUT`. `content_length` is taken from the request's
 //! `Content-Length` header.
 //!
+//! Hyper path: production serve is `prepare` → app and never calls
+//! `handle()`. Container `PUT`/`POST` quota-header validation is
+//! `prepare` (invalid → `ShortCircuit` 400) so admin/reseller set still
+//! reaches the app. Object `PUT` enforcement is a streaming intercept
+//! (`streams_request` + `handle_streaming_request`) so Hyper does not
+//! materialize `MAX_CONTROL_BODY` on every upload. `intercepts_request` +
+//! `handle_request_async` cover the same object `PUT` when
+//! `dispatch_remaining` (COPY dest) never consults `streams_request`.
+//! Over-quota object `PUT` is `413` with body `Upload exceeds quota.` —
+//! the `test_container_quota_bytes` shape (PUT 11B after a 10-byte quota).
+//!
 //! Deferrals:
 //! * The container-info *cache* is not modelled; every policed object `PUT`
 //!   costs one real backend `HEAD` subrequest here.
@@ -48,9 +59,12 @@
 //!   `'PUT'`, not a tuple) is faithfully rendered as `method == "PUT"`, the
 //!   only real HTTP method it can match.
 
-use swift_http::{split_path, Request, Response};
+use std::future::Future;
+use std::pin::Pin;
 
-use crate::{Middleware, NextFn};
+use swift_http::{split_path, AsyncRequest, IncomingBody, Request, Response};
+
+use crate::{AsyncNextFn, Middleware, MwPrep, NextFn, StreamingAsyncNextFn};
 
 /// Resolve the request's byte size for quota math. Prefer `Content-Length`,
 /// then a declared streamed length. When the body is chunked / unknown
@@ -101,6 +115,121 @@ fn upload_exceeds_quota() -> Response {
     resp
 }
 
+/// `(version, account, container, obj)` from `split_path(3, 4, True)`.
+fn request_parts(req: &Request) -> Option<(String, String, String, String)> {
+    let parts = split_path(&req.path, 3, 4, true).ok()?;
+    Some((
+        parts[0].clone().unwrap_or_default(),
+        parts[1].clone().unwrap_or_default(),
+        parts[2].clone().unwrap_or_default(),
+        parts[3].clone().unwrap_or_default(),
+    ))
+}
+
+fn is_container_write(req: &Request) -> bool {
+    matches!(req.method.as_str(), "PUT" | "POST")
+        && matches!(request_parts(req), Some((_, _, container, obj))
+            if !container.is_empty() && obj.is_empty())
+}
+
+fn is_object_put(req: &Request) -> bool {
+    req.method == "PUT"
+        && matches!(request_parts(req), Some((_, _, container, obj))
+            if !container.is_empty() && !obj.is_empty())
+}
+
+/// Setting quotas on the container: verify the new values are
+/// properly formatted (Python: `if val and not val.isdigit()`).
+fn validate_quota_headers(req: &Request) -> Result<(), Response> {
+    if let Some(val) = req.headers.get("X-Container-Meta-Quota-Bytes") {
+        if !val.is_empty() && !is_digit_str(val) {
+            return Err(bad_request("Invalid bytes quota."));
+        }
+    }
+    if let Some(val) = req.headers.get("X-Container-Meta-Quota-Count") {
+        if !val.is_empty() && !is_digit_str(val) {
+            return Err(bad_request("Invalid count quota."));
+        }
+    }
+    Ok(())
+}
+
+fn container_head_request(req: &Request, version: &str, account: &str, container: &str) -> Request {
+    let mut sub = req.clone_head();
+    sub.method = "HEAD".into();
+    sub.path = format!("/{version}/{account}/{container}");
+    sub.query_string = String::new();
+    sub.headers.remove("Content-Length");
+    sub
+}
+
+fn container_head_async(
+    req: &AsyncRequest,
+    version: &str,
+    account: &str,
+    container: &str,
+) -> AsyncRequest {
+    let mut headers = req.headers.clone();
+    headers.remove("Content-Length");
+    AsyncRequest {
+        method: "HEAD".into(),
+        path: format!("/{version}/{account}/{container}"),
+        query_string: String::new(),
+        headers,
+        body: IncomingBody::from_bytes(Vec::new(), 1),
+    }
+}
+
+/// Materialize cap for a chunked / unknown-length PUT: remaining quota
+/// bytes + 1 so an oversize body trips `Err` → 413.
+fn bytes_quota_materialize_cap(info: &Response) -> Option<u64> {
+    let quota = info.headers.get("X-Container-Meta-Quota-Bytes")?;
+    let used = info.headers.get("X-Container-Bytes-Used")?;
+    if !is_digit_str(quota) {
+        return None;
+    }
+    let quota = quota.parse::<i64>().ok()?;
+    let used = used.parse::<i64>().ok()?;
+    let remaining = (quota - used).max(0) as u64;
+    Some(remaining.saturating_add(1).max(1))
+}
+
+/// `413` when the upload would breach a digit byte or count quota.
+/// `None` means no enforceable quota or still under the limit.
+fn reject_if_over_quota(info: &Response, content_length: i64) -> Option<Response> {
+    if let (Some(quota), Some(used)) = (
+        info.headers.get("X-Container-Meta-Quota-Bytes"),
+        info.headers.get("X-Container-Bytes-Used"),
+    ) {
+        if is_digit_str(quota) {
+            if let (Ok(quota), Ok(used)) = (quota.parse::<i64>(), used.parse::<i64>()) {
+                if quota < used + content_length {
+                    return Some(upload_exceeds_quota());
+                }
+            }
+        }
+    }
+    if let (Some(quota), Some(count)) = (
+        info.headers.get("X-Container-Meta-Quota-Count"),
+        info.headers.get("X-Container-Object-Count"),
+    ) {
+        if is_digit_str(quota) {
+            if let (Ok(quota), Ok(count)) = (quota.parse::<i64>(), count.parse::<i64>()) {
+                if quota < count + 1 {
+                    return Some(upload_exceeds_quota());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn header_content_length(headers: &swift_http::HeaderKeyDict) -> Option<i64> {
+    headers
+        .get("Content-Length")
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
 /// Middleware that enforces `X-Container-Meta-Quota-Bytes` /
 /// `X-Container-Meta-Quota-Count` on object `PUT`s.
 #[derive(Default)]
@@ -110,91 +239,158 @@ impl ContainerQuotas {
     pub fn new() -> Self {
         ContainerQuotas
     }
+
+    async fn enforce_object_put_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        let Some((version, account, container, obj)) = request_parts(&req) else {
+            return next(req).await;
+        };
+        if obj.is_empty() {
+            return next(req).await;
+        }
+        let info = next(container_head_request(&req, &version, &account, &container)).await;
+        if !is_success(info.status) {
+            return next(req).await;
+        }
+        let cap = bytes_quota_materialize_cap(&info).unwrap_or(1);
+        let content_length = match request_content_length(&mut req, cap) {
+            Ok(n) => n,
+            Err(()) => return upload_exceeds_quota(),
+        };
+        if let Some(resp) = reject_if_over_quota(&info, content_length) {
+            return resp;
+        }
+        next(req).await
+    }
+
+    async fn enforce_object_put_streaming(
+        &self,
+        mut req: AsyncRequest,
+        next: StreamingAsyncNextFn,
+    ) -> Response {
+        let head = Request {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            query_string: req.query_string.clone(),
+            headers: req.headers.clone(),
+            body: swift_http::Body::empty(),
+        };
+        let Some((version, account, container, obj)) = request_parts(&head) else {
+            return next(req).await;
+        };
+        if obj.is_empty() {
+            return next(req).await;
+        }
+        let info = next(container_head_async(&req, &version, &account, &container)).await;
+        if !is_success(info.status) {
+            return next(req).await;
+        }
+        let content_length = if let Some(n) = header_content_length(&req.headers) {
+            n
+        } else if let Some(n) = req.body.content_length() {
+            n as i64
+        } else if let Some(cap) = bytes_quota_materialize_cap(&info) {
+            match req.body.materialize(cap).await {
+                Ok(bytes) => {
+                    let n = bytes.len() as i64;
+                    req.body = IncomingBody::from_bytes(bytes, cap.max(n as u64).max(1));
+                    n
+                }
+                Err(_) => return upload_exceeds_quota(),
+            }
+        } else {
+            0
+        };
+        if let Some(resp) = reject_if_over_quota(&info, content_length) {
+            return resp;
+        }
+        next(req).await
+    }
 }
 
 impl Middleware for ContainerQuotas {
+    /// Hyper never calls `handle()`. Invalid container quota-set headers
+    /// short-circuit here; valid admin/reseller set Continues to the app.
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        if is_container_write(req) {
+            if let Err(resp) = validate_quota_headers(req) {
+                return MwPrep::ShortCircuit(resp);
+            }
+        }
+        MwPrep::Continue
+    }
+
+    /// Object PUT so `dispatch_remaining` (COPY dest) still enforces.
+    /// Container PUT/POST so Hyper validation matches sync `handle`.
+    fn intercepts_request(&self, req: &Request) -> bool {
+        is_container_write(req) || is_object_put(req)
+    }
+
+    /// Object-sized PUT must not `materialize(MAX_CONTROL_BODY)`.
+    fn streams_request(&self, req: &Request) -> bool {
+        is_object_put(req)
+    }
+
+    fn handle_streaming_request(
+        &self,
+        req: AsyncRequest,
+        next: StreamingAsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move { self.enforce_object_put_streaming(req, next).await })
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            if is_container_write(&req) {
+                if let Err(resp) = validate_quota_headers(&req) {
+                    return resp;
+                }
+                return next(req).await;
+            }
+            if is_object_put(&req) {
+                return self.enforce_object_put_async(req, next).await;
+            }
+            next(req).await
+        })
+    }
+
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         // req.split_path(3, 4, True); a ValueError (bad/short path) means
         // this is not an object or container request we police -> pass through.
-        let parts = match split_path(&req.path, 3, 4, true) {
-            Ok(p) => p,
-            Err(_) => return next(req),
+        let Some((version, account, container, obj)) = request_parts(&req) else {
+            return next(req);
         };
-        // [version, account, container, obj]; obj is None (padded) or "" for
-        // a container-level path.
-        let version = parts[0].clone().unwrap_or_default();
-        let account = parts[1].clone().unwrap_or_default();
-        let container = parts[2].clone().unwrap_or_default();
-        let obj = parts[3].clone().unwrap_or_default();
 
         if obj.is_empty() && (req.method == "PUT" || req.method == "POST") {
-            // Setting quotas on the container: verify the new values are
-            // properly formatted (Python: `if val and not val.isdigit()`).
-            if let Some(val) = req.headers.get("X-Container-Meta-Quota-Bytes") {
-                if !val.is_empty() && !is_digit_str(val) {
-                    return bad_request("Invalid bytes quota.");
-                }
-            }
-            if let Some(val) = req.headers.get("X-Container-Meta-Quota-Count") {
-                if !val.is_empty() && !is_digit_str(val) {
-                    return bad_request("Invalid count quota.");
-                }
+            if let Err(resp) = validate_quota_headers(&req) {
+                return resp;
             }
         } else if !obj.is_empty() && req.method == "PUT" {
             // Uploading an object: check it against the container's quotas.
             // HEAD the container with the caller's auth headers (clone_head),
             // standing in for `get_container_info` / make_subrequest.
-            let info = {
-                let mut sub = req.clone_head();
-                sub.method = "HEAD".into();
-                sub.path = format!("/{version}/{account}/{container}");
-                sub.query_string = String::new();
-                sub.headers.remove("Content-Length");
-                next(sub)
-            };
+            let info = next(container_head_request(
+                &req, &version, &account, &container,
+            ));
             if !is_success(info.status) {
                 // No usable container info; let the real request 404 later.
                 return next(req);
             }
 
-            // Byte quota: enforced only when the container carries a digit
-            // `quota-bytes` meta value and a usable `bytes` figure.
-            if let (Some(quota), Some(used)) = (
-                info.headers.get("X-Container-Meta-Quota-Bytes"),
-                info.headers.get("X-Container-Bytes-Used"),
-            ) {
-                if is_digit_str(quota) {
-                    if let (Ok(quota), Ok(used)) = (quota.parse::<i64>(), used.parse::<i64>()) {
-                        let remaining = (quota - used).max(0) as u64;
-                        // Cap materialize at remaining+1 so an oversize
-                        // chunked body (e.g. HAProxy) trips Err → 413.
-                        let cap = remaining.saturating_add(1).max(1);
-                        let content_length = match request_content_length(&mut req, cap) {
-                            Ok(n) => n,
-                            Err(()) => return upload_exceeds_quota(),
-                        };
-                        let new_size = used + content_length;
-                        if quota < new_size {
-                            return upload_exceeds_quota();
-                        }
-                    }
+            if let Some(cap) = bytes_quota_materialize_cap(&info) {
+                let content_length = match request_content_length(&mut req, cap) {
+                    Ok(n) => n,
+                    Err(()) => return upload_exceeds_quota(),
+                };
+                if let Some(resp) = reject_if_over_quota(&info, content_length) {
+                    return resp;
                 }
-            }
-
-            // Object-count quota: enforced only when the container carries a
-            // digit `quota-count` meta value and a usable `object_count`.
-            if let (Some(quota), Some(count)) = (
-                info.headers.get("X-Container-Meta-Quota-Count"),
-                info.headers.get("X-Container-Object-Count"),
-            ) {
-                if is_digit_str(quota) {
-                    if let (Ok(quota), Ok(count)) = (quota.parse::<i64>(), count.parse::<i64>()) {
-                        let new_count = count + 1;
-                        if quota < new_count {
-                            return upload_exceeds_quota();
-                        }
-                    }
-                }
+            } else if let Some(resp) = reject_if_over_quota(&info, 0) {
+                // Count quota only (no usable bytes quota / Content-Length).
+                return resp;
             }
         }
 
@@ -206,7 +402,7 @@ impl Middleware for ContainerQuotas {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use swift_http::HeaderKeyDict;
+    use swift_http::{HeaderKeyDict, IncomingBody};
 
     /// Records every `(method, path)` that reaches the fake backend, so a
     /// test can prove whether the container HEAD subrequest was issued.
@@ -548,5 +744,241 @@ mod tests {
             log.lock().unwrap().as_slice(),
             &[("PUT".into(), "/v1/a".into())]
         );
+    }
+
+    fn async_backend(head: Response) -> (Log, crate::AsyncNextFn) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let (head_status, head_headers) = (head.status, head.headers);
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            log2.lock()
+                .unwrap()
+                .push((req.method.clone(), req.path.clone()));
+            let (head_status, head_headers) = (head_status, head_headers.clone());
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut resp = Response::new(head_status);
+                    resp.headers = head_headers;
+                    resp
+                } else {
+                    Response::with_body(201, b"Created".to_vec())
+                }
+            })
+        });
+        (log, next)
+    }
+
+    fn streaming_backend(head: Response) -> (Log, crate::StreamingAsyncNextFn) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let (head_status, head_headers) = (head.status, head.headers);
+        let next: crate::StreamingAsyncNextFn = Arc::new(move |req: AsyncRequest| {
+            log2.lock()
+                .unwrap()
+                .push((req.method.clone(), req.path.clone()));
+            let (head_status, head_headers) = (head_status, head_headers.clone());
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut resp = Response::new(head_status);
+                    resp.headers = head_headers;
+                    resp
+                } else {
+                    Response::with_body(201, b"Created".to_vec())
+                }
+            })
+        });
+        (log, next)
+    }
+
+    fn mk_async(method: &str, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> AsyncRequest {
+        let mut h = HeaderKeyDict::new();
+        for (k, v) in headers {
+            h.set(k, v);
+        }
+        AsyncRequest {
+            method: method.into(),
+            path: path.into(),
+            query_string: String::new(),
+            headers: h,
+            body: IncomingBody::from_bytes(body, u64::MAX),
+        }
+    }
+
+    async fn run_hyper(req: Request, head: Response) -> (Response, Log) {
+        let cq = ContainerQuotas::new();
+        let (log, next) = async_backend(head);
+        let mut resp = cq.handle_request_async(req, next).await;
+        resp.body.materialize(u64::MAX).unwrap();
+        (resp, log)
+    }
+
+    async fn run_hyper_stream(req: AsyncRequest, head: Response) -> (Response, Log) {
+        let cq = ContainerQuotas::new();
+        let (log, next) = streaming_backend(head);
+        let mut resp = cq.handle_streaming_request(req, next).await;
+        resp.body.materialize(u64::MAX).unwrap();
+        (resp, log)
+    }
+
+    // ---- Hyper path (Field H1: object PUT was 201 because handle()
+    // never ran). Shapes match TestContainer.test_container_quota_bytes.
+
+    #[test]
+    fn hyper_intercepts_container_write_and_object_put() {
+        let cq = ContainerQuotas::new();
+        assert!(cq.intercepts_request(&mk("POST", "/v1/a/c", &[])));
+        assert!(cq.intercepts_request(&mk("PUT", "/v1/a/c", &[])));
+        assert!(cq.intercepts_request(&mk(
+            "PUT",
+            "/v1/a/c/o",
+            &[("Content-Length", "11")]
+        )));
+        assert!(cq.streams_request(&mk(
+            "PUT",
+            "/v1/a/c/o",
+            &[("Content-Length", "11")]
+        )));
+        assert!(!cq.intercepts_request(&mk("GET", "/v1/a/c", &[])));
+        assert!(!cq.intercepts_request(&mk("GET", "/v1/a/c/o", &[])));
+        assert!(!cq.streams_request(&mk("POST", "/v1/a/c", &[])));
+        assert!(
+            !cq.intercepts_request(&mk("PUT", "/v1/a", &[])),
+            "account PUT is AccountQuotas, not ContainerQuotas"
+        );
+        assert!(!cq.streams_request(&mk("PUT", "/v1/a/c", &[])));
+    }
+
+    #[test]
+    fn prepare_rejects_invalid_quota_set_on_hyper() {
+        let cq = ContainerQuotas::new();
+        let mut req = mk("POST", "/v1/a/c", &[("X-Container-Meta-Quota-Bytes", "1TB")]);
+        match cq.prepare(&mut req) {
+            crate::MwPrep::ShortCircuit(resp) => {
+                assert_eq!(resp.status, 400);
+            }
+            crate::MwPrep::Continue => panic!("invalid quota set must ShortCircuit 400"),
+        }
+    }
+
+    #[test]
+    fn prepare_allows_admin_quota_set() {
+        let cq = ContainerQuotas::new();
+        let mut req = mk(
+            "POST",
+            "/v1/a/c",
+            &[("X-Container-Meta-Quota-Bytes", "10")],
+        );
+        assert!(matches!(cq.prepare(&mut req), crate::MwPrep::Continue));
+    }
+
+    #[tokio::test]
+    async fn hyper_object_put_over_quota_bytes_is_413() {
+        // test_container_quota_bytes: quota 10, PUT 11B → 413 not 201.
+        let (resp, log) = run_hyper(
+            mk("PUT", "/v1/a/c/o", &[("Content-Length", "11")]),
+            container_head(
+                204,
+                &[
+                    ("X-Container-Meta-Quota-Bytes", "10"),
+                    ("X-Container-Bytes-Used", "0"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 413, "over-quota object PUT must be 413, got {}", resp.status);
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Upload exceeds quota."
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[("HEAD".into(), "/v1/a/c".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn hyper_stream_object_put_over_quota_bytes_is_413() {
+        let body = vec![b'x'; 11];
+        let (resp, log) = run_hyper_stream(
+            mk_async(
+                "PUT",
+                "/v1/a/c/o",
+                &[("Content-Length", "11")],
+                body,
+            ),
+            container_head(
+                204,
+                &[
+                    ("X-Container-Meta-Quota-Bytes", "10"),
+                    ("X-Container-Bytes-Used", "0"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 413);
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Upload exceeds quota."
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[("HEAD".into(), "/v1/a/c".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn hyper_object_put_at_quota_bytes_passes() {
+        let (resp, log) = run_hyper(
+            mk("PUT", "/v1/a/c/o", &[("Content-Length", "10")]),
+            container_head(
+                204,
+                &[
+                    ("X-Container-Meta-Quota-Bytes", "10"),
+                    ("X-Container-Bytes-Used", "0"),
+                ],
+            ),
+        )
+        .await;
+        assert_created(&resp);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[
+                ("HEAD".into(), "/v1/a/c".into()),
+                ("PUT".into(), "/v1/a/c/o".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hyper_admin_can_set_container_quota_bytes() {
+        let (resp, log) = run_hyper(
+            mk(
+                "POST",
+                "/v1/a/c",
+                &[("X-Container-Meta-Quota-Bytes", "10")],
+            ),
+            container_head(204, &[]),
+        )
+        .await;
+        assert_created(&resp);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[("POST".into(), "/v1/a/c".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn hyper_invalid_quota_set_is_400() {
+        let (resp, log) = run_hyper(
+            mk("PUT", "/v1/a/c", &[("X-Container-Meta-Quota-Bytes", "1TB")]),
+            container_head(204, &[]),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            String::from_utf8_lossy(body_bytes(&resp)),
+            "Invalid bytes quota."
+        );
+        assert!(log.lock().unwrap().is_empty());
     }
 }

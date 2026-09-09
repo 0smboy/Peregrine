@@ -9095,6 +9095,120 @@ mod pipeline_async_tests {
             resp.status
         );
     }
+
+    /// Answers container HEAD with a 10-byte quota and object PUT with 201
+    /// so ContainerQuotas can prove Hyper intercept (Field H1).
+    struct ContainerQuotaInfoStub;
+    impl swift_middleware::Middleware for ContainerQuotaInfoStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            (req.method == "HEAD" && req.path == "/v1/AUTH_test/c")
+                || (req.method == "PUT" && req.path.starts_with("/v1/AUTH_test/c/"))
+                || (matches!(req.method.as_str(), "PUT" | "POST") && req.path == "/v1/AUTH_test/c")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Meta-Quota-Bytes", "10");
+                    resp.headers.set("X-Container-Bytes-Used", "0");
+                    resp.headers.set("X-Container-Object-Count", "0");
+                    return resp;
+                }
+                if req.path == "/v1/AUTH_test/c" {
+                    return Response::new(204);
+                }
+                Response::new(201)
+            })
+        }
+    }
+
+    /// Field H1: Hyper used to skip ContainerQuotas.handle(), so object
+    /// PUT 11B after a 10-byte quota returned 201. streams/intercept must run.
+    #[tokio::test]
+    async fn container_quotas_hyper_path_over_quota_object_put_is_413() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig::default(),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::ContainerQuotas::new()),
+                Arc::new(ContainerQuotaInfoStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "11");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/too-big".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(vec![b'x'; 11], u64::MAX),
+            })
+            .await;
+        resp.body.materialize(u64::MAX).unwrap();
+        assert_eq!(
+            resp.status, 413,
+            "over-quota object PUT on Hyper must be 413, got {} {:?}",
+            resp.status, resp.reason
+        );
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.as_slice(),
+            _ => b"",
+        };
+        assert_eq!(
+            String::from_utf8_lossy(body),
+            "Upload exceeds quota.",
+            "413 body must match swob Upload exceeds quota."
+        );
+    }
+
+    #[tokio::test]
+    async fn container_quotas_hyper_path_admin_can_set_quota_bytes() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig::default(),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::ContainerQuotas::new()),
+                Arc::new(ContainerQuotaInfoStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Container-Meta-Quota-Bytes", "10");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 403,
+            "admin container quota set must not be 403 (got {} {:?})",
+            resp.status, resp.reason
+        );
+        assert_eq!(
+            resp.status, 204,
+            "admin container quota set must reach the app, got {}",
+            resp.status
+        );
+    }
 }
 
 #[cfg(test)]
