@@ -4025,10 +4025,15 @@ impl ProxyApp {
                 // the request when !swift_owner so a write-ACL / account-RW
                 // caller cannot overwrite Read/Write/Sync-Key (Field H1:
                 // test_protected_container_acl / test_protected_container_sync).
+                // IsolatedIdentity account-RW can still POST; versions-location
+                // must 403 (official test_versioning_container_acl).
                 let mut write_req;
                 let transfer_req = if matches!(req.method.as_str(), "PUT" | "POST") {
                     write_req = req.clone_head();
                     scrub_container_write_owner_headers(&mut write_req);
+                    if let Some(denied) = deny_non_owner_container_versioning(&write_req) {
+                        return denied;
+                    }
                     &write_req
                 } else {
                     req
@@ -8247,6 +8252,55 @@ fn scrub_container_write_owner_headers(req: &mut Request) {
     scrub_owner_request_headers(req, swift_owner);
 }
 
+/// Client + sysmeta keys `versioned_writes.prepare()` uses to persist
+/// `X-Versions-Location` / `X-History-Location`. Not in Python
+/// `swift_owner_headers`; IsolatedIdentity still needs an owner gate
+/// because account-RW may POST a container (Field H1) while official
+/// `test_versioning_container_acl` requires that POST to raise.
+const CONTAINER_VERSIONING_REQUEST_HEADERS: &[&str] = &[
+    "X-Versions-Location",
+    "X-History-Location",
+    "X-Remove-Versions-Location",
+    "X-Remove-History-Location",
+    "X-Container-Sysmeta-Versions-Location",
+    "X-Container-Sysmeta-Versions-Mode",
+];
+
+/// Official `test_versioning_container_acl`: account2 / account-RW
+/// `update_metadata(X-Versions-Location=…)` must be `ResponseError` (403),
+/// not a silent 204 that persists sysmeta. Owners and pre-authed / container-sync
+/// subrequests keep the headers.
+pub(crate) fn deny_non_owner_container_versioning(req: &Request) -> Option<Response> {
+    if req
+        .headers
+        .get("X-Backend-Swift-Owner")
+        .is_some_and(config_true_value)
+    {
+        return None;
+    }
+    if req
+        .headers
+        .get("X-Backend-Authorize-Override")
+        .is_some_and(config_true_value)
+    {
+        return None;
+    }
+    if req
+        .headers
+        .get("X-Container-Sync-Key")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+    if !CONTAINER_VERSIONING_REQUEST_HEADERS
+        .iter()
+        .any(|name| req.headers.contains_key(name))
+    {
+        return None;
+    }
+    Some(swob_response(403))
+}
+
 fn request_to_async(req: Request) -> AsyncRequest {
     let bytes = match req.body {
         swift_http::Body::Buffered(b) => b,
@@ -8978,6 +9032,79 @@ mod pipeline_async_tests {
         .unwrap()
     }
 
+    /// Field G4 `versioning_container_acl`: Hyper used to rewrite
+    /// `X-Versions-Location` in `versioned_writes.prepare()` and persist it
+    /// on an account-RW / !swift_owner container POST (204). Official
+    /// `update_metadata` must raise.
+    #[tokio::test]
+    async fn versioning_container_acl_hyper_path_non_owner_cannot_set_location() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::VersionedWrites::new())],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Versions-Location", "versions");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "non-owner versions-location POST on Hyper must 403, got {} {:?}",
+            resp.status, resp.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn versioning_container_acl_hyper_path_owner_is_not_403_at_gate() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::VersionedWrites::new())],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Versions-Location", "versions");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 403,
+            "owner versions-location POST must pass the owner gate, got {} {:?}",
+            resp.status, resp.reason
+        );
+    }
+
     /// Field H1: Hyper used to skip AccountQuotas.handle(), so account POST
     /// of X-Account-Quota-Bytes returned 204. intercepts_request must run.
     #[tokio::test]
@@ -9060,7 +9187,9 @@ mod pipeline_async_tests {
         let svc = ProxyAsyncService {
             app: Arc::new(RwLock::new(app)),
             filters: vec![
-                Arc::new(swift_middleware::AccountQuotas::new(account_quota_policies())),
+                Arc::new(swift_middleware::AccountQuotas::new(
+                    account_quota_policies(),
+                )),
                 Arc::new(ta),
             ],
         };
@@ -9534,10 +9663,8 @@ mod stale_read_and_post_tests {
         // L131 ec42 → Policy-0 after 2nd expire: DELETE tombstones only
         // the policy that actually held the object. The other policy's
         // empty 404 must not count as "found".
-        let after_delete = policies_with_backend_timestamp(&[
-            (EC42, Some(tombstone_ts)),
-            (POLICY_0, None),
-        ]);
+        let after_delete =
+            policies_with_backend_timestamp(&[(EC42, Some(tombstone_ts)), (POLICY_0, None)]);
         assert_eq!(after_delete, vec![EC42]);
         assert!(tombstone_ts > create_ts);
 
@@ -11488,6 +11615,71 @@ mod p1a_wiring_tests {
         assert!(req.headers.get("X-Container-Read").is_none());
         assert!(req.headers.get("X-Container-Write").is_none());
         assert!(req.headers.get("X-Container-Sync-Key").is_none());
+    }
+
+    /// Official test_versioning_container_acl: account2 / account-RW
+    /// `update_metadata(X-Versions-Location)` must raise (403), not persist.
+    #[test]
+    fn non_owner_container_put_post_cannot_set_versions_location() {
+        for method in ["PUT", "POST"] {
+            for (name, value) in [
+                ("X-Versions-Location", "versions"),
+                ("X-History-Location", "history"),
+                ("X-Container-Sysmeta-Versions-Location", "versions"),
+                ("X-Remove-Versions-Location", "x"),
+            ] {
+                let mut headers = HeaderKeyDict::new();
+                headers.set(name, value);
+                let req = Request {
+                    method: method.into(),
+                    path: "/v1/AUTH_test/c".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: swift_http::Body::empty(),
+                };
+                let denied = deny_non_owner_container_versioning(&req)
+                    .unwrap_or_else(|| panic!("{method} {name} must 403"));
+                assert_eq!(denied.status, 403, "{method} {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn owner_and_override_can_set_versions_location() {
+        for extra in [
+            vec![("X-Backend-Swift-Owner", "true")],
+            vec![("X-Backend-Authorize-Override", "true")],
+            vec![("X-Container-Sync-Key", "sync")],
+        ] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Versions-Location", "versions");
+            for (k, v) in extra {
+                headers.set(k, v);
+            }
+            let req = Request {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::Body::empty(),
+            };
+            assert!(
+                deny_non_owner_container_versioning(&req).is_none(),
+                "owner/override/sync must keep versions-location"
+            );
+        }
+    }
+
+    #[test]
+    fn non_owner_container_meta_without_versions_headers_is_not_403() {
+        let req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: privileged_container_write_headers(),
+            body: swift_http::Body::empty(),
+        };
+        assert!(deny_non_owner_container_versioning(&req).is_none());
     }
 
     #[test]
