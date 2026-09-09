@@ -9229,7 +9229,22 @@ mod pipeline_async_tests {
             listed.status
         );
         let body = listed.body.collect_async().await.expect("listing body");
-        String::from_utf8_lossy(&body)
+        let text = String::from_utf8_lossy(&body);
+        let trimmed = text.trim();
+        if trimmed.starts_with('[') {
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(trimmed).unwrap_or_else(|_| Vec::new());
+            return rows
+                .into_iter()
+                .filter_map(|row| {
+                    row.get("name")
+                        .or_else(|| row.get("subdir"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect();
+        }
+        trimmed
             .lines()
             .filter(|l| !l.is_empty())
             .map(str::to_string)
@@ -9306,11 +9321,11 @@ mod pipeline_async_tests {
             );
         }
         assert_eq!(
-            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-"),
+            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-").await,
             vec!["test".to_string(), "test-".to_string()]
         );
         assert_eq!(
-            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-&reverse=yes"),
+            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-&reverse=yes").await,
             vec!["test-".to_string(), "test".to_string()]
         );
         assert_eq!(
@@ -9335,7 +9350,7 @@ mod pipeline_async_tests {
             );
         }
         assert_eq!(
-            listing_plain_names(&svc, "/v1/AUTH_test/pre", "delimiter=a&prefix=ba"),
+            listing_plain_names(&svc, "/v1/AUTH_test/pre", "delimiter=a&prefix=ba").await,
             vec!["bar".to_string(), "baza".to_string()]
         );
         assert_eq!(
@@ -9343,7 +9358,8 @@ mod pipeline_async_tests {
                 &svc,
                 "/v1/AUTH_test/pre",
                 "delimiter=a&prefix=ba&reverse=yes"
-            ),
+            )
+            .await,
             vec!["baza".to_string(), "bar".to_string()]
         );
         assert_eq!(
@@ -9373,7 +9389,7 @@ mod pipeline_async_tests {
             );
         }
         assert_eq!(
-            listing_plain_names(&svc, "/v1/AUTH_test/lead", "delimiter=/"),
+            listing_plain_names(&svc, "/v1/AUTH_test/lead", "delimiter=/").await,
             vec!["/".to_string(), "test".to_string()]
         );
         backend.abort();
