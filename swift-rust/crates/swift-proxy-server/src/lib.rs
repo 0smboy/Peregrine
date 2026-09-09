@@ -14707,6 +14707,116 @@ mod pipeline_async_tests {
         .await;
     }
 
+    async fn official_file_copy_from_header_case(
+        svc: &ProxyAsyncService,
+        dest_path: &str,
+        copy_from: &str,
+        copy_from_account: Option<&str>,
+    ) {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Copy-From", copy_from);
+        if let Some(account) = copy_from_account {
+            headers.set("X-Copy-From-Account", account);
+        }
+        let resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: dest_path.into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official TestFile.testCopyFromHeader PUT {copy_from:?} on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: dest_path.into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestFile.testCopyFromHeader dest GET {dest_path}"
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.testCopyFromHeader dest body");
+        assert_eq!(
+            body, b"src-bytes",
+            "official TestFile.testCopyFromHeader dest must keep source bytes ({copy_from})"
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("text/plain"),
+            "official TestFile.testCopyFromHeader dest content-type ({copy_from})"
+        );
+        assert_eq!(
+            got.headers.get("X-Object-Meta-Color"),
+            Some("blue"),
+            "official TestFile.testCopyFromHeader dest metadata ({copy_from})"
+        );
+    }
+
+    /// Official TestFile.testCopyFromHeader / testCopyFromAccountHeader:
+    /// PUT + X-Copy-From (with and without a leading slash) copies body and
+    /// metadata. Hyper never calls `Copy::handle()`.
+    #[tokio::test]
+    async fn file_copy_from_header_keeps_metadata_on_hyper() {
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "text/plain");
+        source.set("X-Object-Meta-Color", "blue");
+        source.set("Content-Length", "9");
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            "/v1/AUTH_test/c/src".into(),
+            (source, b"src-bytes".to_vec()),
+        )])));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(FileCopyEncodedStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        official_file_copy_from_header_case(&svc, "/v1/AUTH_test/c/copied-slash", "/c/src", None)
+            .await;
+        official_file_copy_from_header_case(&svc, "/v1/AUTH_test/c/copied-noslash", "c/src", None)
+            .await;
+        official_file_copy_from_header_case(
+            &svc,
+            "/v1/AUTH_test/dstc/copied-cross",
+            "/c/src",
+            None,
+        )
+        .await;
+        official_file_copy_from_header_case(
+            &svc,
+            "/v1/AUTH_test/c/copied-account",
+            "/c/src",
+            Some("AUTH_test"),
+        )
+        .await;
+    }
+
     /// Official test_versioning_check_acl: versions container is public
     /// read, but a foreign token must not DELETE/pop the source object.
     struct VersioningCheckAclStub {
