@@ -14534,6 +14534,179 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestFile.testCopy / testCopyAccount: COPY a source whose
+    /// name keeps a literal `%2F` plus a real slash, with and without a
+    /// leading slash on Destination, including Destination-Account.
+    /// IsolatedIdentity Hyper never calls `Copy::handle()`.
+    struct FileCopyEncodedStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for FileCopyEncodedStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            Box::pin(async move {
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    async fn official_file_copy_encoded_case(
+        svc: &ProxyAsyncService,
+        destination: &str,
+        dest_account: Option<&str>,
+        dest_path: &str,
+    ) {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", destination);
+        if let Some(account) = dest_account {
+            headers.set("Destination-Account", account);
+        }
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/AUTH_test/c/dealde%2Fl04 011e%204c8df/flash.png".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official TestFile.testCopy COPY {destination:?} on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: dest_path.into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestFile.testCopy dest GET {dest_path} on Hyper"
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.testCopy dest body");
+        assert_eq!(
+            body, b"png-bytes",
+            "official TestFile.testCopy dest must keep source bytes ({destination})"
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("image/png"),
+            "official TestFile.testCopy dest content-type ({destination})"
+        );
+        assert_eq!(
+            got.headers.get("X-Object-Meta-Color"),
+            Some("blue"),
+            "official TestFile.testCopy dest metadata ({destination})"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_copy_keeps_encoded_slash_and_metadata_on_hyper() {
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "image/png");
+        source.set("X-Object-Meta-Color", "blue");
+        source.set("Content-Length", "9");
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            "/v1/AUTH_test/c/dealde%2Fl04 011e%204c8df/flash.png".into(),
+            (source, b"png-bytes".to_vec()),
+        )])));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(FileCopyEncodedStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        official_file_copy_encoded_case(
+            &svc,
+            "/c/copied-slash",
+            None,
+            "/v1/AUTH_test/c/copied-slash",
+        )
+        .await;
+        official_file_copy_encoded_case(
+            &svc,
+            "c/copied-noslash",
+            None,
+            "/v1/AUTH_test/c/copied-noslash",
+        )
+        .await;
+        official_file_copy_encoded_case(
+            &svc,
+            "/dstc/copied-cross",
+            None,
+            "/v1/AUTH_test/dstc/copied-cross",
+        )
+        .await;
+        official_file_copy_encoded_case(
+            &svc,
+            "/c/copied-account",
+            Some("AUTH_test"),
+            "/v1/AUTH_test/c/copied-account",
+        )
+        .await;
+    }
+
     /// Official test_versioning_check_acl: versions container is public
     /// read, but a foreign token must not DELETE/pop the source object.
     struct VersioningCheckAclStub {
