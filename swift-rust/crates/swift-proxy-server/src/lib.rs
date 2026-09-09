@@ -9664,7 +9664,7 @@ mod pipeline_async_tests {
             .await;
             assert_eq!(put.status, 201, "PUT {name:?} got {}", put.status);
         }
-        let mut expect = |mut names: Vec<&str>| -> Vec<String> {
+        let expect = |mut names: Vec<&str>| -> Vec<String> {
             names.sort();
             names.into_iter().map(str::to_string).collect()
         };
@@ -15438,11 +15438,12 @@ mod pipeline_async_tests {
                     let shard = text
                         .to_ascii_lowercase()
                         .contains("x-backend-record-type: shard");
+                    let params = swift_http::parse_query(&query);
                     let qparam = |key: &str| -> String {
-                        query
-                            .split('&')
-                            .find_map(|part| part.strip_prefix(&format!("{key}=")))
-                            .map(swift_http::unquote)
+                        params
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.clone())
                             .unwrap_or_default()
                     };
                     if logical == "/AUTH_test" {
@@ -15505,9 +15506,10 @@ mod pipeline_async_tests {
                             .cloned()
                             .unwrap_or_default();
                         let reverse = swift_core::config::config_true_value(&qparam("reverse"));
-                        let path = query
-                            .split('&')
-                            .find_map(|part| part.strip_prefix("path=").map(swift_http::unquote));
+                        let path = params
+                            .iter()
+                            .find(|(k, _)| k == "path")
+                            .map(|(_, v)| v.clone());
                         let rows = listing_with_delimiter(
                             &names,
                             &qparam("prefix"),
