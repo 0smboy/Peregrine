@@ -9487,6 +9487,120 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainerSorting: reverse truthy set, prefix, exclusive
+    /// / inclusive markers, and reversed-marker empty 204.
+    #[tokio::test]
+    async fn container_list_sorting_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/sort", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let items = ["a1", "a2", "A3", "b1", "B2", "a10", "b10", "zz"];
+        for name in items {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/sort/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "PUT {name}"
+            );
+        }
+        let mut forward: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        forward.sort();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        for rev in ["true", "1", "yes", "on", "t", "y"] {
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/sort", &format!("reverse={rev}")).await,
+                reversed,
+                "official testContainerFileListSortingReversed reverse={rev}"
+            );
+        }
+        for off in ["off", "false", "no", "", "foo", "hai", "o=[]::::>"] {
+            let q = if off.is_empty() {
+                "reverse=".to_string()
+            } else {
+                format!("reverse={off}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/sort", &q).await,
+                forward,
+                "official testContainerFileListSorting reverse={off:?}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/sort", "").await,
+            forward
+        );
+        let mut pref: Vec<String> = items
+            .iter()
+            .filter(|c| c.starts_with('a'))
+            .map(|s| (*s).to_string())
+            .collect();
+        pref.sort();
+        pref.reverse();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/sort", "reverse=on&prefix=a").await,
+            pref,
+            "official testContainerFileSortingByPrefixReversed"
+        );
+        let mut exclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" < **c && **c < "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        exclusive.sort();
+        exclusive.reverse();
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/sort",
+                "reverse=on&marker=b1&end_marker=B2"
+            )
+            .await,
+            exclusive,
+            "official testContainerFileSortingByMarkersExclusiveReversed"
+        );
+        let mut inclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" <= **c && **c <= "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        inclusive.sort();
+        inclusive.reverse();
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/sort",
+                "reverse=on&marker=b1%00&end_marker=B1"
+            )
+            .await,
+            inclusive,
+            "official testContainerFileSortingByMarkersInclusiveReversed"
+        );
+        let empty = listing_plain_names(
+            &svc,
+            "/v1/AUTH_test/sort",
+            "reverse=on&marker=B&end_marker=b1",
+        )
+        .await;
+        assert!(
+            empty.is_empty(),
+            "official testContainerFileSortingByReversedMarkersReversed, got {empty:?}"
+        );
+        backend.abort();
+    }
+
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
     /// because HMAC lived only in `handle()`, which Hyper never calls.
     /// `prepare` must stamp `X-Backend-Authorize-Override` so
@@ -15224,10 +15338,7 @@ mod pipeline_async_tests {
                             .get(&container)
                             .cloned()
                             .unwrap_or_default();
-                        let reverse = matches!(
-                            qparam("reverse").to_ascii_lowercase().as_str(),
-                            "yes" | "true" | "1" | "on"
-                        );
+                        let reverse = swift_core::config::config_true_value(&qparam("reverse"));
                         let rows = listing_with_delimiter(
                             &names,
                             &qparam("prefix"),
