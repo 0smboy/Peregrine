@@ -14867,6 +14867,193 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestObjectVersioning.test_overwriting COPY from another
+    /// container: dest current (`ccccc`) is archived, dest then reads
+    /// `ddddd` / `text/jibberish04`. IsolatedIdentity Hyper leftover is
+    /// VW-outer (copy never sends dest PUT back through VW).
+    struct VersioningCopyOverwriteStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+        archive_puts: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningCopyOverwriteStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            let archive_puts = Arc::clone(&self.archive_puts);
+            Box::pin(async move {
+                let parts = match swift_http::split_path(&req.path, 2, 4, true) {
+                    Ok(parts) => parts,
+                    Err(_) => return Response::new(404),
+                };
+                let object = parts[3].clone().unwrap_or_default();
+                if object.is_empty() {
+                    if req.path == "/v1/AUTH_test/c" {
+                        let mut resp = Response::new(204);
+                        resp.headers
+                            .set("X-Container-Sysmeta-Versions-Location", "versions");
+                        resp.headers
+                            .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                        return resp;
+                    }
+                    return Response::new(204);
+                }
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    if req.path.starts_with("/v1/AUTH_test/versions/") {
+                        *archive_puts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    }
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    if resp.headers.get("X-Timestamp").is_none() {
+                        resp.headers.set("X-Timestamp", "1751500001.00000");
+                    }
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    fn seed_versioning_copy_overwrite_store(
+    ) -> std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)> {
+        let mut current = HeaderKeyDict::new();
+        current.set("Content-Type", "text/jibberish03");
+        current.set("X-Timestamp", "1751500001.00000");
+        current.set("Content-Length", "5");
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "text/jibberish04");
+        source.set("X-Timestamp", "1751500002.00000");
+        source.set("Content-Length", "5");
+        std::collections::HashMap::from([
+            ("/v1/AUTH_test/c/obj".into(), (current, b"ccccc".to_vec())),
+            (
+                "/v1/AUTH_test/src/srcobj".into(),
+                (source, b"ddddd".to_vec()),
+            ),
+        ])
+    }
+
+    async fn official_overwrite_copy_on_hyper(vw_outer: bool) {
+        let store = Arc::new(std::sync::Mutex::new(seed_versioning_copy_overwrite_store()));
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let vw: Arc<dyn swift_middleware::Middleware> =
+            Arc::new(swift_middleware::VersionedWrites::new());
+        let copy: Arc<dyn swift_middleware::Middleware> = Arc::new(swift_middleware::Copy::new());
+        let stub: Arc<dyn swift_middleware::Middleware> = Arc::new(VersioningCopyOverwriteStub {
+            store: Arc::clone(&store),
+            archive_puts: Arc::clone(&archive_puts),
+        });
+        let filters = if vw_outer {
+            vec![vw, copy, stub]
+        } else {
+            vec![copy, vw, stub]
+        };
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters,
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/obj");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/AUTH_test/src/srcobj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official test_overwriting COPY on Hyper (vw_outer={vw_outer}), got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 1,
+            "official test_overwriting COPY must archive dest current (vw_outer={vw_outer})"
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official test_overwriting COPY dest GET on Hyper (vw_outer={vw_outer})"
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official test_overwriting COPY dest body");
+        assert_eq!(
+            body, b"ddddd",
+            "official test_overwriting COPY dest must be source bytes (vw_outer={vw_outer})"
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("text/jibberish04"),
+            "official test_overwriting COPY dest content-type (vw_outer={vw_outer})"
+        );
+    }
+
+    #[tokio::test]
+    async fn versioning_overwrite_copy_archives_when_vw_outer_on_hyper() {
+        official_overwrite_copy_on_hyper(true).await;
+    }
+
+    #[tokio::test]
+    async fn versioning_overwrite_copy_archives_when_copy_outer_on_hyper() {
+        official_overwrite_copy_on_hyper(false).await;
+    }
+
     /// Official IsolatedIdentity `update_metadata` + Python `clean_acl`:
     /// empty `.r:` and write-ACL referrers are 400 on Hyper container POST.
     #[tokio::test]

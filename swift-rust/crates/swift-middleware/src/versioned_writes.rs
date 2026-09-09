@@ -369,6 +369,53 @@ fn buffered_to_async(req: Request) -> AsyncRequest {
     }
 }
 
+/// IsolatedIdentity and Peregrine production place `versioned_writes`
+/// *outside* `copy`. Client `COPY` / `X-Copy-From` never re-enter this
+/// filter as a dest PUT. Rewrite `COPY` the way `copy.rs` does so
+/// copy-current runs on the destination before inner `copy` GET+PUTs.
+fn rewrite_copy_as_dest_put(mut req: Request) -> Result<Request, Response> {
+    let parts = match split_path(&req.path, 4, 4, true) {
+        Ok(parts) => parts,
+        Err(_) => return Err(Response::error(412, "Invalid destination path")),
+    };
+    let version = parts[0].clone().unwrap_or_default();
+    let account = parts[1].clone().unwrap_or_default();
+    let container = parts[2].clone().unwrap_or_default();
+    let object = parts[3].clone().unwrap_or_default();
+    let Some(dest) = req.headers.get("Destination").map(|s| s.to_string()) else {
+        return Err(Response::error(412, "Destination header required"));
+    };
+    let dest_parts = {
+        let value = dest.strip_prefix('/').unwrap_or(dest.as_str());
+        value.split_once('/').and_then(|(container, object)| {
+            if container.is_empty() || object.is_empty() {
+                None
+            } else {
+                Some((container.to_string(), object.to_string()))
+            }
+        })
+    };
+    let Some((dst_container, dst_object)) = dest_parts else {
+        return Err(Response::error(
+            412,
+            "Destination header must be of the form /container/object",
+        ));
+    };
+    let dst_account = req
+        .headers
+        .get("Destination-Account")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| account.clone());
+    req.method = "PUT".to_string();
+    req.path = format!("/{version}/{dst_account}/{dst_container}/{dst_object}");
+    req.headers
+        .set("X-Copy-From", format!("/{container}/{object}"));
+    req.headers.set("X-Copy-From-Account", account);
+    req.headers.remove("Destination");
+    req.headers.remove("Destination-Account");
+    Ok(req)
+}
+
 /// `dispatch_remaining` (COPY dest PUT) only honors `intercepts_request`,
 /// not `streams_request`. Wrap the buffered inner next so the streaming
 /// PUT handler can still copy-current.
@@ -3175,9 +3222,11 @@ impl Middleware for VersionedWrites {
         {
             return true;
         }
-        // COPY dest PUT is rewritten by `copy` then dispatched through
-        // `dispatch_remaining`, which never consults `streams_request`.
-        // Intercept the dest PUT so legacy copy-current still runs.
+        // IsolatedIdentity / Peregrine production: VW is outer than `copy`.
+        // Client COPY and X-Copy-From PUT never come back as a dest PUT
+        // through this filter. Intercept them so copy-current runs on dest
+        // before inner copy GET+PUTs. Swift 2.9 sample (copy outer) still
+        // hits the dest PUT without X-Copy-From via `dispatch_remaining`.
         let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
             if parts[2].as_deref().is_some_and(|container| !container.is_empty())
                 && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
@@ -3185,12 +3234,12 @@ impl Middleware for VersionedWrites {
             && self.allow_object_versioning
             && matches!(req.method.as_str(), "GET" | "HEAD" | "DELETE")
             && query_param(&req.query_string, "version-id").is_some_and(|value| !value.is_empty());
-        // COPY source GET is intercept next(), not Hyper streaming.
+        let versioning_on =
+            self.allow_object_versioning || self.allow_versioned_writes != Some(false);
         (is_object
-            && req.method == "PUT"
-            && !put_has_version_id(&req.query_string)
-            && !req.headers.contains_key("X-Copy-From")
-            && (self.allow_object_versioning || self.allow_versioned_writes != Some(false)))
+            && versioning_on
+            && ((req.method == "PUT" && !put_has_version_id(&req.query_string))
+                || req.method == "COPY"))
             || version_id_object
     }
 
@@ -3253,6 +3302,17 @@ impl Middleware for VersionedWrites {
             let is_object = matches!(split_path(&req.path, 4, 4, true), Ok(parts)
                 if parts[2].as_deref().is_some_and(|container| !container.is_empty())
                     && parts[3].as_deref().is_some_and(|object| !object.is_empty()));
+            if is_object && req.method == "COPY" {
+                match rewrite_copy_as_dest_put(req) {
+                    Ok(put) => {
+                        let streaming_next = streaming_next_from_async(next);
+                        return self
+                            .handle_modern_put_streaming(buffered_to_async(put), streaming_next)
+                            .await;
+                    }
+                    Err(resp) => return resp,
+                }
+            }
             if is_object && req.method == "PUT" && !put_has_version_id(&req.query_string) {
                 let streaming_next = streaming_next_from_async(next);
                 return self
@@ -3985,11 +4045,24 @@ mod tests {
         let mut x_copy = copy_dest_put();
         x_copy.headers.set("X-Copy-From", "/src/srcobj");
         assert!(
-            !vw.intercepts_request(&x_copy),
-            "copy middleware must own X-Copy-From"
+            vw.intercepts_request(&x_copy),
+            "VW-outer IsolatedIdentity must archive dest before copy owns X-Copy-From"
         );
-        let copy_method = req("COPY", "/v1/AUTH_test/src/srcobj");
-        assert!(!vw.intercepts_request(&copy_method));
+        let mut copy_method = req("COPY", "/v1/AUTH_test/src/srcobj");
+        copy_method.headers.set("Destination", "/c/obj");
+        assert!(
+            vw.intercepts_request(&copy_method),
+            "VW-outer IsolatedIdentity must intercept COPY so dest is archived"
+        );
+        let legacy = VersionedWrites::new();
+        assert!(
+            !legacy.allow_object_versioning,
+            "IsolatedIdentity default must stay legacy-only"
+        );
+        assert!(
+            legacy.intercepts_request(&copy_method),
+            "IsolatedIdentity default must still intercept COPY"
+        );
     }
 
     #[tokio::test]
@@ -4008,6 +4081,29 @@ mod tests {
                 .iter()
                 .any(|(m, p, _)| m == "PUT" && p.starts_with("/v1/AUTH_test/versions/003obj/")),
             "COPY dest PUT ?symlink=get must archive current: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_method_archives_dest_via_handle_request_async() {
+        let (calls, next) = intercept_legacy_backend(true);
+        let vw = VersionedWrites::new();
+        let mut copy = req("COPY", "/v1/AUTH_test/src/srcobj");
+        copy.headers.set("Destination", "/c/obj");
+        let resp = vw.handle_request_async(copy, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p.starts_with("/v1/AUTH_test/versions/003obj/")),
+            "official test_overwriting COPY must archive dest current: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
+            "COPY must proceed as dest PUT after copy-current: {calls:?}"
         );
     }
 
