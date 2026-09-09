@@ -9244,6 +9244,141 @@ mod pipeline_async_tests {
         assert_eq!(body, b"onetwo");
     }
 
+    /// Official TestDlo.test_dlo_referer_on_segment_container step 2:
+    /// manifest readable, segment-container listing 403, relayed as 403.
+    struct DloRefererDeniedListingStub;
+    impl swift_middleware::Middleware for DloRefererDeniedListingStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "other/segs/");
+                    return resp;
+                }
+                if req.path == "/v1/a/other" {
+                    return Response::error(403, "Forbidden");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlo_referer_denied_listing_is_403_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloRefererDeniedListingStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "official test_dlo_referer step 2 on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_get_root: listings on, prefix=""
+    /// TempURL of the container without a trailing slash is 301.
+    struct ListingsOnContainerStub;
+    impl swift_middleware::Middleware for ListingsOnContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD")
+                && (req.path == "/v1/AUTH_account/container"
+                    || req.path == "/v1/AUTH_account/container/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(204)
+                } else {
+                    Response::with_body(200, b"[]".to_vec())
+                };
+                resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                resp.headers.set("X-Container-Object-Count", "1");
+                resp.headers.set("X-Timestamp", "1000.00000");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_without_slash_is_301_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsOnContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix="
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 301,
+            "official test_get_root no-slash prefix TempURL must 301, got {}",
+            resp.status
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
