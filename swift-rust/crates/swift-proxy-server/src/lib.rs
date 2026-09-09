@@ -14717,6 +14717,10 @@ mod pipeline_async_tests {
                         stored.set("Content-Type", &ct);
                         stored.set("ETag", etag);
                         stored.set("Content-Length", body.len().to_string());
+                        // Official TestFileComparison uses Last-Modified, not
+                        // X-Timestamp, for If-Modified-Since / If-Unmodified-Since.
+                        stored.set("Last-Modified", "Wed, 09 Sep 2026 12:00:00 GMT");
+                        stored.set("Accept-Ranges", "bytes");
                         for line in text.lines() {
                             if let Some((k, v)) = line.split_once(':') {
                                 if k.to_ascii_lowercase().starts_with("x-object-meta-") {
@@ -14734,7 +14738,16 @@ mod pipeline_async_tests {
                                 .unwrap_or_else(|p| p.into_inner())
                                 .insert(name, (body.len() as u64, etag.to_string(), ct));
                         }
-                        write_backend_http_status(&mut stream, 201, &[("ETag", etag)], &[]).await;
+                        write_backend_http_status(
+                            &mut stream,
+                            201,
+                            &[
+                                ("ETag", etag),
+                                ("Last-Modified", "Wed, 09 Sep 2026 12:00:00 GMT"),
+                            ],
+                            &[],
+                        )
+                        .await;
                         return;
                     }
                     if is_post {
@@ -14824,6 +14837,49 @@ mod pipeline_async_tests {
                                 return;
                             }
                         }
+                        let last_modified = headers
+                            .get("Last-Modified")
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        if let Some(lm) = swift_http::parse_http_date(&last_modified) {
+                            if let Some(ims) = header("If-Modified-Since")
+                                .as_deref()
+                                .and_then(swift_http::parse_http_date)
+                            {
+                                if lm <= ims {
+                                    write_backend_http_status(
+                                        &mut stream,
+                                        304,
+                                        &[
+                                            ("ETag", etag.as_str()),
+                                            ("Accept-Ranges", "bytes"),
+                                            ("Last-Modified", last_modified.as_str()),
+                                        ],
+                                        &[],
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            if let Some(ius) = header("If-Unmodified-Since")
+                                .as_deref()
+                                .and_then(swift_http::parse_http_date)
+                            {
+                                if lm > ius {
+                                    write_backend_http_status(
+                                        &mut stream,
+                                        412,
+                                        &[
+                                            ("ETag", etag.as_str()),
+                                            ("Last-Modified", last_modified.as_str()),
+                                        ],
+                                        &[],
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
                         if !is_head {
                             if let Some(range_h) = header("Range") {
                                 if let Ok(parsed) = swift_http::Range::parse(&range_h) {
@@ -14864,7 +14920,37 @@ mod pipeline_async_tests {
                                             .await;
                                             return;
                                         }
-                                        _ => {}
+                                        Some(ranges) => {
+                                            let ct = headers
+                                                .get("Content-Type")
+                                                .unwrap_or("application/octet-stream")
+                                                .to_string();
+                                            let boundary = "filefunc";
+                                            let payload = swift_http::multipart_byteranges(
+                                                boundary,
+                                                &ranges,
+                                                &obj,
+                                                &ct,
+                                                obj.len() as u64,
+                                            );
+                                            let mp_ct =
+                                                swift_http::multipart_byteranges_content_type(
+                                                    boundary,
+                                                );
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                206,
+                                                &[
+                                                    ("ETag", etag.as_str()),
+                                                    ("Accept-Ranges", "bytes"),
+                                                    ("Content-Type", mp_ct.as_str()),
+                                                ],
+                                                &payload,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        None => {}
                                     }
                                 }
                             }
@@ -16785,6 +16871,403 @@ mod pipeline_async_tests {
                 .or_else(|| suffix0.headers.get("Etag"))
                 .map(|s| s.trim_matches('"')),
             Some("7265f4d211b56873a381d321f586e4a9")
+        );
+        backend.abort();
+    }
+
+    fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn multipart_byterange_parts(
+        content_type: &str,
+        body: &[u8],
+    ) -> Vec<(String, String, Vec<u8>)> {
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_default();
+        assert!(
+            !boundary.is_empty(),
+            "official testMultiRangeGets missing boundary in {content_type}"
+        );
+        let sep = format!("--{boundary}");
+        let sep_b = sep.as_bytes();
+        let mut parts = Vec::new();
+        let mut i = 0;
+        while let Some(rel) = find_bytes(&body[i..], sep_b) {
+            let start = i + rel + sep_b.len();
+            if body.get(start..start + 2) == Some(b"--") {
+                break;
+            }
+            let rest = if body.get(start..start + 2) == Some(b"\r\n") {
+                &body[start + 2..]
+            } else {
+                &body[start..]
+            };
+            let Some(hdr_end) = find_bytes(rest, b"\r\n\r\n") else {
+                break;
+            };
+            let headers = String::from_utf8_lossy(&rest[..hdr_end]);
+            let payload_off = hdr_end + 4;
+            let next = find_bytes(&rest[payload_off..], sep_b)
+                .map(|n| payload_off + n)
+                .unwrap_or(rest.len());
+            let mut payload = rest[payload_off..next].to_vec();
+            if payload.ends_with(b"\r\n") {
+                payload.truncate(payload.len() - 2);
+            }
+            let mut ct = String::new();
+            let mut cr = String::new();
+            for line in headers.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("Content-Type") {
+                        ct = v.trim().to_string();
+                    } else if k.eq_ignore_ascii_case("Content-Range") {
+                        cr = v.trim().to_string();
+                    }
+                }
+            }
+            parts.push((ct, cr, payload));
+            i = start + next;
+        }
+        parts
+    }
+
+    /// Official TestFileComparison.testIfModifiedSince / testIfUnmodifiedSince
+    /// / testIfMatchAndUnmodified (IMF-fixdate, RFC 850, asctime).
+    #[tokio::test]
+    async fn file_if_modified_and_unmodified_since_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        let time_old = "Tue, 08 Sep 2026 12:00:00 GMT";
+        let time_new = "Thu, 10 Sep 2026 12:00:00 GMT";
+        let time_old_rfc850 = "Tuesday, 08-Sep-26 12:00:00 GMT";
+        let time_old_asctime = "Tue Sep 8 12:00:00 2026";
+        for method in ["GET", "HEAD"] {
+            let old = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Modified-Since", time_old)],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&old.status),
+                "official testIfModifiedSince {method} older date on Hyper, got {}",
+                old.status
+            );
+            let fresh = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Modified-Since", time_new)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                fresh.status, 304,
+                "official testIfModifiedSince {method} newer date on Hyper, got {}",
+                fresh.status
+            );
+            assert_eq!(
+                fresh
+                    .headers
+                    .get("ETag")
+                    .or_else(|| fresh.headers.get("Etag"))
+                    .map(|s| s.trim_matches('"')),
+                Some(etag.as_str())
+            );
+            assert_eq!(
+                fresh
+                    .headers
+                    .get("Accept-Ranges")
+                    .or_else(|| fresh.headers.get("accept-ranges"))
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("bytes")
+            );
+            let ius_ok = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Unmodified-Since", time_new)],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&ius_ok.status),
+                "official testIfUnmodifiedSince {method} newer date on Hyper, got {}",
+                ius_ok.status
+            );
+            let ius_old = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Unmodified-Since", time_old_rfc850)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                ius_old.status, 412,
+                "official testIfUnmodifiedSince {method} RFC 850 on Hyper, got {}",
+                ius_old.status
+            );
+            assert_eq!(
+                ius_old
+                    .headers
+                    .get("ETag")
+                    .or_else(|| ius_old.headers.get("Etag"))
+                    .map(|s| s.trim_matches('"')),
+                Some(etag.as_str())
+            );
+        }
+        let both_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[("If-Match", &etag), ("If-Unmodified-Since", time_new)],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&both_ok.status),
+            "official testIfMatchAndUnmodified matching on Hyper, got {}",
+            both_ok.status
+        );
+        let bad_match = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[("If-Match", "bogus"), ("If-Unmodified-Since", time_new)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_match.status, 412,
+            "official testIfMatchAndUnmodified bad If-Match on Hyper, got {}",
+            bad_match.status
+        );
+        let old_ius = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[
+                ("If-Match", &etag),
+                ("If-Unmodified-Since", time_old_asctime),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            old_ius.status, 412,
+            "official testIfMatchAndUnmodified asctime on Hyper, got {}",
+            old_ius.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testMultiRangeGets.
+    #[tokio::test]
+    async fn file_multi_range_gets_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let file_length = 10000usize;
+        let range_size = file_length / 10;
+        let subrange_size = range_size / 10;
+        let data: Vec<u8> = (0..file_length).map(|i| (i % 251) as u8).collect();
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[
+                ("Content-Length", "10000"),
+                ("Content-Type", "lovecraft/rugose; squamous=true"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        for i in (0..file_length).step_by(range_size) {
+            let range = format!(
+                "bytes={}-{},{}-{},{}-{}",
+                i,
+                i + subrange_size - 1,
+                i + 2 * subrange_size,
+                i + 3 * subrange_size - 1,
+                i + 4 * subrange_size,
+                i + 5 * subrange_size - 1
+            );
+            let got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/multi",
+                "",
+                &[("Range", &range)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                got.status, 206,
+                "official testMultiRangeGets {range} on Hyper, got {}",
+                got.status
+            );
+            let ct = got
+                .headers
+                .get("Content-Type")
+                .or_else(|| got.headers.get("content-type"))
+                .unwrap_or("");
+            assert!(
+                ct.starts_with("multipart/byteranges"),
+                "official testMultiRangeGets Content-Type {ct}"
+            );
+            assert!(
+                got.headers.get("Content-Range").is_none()
+                    && got.headers.get("content-range").is_none(),
+                "official testMultiRangeGets outer Content-Range must be absent"
+            );
+            let body = got.body.collect_async().await.expect("multi-range body");
+            let parts = multipart_byterange_parts(ct, &body);
+            assert_eq!(parts.len(), 3, "{range} parts");
+            let expect = [
+                (i, i + subrange_size - 1, &data[i..i + subrange_size]),
+                (
+                    i + 2 * subrange_size,
+                    i + 3 * subrange_size - 1,
+                    &data[i + 2 * subrange_size..i + 3 * subrange_size],
+                ),
+                (
+                    i + 4 * subrange_size,
+                    i + 5 * subrange_size - 1,
+                    &data[i + 4 * subrange_size..i + 5 * subrange_size],
+                ),
+            ];
+            for (part, (start, end, slice)) in parts.iter().zip(expect) {
+                assert_eq!(part.0, "lovecraft/rugose; squamous=true", "{range}");
+                assert_eq!(
+                    part.1,
+                    format!("bytes {start}-{end}/{file_length}"),
+                    "{range}"
+                );
+                assert_eq!(part.2, slice, "{range}");
+            }
+        }
+        let two_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[(
+                "Range",
+                &format!(
+                    "bytes=0-{},{}-{},{}-{}",
+                    subrange_size - 1,
+                    2 * subrange_size,
+                    3 * subrange_size - 1,
+                    file_length,
+                    file_length + subrange_size - 1
+                ),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(two_ok.status, 206);
+        let ct = two_ok
+            .headers
+            .get("Content-Type")
+            .or_else(|| two_ok.headers.get("content-type"))
+            .unwrap_or("");
+        assert!(ct.starts_with("multipart/byteranges"), "{ct}");
+        let body = two_ok.body.collect_async().await.expect("two-ok body");
+        let parts = multipart_byterange_parts(ct, &body);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].2, &data[..subrange_size]);
+        assert_eq!(parts[1].2, &data[2 * subrange_size..3 * subrange_size]);
+        let one_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[(
+                "Range",
+                &format!(
+                    "bytes=0-{},{}-{}",
+                    subrange_size - 1,
+                    file_length,
+                    file_length + subrange_size - 1
+                ),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(one_ok.status, 206);
+        let ct = one_ok
+            .headers
+            .get("Content-Type")
+            .or_else(|| one_ok.headers.get("content-type"))
+            .unwrap_or("");
+        let body = one_ok.body.collect_async().await.expect("one-ok body");
+        if ct.starts_with("multipart/byteranges") {
+            let parts = multipart_byterange_parts(ct, &body);
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].2, &data[..subrange_size]);
+        } else {
+            assert_eq!(
+                one_ok
+                    .headers
+                    .get("Content-Range")
+                    .or_else(|| one_ok.headers.get("content-range")),
+                Some(format!("bytes 0-{}/{file_length}", subrange_size - 1).as_str())
+            );
+            assert_eq!(ct, "lovecraft/rugose; squamous=true");
+            assert_eq!(body, &data[..subrange_size]);
+        }
+        let none = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[(
+                "Range",
+                &format!(
+                    "bytes={}-{},{}-{}",
+                    file_length,
+                    file_length + 2,
+                    file_length + 100,
+                    file_length + 102
+                ),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            none.status, 416,
+            "official testMultiRangeGets unsatisfiable on Hyper, got {}",
+            none.status
         );
         backend.abort();
     }
