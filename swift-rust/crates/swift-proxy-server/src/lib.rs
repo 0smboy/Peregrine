@@ -9783,6 +9783,206 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestSlo.test_slo_copy: COPY an SLO must persist assembled
+    /// bytes. Dest GET `?multipart-manifest=get` then returns that body
+    /// (not a JSON remanifest).
+    struct SloCopyAssembleStub {
+        dest: Arc<std::sync::Mutex<Option<(HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for SloCopyAssembleStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let dest = Arc::clone(&self.dest);
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest-abcde" && req.method != "PUT" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-json");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                if req.method == "PUT" && req.path == "/v1/a/c/copied-abcde" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(b) => b.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    *dest.lock().unwrap_or_else(|p| p.into_inner()) = Some((headers, body));
+                    return Response::new(201);
+                }
+                if req.path == "/v1/a/c/copied-abcde" {
+                    if let Some((headers, body)) =
+                        dest.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                    {
+                        let mut resp = Response::with_body(200, body);
+                        if let Some(ct) = headers.get("Content-Type") {
+                            resp.headers.set("Content-Type", ct);
+                        }
+                        return resp;
+                    }
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_copy_assembles_without_slo_header_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_body, b"one", "COPY must persist assembled SLO bytes");
+        assert!(
+            put_headers.get("X-Static-Large-Object").is_none(),
+            "official test_slo_copy: dest must not carry X-Static-Large-Object"
+        );
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/copied-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"one",
+            "official test_slo_copy dest multipart-manifest=get is assembled"
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_copy_the_manifest_reputs_json_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_the_manifest COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&put_body).is_ok(),
+            "official test_slo_copy_the_manifest dest must be JSON, got {:?}",
+            String::from_utf8_lossy(&put_body)
+        );
+        assert_ne!(
+            put_body, b"one",
+            "remanifest must not persist assembled bytes"
+        );
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/copied-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        let got_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("copied manifest JSON");
+        assert!(
+            got_json.is_array(),
+            "official test_slo_copy_the_manifest GET must be JSON list"
+        );
+        let _ = put_headers;
+    }
+
     /// Official listing_formats test_GET_HEAD_content_type: HEAD
     /// `?format=json` must stamp application/json even when the backend
     /// HEAD is a 204 text/plain.
