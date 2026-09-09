@@ -9853,6 +9853,250 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccountNoContainers.testGetRequest / testAccountHead /
+    /// testContainerSerializedInfo.
+    #[tokio::test]
+    async fn account_empty_get_head_and_serialized_info_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let plain = file_hyper_call(&svc, "GET", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(
+            plain.status, 204,
+            "official testGetRequest no format on empty account, got {}",
+            plain.status
+        );
+        for format_type in ["json", "xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                &format!("format={format_type}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                listed.status, 200,
+                "official testGetRequest format={format_type} empty account, got {}",
+                listed.status
+            );
+            let ct = listed
+                .headers
+                .get("Content-Type")
+                .or_else(|| listed.headers.get("content-type"))
+                .unwrap_or("");
+            assert_eq!(
+                ct,
+                format!("application/{format_type}; charset=utf-8"),
+                "official testGetRequest {format_type} Content-Type"
+            );
+        }
+        for name in ["ser-a", "ser-b"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ser-a/obj1",
+                "",
+                &[("Content-Length", "4")],
+                b"abcd".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(
+            head.status, 204,
+            "official testAccountHead on Hyper, got {}",
+            head.status
+        );
+        let count: i64 = head
+            .headers
+            .get("X-Account-Container-Count")
+            .or_else(|| head.headers.get("x-account-container-count"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        assert_eq!(
+            count, 2,
+            "official testAccountHead container_count, headers {:?}",
+            head.headers
+        );
+        for field in [
+            "X-Account-Object-Count",
+            "X-Account-Bytes-Used",
+        ] {
+            let v: i64 = head
+                .headers
+                .get(field)
+                .or_else(|| head.headers.get(&field.to_ascii_lowercase()))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            assert!(
+                v >= 0,
+                "official testAccountHead {field} missing/negative: {:?}",
+                head.headers
+            );
+        }
+        for format_type in ["json", "xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                &format!("format={format_type}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(listed.status, 200);
+            let ct = listed
+                .headers
+                .get("Content-Type")
+                .or_else(|| listed.headers.get("content-type"))
+                .unwrap_or("");
+            assert_eq!(
+                ct,
+                format!("application/{format_type}; charset=utf-8"),
+                "official testContainerSerializedInfo {format_type} Content-Type"
+            );
+            if format_type == "json" {
+                let body = listed.body.collect_async().await.expect("account json");
+                let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                for row in &rows {
+                    assert!(
+                        row.get("count").and_then(|v| v.as_i64()).unwrap_or(-1) >= 0,
+                        "official testContainerSerializedInfo count {row}"
+                    );
+                    assert!(
+                        row.get("bytes").and_then(|v| v.as_i64()).unwrap_or(-1) >= 0,
+                        "official testContainerSerializedInfo bytes {row}"
+                    );
+                }
+            }
+        }
+        backend.abort();
+    }
+
+    /// Official TestContainer.testCreateOnExisting / testDelete /
+    /// testDeleteOnContainerWithFiles / testFileCreateInContainerThatDoesNotExist
+    /// / testContainerFileListOnContainerThatDoesNotExist / testSlashInName.
+    #[tokio::test]
+    async fn container_create_delete_and_missing_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let first = file_hyper_call(&svc, "PUT", "/v1/AUTH_test/exists", "", &[], Vec::new()).await;
+        assert_eq!(
+            first.status, 201,
+            "official testCreateOnExisting first PUT, got {}",
+            first.status
+        );
+        let second = file_hyper_call(&svc, "PUT", "/v1/AUTH_test/exists", "", &[], Vec::new()).await;
+        assert_eq!(
+            second.status, 202,
+            "official testCreateOnExisting second PUT, got {}",
+            second.status
+        );
+        let empty = file_hyper_call(&svc, "PUT", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
+        assert_eq!(empty.status, 201);
+        let deleted =
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
+        assert_eq!(
+            deleted.status, 204,
+            "official testDelete empty container, got {}",
+            deleted.status
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/with-files", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/with-files/obj",
+                "",
+                &[("Content-Length", "1")],
+                b"x".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let conflict = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/with-files",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            conflict.status, 409,
+            "official testDeleteOnContainerWithFiles, got {}",
+            conflict.status
+        );
+        let missing_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/no-such-cont/obj",
+            "",
+            &[("Content-Length", "1")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            missing_put.status, 404,
+            "official testFileCreateInContainerThatDoesNotExist, got {}",
+            missing_put.status
+        );
+        for format_type in ["", "format=json", "format=xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/missing-list",
+                format_type,
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                listed.status, 404,
+                "official testContainerFileListOnContainerThatDoesNotExist {format_type:?}, got {}",
+                listed.status
+            );
+        }
+        let slash = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/ab/cd",
+            "",
+            &[("Content-Length", "0")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            slash.status, 404,
+            "official testSlashInName unquoted slash is object PUT to a missing container, got {}",
+            slash.status
+        );
+        backend.abort();
+    }
+
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
     /// because HMAC lived only in `handle()`, which Hyper never calls.
     /// `prepare` must stamp `X-Backend-Authorize-Override` so
@@ -10584,10 +10828,12 @@ mod pipeline_async_tests {
     ) {
         let reason = match status {
             201 => "Created",
+            202 => "Accepted",
             204 => "No Content",
             206 => "Partial Content",
             304 => "Not Modified",
             404 => "Not Found",
+            409 => "Conflict",
             412 => "Precondition Failed",
             416 => "Range Not Satisfiable",
             422 => "Unprocessable Entity",
@@ -10608,6 +10854,45 @@ mod pipeline_async_tests {
         let _ = stream.flush().await;
     }
 
+    async fn read_http_chunked_body(
+        stream: &mut tokio::net::TcpStream,
+        mut buf: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut i = 0usize;
+        let mut tmp = [0u8; 512];
+        loop {
+            let crlf = loop {
+                if let Some(rel) = buf[i..].windows(2).position(|w| w == b"\r\n") {
+                    break i + rel;
+                }
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return body,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let size_line = String::from_utf8_lossy(&buf[i..crlf]);
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+                return body;
+            };
+            i = crlf + 2;
+            if size == 0 {
+                return body;
+            }
+            while buf.len() < i + size + 2 {
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return body,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            body.extend_from_slice(&buf[i..i + size]);
+            i += size + 2;
+        }
+    }
+
     async fn read_backend_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let mut head = Vec::new();
         let mut tmp = [0u8; 512];
@@ -10620,23 +10905,25 @@ mod pipeline_async_tests {
             if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
                 let header_end = pos + 4;
                 let header_text = String::from_utf8_lossy(&head[..header_end]).into_owned();
+                let lower = header_text.to_ascii_lowercase();
                 let cl = header_text
                     .lines()
                     .find_map(|line| {
-                        let lower = line.to_ascii_lowercase();
-                        lower
-                            .strip_prefix("content-length:")
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("content-length:")
                             .and_then(|v| v.trim().parse::<usize>().ok())
                     })
                     .unwrap_or(0);
-                if header_text
-                    .to_ascii_lowercase()
-                    .contains("expect: 100-continue")
-                {
+                if lower.contains("expect: 100-continue") {
                     let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
                     let _ = stream.flush().await;
                 }
-                let mut body = head[header_end..].to_vec();
+                let leftover = head[header_end..].to_vec();
+                if lower.contains("transfer-encoding:") && lower.contains("chunked") {
+                    let body = read_http_chunked_body(stream, leftover).await;
+                    return (header_text, body);
+                }
+                let mut body = leftover;
                 while body.len() < cl {
                     let n = match stream.read(&mut tmp).await {
                         Ok(0) | Err(_) => break,
@@ -15163,21 +15450,27 @@ mod pipeline_async_tests {
                     if is_put {
                         let ct = header("Content-Type")
                             .unwrap_or_else(|| "application/octet-stream".into());
-                        let etag = "7265f4d211b56873a381d321f586e4a9";
+                        use md5::{Digest, Md5};
+                        let etag = format!("{:x}", Md5::digest(&body));
                         if let Some(client_etag) = header("ETag") {
                             let norm = client_etag.trim_matches('"');
-                            if !norm.is_empty() && !norm.eq_ignore_ascii_case(etag) {
+                            if !norm.is_empty() && !norm.eq_ignore_ascii_case(&etag) {
                                 write_backend_http_status(&mut stream, 422, &[], &[]).await;
                                 return;
                             }
                         }
+                        // IsolatedIdentity object-server Last-Modified is
+                        // http_date(X-Timestamp.ceil()). Official
+                        // testLastModified compares that PUT header to HEAD.
+                        let last_modified = header("X-Timestamp")
+                            .and_then(|raw| raw.parse::<Timestamp>().ok())
+                            .map(|ts| swift_http::http_date(ts.ceil()))
+                            .unwrap_or_else(|| "Wed, 09 Sep 2026 12:00:00 GMT".to_string());
                         let mut stored = HeaderKeyDict::new();
                         stored.set("Content-Type", &ct);
-                        stored.set("ETag", etag);
+                        stored.set("ETag", &etag);
                         stored.set("Content-Length", body.len().to_string());
-                        // Official TestFileComparison uses Last-Modified, not
-                        // X-Timestamp, for If-Modified-Since / If-Unmodified-Since.
-                        stored.set("Last-Modified", "Wed, 09 Sep 2026 12:00:00 GMT");
+                        stored.set("Last-Modified", &last_modified);
                         stored.set("Accept-Ranges", "bytes");
                         for line in text.lines() {
                             if let Some((k, v)) = line.split_once(':') {
@@ -15194,14 +15487,14 @@ mod pipeline_async_tests {
                             listings
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
-                                .insert(name, (body.len() as u64, etag.to_string(), ct));
+                                .insert(name, (body.len() as u64, etag.clone(), ct));
                         }
                         write_backend_http_status(
                             &mut stream,
                             201,
                             &[
-                                ("ETag", etag),
-                                ("Last-Modified", "Wed, 09 Sep 2026 12:00:00 GMT"),
+                                ("ETag", etag.as_str()),
+                                ("Last-Modified", last_modified.as_str()),
                             ],
                             &[],
                         )
@@ -15499,6 +15792,7 @@ mod pipeline_async_tests {
                 rows.push(serde_json::json!({
                     "name": name,
                     "bytes": 0,
+                    "count": 0,
                     "hash": "x",
                     "content_type": "text/plain",
                     "last_modified": "2010-01-01T00:00:00.000000",
@@ -15518,6 +15812,7 @@ mod pipeline_async_tests {
             rows.push(serde_json::json!({
                 "name": name,
                 "bytes": 0,
+                "count": 0,
                 "hash": "x",
                 "content_type": "text/plain",
                 "last_modified": "2010-01-01T00:00:00.000000",
@@ -15539,6 +15834,10 @@ mod pipeline_async_tests {
             String,
             Vec<String>,
         >::new()));
+        let stats = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (u64, u64),
+        >::new()));
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -15546,9 +15845,10 @@ mod pipeline_async_tests {
                 };
                 let containers = Arc::clone(&containers);
                 let objects = Arc::clone(&objects);
+                let stats = Arc::clone(&stats);
                 tokio::spawn(async move {
                     let mut stream = stream;
-                    let (text, _body) = read_backend_http_request(&mut stream).await;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
                     if text.is_empty() {
                         return;
                     }
@@ -15558,6 +15858,7 @@ mod pipeline_async_tests {
                     let is_head = first.starts_with("HEAD ");
                     let is_put = first.starts_with("PUT ");
                     let is_get = first.starts_with("GET ");
+                    let is_delete = first.starts_with("DELETE ");
                     let shard = text
                         .to_ascii_lowercase()
                         .contains("x-backend-record-type: shard");
@@ -15569,7 +15870,20 @@ mod pipeline_async_tests {
                             .map(|(_, v)| v.clone())
                             .unwrap_or_default()
                     };
+                    let account_counts = || {
+                        let n = containers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .len();
+                        let (objects_n, bytes_n) = stats
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .values()
+                            .fold((0u64, 0u64), |acc, &(c, b)| (acc.0 + c, acc.1 + b));
+                        (n.to_string(), objects_n.to_string(), bytes_n.to_string())
+                    };
                     if logical == "/AUTH_test" {
+                        let (n_s, o_s, b_s) = account_counts();
                         if is_get {
                             let names: Vec<String> = containers
                                 .lock()
@@ -15582,7 +15896,7 @@ mod pipeline_async_tests {
                                 .iter()
                                 .find(|(k, _)| k == "path")
                                 .map(|(_, v)| v.clone());
-                            let rows = listing_with_delimiter(
+                            let mut rows = listing_with_delimiter(
                                 &names,
                                 &qparam("prefix"),
                                 &qparam("delimiter"),
@@ -15592,16 +15906,44 @@ mod pipeline_async_tests {
                                 qparam("limit").parse().ok(),
                                 path.as_deref(),
                             );
+                            let stats_g = stats.lock().unwrap_or_else(|p| p.into_inner());
+                            for row in rows.iter_mut() {
+                                if let Some(name) = row
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                                {
+                                    if let Some(&(count, bytes)) = stats_g.get(&name) {
+                                        row["count"] = serde_json::json!(count);
+                                        row["bytes"] = serde_json::json!(bytes);
+                                    }
+                                }
+                            }
                             let payload = serde_json::to_vec(&rows).unwrap();
                             write_backend_http(
                                 &mut stream,
-                                &[("Content-Type", "application/json")],
+                                &[
+                                    ("Content-Type", "application/json"),
+                                    ("X-Account-Container-Count", n_s.as_str()),
+                                    ("X-Account-Object-Count", o_s.as_str()),
+                                    ("X-Account-Bytes-Used", b_s.as_str()),
+                                ],
                                 &payload,
                             )
                             .await;
                             return;
                         }
-                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[
+                                ("X-Account-Container-Count", n_s.as_str()),
+                                ("X-Account-Object-Count", o_s.as_str()),
+                                ("X-Account-Bytes-Used", b_s.as_str()),
+                            ],
+                            &[],
+                        )
+                        .await;
                         return;
                     }
                     if !logical.starts_with("/AUTH_test/") {
@@ -15611,16 +15953,24 @@ mod pipeline_async_tests {
                     let rest = logical.trim_start_matches("/AUTH_test/");
                     if let Some((container, object)) = rest.split_once('/') {
                         if is_put {
-                            containers
+                            let exists = containers
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
-                                .insert(container.to_string());
+                                .contains(container);
+                            if !exists {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
                             objects
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .entry(container.to_string())
                                 .or_default()
                                 .push(object.to_string());
+                            let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+                            let entry = st.entry(container.to_string()).or_insert((0, 0));
+                            entry.0 += 1;
+                            entry.1 += body.len() as u64;
                             write_backend_http_status(&mut stream, 201, &[], &[]).await;
                             return;
                         }
@@ -15633,11 +15983,17 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_put {
-                        containers
+                        let inserted = containers
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .insert(container);
-                        write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        write_backend_http_status(
+                            &mut stream,
+                            if inserted { 201 } else { 202 },
+                            &[],
+                            &[],
+                        )
+                        .await;
                         return;
                     }
                     let exists = containers
@@ -15646,6 +16002,23 @@ mod pipeline_async_tests {
                         .contains(&container);
                     if !exists {
                         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_delete {
+                        let has_files = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .is_some_and(|v| !v.is_empty());
+                        if has_files {
+                            write_backend_http_status(&mut stream, 409, &[], &[]).await;
+                            return;
+                        }
+                        containers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&container);
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
                     }
                     if is_head {
@@ -17425,13 +17798,19 @@ mod pipeline_async_tests {
             "official testRangedGets bytes=-0 on Hyper, got {}",
             suffix0.status
         );
+        let put_etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
         assert_eq!(
             suffix0
                 .headers
                 .get("ETag")
                 .or_else(|| suffix0.headers.get("Etag"))
                 .map(|s| s.trim_matches('"')),
-            Some("7265f4d211b56873a381d321f586e4a9")
+            Some(put_etag.as_str())
         );
         backend.abort();
     }
@@ -17496,6 +17875,46 @@ mod pipeline_async_tests {
         parts
     }
 
+    fn dow_long(short: &str) -> &'static str {
+        match short {
+            "Mon" => "Monday",
+            "Tue" => "Tuesday",
+            "Wed" => "Wednesday",
+            "Thu" => "Thursday",
+            "Fri" => "Friday",
+            "Sat" => "Saturday",
+            "Sun" => "Sunday",
+            _ => "Tuesday",
+        }
+    }
+
+    fn imf_to_rfc850(imf: &str) -> String {
+        let parts: Vec<&str> = imf.split_whitespace().collect();
+        let dow = parts[0].trim_end_matches(',');
+        let day = parts[1];
+        let mon = parts[2];
+        let year2 = parts[3].get(2..).unwrap_or(parts[3]);
+        let time = parts[4];
+        format!(
+            "{}, {}-{}-{} {} GMT",
+            dow_long(dow),
+            day,
+            mon,
+            year2,
+            time
+        )
+    }
+
+    fn imf_to_asctime(imf: &str) -> String {
+        let parts: Vec<&str> = imf.split_whitespace().collect();
+        let dow = parts[0].trim_end_matches(',');
+        let day: u32 = parts[1].parse().unwrap_or(1);
+        let mon = parts[2];
+        let year = parts[3];
+        let time = parts[4];
+        format!("{dow} {mon} {day:>2} {time} {year}")
+    }
+
     /// Official TestFileComparison.testIfModifiedSince / testIfUnmodifiedSince
     /// / testIfMatchAndUnmodified (IMF-fixdate, RFC 850, asctime).
     #[tokio::test]
@@ -17517,10 +17936,17 @@ mod pipeline_async_tests {
             .or_else(|| put.headers.get("Etag"))
             .map(|s| s.trim_matches('"').to_string())
             .expect("PUT etag");
-        let time_old = "Tue, 08 Sep 2026 12:00:00 GMT";
-        let time_new = "Thu, 10 Sep 2026 12:00:00 GMT";
-        let time_old_rfc850 = "Tuesday, 08-Sep-26 12:00:00 GMT";
-        let time_old_asctime = "Tue Sep 8 12:00:00 2026";
+        let lm = put
+            .headers
+            .get("Last-Modified")
+            .or_else(|| put.headers.get("last-modified"))
+            .expect("PUT Last-Modified")
+            .to_string();
+        let lm_ts = swift_http::parse_http_date(&lm).expect("parse PUT Last-Modified");
+        let time_old = swift_http::http_date(lm_ts - 86_400);
+        let time_new = swift_http::http_date(lm_ts + 86_400);
+        let time_old_rfc850 = imf_to_rfc850(&time_old);
+        let time_old_asctime = imf_to_asctime(&time_old);
         for method in ["GET", "HEAD"] {
             let old = file_hyper_call(
                 &svc,
@@ -17831,6 +18257,310 @@ mod pipeline_async_tests {
             "official testMultiRangeGets unsatisfiable on Hyper, got {}",
             none.status
         );
+        backend.abort();
+    }
+
+    /// Official TestFile.testLastModified: PUT Last-Modified == HEAD;
+    /// IMS on that exact date is 304; IUMS on that date is 200.
+    #[tokio::test]
+    async fn file_last_modified_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/lm",
+            "",
+            &[
+                ("Content-Length", "4"),
+                ("Content-Type", "application/x-last-modified"),
+            ],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let put_lm = put
+            .headers
+            .get("Last-Modified")
+            .or_else(|| put.headers.get("last-modified"))
+            .expect("official testLastModified PUT Last-Modified")
+            .to_string();
+        let etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        let head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/lm", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official testLastModified HEAD on Hyper, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers
+                .get("Last-Modified")
+                .or_else(|| head.headers.get("last-modified")),
+            Some(put_lm.as_str()),
+            "official testLastModified PUT Last-Modified must equal HEAD"
+        );
+        let ims = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/lm",
+            "",
+            &[("If-Modified-Since", put_lm.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ims.status, 304,
+            "official testLastModified IMS==Last-Modified on Hyper, got {}",
+            ims.status
+        );
+        assert_eq!(
+            ims.headers
+                .get("ETag")
+                .or_else(|| ims.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            ims.headers
+                .get("Accept-Ranges")
+                .or_else(|| ims.headers.get("accept-ranges"))
+                .map(|s| s.to_ascii_lowercase()),
+            Some("bytes".to_string())
+        );
+        let iums = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/lm",
+            "",
+            &[("If-Unmodified-Since", put_lm.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&iums.status),
+            "official testLastModified IUMS==Last-Modified on Hyper, got {}",
+            iums.status
+        );
+        let body = iums.body.collect_async().await.expect("IUMS body");
+        assert_eq!(body, b"abcd");
+        backend.abort();
+    }
+
+    /// Official TestFile.testFileSizeLimit over-limit Content-Length is 413
+    /// before any body is sent (IsolatedIdentity Hyper check_object_creation).
+    #[tokio::test]
+    async fn file_size_limit_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let limit = swift_core::constraints::MAX_FILE_SIZE;
+        for extra in [1i64, 10, 100] {
+            let cl = (limit + extra).to_string();
+            let resp = file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/toobig",
+                "",
+                &[("Content-Length", cl.as_str()), ("Content-Type", "text/plain")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.status, 413,
+                "official testFileSizeLimit CL={} on Hyper, got {}",
+                cl, resp.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testZeroByteFile / testStackedOverwrite /
+    /// testChunkedPut (Hyper already decoded the body; leftover stub must
+    /// still accept a chunked backend PUT).
+    #[tokio::test]
+    async fn file_zero_byte_overwrite_and_chunked_put_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let zero = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/empty",
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            zero.status, 201,
+            "official testZeroByteFile PUT on Hyper, got {}",
+            zero.status
+        );
+        assert!(
+            file_listing_names(&svc).await.iter().any(|n| n == "empty"),
+            "official testZeroByteFile must appear in the listing"
+        );
+        let got = file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/empty", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&got.status),
+            "official testZeroByteFile GET on Hyper, got {}",
+            got.status
+        );
+        let empty = got.body.collect_async().await.expect("zero-byte body");
+        assert!(empty.is_empty(), "official testZeroByteFile body must be empty");
+
+        let mut last = Vec::new();
+        for i in 1..=10u8 {
+            last = vec![i; 512];
+            let cl = last.len().to_string();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/stack",
+                "",
+                &[("Content-Length", cl.as_str()), ("Content-Type", "text/plain")],
+                last.clone(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testStackedOverwrite PUT {i} on Hyper, got {}",
+                put.status
+            );
+        }
+        let stacked =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/stack", "", &[], Vec::new()).await;
+        assert_eq!(
+            stacked.body.collect_async().await.expect("stacked body"),
+            last,
+            "official testStackedOverwrite last write wins"
+        );
+
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        use md5::{Digest, Md5};
+        let expect_etag = format!("{:x}", Md5::digest(&data));
+        let chunked = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/chunked",
+            "",
+            &[
+                ("Transfer-Encoding", "chunked"),
+                ("Content-Type", "text/plain"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(
+            chunked.status, 201,
+            "official testChunkedPut on Hyper, got {}",
+            chunked.status
+        );
+        let read = file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
+        assert_eq!(
+            read.body.collect_async().await.expect("chunked GET"),
+            data,
+            "official testChunkedPut body"
+        );
+        let info = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
+        assert_eq!(
+            info.headers
+                .get("ETag")
+                .or_else(|| info.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str()),
+            "official testChunkedPut etag"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testSerialization: json/xml listings carry
+    /// content_type, bytes, hash, last_modified and the listing Content-Type.
+    #[tokio::test]
+    async fn file_serialization_listing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let files = [
+            ("s0", 0usize, "application/x-zero"),
+            ("s1", 1, "application/x-one"),
+            ("s10", 10, "application/x-ten"),
+            ("s100", 100, "application/x-hundred"),
+        ];
+        let mut hashes = std::collections::HashMap::new();
+        for (name, bytes, ct) in files {
+            let body = vec![b'z'; bytes];
+            use md5::{Digest, Md5};
+            hashes.insert(name, format!("{:x}", Md5::digest(&body)));
+            let cl = bytes.to_string();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", cl.as_str()), ("Content-Type", ct)],
+                body,
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testSerialization PUT {name} on Hyper, got {}",
+                put.status
+            );
+        }
+        for format_type in ["json", "xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c",
+                &format!("format={format_type}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                listed.status, 200,
+                "official testSerialization {format_type} on Hyper, got {}",
+                listed.status
+            );
+            let ct = listed
+                .headers
+                .get("Content-Type")
+                .or_else(|| listed.headers.get("content-type"))
+                .unwrap_or("");
+            assert_eq!(
+                ct,
+                format!("application/{format_type}; charset=utf-8"),
+                "official testSerialization {format_type} Content-Type"
+            );
+            let body = listed
+                .body
+                .collect_async()
+                .await
+                .expect("serialization listing");
+            if format_type == "json" {
+                let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                for (name, bytes, ct) in files {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(name))
+                        .unwrap_or_else(|| panic!("missing {name} in json listing"));
+                    assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(bytes as u64));
+                    assert_eq!(row.get("content_type").and_then(|v| v.as_str()), Some(ct));
+                    assert_eq!(
+                        row.get("hash").and_then(|v| v.as_str()),
+                        Some(hashes[name].as_str())
+                    );
+                    assert!(row.get("last_modified").and_then(|v| v.as_str()).is_some());
+                }
+            } else {
+                let text = String::from_utf8_lossy(&body);
+                for (name, _, _) in files {
+                    assert!(
+                        text.contains(name),
+                        "official testSerialization xml missing {name}: {text}"
+                    );
+                }
+            }
+        }
         backend.abort();
     }
 
