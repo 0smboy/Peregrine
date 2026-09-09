@@ -2639,10 +2639,11 @@ impl ProxyApp {
 
     pub(crate) async fn container_post_async(
         self: &Arc<Self>,
-        req: swift_http::Request,
+        mut req: swift_http::Request,
         account: &str,
         container: &str,
     ) -> Response {
+        super::scrub_container_write_owner_headers(&mut req);
         if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "container") {
             let mut r = Response::with_body(400, e.0);
             r.headers.set("Content-Type", "text/plain");
@@ -2740,10 +2741,11 @@ impl ProxyApp {
 
     pub(crate) async fn container_put_async(
         self: &Arc<Self>,
-        req: swift_http::Request,
+        mut req: swift_http::Request,
         account: &str,
         container: &str,
     ) -> Response {
+        super::scrub_container_write_owner_headers(&mut req);
         if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "container") {
             let mut r = Response::with_body(400, e.0);
             r.headers.set("Content-Type", "text/plain");
