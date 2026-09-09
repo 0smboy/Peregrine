@@ -36,13 +36,35 @@ pub fn parse_acl_v1(acl_string: &str) -> (Vec<String>, Vec<String>) {
     if !acl_string.is_empty() {
         for value in acl_string.split(',') {
             if let Some(rest) = value.strip_prefix(".r:") {
-                referrers.push(rest.to_string());
+                // Python clean_acl: `.r:*.example.com` → `.r:.example.com`
+                // (leading `*.` is a domain wildcard). IsolatedIdentity
+                // TestSlo/TestDlo referer tests POST that form.
+                referrers.push(normalize_referrer_designation(rest));
             } else {
                 groups.push(unquote(value));
             }
         }
     }
     (referrers, groups)
+}
+
+/// Python `clean_acl` star-domain rewrite on a `.r:` payload (`*.example.com`
+/// → `.example.com`; `-*.example.com` → `-.example.com`). Bare `*` is kept.
+fn normalize_referrer_designation(rest: &str) -> String {
+    let (negated, host) = match rest.strip_prefix('-') {
+        Some(host) => (true, host),
+        None => (false, rest),
+    };
+    let host = if host != "*" && host.starts_with('*') {
+        host.trim_start_matches('*')
+    } else {
+        host
+    };
+    if negated {
+        format!("-{host}")
+    } else {
+        host.to_string()
+    }
 }
 
 /// `referrer_allowed`: whether `referrer` is permitted by `referrer_acl` (the
@@ -307,6 +329,14 @@ mod tests {
         let suffix = vec![".example.com".to_string()];
         assert!(referrer_allowed(Some("http://www.example.com/"), &suffix));
         assert!(!referrer_allowed(Some("http://example.com/"), &suffix));
+
+        let (star_domain, groups) = parse_acl_v1(".r:*.example.com,.rlistings");
+        assert_eq!(star_domain, vec![".example.com"]);
+        assert_eq!(groups, vec![".rlistings"]);
+        assert!(referrer_allowed(
+            Some("http://blah.example.com"),
+            &star_domain
+        ));
     }
 
     #[test]

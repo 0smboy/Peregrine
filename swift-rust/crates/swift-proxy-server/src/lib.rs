@@ -9507,7 +9507,8 @@ mod pipeline_async_tests {
     /// Official TestSlo.test_slo_referer_on_segment_container step 1 and
     /// TestDlo.test_dlo_referer_on_segment_container step 1: a foreign
     /// TempAuth token plus Referer is 403 until the container read ACL
-    /// allows `.r:*.example.com`. authorize_async must run on Hyper.
+    /// allows `.r:*.example.com` (Python `clean_acl` → `.r:.example.com`).
+    /// authorize_async must run on Hyper.
     async fn foreign_referer_token(svc: &ProxyAsyncService) -> String {
         let mut headers = HeaderKeyDict::new();
         headers.set("X-Auth-User", "other:tester3");
