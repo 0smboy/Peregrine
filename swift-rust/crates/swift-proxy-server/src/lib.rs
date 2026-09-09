@@ -10252,6 +10252,241 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainer.testFileThenContainerDelete /
+    /// testContainerExistenceCachingProblem / testPrefixAndLimit /
+    /// testFileOrder / testContainerJsonFileList.
+    #[tokio::test]
+    async fn container_file_then_delete_cache_and_prefix_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let missing =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/cache-c", "", &[], Vec::new()).await;
+        assert_eq!(
+            missing.status, 404,
+            "official testContainerExistenceCachingProblem listing before create, got {}",
+            missing.status
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/cache-c", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let after =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/cache-c", "", &[], Vec::new()).await;
+        assert!(
+            after.status == 204 || after.status == 200,
+            "official testContainerExistenceCachingProblem listing after create, got {}",
+            after.status
+        );
+
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/ftd", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ftd/obj",
+                "",
+                &[("Content-Length", "1")],
+                b"x".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/ftd", "").await,
+            vec!["obj".to_string()]
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/ftd/obj", "", &[], Vec::new())
+                .await
+                .status,
+            204,
+            "official testFileThenContainerDelete object DELETE"
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test/ftd", "")
+                .await
+                .is_empty(),
+            "official testFileThenContainerDelete object must leave the listing"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/ftd", "", &[], Vec::new())
+                .await
+                .status,
+            204,
+            "official testFileThenContainerDelete container DELETE"
+        );
+        assert!(
+            !listing_plain_names(&svc, "/v1/AUTH_test", "")
+                .await
+                .iter()
+                .any(|n| n == "ftd"),
+            "official testFileThenContainerDelete container must leave the account listing"
+        );
+
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/pref", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let mut expected = std::collections::HashMap::<&str, Vec<String>>::new();
+        for prefix in ["alpha/", "beta/", "kappa/"] {
+            let mut names = Vec::new();
+            for i in 0..10 {
+                let name = format!("{prefix}f{i:02}");
+                assert_eq!(
+                    file_hyper_call(
+                        &svc,
+                        "PUT",
+                        &format!("/v1/AUTH_test/pref/{name}"),
+                        "",
+                        &[("Content-Length", "0")],
+                        Vec::new(),
+                    )
+                    .await
+                    .status,
+                    201,
+                    "PUT {name}"
+                );
+                names.push(name);
+            }
+            names.sort();
+            expected.insert(prefix, names);
+        }
+        for prefix in ["alpha/", "beta/", "kappa/"] {
+            let listed =
+                listing_plain_names(&svc, "/v1/AUTH_test/pref", &format!("prefix={prefix}")).await;
+            assert_eq!(
+                listed, expected[prefix],
+                "official testPrefixAndLimit prefix={prefix}"
+            );
+            let limited = listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/pref",
+                &format!("prefix={prefix}&limit=2"),
+            )
+            .await;
+            assert_eq!(
+                limited.len(),
+                2,
+                "official testPrefixAndLimit limit=2 {prefix}"
+            );
+            assert!(
+                limited.iter().all(|n| n.starts_with(prefix)),
+                "official testPrefixAndLimit prefix filter {limited:?}"
+            );
+        }
+
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/order", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let items = ["zz", "a10", "B2", "a1", "b1", "A3", "a2", "b10"];
+        for name in items {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/order/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        let mut sorted: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        sorted.sort();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/order", "").await,
+            sorted,
+            "official testFileOrder / testContainersOrderedByName byte order"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.testContainerJsonFileList: listing hash /
+    /// content_type / bytes match HEAD info.
+    #[tokio::test]
+    async fn container_json_file_list_matches_head_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let files = [
+            ("j1", b"aa".as_slice(), "text/j1"),
+            ("j2", b"bbbb".as_slice(), "image/j2"),
+            ("j3", b"c".as_slice(), "application/j3"),
+        ];
+        let mut expect = std::collections::HashMap::new();
+        for (name, body, ct) in files {
+            use md5::{Digest, Md5};
+            let etag = format!("{:x}", Md5::digest(body));
+            let cl = body.len().to_string();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", cl.as_str()), ("Content-Type", ct)],
+                body.to_vec(),
+            )
+            .await;
+            assert_eq!(put.status, 201, "PUT {name}");
+            let head = file_hyper_call(
+                &svc,
+                "HEAD",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&head.status),
+                "HEAD {name} got {}",
+                head.status
+            );
+            expect.insert(name, (etag, ct.to_string(), body.len() as u64));
+        }
+        let listed = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        let body = listed.body.collect_async().await.expect("json listing");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        for (name, (etag, ct, bytes)) in &expect {
+            let row = rows
+                .iter()
+                .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(*name))
+                .unwrap_or_else(|| panic!("official testContainerJsonFileList missing {name}"));
+            assert_eq!(
+                row.get("hash").and_then(|v| v.as_str()),
+                Some(etag.as_str())
+            );
+            assert_eq!(
+                row.get("content_type").and_then(|v| v.as_str()),
+                Some(ct.as_str())
+            );
+            assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(*bytes));
+        }
+        backend.abort();
+    }
+
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
     /// because HMAC lived only in `handle()`, which Hyper never calls.
     /// `prepare` must stamp `X-Backend-Authorize-Override` so
@@ -16140,6 +16375,39 @@ mod pipeline_async_tests {
                                 entry.1 += body.len() as u64;
                             }
                             write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                            return;
+                        }
+                        if is_delete {
+                            let exists = containers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains(container);
+                            if !exists {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            let removed = {
+                                let mut objs = objects.lock().unwrap_or_else(|p| p.into_inner());
+                                let list = objs.entry(container.to_string()).or_default();
+                                if let Some(idx) = list.iter().position(|n| n == object) {
+                                    list.remove(idx);
+                                    if let Some(st) = stats
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .get_mut(container)
+                                    {
+                                        st.0 = st.0.saturating_sub(1);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if removed {
+                                write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                            } else {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            }
                             return;
                         }
                         write_backend_http_status(&mut stream, 200, &[], b"x").await;
