@@ -10959,7 +10959,7 @@ mod pipeline_async_tests {
                 Arc::new(SloManifestGetStub),
             ],
         };
-        let mut resp = svc
+        let resp = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/a/c/manifest-abcde".into(),
