@@ -9789,10 +9789,14 @@ mod pipeline_async_tests {
                         }
                         extra = vec![("Content-Type", "application/json")];
                         body = br#"[{"name":"segs/1","bytes":10,"hash":"x","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"},{"name":"segs/2","bytes":10,"hash":"y","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"}]"#;
-                    } else if logical == "/AUTH_test/c2/segs/1" {
+                    } else if logical == "/AUTH_test/c2/segs/1"
+                        || logical == "/AUTH_test/c2/segs%2F1"
+                    {
                         extra = vec![];
                         body = b"ffffffffff";
-                    } else if logical == "/AUTH_test/c2/segs/2" {
+                    } else if logical == "/AUTH_test/c2/segs/2"
+                        || logical == "/AUTH_test/c2/segs%2F2"
+                    {
                         extra = vec![];
                         body = b"gggggggggg";
                     } else {
