@@ -9709,6 +9709,14 @@ mod pipeline_async_tests {
         Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
     }
 
+    fn object_etag_listed(header: &str, etag: &str) -> bool {
+        let etag = etag.trim_matches('"');
+        header.split(',').any(|token| {
+            let token = token.trim().trim_matches('"');
+            token == "*" || token.eq_ignore_ascii_case(etag)
+        })
+    }
+
     fn backend_logical_target(first_line: &str) -> (String, String) {
         let target = first_line.split_whitespace().nth(1).unwrap_or("");
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -9737,7 +9745,9 @@ mod pipeline_async_tests {
         let reason = match status {
             201 => "Created",
             204 => "No Content",
+            304 => "Not Modified",
             404 => "Not Found",
+            412 => "Precondition Failed",
             _ => "OK",
         };
         let mut hdr = format!(
@@ -14243,11 +14253,12 @@ mod pipeline_async_tests {
                         return;
                     }
                     let first = text.lines().next().unwrap_or("");
-                    let (logical, _query) = backend_logical_target(first);
+                    let (logical, query) = backend_logical_target(first);
                     let is_head = first.starts_with("HEAD ");
                     let is_put = first.starts_with("PUT ");
                     let is_post = first.starts_with("POST ");
                     let is_get = first.starts_with("GET ");
+                    let is_delete = first.starts_with("DELETE ");
                     let shard = text
                         .to_ascii_lowercase()
                         .contains("x-backend-record-type: shard");
@@ -14261,10 +14272,16 @@ mod pipeline_async_tests {
                             return;
                         }
                         if is_get {
+                            let prefix = query
+                                .split('&')
+                                .find_map(|part| part.strip_prefix("prefix="))
+                                .map(swift_http::unquote)
+                                .unwrap_or_default();
                             let rows: Vec<serde_json::Value> = listings
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .iter()
+                                .filter(|(name, _)| prefix.is_empty() || name.starts_with(&prefix))
                                 .map(|(name, (bytes, hash, ct))| {
                                     serde_json::json!({
                                         "name": name,
@@ -14363,12 +14380,58 @@ mod pipeline_async_tests {
                         write_backend_http_status(&mut stream, 202, &[], &[]).await;
                         return;
                     }
+                    if is_delete {
+                        let found = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&logical)
+                            .is_some();
+                        listings
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&name);
+                        if found {
+                            write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        } else {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        }
+                        return;
+                    }
                     let stored = objects
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .get(&logical)
                         .cloned();
                     if let Some((headers, obj)) = stored {
+                        let etag = headers
+                            .get("ETag")
+                            .or_else(|| headers.get("Etag"))
+                            .unwrap_or("7265f4d211b56873a381d321f586e4a9")
+                            .to_string();
+                        if let Some(im) = header("If-Match") {
+                            if !object_etag_listed(&im, &etag) {
+                                write_backend_http_status(
+                                    &mut stream,
+                                    412,
+                                    &[("ETag", &etag), ("Accept-Ranges", "bytes")],
+                                    &[],
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        if let Some(inm) = header("If-None-Match") {
+                            if object_etag_listed(&inm, &etag) {
+                                write_backend_http_status(
+                                    &mut stream,
+                                    304,
+                                    &[("ETag", &etag), ("Accept-Ranges", "bytes")],
+                                    &[],
+                                )
+                                .await;
+                                return;
+                            }
+                        }
                         let send = if is_head { &[][..] } else { obj.as_slice() };
                         let extra: Vec<(&str, String)> =
                             headers.iter().map(|(k, v)| (k, v.to_string())).collect();
@@ -15435,6 +15498,550 @@ mod pipeline_async_tests {
                 "official testCopyFromAccountHeader404s missing dest {copy_from}"
             );
         }
+        backend.abort();
+    }
+
+    async fn file_listing_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_file_post_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        (svc, backend)
+    }
+
+    async fn file_hyper_call(
+        svc: &ProxyAsyncService,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Response {
+        let mut h = HeaderKeyDict::new();
+        for (k, v) in headers {
+            h.set(*k, *v);
+        }
+        svc.call(AsyncRequest {
+            method: method.into(),
+            path: path.into(),
+            query_string: query.into(),
+            headers: h,
+            body: IncomingBody::from_bytes(body, u64::MAX),
+        })
+        .await
+    }
+
+    async fn file_listing_names(svc: &ProxyAsyncService) -> Vec<String> {
+        let listed = file_hyper_call(
+            svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            listed.status, 200,
+            "container listing, got {}",
+            listed.status
+        );
+        let body = listed
+            .body
+            .collect_async()
+            .await
+            .expect("container listing body");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        rows.iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    /// Official TestFile.testNoContentLengthForPut / testBadHeaders.
+    /// IsolatedIdentity Hyper never calls check_object_creation from
+    /// `handle()` — the leftover is handle_async + HTTP headers as sent
+    /// (`no_content_length` omits both Content-Length and Transfer-Encoding).
+    #[tokio::test]
+    async fn file_put_missing_content_length_and_bad_headers_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let no_ct = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/noct.txt",
+            "",
+            &[("Content-Length", "4")],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            no_ct.status, 201,
+            "official testBadHeaders no content-type PUT on Hyper, got {}",
+            no_ct.status
+        );
+        let cl_x = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/cl-x",
+            "",
+            &[("Content-Type", "text/plain"), ("Content-Length", "X")],
+            b"xxxx".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            cl_x.status, 400,
+            "official testBadHeaders Content-Length X on Hyper, got {}",
+            cl_x.status
+        );
+        let missing_cl = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/no-cl",
+            "",
+            &[("Content-Type", "text/plain")],
+            b"testing".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            missing_cl.status, 411,
+            "official testNoContentLengthForPut on Hyper, got {}",
+            missing_cl.status
+        );
+        let te = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/te-gzip",
+            "",
+            &[
+                ("Content-Type", "text/plain"),
+                ("Transfer-Encoding", "gzip,chunked"),
+            ],
+            b"xxxx".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            te.status, 501,
+            "official testBadHeaders transfer-encoding gzip,chunked on Hyper, got {}",
+            te.status
+        );
+        for method in ["LICK", "GETorHEAD_base"] {
+            let resp = file_hyper_call(&svc, method, "/v1/AUTH_test", "", &[], Vec::new()).await;
+            assert_eq!(
+                resp.status, 405,
+                "official testBadHeaders {method} on Hyper, got {}",
+                resp.status
+            );
+        }
+        let ranged = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/noct.txt",
+            "",
+            &[("Range", "parsecs=8-12")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ranged.status, 200,
+            "official testBadHeaders invalid Range unit on Hyper, got {}",
+            ranged.status
+        );
+        let body = ranged
+            .body
+            .collect_async()
+            .await
+            .expect("invalid Range GET body");
+        assert_eq!(
+            body, b"abcd",
+            "official testBadHeaders invalid Range must return the full object"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testNameLimit / testQuestionMarkInName.
+    #[tokio::test]
+    async fn file_name_limit_and_question_mark_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let limit = swift_core::constraints::MAX_OBJECT_NAME_LENGTH as usize;
+        for n in [1usize, 10, limit / 2, limit - 1, limit] {
+            let name = "a".repeat(n);
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testNameLimit len={n} on Hyper, got {}",
+                put.status
+            );
+        }
+        let over = "a".repeat(limit + 1);
+        let too_long = file_hyper_call(
+            &svc,
+            "PUT",
+            &format!("/v1/AUTH_test/c/{over}"),
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            too_long.status, 400,
+            "official testNameLimit over-limit on Hyper, got {}",
+            too_long.status
+        );
+        let q_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/pre",
+            "suf=1",
+            &[("Content-Length", "3"), ("Content-Type", "text/plain")],
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            q_put.status, 201,
+            "official testQuestionMarkInName no_path_quote PUT on Hyper, got {}",
+            q_put.status
+        );
+        let names = file_listing_names(&svc).await;
+        assert!(
+            names.iter().any(|n| n == "pre"),
+            "official testQuestionMarkInName listing must keep the prefix before '?', got {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| !n.contains('?')),
+            "official testQuestionMarkInName listing must not keep '?' in the name, got {names:?}"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testBlankMetadataName / testMetadataNumberLimit /
+    /// testMetadataLengthLimits.
+    #[tokio::test]
+    async fn file_blank_and_metadata_limits_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let blank = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/blank-meta",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Object-Meta-", "nope"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            blank.status, 400,
+            "official testBlankMetadataName on Hyper, got {}",
+            blank.status
+        );
+        let key_limit = swift_core::constraints::MAX_META_NAME_LENGTH as usize;
+        let value_limit = swift_core::constraints::MAX_META_VALUE_LENGTH as usize;
+        let ok_len = {
+            let mut h = HeaderKeyDict::new();
+            h.set("Content-Length", "0");
+            h.set("Content-Type", "text/plain");
+            let ok_key = format!("X-Object-Meta-{}", "a".repeat(key_limit));
+            h.set(&ok_key, "b".repeat(value_limit));
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-ok".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            ok_len.status, 201,
+            "official testMetadataLengthLimits at-limit on Hyper, got {}",
+            ok_len.status
+        );
+        let long_key = {
+            let mut h = HeaderKeyDict::new();
+            h.set("Content-Length", "0");
+            h.set("Content-Type", "text/plain");
+            let long_name = format!("X-Object-Meta-{}", "a".repeat(key_limit + 1));
+            h.set(&long_name, "b");
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-long-key".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            long_key.status, 400,
+            "official testMetadataLengthLimits long key on Hyper, got {}",
+            long_key.status
+        );
+        let long_val = {
+            let mut h = HeaderKeyDict::new();
+            h.set("Content-Length", "0");
+            h.set("Content-Type", "text/plain");
+            h.set("X-Object-Meta-k", "b".repeat(value_limit + 1));
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-long-val".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            long_val.status, 400,
+            "official testMetadataLengthLimits long value on Hyper, got {}",
+            long_val.status
+        );
+        let count_limit = swift_core::constraints::MAX_META_COUNT as usize;
+        let mut ok_count = HeaderKeyDict::new();
+        ok_count.set("Content-Length", "0");
+        ok_count.set("Content-Type", "text/plain");
+        for i in 0..count_limit {
+            let key = format!("X-Object-Meta-k{i:02}");
+            ok_count.set(&key, "v");
+        }
+        let at_count = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-count-ok".into(),
+                query_string: String::new(),
+                headers: ok_count,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            at_count.status, 201,
+            "official testMetadataNumberLimit at-limit on Hyper, got {}",
+            at_count.status
+        );
+        let mut over_count = HeaderKeyDict::new();
+        over_count.set("Content-Length", "0");
+        over_count.set("Content-Type", "text/plain");
+        for i in 0..=count_limit {
+            let key = format!("X-Object-Meta-k{i:02}");
+            over_count.set(&key, "v");
+        }
+        let over = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-count-over".into(),
+                query_string: String::new(),
+                headers: over_count.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            over.status, 400,
+            "official testMetadataNumberLimit over-limit PUT on Hyper, got {}",
+            over.status
+        );
+        let seeded = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/meta-count-over",
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(seeded.status, 201, "seed object before over-limit POST");
+        let post_over = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c/meta-count-over".into(),
+                query_string: String::new(),
+                headers: over_count,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            post_over.status, 400,
+            "official testMetadataNumberLimit over-limit POST on Hyper, got {}",
+            post_over.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testDeleteThen404s.
+    #[tokio::test]
+    async fn file_delete_then_404s_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/gone",
+            "",
+            &[("Content-Length", "3"), ("Content-Type", "text/plain")],
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official testDeleteThen404s PUT, got {}",
+            put.status
+        );
+        let del =
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/c/gone", "", &[], Vec::new()).await;
+        assert_eq!(
+            del.status, 204,
+            "official testDeleteThen404s DELETE, got {}",
+            del.status
+        );
+        for method in ["HEAD", "GET", "POST", "DELETE"] {
+            let resp = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/gone",
+                "",
+                &[("X-Object-Meta-A", "b")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.status, 404,
+                "official testDeleteThen404s {method} after DELETE on Hyper, got {}",
+                resp.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testIfMatch / testIfNoneMatch (regular object).
+    #[tokio::test]
+    async fn file_if_match_and_if_none_match_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        let hit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-Match", &etag)],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&hit.status),
+            "official testIfMatch matching etag on Hyper, got {}",
+            hit.status
+        );
+        let multi = {
+            let mut h = HeaderKeyDict::new();
+            h.set("If-Match", format!("\"bogus1\", \"{etag}\", \"bogus2\""));
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/cond".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert!(
+            (200..300).contains(&multi.status),
+            "official testIfMatchMultipleEtags on Hyper, got {}",
+            multi.status
+        );
+        let miss = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-Match", "bogus")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            miss.status, 412,
+            "official testIfMatch mismatch on Hyper, got {}",
+            miss.status
+        );
+        assert_eq!(
+            miss.headers
+                .get("ETag")
+                .or_else(|| miss.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str()),
+            "official testIfMatch 412 must still expose etag"
+        );
+        let none_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-None-Match", "bogus")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&none_ok.status),
+            "official testIfNoneMatch miss on Hyper, got {}",
+            none_ok.status
+        );
+        let none_hit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-None-Match", &etag)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            none_hit.status, 304,
+            "official testIfNoneMatch hit on Hyper, got {}",
+            none_hit.status
+        );
+        assert_eq!(
+            none_hit
+                .headers
+                .get("ETag")
+                .or_else(|| none_hit.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str())
+        );
         backend.abort();
     }
 
