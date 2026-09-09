@@ -2178,4 +2178,43 @@ mod tests {
             Some(".wsgi.tempurl")
         );
     }
+
+    #[test]
+    fn test_prepare_accepts_utf8_object_path() {
+        // Official TestTempurlUTF8: HMAC is over the decoded Unicode path,
+        // not the percent-encoded request-target.
+        let tu = tempurl(&[KEY]);
+        let obj = "dir/caf\u{e9}.txt";
+        let path = format!("/v1/{ACCT}/{CONT}/{obj}");
+        let message = format!("GET\n{EXPIRES}\n{path}");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let mut req = mk("GET", &path, &query(&sig), &[]);
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("UTF-8 object HMAC must Continue, got {}", resp.status)
+            }
+        }
+        assert_eq!(
+            req.headers.get("X-Backend-Remote-User"),
+            Some(".wsgi.tempurl")
+        );
+    }
+
+    #[test]
+    fn test_prepare_accepts_utf8_prefix_tempurl() {
+        let tu = tempurl(&[KEY]);
+        let pfx = "dir/caf\u{e9}";
+        let path = format!("/v1/{ACCT}/{CONT}/{pfx}/obj");
+        let message = format!("GET\n{EXPIRES}\nprefix:/v1/{ACCT}/{CONT}/{pfx}");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let q = format!("temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_prefix={pfx}");
+        let mut req = mk("GET", &path, &q, &[]);
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("UTF-8 prefix HMAC must Continue, got {}", resp.status)
+            }
+        }
+    }
 }

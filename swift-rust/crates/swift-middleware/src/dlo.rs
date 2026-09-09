@@ -1427,6 +1427,49 @@ mod tests {
         assert_eq!(body_of(&mut resp), b"one");
     }
 
+    /// Official TestDlo.test_dlo_referer_on_segment_container step 2:
+    /// referer ACL on the manifest container only → listing the segment
+    /// container is 403, relayed (not 409 / not assembled).
+    #[test]
+    fn test_dlo_referer_denied_on_segment_container_is_403() {
+        let dlo = DynamicLargeObject::new();
+        let be: NextFn = Arc::new(|req: Request| {
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                return manifest_response("other/segs/");
+            }
+            if req.path == "/v1/a/other" {
+                return Response::error(403, "Forbidden");
+            }
+            Response::new(404)
+        });
+        let resp = dlo.handle(get_req("/v1/a/c/manifest", None), &be);
+        assert_eq!(resp.status, 403);
+    }
+
+    /// Official TestSlo.test_slo_referer_on_segment_container step 2 is
+    /// 409 (manifest readable, first segment 403). DLO listings relay
+    /// the listing status instead.
+    #[test]
+    fn test_dlo_referer_on_both_containers_assembles() {
+        let dlo = DynamicLargeObject::new();
+        let listing = listing_json(&[("segs/1", 3, &md5_hex(b"one"))]);
+        let be: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                return manifest_response("other/segs/");
+            }
+            if req.path == "/v1/a/other" {
+                return Response::with_body(200, listing.clone());
+            }
+            if req.path == "/v1/a/other/segs/1" {
+                return Response::with_body(200, b"one".to_vec());
+            }
+            Response::new(404)
+        });
+        let mut resp = dlo.handle(get_req("/v1/a/c/manifest", None), &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), b"one");
+    }
+
     #[test]
     fn test_head_no_body() {
         let dlo = DynamicLargeObject::new();
