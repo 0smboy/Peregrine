@@ -10805,12 +10805,16 @@ mod pipeline_async_tests {
                 Arc::new(SloNestedManifestStub),
             ],
         };
+        // Hyper reassemble's first next() is captured; nested segment GETs
+        // only reach the stub when SLO intercepts_request (If-*).
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", "not-nested");
         let mut resp = svc
             .call(AsyncRequest {
                 method: "GET".into(),
                 path: "/v1/a/c/manifest-abcde-submanifest".into(),
                 query_string: String::new(),
-                headers: HeaderKeyDict::new(),
+                headers,
                 body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
             })
             .await;
