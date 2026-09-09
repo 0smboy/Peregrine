@@ -13201,6 +13201,153 @@ mod pipeline_async_tests {
         );
     }
 
+    #[tokio::test]
+    async fn container_tempurl_dlo_inside_container_assembles_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloInsideContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official TestContainerTempurl.test_GET_DLO_inside_container on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("container TempURL DLO body");
+        assert_eq!(
+            body, b"one fish two fish red fish blue fish",
+            "official TestContainerTempurl.test_GET_DLO_inside_container assembled body"
+        );
+    }
+
+    /// Official TestTempURL.test_GET_DLO_outside_container: account-key
+    /// TempURL of a manifest in another container still assembles.
+    struct DloAccountOutsideContainerStub;
+    impl swift_middleware::Middleware for DloAccountOutsideContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/other/object" {
+                    let mut resp = Response::new(200);
+                    resp.headers
+                        .set("X-Object-Manifest", "container/get-dlo-outside-seg");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_account/container" {
+                    let listing = serde_json::json!([
+                        {
+                            "name": "get-dlo-outside-seg1",
+                            "bytes": 18,
+                            "hash": "daef64a0c87719319ea9c7c95a21e98b"
+                        },
+                        {
+                            "name": "get-dlo-outside-seg2",
+                            "bytes": 18,
+                            "hash": "fdf1d32b54e50bf56b5676e19bdea8ae"
+                        }
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-outside-seg1" {
+                    return Response::with_body(200, b"one fish two fish ".to_vec());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-outside-seg2" {
+                    return Response::with_body(200, b"red fish blue fish".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn account_tempurl_dlo_outside_container_assembles_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "6d8d85ae6488fbc2c28a5a86041f173b8b580d9616679847eeb706c95fa7a164";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloAccountOutsideContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/other/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official TestTempURL.test_GET_DLO_outside_container on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("account TempURL cross-container DLO body");
+        assert_eq!(
+            body, b"one fish two fish red fish blue fish",
+            "official TestTempURL.test_GET_DLO_outside_container assembled body"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
