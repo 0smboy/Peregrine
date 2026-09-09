@@ -10467,9 +10467,9 @@ mod pipeline_async_tests {
     }
 
     /// Official TestTempurl.test_HEAD / test_different_object /
-    /// test_changing_expires: HEAD-only sig allows HEAD; GET with that sig
-    /// is 401; a GET sig for `object` does not authorize `other`; mutating
-    /// expires invalidates the HMAC.
+    /// test_changing_sig / test_changing_expires: HEAD-only sig allows HEAD;
+    /// GET with that sig is 401; a GET sig for `object` does not authorize
+    /// `other`; flipping the first HMAC char or mutating expires is 401.
     #[tokio::test]
     async fn tempurl_head_scope_and_expires_on_hyper() {
         const KEY: &str = "mykey";
@@ -10549,6 +10549,25 @@ mod pipeline_async_tests {
             bad_expires.status, 401,
             "official TestTempurl.test_changing_expires on Hyper, got {}",
             bad_expires.status
+        );
+        let flipped = if SIG_GET.as_bytes()[0] == b'a' {
+            format!("b{}", &SIG_GET[1..])
+        } else {
+            format!("a{}", &SIG_GET[1..])
+        };
+        let bad_sig = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={flipped}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_sig.status, 401,
+            "official TestTempurl.test_changing_sig on Hyper, got {}",
+            bad_sig.status
         );
         backend.abort();
     }
@@ -10667,6 +10686,159 @@ mod pipeline_async_tests {
             (200..300).contains(&head.status),
             "official TestContainerTempurl.test_GET HEAD on same TempURL, got {}",
             head.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainerTempurl.test_PUT / test_HEAD /
+    /// test_different_object / test_changing_sig / test_changing_expires.
+    /// Container-key HMAC is the same message as account-key; only
+    /// `scoped_keys_for` differs. Must hit the app (no stub).
+    #[tokio::test]
+    async fn container_tempurl_put_head_scope_and_sig_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        const SIG_HEAD: &str = "22036d1f61977422e6422ac9f9580781a8fb9b457768c27a93374f407ca94851";
+        const SIG_PUT: &str = "d340717b5dff896550ef70a3dcfb90136f11e783be4259d921d2c32fa15b3008";
+        const SIG_GET_NEW: &str =
+            "4b4c6b6bca8afdcbdc5f8ee87a4f037471b871c99a63c212c16f68132248bd55";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        };
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("Content-Type", "application/octet-stream");
+        put_headers.set("Content-Length", "16");
+        let put_qs = format!("temp_url_sig={SIG_PUT}&temp_url_expires={EXPIRES}");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs.clone(),
+                headers: put_headers,
+                body: IncomingBody::from_bytes(b"new obj contents".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestContainerTempurl.test_PUT on Hyper, got {} {:?}",
+            put.status, put.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: format!("temp_url_sig={SIG_GET_NEW}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestContainerTempurl.test_PUT read-after-write on Hyper, got {}",
+            got.status
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestContainerTempurl.test_PUT body");
+        assert_eq!(body, b"new obj contents");
+        let put_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&put_head.status),
+            "official TestContainerTempurl.test_PUT HEAD on PUT TempURL, got {}",
+            put_head.status
+        );
+        let head_qs = format!("temp_url_sig={SIG_HEAD}&temp_url_expires={EXPIRES}");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestContainerTempurl.test_HEAD on Hyper, got {}",
+            head.status
+        );
+        let get_with_head = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            get_with_head.status, 401,
+            "official TestContainerTempurl.test_HEAD GET with HEAD sig must 401, got {}",
+            get_with_head.status
+        );
+        let get_qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let other = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/other".into(),
+                query_string: get_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            other.status, 401,
+            "official TestContainerTempurl.test_different_object on Hyper, got {}",
+            other.status
+        );
+        let flipped = if SIG_GET.as_bytes()[0] == b'a' {
+            format!("b{}", &SIG_GET[1..])
+        } else {
+            format!("a{}", &SIG_GET[1..])
+        };
+        let bad_sig = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={flipped}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_sig.status, 401,
+            "official TestContainerTempurl.test_changing_sig on Hyper, got {}",
+            bad_sig.status
+        );
+        let bad_expires = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG_GET}&temp_url_expires=4102444801"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_expires.status, 401,
+            "official TestContainerTempurl.test_changing_expires on Hyper, got {}",
+            bad_expires.status
         );
         backend.abort();
     }
