@@ -3755,6 +3755,9 @@ impl ProxyApp {
         let path = format!("/{}", percent_encode(account));
         match req.method.as_str() {
             "GET" | "HEAD" => {
+                if let Err(resp) = constrain_account_listing_limit(req) {
+                    return resp;
+                }
                 let headers = self.backend_headers(req, false, "account");
                 let nodes = self.iter_nodes(&self.account_ring, part);
                 match self.get_or_head(
@@ -6672,11 +6675,22 @@ fn constraint_plain(status: u16, body: &str) -> Response {
 }
 
 /// Python `constrain_req_limit` / `validate_container_params`: listing
-/// `limit=` above CONTAINER_LISTING_LIMIT is 412 `Maximum limit is N`
+/// `limit=` above the listing max is 412 `Maximum limit is N`.
+/// Account GET uses `ACCOUNT_LISTING_LIMIT`; container GET uses
+/// `CONTAINER_LISTING_LIMIT`. IsolatedIdentity Hyper used to skip the
+/// account check (`account_get_head_async`), so official
+/// `TestAccount.testListingLimit` over-limit was not 412.
 /// (probe test_sharding_listing L583). Must run in the proxy — sharded
 /// fan-out never forwards the oversized limit to the container-server.
 pub(crate) fn constrain_listing_limit(req: &Request) -> Result<usize, Response> {
-    let max = swift_core::constraints::CONTAINER_LISTING_LIMIT;
+    constrain_listing_limit_max(req, swift_core::constraints::CONTAINER_LISTING_LIMIT)
+}
+
+pub(crate) fn constrain_account_listing_limit(req: &Request) -> Result<usize, Response> {
+    constrain_listing_limit_max(req, swift_core::constraints::ACCOUNT_LISTING_LIMIT)
+}
+
+fn constrain_listing_limit_max(req: &Request, max: i64) -> Result<usize, Response> {
     match req.param("limit") {
         Some(given) if !given.is_empty() && given.bytes().all(|b| b.is_ascii_digit()) => {
             let limit: i64 = given.parse().unwrap_or(max + 1);
@@ -9010,6 +9024,150 @@ mod pipeline_async_tests {
         assert!(
             resp.headers.get("X-Trans-Id").is_some(),
             "catch_errors must stamp X-Trans-Id on the async path"
+        );
+    }
+
+    fn quote_www_authenticate_realm(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                b => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    fn account_tempauth_hyper_app() -> (Arc<ProxyApp>, swift_middleware::TempAuth) {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                allow_account_management: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        (app, ta)
+    }
+
+    /// Official TestAccount.testNoAuthToken / testInvalidAuthToken /
+    /// testQuotedWWWAuthenticateHeader / testPUTError / testListingLimit.
+    #[tokio::test]
+    async fn account_auth_and_listing_limit_on_hyper() {
+        let (app, ta) = account_tempauth_hyper_app();
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![Arc::new(ta)],
+        };
+        let no_tok = file_hyper_call(&svc, "GET", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert!(
+            no_tok.status == 401 || no_tok.status == 412,
+            "official testNoAuthToken account GET on Hyper, got {}",
+            no_tok.status
+        );
+        let no_tok_head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert!(
+            no_tok_head.status == 401 || no_tok_head.status == 412,
+            "official testNoAuthToken account HEAD on Hyper, got {}",
+            no_tok_head.status
+        );
+        let bogus = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", "bogus_auth_token")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bogus.status, 401,
+            "official testInvalidAuthToken on Hyper, got {}",
+            bogus.status
+        );
+        let hax = "AUTH_haxx\"\nContent-Length: 14\n\n<b>Hello World";
+        app.info_cache.set_account(
+            hax.to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let quoted = file_hyper_call(&svc, "GET", &format!("/v1/{hax}"), "", &[], Vec::new()).await;
+        assert_eq!(
+            quoted.status, 401,
+            "official testQuotedWWWAuthenticateHeader on Hyper, got {}",
+            quoted.status
+        );
+        let www = quoted
+            .headers
+            .get("Www-Authenticate")
+            .or_else(|| quoted.headers.get("WWW-Authenticate"))
+            .unwrap_or("");
+        let expected = format!("Swift realm=\"{}\"", quote_www_authenticate_realm(hax));
+        assert!(
+            www.split(',').any(|part| part.trim() == expected),
+            "official testQuotedWWWAuthenticateHeader realm, got {www:?} want {expected}"
+        );
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", &owner)],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            put.status == 403 || put.status == 405,
+            "official testPUTError on Hyper, got {}",
+            put.status
+        );
+        let over = swift_core::constraints::ACCOUNT_LISTING_LIMIT + 1;
+        let limited = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            &format!("limit={over}"),
+            &[("X-Auth-Token", &owner)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            limited.status, 412,
+            "official testListingLimit over-limit on Hyper, got {}",
+            limited.status
+        );
+        let at_limit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            &format!("limit={}", swift_core::constraints::ACCOUNT_LISTING_LIMIT),
+            &[("X-Auth-Token", &owner)],
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(
+            at_limit.status, 412,
+            "official testListingLimit at-limit must not 412, got {}",
+            at_limit.status
         );
     }
 

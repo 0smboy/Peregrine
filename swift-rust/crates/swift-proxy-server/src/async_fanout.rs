@@ -2448,6 +2448,9 @@ impl ProxyApp {
             return swob_response(503);
         };
         let path = format!("/{}", percent_encode(account));
+        if let Err(resp) = super::constrain_account_listing_limit(&req) {
+            return resp;
+        }
         let method = req.method.clone();
         let query = req.query_string.clone();
         let headers = self.backend_headers(&req, false, "account");
