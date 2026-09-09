@@ -14961,6 +14961,269 @@ mod pipeline_async_tests {
         }
     }
 
+    /// Official TestFile.testCopyAccount / testCopyFromAccountHeader
+    /// cross-account leftover: Destination-Account and X-Copy-From-Account
+    /// must hit `authorize_async` (no intercepting stub).
+    async fn spawn_file_copy_account_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (HeaderKeyDict, Vec<u8>),
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let objects = Arc::clone(&objects);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (raw_logical, _query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_get = first.starts_with("GET ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    let header = |want: &str| -> Option<String> {
+                        text.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case(want).then(|| v.trim().to_string())
+                            })
+                        })
+                    };
+                    if logical == "/AUTH_test" || logical == "/AUTH_test2" {
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if logical == "/AUTH_test/c" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[("X-Container-Read", "test2:tester2")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    if logical == "/AUTH_test2/dst" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[("X-Container-Write", "test:tester")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    if logical == "/AUTH_test2/dst2" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/c/")
+                        && !logical.starts_with("/AUTH_test2/dst/")
+                        && !logical.starts_with("/AUTH_test2/dst2/")
+                    {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_put {
+                        let mut stored = HeaderKeyDict::new();
+                        stored.set(
+                            "Content-Type",
+                            header("Content-Type").unwrap_or_else(|| "text/plain".into()),
+                        );
+                        stored.set("Content-Length", body.len().to_string());
+                        if let Some(color) = header("X-Object-Meta-Color") {
+                            stored.set("X-Object-Meta-Color", color);
+                        }
+                        objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical, (stored, body));
+                        write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        return;
+                    }
+                    let stored = objects
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some((headers, obj)) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        let extra: Vec<(&str, String)> =
+                            headers.iter().map(|(k, v)| (k, v.to_string())).collect();
+                        let extra_ref: Vec<(&str, &str)> =
+                            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                        write_backend_http(&mut stream, &extra_ref, send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let _ = (is_get, is_head);
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn file_copy_account_and_copy_from_account_acl_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", Some("test2:tester2"), None);
+        seed_container_rw(&app, "AUTH_test2", "dst", None, Some("test:tester"));
+        seed_container_rw(&app, "AUTH_test2", "dst2", None, None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Copy::new())],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let writer2 = auth_token(&svc, "test2:tester2", "testing2").await;
+        let mut put_src = HeaderKeyDict::new();
+        put_src.set("X-Auth-Token", &owner);
+        put_src.set("Content-Type", "image/png");
+        put_src.set("Content-Length", "9");
+        put_src.set("X-Object-Meta-Color", "blue");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/src".into(),
+                query_string: String::new(),
+                headers: put_src,
+                body: IncomingBody::from_bytes(b"png-bytes".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "source PUT, got {} {:?}",
+            put.status, put.reason
+        );
+
+        for dest in ["/dst/copied-slash", "dst/copied-noslash"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("Destination", dest);
+            headers.set("Destination-Account", "AUTH_test2");
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/c/src".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert!(
+                (200..300).contains(&resp.status),
+                "official testCopyAccount Destination-Account {dest}, got {} {:?}",
+                resp.status,
+                resp.reason
+            );
+            let name = dest.rsplit('/').next().unwrap();
+            let mut get_h = HeaderKeyDict::new();
+            get_h.set("X-Auth-Token", &writer2);
+            let got = svc
+                .call(AsyncRequest {
+                    method: "GET".into(),
+                    path: format!("/v1/AUTH_test2/dst/{name}"),
+                    query_string: String::new(),
+                    headers: get_h,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(got.status, 200, "dest GET {name}, got {}", got.status);
+            assert_eq!(
+                got.body.collect_async().await.expect("dest body"),
+                b"png-bytes"
+            );
+            assert_eq!(got.headers.get("Content-Type"), Some("image/png"));
+            assert_eq!(got.headers.get("X-Object-Meta-Color"), Some("blue"));
+        }
+
+        for copy_from in ["/c/src", "c/src"] {
+            let dest = format!(
+                "/v1/AUTH_test2/dst2/from-{}",
+                if copy_from.starts_with('/') {
+                    "slash"
+                } else {
+                    "noslash"
+                }
+            );
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &writer2);
+            headers.set("X-Copy-From-Account", "AUTH_test");
+            headers.set("X-Copy-From", copy_from);
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: dest.clone(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert!(
+                (200..300).contains(&resp.status),
+                "official testCopyFromAccountHeader {copy_from}, got {} {:?}",
+                resp.status,
+                resp.reason
+            );
+            let mut get_h = HeaderKeyDict::new();
+            get_h.set("X-Auth-Token", &writer2);
+            let got = svc
+                .call(AsyncRequest {
+                    method: "GET".into(),
+                    path: dest,
+                    query_string: String::new(),
+                    headers: get_h,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(got.status, 200);
+            assert_eq!(
+                got.body.collect_async().await.expect("from-account body"),
+                b"png-bytes"
+            );
+            assert_eq!(got.headers.get("X-Object-Meta-Color"), Some("blue"));
+        }
+        backend.abort();
+    }
+
     /// Official test_versioning_check_acl: versions container is public
     /// read, but a foreign token must not DELETE/pop the source object.
     struct VersioningCheckAclStub {
