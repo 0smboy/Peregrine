@@ -11385,7 +11385,7 @@ mod pipeline_async_tests {
                 if req.method == "PUT" {
                     let headers = req.headers.clone();
                     let body = match req.body.materialize(u64::MAX) {
-                        Ok(b) => b,
+                        Ok(b) => b.to_vec(),
                         Err(_) => Vec::new(),
                     };
                     store
