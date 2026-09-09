@@ -4021,7 +4021,19 @@ impl ProxyApp {
                     }
                 }
 
-                let mut base = self.backend_headers(req, true, "container");
+                // Python container.py PUT/POST: pop swift_owner_headers from
+                // the request when !swift_owner so a write-ACL / account-RW
+                // caller cannot overwrite Read/Write/Sync-Key (Field H1:
+                // test_protected_container_acl / test_protected_container_sync).
+                let mut write_req;
+                let transfer_req = if matches!(req.method.as_str(), "PUT" | "POST") {
+                    write_req = req.clone_head();
+                    scrub_container_write_owner_headers(&mut write_req);
+                    &write_req
+                } else {
+                    req
+                };
+                let mut base = self.backend_headers(transfer_req, true, "container");
                 base.set("X-Timestamp", Timestamp::now().internal());
                 if req.method == "PUT" {
                     base.set(
@@ -8187,26 +8199,52 @@ fn expose_account_acl_header(resp: &mut Response) {
     }
 }
 
+/// Privileged account/container headers (Python `swift.proxy.server`
+/// `swift_owner_headers` / `swift.common.middleware.acl` owner-only set).
+const SWIFT_OWNER_HEADERS: &[&str] = &[
+    "X-Container-Read",
+    "X-Container-Write",
+    "X-Container-Sync-Key",
+    "X-Container-Sync-To",
+    "X-Account-Meta-Temp-Url-Key",
+    "X-Account-Meta-Temp-Url-Key-2",
+    "X-Container-Meta-Temp-Url-Key",
+    "X-Container-Meta-Temp-Url-Key-2",
+    "X-Account-Access-Control",
+];
+
 /// Strip privileged account/container headers for non-owners (Python
 /// `swift_owner_headers`).
 fn strip_owner_headers(resp: &mut Response, swift_owner: bool) {
     if swift_owner {
         return;
     }
-    const OWNER_HEADERS: &[&str] = &[
-        "X-Container-Read",
-        "X-Container-Write",
-        "X-Container-Sync-Key",
-        "X-Container-Sync-To",
-        "X-Account-Meta-Temp-Url-Key",
-        "X-Account-Meta-Temp-Url-Key-2",
-        "X-Container-Meta-Temp-Url-Key",
-        "X-Container-Meta-Temp-Url-Key-2",
-        "X-Account-Access-Control",
-    ];
-    for name in OWNER_HEADERS {
+    for name in SWIFT_OWNER_HEADERS {
         resp.headers.remove(name);
     }
+}
+
+/// Python `ContainerController` PUT/POST: when `not req.environ.get('swift_owner')`,
+/// `req.headers.pop` each `swift_owner_headers` key so the transfer to the
+/// container server cannot persist Read/Write ACL or Sync-To/Key.
+fn scrub_owner_request_headers(req: &mut Request, swift_owner: bool) {
+    if swift_owner {
+        return;
+    }
+    for name in SWIFT_OWNER_HEADERS {
+        req.headers.remove(name);
+    }
+}
+
+/// Request-side owner-header scrub for container PUT/POST. Reads the
+/// authorize stamp `X-Backend-Swift-Owner` (TempAuth/Keystone; reseller_admin
+/// is also a swift_owner).
+fn scrub_container_write_owner_headers(req: &mut Request) {
+    let swift_owner = req
+        .headers
+        .get("X-Backend-Swift-Owner")
+        .is_some_and(config_true_value);
+    scrub_owner_request_headers(req, swift_owner);
 }
 
 fn request_to_async(req: Request) -> AsyncRequest {
@@ -11294,6 +11332,162 @@ mod p1a_wiring_tests {
         ] {
             assert!(resp.headers.get(name).is_none(), "{name} leaked");
         }
+    }
+
+    fn privileged_container_write_headers() -> HeaderKeyDict {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Container-Read", "frank");
+        headers.set("X-Container-Write", "frank");
+        headers.set("X-Container-Sync-Key", "uuid-not-secret");
+        headers.set("X-Container-Sync-To", "//other/sync");
+        headers.set("X-Container-Meta-Color", "blue");
+        headers.set("X-Container-Meta-Temp-Url-Key", "tempurl");
+        headers
+    }
+
+    /// Field H1: account-RW / container-write callers are authorized but
+    /// `swift_owner` stays false — Python pops privileged request headers
+    /// so test_protected_container_acl keeps `jdoe` and
+    /// test_protected_container_sync keeps `secret`.
+    #[test]
+    fn non_owner_container_put_post_cannot_set_privileged_headers() {
+        for method in ["PUT", "POST"] {
+            let mut req = Request {
+                method: method.into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers: privileged_container_write_headers(),
+                body: swift_http::Body::empty(),
+            };
+            assert!(req.headers.get("X-Backend-Swift-Owner").is_none());
+            scrub_container_write_owner_headers(&mut req);
+            for name in [
+                "X-Container-Read",
+                "X-Container-Write",
+                "X-Container-Sync-Key",
+                "X-Container-Sync-To",
+                "X-Container-Meta-Temp-Url-Key",
+            ] {
+                assert!(
+                    req.headers.get(name).is_none(),
+                    "{method} !swift_owner left {name}"
+                );
+            }
+            assert_eq!(
+                req.headers.get("X-Container-Meta-Color"),
+                Some("blue"),
+                "{method} must keep unprivileged container meta"
+            );
+
+            let app = app(false);
+            let transferred = app.backend_headers(&req, true, "container");
+            for name in [
+                "X-Container-Read",
+                "X-Container-Write",
+                "X-Container-Sync-Key",
+                "X-Container-Sync-To",
+                "X-Container-Meta-Temp-Url-Key",
+            ] {
+                assert!(
+                    transferred.get(name).is_none(),
+                    "{method} backend_headers leaked {name}"
+                );
+            }
+            assert_eq!(transferred.get("X-Container-Meta-Color"), Some("blue"));
+        }
+    }
+
+    #[test]
+    fn owner_and_reseller_container_put_post_can_set_privileged_headers() {
+        for (label, extra) in [
+            ("owner", vec![("X-Backend-Swift-Owner", "true")]),
+            (
+                "reseller",
+                vec![
+                    ("X-Backend-Swift-Owner", "true"),
+                    ("X-Backend-Reseller-Request", "true"),
+                ],
+            ),
+        ] {
+            for method in ["PUT", "POST"] {
+                let mut headers = privileged_container_write_headers();
+                for (k, v) in &extra {
+                    headers.set(*k, *v);
+                }
+                let mut req = Request {
+                    method: method.into(),
+                    path: "/v1/AUTH_test/c".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: swift_http::Body::empty(),
+                };
+                scrub_container_write_owner_headers(&mut req);
+                assert_eq!(
+                    req.headers.get("X-Container-Read"),
+                    Some("frank"),
+                    "{label} {method} must keep X-Container-Read"
+                );
+                assert_eq!(
+                    req.headers.get("X-Container-Write"),
+                    Some("frank"),
+                    "{label} {method} must keep X-Container-Write"
+                );
+                assert_eq!(
+                    req.headers.get("X-Container-Sync-Key"),
+                    Some("uuid-not-secret"),
+                    "{label} {method} must keep X-Container-Sync-Key"
+                );
+
+                let app = app(false);
+                let transferred = app.backend_headers(&req, true, "container");
+                assert_eq!(transferred.get("X-Container-Read"), Some("frank"));
+                assert_eq!(transferred.get("X-Container-Write"), Some("frank"));
+                assert_eq!(
+                    transferred.get("X-Container-Sync-Key"),
+                    Some("uuid-not-secret")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn account_rw_authorize_is_not_swift_owner_so_acl_headers_scrub() {
+        // frank: X-Account-Access-Control read-write — authorized to POST the
+        // container, but not swift_owner (TempAuth.authorize_acl).
+        let acct = swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["frank".into()],
+            read_only: Vec::new(),
+        };
+        let frank = vec!["frank".to_string()];
+        let mut swift_owner = true;
+        let denied = swift_middleware::TempAuth::authorize_acl(
+            "POST",
+            "/v1/AUTH_test/c",
+            &frank,
+            None,
+            None,
+            "AUTH_",
+            Some(&acct),
+            &mut swift_owner,
+        );
+        assert!(denied.is_none(), "account-RW frank must be allowed");
+        assert!(!swift_owner, "account-RW is not swift_owner");
+
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: privileged_container_write_headers(),
+            body: swift_http::Body::empty(),
+        };
+        if swift_owner {
+            req.headers.set("X-Backend-Swift-Owner", "true");
+        }
+        scrub_container_write_owner_headers(&mut req);
+        assert!(req.headers.get("X-Container-Read").is_none());
+        assert!(req.headers.get("X-Container-Write").is_none());
+        assert!(req.headers.get("X-Container-Sync-Key").is_none());
     }
 
     #[test]
