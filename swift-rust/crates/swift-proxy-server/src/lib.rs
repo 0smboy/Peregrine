@@ -9961,6 +9961,287 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestSloTempurl.test_GET: a signed GET of an SLO assembles,
+    /// and the same TempURL also authorizes HEAD. No intercepting stub —
+    /// authorize_async must see X-Backend-Authorize-Override.
+    async fn spawn_slo_tempurl_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&tmp[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let empty = [];
+                    let body: &[u8];
+                    let extra: Vec<(&str, &str)>;
+                    if logical == "/AUTH_account/container/object" {
+                        extra = vec![("X-Static-Large-Object", "True")];
+                        body = br#"[{"name":"/container/s1","bytes":3,"hash":"c4ca4238a0b923820dcc509a6f75849b"},{"name":"/container/s2","bytes":3,"hash":"c81e728d9d4c2f636f067f89cc14862c"}]"#;
+                    } else if logical == "/AUTH_account/container/s1" {
+                        extra = vec![];
+                        body = b"aaa";
+                    } else if logical == "/AUTH_account/container/s2" {
+                        extra = vec![];
+                        body = b"bbb";
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let send = if is_head { &empty[..] } else { body };
+                    write_backend_http(&mut stream, &extra, send).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    async fn spawn_container_tempurl_key_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&tmp[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    if logical == "/AUTH_test/c"
+                        && !text
+                            .to_ascii_lowercase()
+                            .contains("x-backend-record-type: shard")
+                    {
+                        write_backend_http(
+                            &mut stream,
+                            &[
+                                ("X-Backend-Sharding-State", "unsharded"),
+                                ("X-Container-Meta-Temp-Url-Key", "mykey"),
+                                ("X-Container-Meta-Temp-Url-Key-2", "mykey2"),
+                            ],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    async fn auth_token(svc: &ProxyAsyncService, user: &str, key: &str) -> String {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-User", user);
+        headers.set("X-Auth-Key", key);
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/auth/v1.0".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200, "token for {user}");
+        resp.headers.get("X-Auth-Token").unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn slo_tempurl_get_assembles_and_head_is_allowed_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let (port, backend) = spawn_slo_tempurl_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_account", "container", None);
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu), Arc::new(swift_middleware::Slo::new())],
+        };
+        let qs = format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}");
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            assembled.status, 200,
+            "official TestSloTempurl.test_GET on Hyper, got {} {:?}",
+            assembled.status, assembled.reason
+        );
+        let body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("SLO TempURL assembled body");
+        assert_eq!(
+            body, b"aaabbb",
+            "official TestSloTempurl.test_GET assembled"
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestSloTempurl.test_GET HEAD on same TempURL, got {}",
+            head.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainerTempurl.test_tempurl_keys_visible_to_account_owner
+    /// and test_tempurl_keys_hidden_from_acl_readonly. Must run
+    /// `finish_container_resp` on the Hyper app path (a stub is a false pass).
+    #[tokio::test]
+    async fn tempurl_keys_visible_to_owner_hidden_from_acl_readonly_on_hyper() {
+        let (port, backend) = spawn_container_tempurl_key_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", Some("AUTH_other"));
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta)],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let mut owner_headers = HeaderKeyDict::new();
+        owner_headers.set("X-Auth-Token", &owner);
+        let owner_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers: owner_headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&owner_head.status),
+            "official test_tempurl_keys_visible_to_account_owner on Hyper, got {}",
+            owner_head.status
+        );
+        assert_eq!(
+            owner_head.headers.get("X-Container-Meta-Temp-Url-Key"),
+            Some("mykey")
+        );
+        assert_eq!(
+            owner_head.headers.get("X-Container-Meta-Temp-Url-Key-2"),
+            Some("mykey2")
+        );
+        let reader = auth_token(&svc, "other:tester3", "otherpass").await;
+        let mut reader_headers = HeaderKeyDict::new();
+        reader_headers.set("X-Auth-Token", &reader);
+        let hidden = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers: reader_headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&hidden.status),
+            "readonly ACL HEAD must be allowed, got {}",
+            hidden.status
+        );
+        assert!(
+            hidden
+                .headers
+                .get("X-Container-Meta-Temp-Url-Key")
+                .is_none(),
+            "official test_tempurl_keys_hidden_from_acl_readonly leaked key"
+        );
+        assert!(
+            hidden
+                .headers
+                .get("X-Container-Meta-Temp-Url-Key-2")
+                .is_none(),
+            "official test_tempurl_keys_hidden_from_acl_readonly leaked key-2"
+        );
+        backend.abort();
+    }
+
     /// Object-server apply_conditional on the physical SLO JSON ETag.
     /// Official TestSlo.test_slo_if_match_get uses the assembled SLO ETag.
     struct SloIfMatchObjectServerStub;
