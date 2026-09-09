@@ -14907,6 +14907,10 @@ mod pipeline_async_tests {
                                                 end.saturating_sub(1),
                                                 obj.len()
                                             );
+                                            let ct = headers
+                                                .get("Content-Type")
+                                                .unwrap_or("application/octet-stream")
+                                                .to_string();
                                             write_backend_http_status(
                                                 &mut stream,
                                                 206,
@@ -14914,6 +14918,7 @@ mod pipeline_async_tests {
                                                     ("ETag", etag.as_str()),
                                                     ("Accept-Ranges", "bytes"),
                                                     ("Content-Range", cr.as_str()),
+                                                    ("Content-Type", ct.as_str()),
                                                 ],
                                                 &slice,
                                             )
@@ -17236,12 +17241,13 @@ mod pipeline_async_tests {
             assert_eq!(parts.len(), 1);
             assert_eq!(parts[0].2, &data[..subrange_size]);
         } else {
+            let expect_cr = format!("bytes 0-{}/{file_length}", subrange_size - 1);
             assert_eq!(
                 one_ok
                     .headers
                     .get("Content-Range")
                     .or_else(|| one_ok.headers.get("content-range")),
-                Some(format!("bytes 0-{}/{file_length}", subrange_size - 1).as_str())
+                Some(expect_cr.as_str())
             );
             assert_eq!(ct, "lovecraft/rugose; squamous=true");
             assert_eq!(body, &data[..subrange_size]);
