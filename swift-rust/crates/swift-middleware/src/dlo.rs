@@ -175,6 +175,17 @@ fn update_ignore_range_header(headers: &mut HeaderKeyDict, name: &str) {
     headers.set(IGNORE_RANGE_HDR, val);
 }
 
+/// Object-server `apply_conditional` compares `If-Match` to the physical
+/// manifest ETag. Official `test_dlo_if_match_*` uses the assembled DLO
+/// ETag (HEAD through DLO). Strip conditionals after cloning `orig` so
+/// Hyper/object-server cannot 412 before reassembly (SLO SloGetContext).
+fn strip_conditionals(headers: &mut HeaderKeyDict) {
+    headers.remove("If-Match");
+    headers.remove("If-None-Match");
+    headers.remove("If-Modified-Since");
+    headers.remove("If-Unmodified-Since");
+}
+
 /// Build a backend subrequest that preserves the original request's auth
 /// context (headers/env) while overriding the method/path/query and dropping
 /// the body plus any range/length/conditional headers.
@@ -717,14 +728,16 @@ impl DynamicLargeObject {
     fn handle_get_head(&self, mut req: Request, next: &NextFn) -> Response {
         update_ignore_range_header(&mut req.headers, X_OBJECT_MANIFEST);
         let orig_req = req.clone_head();
+        strip_conditionals(&mut req.headers);
         let resp = next(req);
 
         match resp.headers.get(X_OBJECT_MANIFEST).map(str::to_string) {
             Some(x_object_manifest) => {
                 self.get_or_head_response(&orig_req, &resp, &x_object_manifest, next)
             }
-            // Not a DLO manifest; pass the response through unchanged.
-            None => resp,
+            // Not a DLO manifest. Re-apply If-* we stripped so ordinary
+            // objects still satisfy official If-Match on the Hyper path.
+            None => apply_conditional(&orig_req, resp),
         }
     }
 
@@ -912,7 +925,7 @@ impl DynamicLargeObject {
         let mut resp = Response::new(status);
         resp.headers = headers;
         resp.body = body;
-        resp
+        apply_conditional(req, resp)
     }
 
     /// Lazy, marker-paginated reassembly. The first readable body chunk is
@@ -978,9 +991,10 @@ impl DynamicLargeObject {
         }
         update_ignore_range_header(&mut req.headers, X_OBJECT_MANIFEST);
         let orig = req.clone_head();
+        strip_conditionals(&mut req.headers);
         let resp = next(req).await;
         let Some(manifest) = resp.headers.get(X_OBJECT_MANIFEST).map(str::to_string) else {
-            return resp;
+            return apply_conditional(&orig, resp);
         };
         let decoded = unquote(&manifest);
         let (container, obj_prefix) = decoded.split_once('/').unwrap_or((decoded.as_str(), ""));
@@ -1179,9 +1193,20 @@ impl Middleware for DynamicLargeObject {
     }
 
     fn intercepts_request(&self, req: &Request) -> bool {
-        req.method == "PUT"
-            && req.headers.get(X_OBJECT_MANIFEST).is_some()
-            && split_path(&req.path, 4, 4, true).is_ok()
+        if split_path(&req.path, 4, 4, true).is_err() {
+            return false;
+        }
+        if req.method == "PUT" && req.headers.get(X_OBJECT_MANIFEST).is_some() {
+            return true;
+        }
+        // Hyper: first `next()` in reassemble_async is the already-completed
+        // object-server GET. If-Match must be stripped *before* that GET
+        // (official test_dlo_if_match_get / test_dlo_if_match_head).
+        (req.method == "GET" || req.method == "HEAD")
+            && req.param("multipart-manifest").as_deref() != Some("get")
+            && (req.headers.contains_key("If-Match")
+                || req.headers.contains_key("If-None-Match")
+                || req.headers.contains_key("Range"))
     }
 
     fn intercepts_response(&self) -> bool {
@@ -1194,8 +1219,14 @@ impl Middleware for DynamicLargeObject {
         next: AsyncNextFn,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
-            if let Some(err) = validate_x_object_manifest_header(&req) {
-                return err;
+            if req.method == "PUT" {
+                if let Some(err) = validate_x_object_manifest_header(&req) {
+                    return err;
+                }
+                return next(req).await;
+            }
+            if req.method == "GET" || req.method == "HEAD" {
+                return self.handle_get_head_async(req, next).await;
             }
             next(req).await
         })
@@ -1292,6 +1323,83 @@ mod tests {
         raw.query_string = "multipart-manifest=get".into();
         assert!(matches!(dlo.prepare(&mut raw), crate::MwPrep::Continue));
         assert!(raw.headers.get(IGNORE_RANGE_HDR).is_none());
+    }
+
+    /// Object-server apply_conditional on the physical manifest ETag: 412
+    /// and no X-Object-Manifest. Official test_dlo_if_match_get must still
+    /// assemble (If-Match is the DLO ETag from HEAD).
+    fn object_server_if_match_backend() -> NextFn {
+        let inner = manifest_backend();
+        Arc::new(move |req: Request| {
+            if (req.method == "GET" || req.method == "HEAD")
+                && req.path == "/v1/a/c/manifest"
+                && req.headers.get("If-Match").is_some()
+            {
+                return Response::error(412, "Precondition Failed");
+            }
+            inner(req)
+        })
+    }
+
+    #[test]
+    fn test_dlo_if_match_strips_before_backend_so_assembled_etag_is_200() {
+        let dlo = DynamicLargeObject::new();
+        let be = object_server_if_match_backend();
+        let head = dlo.handle(
+            Request {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: Body::empty(),
+            },
+            &be,
+        );
+        assert_eq!(head.status, 200, "{}", head.reason);
+        let etag = head.headers.get("Etag").unwrap().to_string();
+        let mut get = get_req("/v1/a/c/manifest", None);
+        get.headers.set("If-Match", &etag);
+        assert!(
+            dlo.intercepts_request(&get),
+            "Hyper must intercept If-Match before object-server GET"
+        );
+        let mut resp = dlo.handle(get, &be);
+        assert_eq!(resp.status, 200, "{}", resp.reason);
+        assert_eq!(body_of(&mut resp), b"onetwothree");
+        let mut mismatch = get_req("/v1/a/c/manifest", None);
+        mismatch.headers.set("If-Match", "not-the-dlo-etag");
+        assert_eq!(dlo.handle(mismatch, &be).status, 412);
+    }
+
+    #[tokio::test]
+    async fn test_async_dlo_if_match_strips_before_backend() {
+        let dlo = DynamicLargeObject::new();
+        let sync = object_server_if_match_backend();
+        let next: crate::AsyncNextFn = Arc::new(move |r| {
+            let sync = Arc::clone(&sync);
+            Box::pin(async move { sync(r) })
+        });
+        let head = dlo
+            .handle_request_async(
+                Request {
+                    method: "HEAD".into(),
+                    path: "/v1/a/c/manifest".into(),
+                    query_string: String::new(),
+                    headers: HeaderKeyDict::new(),
+                    body: Body::empty(),
+                },
+                next.clone(),
+            )
+            .await;
+        assert_eq!(head.status, 200, "{}", head.reason);
+        let etag = head.headers.get("Etag").unwrap().to_string();
+        let mut get = get_req("/v1/a/c/manifest", None);
+        get.headers.set("If-Match", &etag);
+        let resp = dlo.handle_request_async(get, next).await;
+        assert_eq!(resp.status, 200, "{}", resp.reason);
+        let mut resp = resp;
+        let body = resp.body.collect_async().await.unwrap();
+        assert_eq!(body, b"onetwothree");
     }
 
     fn get_req(path: &str, range: Option<&str>) -> Request {

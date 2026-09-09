@@ -9138,6 +9138,112 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Object-server apply_conditional on the physical manifest ETag.
+    /// Official TestDlo.test_dlo_if_match_get uses the assembled DLO ETag.
+    struct DloIfMatchObjectServerStub;
+    impl swift_middleware::Middleware for DloIfMatchObjectServerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if (req.method == "GET" || req.method == "HEAD")
+                    && req.path == "/v1/a/c/manifest"
+                    && req.headers.get("If-Match").is_some()
+                {
+                    return Response::error(412, "Precondition Failed");
+                }
+                if req.path == "/v1/a/c/manifest" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "c/segs/");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/a/c" {
+                    let listing = serde_json::json!([
+                        {"name": "segs/1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "segs/2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/a/c/segs/1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                if req.path == "/v1/a/c/segs/2" {
+                    return Response::with_body(200, b"two".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlo_if_match_assembled_etag_is_200_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head.status, 200,
+            "HEAD DLO must assemble, got {}",
+            head.status
+        );
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled DLO Etag")
+            .to_string();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-Match", &etag);
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_dlo_if_match_get on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"onetwo");
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
