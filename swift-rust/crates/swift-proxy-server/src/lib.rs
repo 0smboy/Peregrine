@@ -9597,6 +9597,266 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestDlo.test_copy: COPY a DLO manifest must PUT the
+    /// assembled bytes and must not persist `X-Object-Manifest`.
+    struct DloCopyAssembleStub {
+        dest: Arc<std::sync::Mutex<Option<(HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for DloCopyAssembleStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let dest = Arc::clone(&self.dest);
+            Box::pin(async move {
+                if req.path == "/v1/a/c/man" && req.method != "PUT" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "c/segs/");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/a/c" {
+                    let listing = serde_json::json!([
+                        {"name": "segs/1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "segs/2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/a/c/segs/1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                if req.path == "/v1/a/c/segs/2" {
+                    return Response::with_body(200, b"two".to_vec());
+                }
+                if req.method == "PUT" && req.path == "/v1/a/c/copied" {
+                    let headers = req.headers.clone();
+                    let body = match req.body {
+                        swift_http::Body::Buffered(b) => b,
+                        _ => Vec::new(),
+                    };
+                    *dest.lock().unwrap_or_else(|p| p.into_inner()) = Some((headers, body));
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlo_copy_assembles_without_manifest_header_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_copy COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_body, b"onetwo", "COPY must persist assembled DLO bytes");
+        assert!(
+            put_headers.get("X-Object-Manifest").is_none(),
+            "official test_copy: dest must not carry X-Object-Manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_if_none_match_assembled_etag_is_304_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled DLO Etag")
+            .to_string();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", &etag);
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 304,
+            "official test_dlo_if_none_match_get on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_get_dir: listings on, prefix=""
+    /// TempURL of `/container/dir/` is 200 with parent `href="..` and
+    /// TempURL query on object hrefs.
+    struct ListingsDirContainerStub;
+    impl swift_middleware::Middleware for ListingsDirContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/container")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/container/dir"
+                    || req.path == "/v1/AUTH_account/container/dir/"
+                {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Content-Type", "application/directory");
+                    resp.headers.set("Content-Length", "0");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_account/container" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                    resp.headers.set("X-Container-Object-Count", "2");
+                    resp.headers.set("X-Timestamp", "1000.00000");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_account/container" {
+                    let listing = serde_json::json!([
+                        {"name": "dir/obj", "bytes": 3, "hash": "x", "content_type": "text/plain", "last_modified": "2010-01-01T00:00:00.000000"},
+                        {"subdir": "dir/subdir/"}
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                    resp.headers.set("Content-Type", "application/json");
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_dir_is_200_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix="
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_dir on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Listing of /v1/"),
+            "official test_get_dir listing title, got {body}"
+        );
+        assert!(
+            body.contains("href=\".."),
+            "official test_get_dir parent href, got {body}"
+        );
+        assert!(
+            body.contains(&format!("temp_url_sig={SIG}")),
+            "official test_get_dir must keep TempURL query on hrefs, got {body}"
+        );
+        assert!(
+            body.contains("<a href=\"./obj"),
+            "official test_get_dir object href, got {body}"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
