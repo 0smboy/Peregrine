@@ -8914,6 +8914,34 @@ mod pipeline_async_tests {
     use super::*;
     use swift_http::IncomingBody;
 
+    /// Object-server Range on a stub segment (inclusive `bytes=start-end`).
+    fn stub_object_range(req: &Request, body: &[u8]) -> Response {
+        let Some(spec) = req
+            .headers
+            .get("Range")
+            .and_then(|r| r.strip_prefix("bytes="))
+        else {
+            return Response::with_body(200, body.to_vec());
+        };
+        let Some((start, end)) = spec.split_once('-') else {
+            return Response::with_body(200, body.to_vec());
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) else {
+            return Response::with_body(200, body.to_vec());
+        };
+        if body.is_empty() || start >= body.len() || start > end {
+            return Response::error(416, "Requested Range Not Satisfiable");
+        }
+        let end = end.min(body.len() - 1);
+        let slice = body[start..=end].to_vec();
+        let mut resp = Response::with_body(206, slice);
+        resp.headers.set(
+            "Content-Range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        );
+        resp
+    }
+
     #[tokio::test]
     async fn tempauth_prepare_runs_on_hyper_path_so_auth_endpoint_is_not_404() {
         let app = Arc::new(ProxyApp::new(
@@ -10010,10 +10038,10 @@ mod pipeline_async_tests {
                     return resp;
                 }
                 if req.path == "/v1/a/c/s1" {
-                    return Response::with_body(200, b"aaa".to_vec());
+                    return stub_object_range(&req, b"aaa");
                 }
                 if req.path == "/v1/a/c/s2" {
-                    return Response::with_body(200, b"bbb".to_vec());
+                    return stub_object_range(&req, b"bbb");
                 }
                 Response::new(404)
             })
