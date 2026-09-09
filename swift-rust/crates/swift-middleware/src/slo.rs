@@ -1075,6 +1075,12 @@ fn merge_slo_listing_override_etag(req: &Request, json_etag: &str, slo_etag: &st
             base.push_str(s3.trim().trim_matches('"'));
         }
     }
+    // Idempotent: a copied SLO sink PUT that still carries source
+    // `md5; slo_etag=` must not grow a second `; slo_etag=` (listing
+    // rewrite would otherwise leave the duplicate in `hash`).
+    if listing_hash_has_param(&base, "slo_etag") {
+        return base;
+    }
     format!("{base}; slo_etag={slo_etag}")
 }
 
@@ -1119,10 +1125,14 @@ fn rewrite_listing_slo_etag(resp: &mut Response) {
         let mut slo = None;
         let mut s3 = None;
         for (k, v) in params {
-            if k == "slo_etag" && slo.is_none() {
-                slo = Some(v);
-            } else if k == "s3_etag" && s3.is_none() {
-                s3 = Some(v);
+            if k == "slo_etag" {
+                if slo.is_none() {
+                    slo = Some(v);
+                }
+            } else if k == "s3_etag" {
+                if s3.is_none() {
+                    s3 = Some(v);
+                }
             } else {
                 leftover.push_str("; ");
                 leftover.push_str(&k);

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
 use swift_http::{HeaderKeyDict, Request, Response};
-use swift_middleware::{AsyncNextFn, Middleware, NextFn, Slo};
+use swift_middleware::{AsyncNextFn, Copy, Middleware, NextFn, Slo};
 
 fn md5_hex(data: &[u8]) -> String {
     let digest = Md5::digest(data);
@@ -638,6 +638,150 @@ fn container_listing_promotes_s3_etag_and_slo_etag() {
     assert_eq!(v[0]["hash"], "cafef00d");
     assert_eq!(v[0]["slo_etag"], "\"slohash\"");
     assert_eq!(v[0]["s3_etag"], format!("\"{composite}\""));
+}
+
+#[test]
+fn container_listing_drops_duplicate_slo_etag_from_hash() {
+    // Field H1: rewrite used to leave the second `; slo_etag=` in `hash`.
+    let v = listing_json_via_slo("cafef00d; slo_etag=slohash; slo_etag=slohash");
+    assert_eq!(v[0]["hash"], "cafef00d");
+    assert_eq!(v[0]["slo_etag"], "\"slohash\"");
+}
+
+#[test]
+fn copied_slo_override_etag_merge_is_idempotent() {
+    // Source listing override forwarded onto SLO remanifest PUT (the
+    // copy.rs miss). Merge must not append a second `; slo_etag=`.
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let source_override = format!("cafef00d; slo_etag={slo_etag}");
+    let (response, writes) = run_manifest_put_with_headers(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        None,
+        &[(
+            "X-Object-Sysmeta-Container-Update-Override-Etag",
+            &source_override,
+        )],
+    );
+    assert_eq!(response.status, 201);
+    let override_etag = writes[0]
+        .headers
+        .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        .expect("SLO PUT must set listing override");
+    assert_eq!(
+        override_etag.matches("slo_etag=").count(),
+        1,
+        "duplicate slo_etag on copied SLO PUT: {override_etag}"
+    );
+    assert!(
+        override_etag.contains(&format!("slo_etag={slo_etag}")),
+        "{override_etag}"
+    );
+    let listed = listing_json_via_slo(override_etag);
+    assert_eq!(
+        listed[0]["hash"].as_str().unwrap().contains("slo_etag"),
+        false,
+        "listing hash must be bare md5, got {}",
+        listed[0]["hash"]
+    );
+    assert_eq!(listed[0]["slo_etag"], format!("\"{slo_etag}\""));
+}
+
+#[test]
+fn copy_the_manifest_listing_hash_is_bare_md5() {
+    // Python `TestSlo.test_slo_copy_the_manifest*`: COPY
+    // `?multipart-manifest=get` remanifests the SLO. Source listing hash
+    // stays bare md5; dest listing hash must also be bare md5 (not
+    // `md5; slo_etag=…`).
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let stored = serde_json::to_vec(&json!([{
+        "name": "/c/segment",
+        "bytes": 3,
+        "hash": segment_etag
+    }]))
+    .unwrap();
+    let source_physical = md5_hex(&stored);
+    let source_override = format!("{source_physical}; slo_etag={slo_etag}");
+    let writes: Arc<Mutex<Vec<CapturedPut>>> = Arc::new(Mutex::new(Vec::new()));
+    let writes_for_backend = Arc::clone(&writes);
+    let stored_for_get = stored.clone();
+    let source_override_for_get = source_override.clone();
+    let slo_etag_for_get = slo_etag.clone();
+    let segment_etag_for_head = segment_etag.clone();
+    let backend: NextFn = Arc::new(move |mut request: Request| {
+        if request.method == "HEAD" && request.path == "/v1/a/c/segment" {
+            return head_response(&segment_etag_for_head, 3);
+        }
+        if request.method == "GET" && request.path == "/v1/a/c/src" {
+            let mut response = Response::with_body(200, stored_for_get.clone());
+            response.headers.set("X-Static-Large-Object", "True");
+            response.headers.set("Content-Type", "application/json");
+            response
+                .headers
+                .set("X-Object-Sysmeta-Slo-Etag", &slo_etag_for_get);
+            response.headers.set(
+                "X-Object-Sysmeta-Container-Update-Override-Etag",
+                &source_override_for_get,
+            );
+            return response;
+        }
+        if request.method == "PUT" && request.path == "/v1/a/c/dst" {
+            let body = request.body.materialize(u64::MAX).unwrap().to_vec();
+            writes_for_backend.lock().unwrap().push(CapturedPut {
+                headers: request.headers,
+                body,
+            });
+            return Response::new(201);
+        }
+        Response::new(404)
+    });
+    let slo_backend = Arc::clone(&backend);
+    let through_slo: NextFn = Arc::new(move |request: Request| {
+        Slo::new().with_concurrency(1).handle(request, &slo_backend)
+    });
+
+    let source_listed = listing_json_via_slo(&source_override);
+    assert_eq!(source_listed[0]["hash"], source_physical);
+    assert_eq!(source_listed[0]["slo_etag"], format!("\"{slo_etag}\""));
+
+    let mut copy_req = Request {
+        method: "COPY".to_string(),
+        path: "/v1/a/c/src".to_string(),
+        query_string: "multipart-manifest=get".to_string(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    copy_req.headers.set("Destination", "/c/dst");
+    let response = Copy::new().handle(copy_req, &through_slo);
+    assert_eq!(response.status, 201, "copy_the_manifest remanifest PUT");
+
+    let captured = writes.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "dest SLO stored once");
+    let dest_override = captured[0]
+        .headers
+        .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        .expect("SLO remanifest PUT must recompute listing override")
+        .to_string();
+    assert_eq!(
+        dest_override.matches("slo_etag=").count(),
+        1,
+        "copied SLO override must not duplicate slo_etag: {dest_override}"
+    );
+    let dest_physical = md5_hex(&captured[0].body);
+    let listed = listing_json_via_slo(&dest_override);
+    assert_eq!(
+        listed[0]["hash"], dest_physical,
+        "copied SLO listing hash must be bare md5, got {}",
+        listed[0]["hash"]
+    );
+    assert_eq!(listed[0]["slo_etag"], format!("\"{slo_etag}\""));
+    assert!(listed[0].get("s3_etag").is_none(), "{listed}");
 }
 
 #[test]

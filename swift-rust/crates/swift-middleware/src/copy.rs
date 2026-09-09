@@ -31,8 +31,10 @@
 //! Manifest-aware copy (`?multipart-manifest=get`) fetches the raw SLO/DLO
 //! manifest and re-PUTs it as a manifest (`multipart-manifest=put` for SLO;
 //! `X-Object-Manifest` for DLO). `Range` partial copy is supported via the
-//! source GET. Residual vs. `copy.py` (wontfix P1c): container/account
-//! sync-key propagation.
+//! source GET. SLO (and other non-Etag-copy) sink PUTs drop
+//! `X-Object-Sysmeta-Container-Update-Override-*` the way `copy.py` does so
+//! listing `hash` stays bare md5. Residual vs. `copy.py` (wontfix P1c):
+//! container/account sync-key propagation.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -137,6 +139,39 @@ fn is_copied_source_header(name: &str) -> bool {
         // copy_header_subset still carries those onto the dest PUT so the
         // dest is a symlink, not a 0-byte regular object.
         || lname.starts_with("x-symlink-")
+}
+
+/// Python `copy.py` `X-Object-Sysmeta-Container-Update-Override-*`.
+fn is_container_update_override(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .starts_with("x-object-sysmeta-container-update-override-")
+}
+
+/// Inverse of Python `copy.py` "copy source Etag onto sink PUT".
+///
+/// Source Etag is copied only on HTTP 200 regular objects. DLO +
+/// `?multipart-manifest=get` copies the manifest bytes as a regular
+/// object. Otherwise (SLO assembled or remanifest, DLO assembled, 206
+/// Range) Python strips every Container-Update-Override-* header so SLO
+/// PUT can recompute listing `hash` as bare md5 (`copy_the_manifest*`).
+fn should_strip_container_update_override(
+    source_status: u16,
+    source_is_slo: bool,
+    source_is_dlo: bool,
+    manifest_get: bool,
+) -> bool {
+    !(source_status == 200 && !source_is_slo && (!source_is_dlo || manifest_get))
+}
+
+fn strip_container_update_override(headers: &mut HeaderKeyDict) {
+    let keys: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| is_container_update_override(k))
+        .map(|(k, _)| k.to_string())
+        .collect();
+    for k in keys {
+        headers.remove(&k);
+    }
 }
 
 /// True when the client asked for a raw-manifest copy
@@ -331,6 +366,17 @@ impl Copy {
                 req.query_string = set_multipart_manifest_param(&req.query_string, None);
             }
         }
+        // Python copy.py: when the source Etag is not copied (SLO, assembled
+        // DLO, non-200), drop Container-Update-Override-* so SLO remanifest
+        // PUT does not inherit `md5; slo_etag=…` and then append another.
+        if should_strip_container_update_override(
+            source.status,
+            source_is_slo,
+            source_dlo_manifest.is_some(),
+            manifest_get,
+        ) {
+            strip_container_update_override(&mut put_headers);
+        }
 
         // The source body is plumbed straight through to the destination PUT
         // as a stream — an object copy never materializes the object.
@@ -487,6 +533,14 @@ impl Copy {
             } else {
                 req.query_string = set_multipart_manifest_param(&req.query_string, None);
             }
+        }
+        if should_strip_container_update_override(
+            source.status,
+            source_is_slo,
+            source_dlo_manifest.is_some(),
+            manifest_get,
+        ) {
+            strip_container_update_override(&mut put_headers);
         }
         let bytes = match source.body.collect_async().await {
             Ok(b) => b,
@@ -989,6 +1043,103 @@ mod tests {
     }
 
     #[test]
+    fn test_slo_manifest_copy_strips_container_update_override() {
+        // Python copy.py: SLO source (assembled or ?multipart-manifest=get)
+        // does not copy Etag, so Override-* must not reach the sink PUT.
+        // Forwarding Override-Etag makes listing hash `md5; slo_etag=…`.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(
+                    200,
+                    br#"[{"path":"/c/s","etag":"e","size_bytes":1}]"#.to_vec(),
+                );
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Content-Type", "application/json");
+                resp.headers.set(
+                    "X-Object-Sysmeta-Container-Update-Override-Etag",
+                    "cafef00d; slo_etag=slohash",
+                );
+                resp.headers
+                    .set("X-Object-Sysmeta-Container-Update-Override-Size", "1");
+                resp.headers.set("X-Object-Sysmeta-Slo-Etag", "slohash");
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let mut r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        r.query_string = "multipart-manifest=get".to_string();
+        let resp = Copy::new().handle(r, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert!(
+            put.headers
+                .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+                .is_none(),
+            "SLO sink PUT must strip source Override-Etag, got {:?}",
+            put.headers
+                .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        );
+        assert!(
+            put.headers
+                .get("X-Object-Sysmeta-Container-Update-Override-Size")
+                .is_none(),
+            "Python strips every Container-Update-Override-* header"
+        );
+        assert_eq!(
+            put.headers.get("X-Object-Sysmeta-Slo-Etag"),
+            Some("slohash"),
+            "non-override SLO sysmeta is still copied; SLO PUT refreshes it"
+        );
+        assert!(put.query_string.contains("multipart-manifest=put"));
+    }
+
+    #[test]
+    fn test_regular_object_copy_keeps_container_update_override() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(200, b"hello".to_vec());
+                resp.headers.set("Content-Type", "text/plain");
+                resp.headers.set(
+                    "X-Object-Sysmeta-Container-Update-Override-Etag",
+                    "kept-etag",
+                );
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        assert_eq!(Copy::new().handle(r, &app).status, 201);
+        let calls = log.lock().unwrap();
+        let put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert_eq!(
+            put.headers
+                .get("X-Object-Sysmeta-Container-Update-Override-Etag"),
+            Some("kept-etag")
+        );
+    }
+
+    #[test]
     fn test_manifest_get_copy_dlo_sets_x_object_manifest() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
@@ -1029,6 +1180,49 @@ mod tests {
         assert!(!c.intercepts_request(&plain));
         let acc = req("COPY", "/v1/a", &[]);
         assert!(!c.intercepts_request(&acc));
+    }
+
+    #[tokio::test]
+    async fn test_async_slo_manifest_copy_strips_override_etag() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: NextFn = Arc::new(move |mut r: Request| {
+            let is_get = r.method == "GET";
+            r.body.materialize(u64::MAX).unwrap();
+            log2.lock().unwrap().push(r);
+            if is_get {
+                let mut resp = Response::with_body(
+                    200,
+                    br#"[{"path":"/c/s","etag":"e","size_bytes":1}]"#.to_vec(),
+                );
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set(
+                    "X-Object-Sysmeta-Container-Update-Override-Etag",
+                    "cafef00d; slo_etag=slohash",
+                );
+                resp
+            } else {
+                Response::new(201)
+            }
+        });
+        let next: AsyncNextFn = std::sync::Arc::new(move |r: Request| {
+            let app = app.clone();
+            Box::pin(async move { app(r) })
+        });
+        let mut r = req(
+            "PUT",
+            "/v1/AUTH_test/dstc/dsto",
+            &[("X-Copy-From", "/srcc/srco")],
+        );
+        r.query_string = "multipart-manifest=get".to_string();
+        let resp = Copy::new().do_copy_async(r, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        let put = calls.iter().find(|c| c.method == "PUT").unwrap();
+        assert!(put
+            .headers
+            .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+            .is_none());
     }
 
     #[tokio::test]
