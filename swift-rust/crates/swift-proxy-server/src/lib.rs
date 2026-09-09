@@ -9857,6 +9857,114 @@ mod pipeline_async_tests {
         );
     }
 
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_dir_inline_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix=&inline=1"
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_dir_with_inline on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("&amp;inline"),
+            "official test_get_dir_with_inline href must include inline, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn staticweb_limited_dir_prefix_tempurl_hides_parent_on_hyper() {
+        // Official test_get_limited_dir: prefix scoped to dir/ must not
+        // emit href=".." (would escape the signed prefix).
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "19f889cf626f10a4dda11a2474f8906430efd3a4d63ad77f893aa0bbc03646bd";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix=dir/"
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_limited_dir on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            !body.contains("href=\".."),
+            "limited prefix TempURL must hide parent ../, got {body}"
+        );
+        assert!(
+            body.contains("<a href=\"./obj"),
+            "limited dir listing still lists objects, got {body}"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
