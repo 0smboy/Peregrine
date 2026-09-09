@@ -1510,6 +1510,7 @@ impl Slo {
                 let mut get_req = orig.clone_head();
                 get_req.method = "GET".to_string();
                 ignore_range(&mut get_req.headers, SLO_HEADER);
+                strip_conditionals(&mut get_req.headers);
                 resp = next(get_req);
                 if !resp
                     .headers
@@ -1838,6 +1839,7 @@ impl Slo {
                 let mut get_req = orig.clone_head();
                 get_req.method = "GET".to_string();
                 ignore_range(&mut get_req.headers, SLO_HEADER);
+                strip_conditionals(&mut get_req.headers);
                 resp = next(get_req).await;
                 if !resp
                     .headers

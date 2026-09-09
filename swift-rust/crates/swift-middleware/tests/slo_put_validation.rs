@@ -1122,6 +1122,104 @@ async fn if_match_get_uses_slo_etag_not_physical() {
     assert_eq!(body.collect_async().await.unwrap(), b"x");
 }
 
+fn slo_legacy_manifest_backend(stored: Vec<u8>) -> AsyncNextFn {
+    Arc::new(move |request: Request| {
+        let stored = stored.clone();
+        Box::pin(async move {
+            if request.headers.get("If-Match").is_some()
+                || request.headers.get("If-None-Match").is_some()
+            {
+                return Response::new(412);
+            }
+            if request.path == "/v1/a/c/manifest" {
+                let mut resp = if request.method == "HEAD" {
+                    Response::new(200)
+                } else {
+                    Response::with_body(200, stored)
+                };
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Etag", "physicaljson");
+                return resp;
+            }
+            if request.path == "/v1/a/c/s1" {
+                return Response::with_body(200, b"x".to_vec());
+            }
+            Response::new(404)
+        })
+    })
+}
+
+#[tokio::test]
+async fn if_match_head_without_sysmeta_uses_assembled_etag() {
+    let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 1, "hash": "e"}])).unwrap();
+    let backend = slo_legacy_manifest_backend(stored);
+    let head = Slo::new()
+        .handle_request_async(
+            Request {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: Vec::<u8>::new().into(),
+            },
+            backend.clone(),
+        )
+        .await;
+    assert_eq!(head.status, 200);
+    let etag = head.headers.get("Etag").expect("assembled SLO Etag");
+    let mut headers = HeaderKeyDict::new();
+    headers.set("If-Match", etag);
+    let request = Request {
+        method: "HEAD".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: String::new(),
+        headers,
+        body: Vec::<u8>::new().into(),
+    };
+    assert!(Slo::new().intercepts_request(&request));
+    let resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(
+        resp.status, 200,
+        "HEAD If-Match must not refetch with conditionals, got {}",
+        resp.status
+    );
+}
+
+#[tokio::test]
+async fn if_none_match_head_without_sysmeta_is_304() {
+    let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 1, "hash": "e"}])).unwrap();
+    let backend = slo_legacy_manifest_backend(stored);
+    let head = Slo::new()
+        .handle_request_async(
+            Request {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: Vec::<u8>::new().into(),
+            },
+            backend.clone(),
+        )
+        .await;
+    assert_eq!(head.status, 200);
+    let etag = head.headers.get("Etag").expect("assembled SLO Etag");
+    let mut headers = HeaderKeyDict::new();
+    headers.set("If-None-Match", etag);
+    let request = Request {
+        method: "HEAD".into(),
+        path: "/v1/a/c/manifest".into(),
+        query_string: String::new(),
+        headers,
+        body: Vec::<u8>::new().into(),
+    };
+    let resp = Slo::new().handle_request_async(request, backend).await;
+    assert_eq!(
+        resp.status, 304,
+        "HEAD If-None-Match assembled etag must 304, got {}",
+        resp.status
+    );
+}
+
 #[tokio::test]
 async fn head_part_number_refetches_manifest() {
     let stored = serde_json::to_vec(&json!([
