@@ -8931,7 +8931,11 @@ pub fn serve_with_core_filters_and_config(
 #[cfg(test)]
 mod pipeline_async_tests {
     use super::*;
+    use swift_core::hashing::HashPathConfig;
     use swift_http::IncomingBody;
+    use swift_ring::{RingData, RingDevice};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     /// Object-server Range on a stub segment (inclusive `bytes=start-end`).
     fn stub_object_range(req: &Request, body: &[u8]) -> Response {
@@ -9674,6 +9678,272 @@ mod pipeline_async_tests {
             "official test_dlo_referer after container ACL must pass authorize, got {}",
             after_acl.status
         );
+    }
+
+    fn ring_on_127(port: u16) -> Ring {
+        let dev = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".into(),
+            port: port as u32,
+            replication_ip: None,
+            replication_port: None,
+            device: "sda".into(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let data = RingData::from_parts(vec![Some(dev)], 32, vec![vec![0]]);
+        Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
+    }
+
+    fn backend_logical_target(first_line: &str) -> (String, String) {
+        let target = first_line.split_whitespace().nth(1).unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let trimmed = path.trim_start_matches('/');
+        let mut parts = trimmed.splitn(3, '/');
+        let _dev = parts.next();
+        let _part = parts.next();
+        let logical = parts.next().unwrap_or("");
+        (format!("/{logical}"), query.to_string())
+    }
+
+    async fn write_backend_http(
+        stream: &mut tokio::net::TcpStream,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) {
+        let mut hdr = format!(
+            "HTTP/1.1 200 OK\r\nX-Timestamp: 1000.00000\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (k, v) in extra {
+            hdr.push_str(&format!("{k}: {v}\r\n"));
+        }
+        hdr.push_str("\r\n");
+        let _ = stream.write_all(hdr.as_bytes()).await;
+        if !body.is_empty() {
+            let _ = stream.write_all(body).await;
+        }
+        let _ = stream.flush().await;
+    }
+
+    /// Path-dispatching object/container backend for official referer step 3.
+    /// Client GET must hit `authorize_async` (no intercepting stub).
+    async fn spawn_referer_assemble_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&tmp[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let empty = [];
+                    let body: &[u8];
+                    let extra: Vec<(&str, &str)>;
+                    if logical == "/AUTH_test/c2/manifest-abcde" {
+                        extra = vec![("X-Static-Large-Object", "True")];
+                        body = br#"[{"name":"/c/s1","bytes":3,"hash":"c4ca4238a0b923820dcc509a6f75849b"},{"name":"/c/s2","bytes":3,"hash":"c81e728d9d4c2f636f067f89cc14862c"}]"#;
+                    } else if logical == "/AUTH_test/c/s1" {
+                        extra = vec![];
+                        body = b"aaa";
+                    } else if logical == "/AUTH_test/c/s2" {
+                        extra = vec![];
+                        body = b"bbb";
+                    } else if logical == "/AUTH_test/c/mancont2" {
+                        extra = vec![("X-Object-Manifest", "c2/segs/")];
+                        body = b"mancont2-contents";
+                    } else if logical == "/AUTH_test/c2" {
+                        extra = vec![("Content-Type", "application/json")];
+                        body = br#"[{"name":"segs/1","bytes":10,"hash":"x","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"},{"name":"segs/2","bytes":10,"hash":"y","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"}]"#;
+                    } else if logical == "/AUTH_test/c2/segs/1" {
+                        extra = vec![];
+                        body = b"ffffffffff";
+                    } else if logical == "/AUTH_test/c2/segs/2" {
+                        extra = vec![];
+                        body = b"gggggggggg";
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let send = if is_head { &empty[..] } else { body };
+                    write_backend_http(&mut stream, &extra, send).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    fn referer_acl_headers(token: &str) -> HeaderKeyDict {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", token);
+        headers.set("Referer", "http://blah.example.com");
+        headers
+    }
+
+    /// Official TestSlo.test_slo_referer_on_segment_container steps 2–3:
+    /// authorize_async must run (no stub). Manifest ACL alone is 409;
+    /// both container ACLs assemble.
+    #[tokio::test]
+    async fn slo_referer_assembles_after_both_acls_on_hyper() {
+        let (port, backend) = spawn_referer_assemble_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Slo::new())],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let headers = referer_acl_headers(&token);
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 409,
+            "official test_slo_referer step 2 authorize+assemble on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
+        let mut assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            assembled.status, 200,
+            "official test_slo_referer step 3 on Hyper, got {} {:?}",
+            assembled.status, assembled.reason
+        );
+        let body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("SLO referer assembled body");
+        assert_eq!(
+            body, b"aaabbb",
+            "official test_slo_referer step 3 assembled body"
+        );
+        backend.abort();
+    }
+
+    /// Official TestDlo.test_dlo_referer_on_segment_container steps 2–3.
+    #[tokio::test]
+    async fn dlo_referer_assembles_after_both_acls_on_hyper() {
+        let (port, backend) = spawn_referer_assemble_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
+        seed_container_acl(&app, "AUTH_test", "c2", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+            ],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let headers = referer_acl_headers(&token);
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 403,
+            "official test_dlo_referer step 2 authorize+listing on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
+        let mut assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            assembled.status, 200,
+            "official test_dlo_referer step 3 on Hyper, got {} {:?}",
+            assembled.status, assembled.reason
+        );
+        let body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("DLO referer assembled body");
+        assert_eq!(
+            body, b"ffffffffffgggggggggg",
+            "official test_dlo_referer step 3 assembled body"
+        );
+        backend.abort();
     }
 
     /// Object-server apply_conditional on the physical SLO JSON ETag.
