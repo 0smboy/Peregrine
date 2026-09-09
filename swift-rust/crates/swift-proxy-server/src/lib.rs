@@ -10618,6 +10618,59 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainerTempurl.test_GET: container-key TempURL of a
+    /// regular object returns the body; the same GET sig also allows HEAD.
+    #[tokio::test]
+    async fn container_tempurl_get_and_head_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        };
+        let qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestContainerTempurl.test_GET on Hyper, got {} {:?}",
+            got.status, got.reason
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestContainerTempurl.test_GET body");
+        assert_eq!(body, b"obj contents");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestContainerTempurl.test_GET HEAD on same TempURL, got {}",
+            head.status
+        );
+        backend.abort();
+    }
+
     /// Object-server apply_conditional on the physical SLO JSON ETag.
     /// Official TestSlo.test_slo_if_match_get uses the assembled SLO ETag.
     struct SloIfMatchObjectServerStub;
@@ -12766,6 +12819,9 @@ mod pipeline_async_tests {
                 if req.method == "PUT" && req.path == "/v1/AUTH_test/c/obj" {
                     return Response::new(201);
                 }
+                if req.method == "POST" && req.path == "/v1/AUTH_test/c/obj" {
+                    return Response::new(202);
+                }
                 Response::new(404)
             })
         }
@@ -14098,6 +14154,73 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestObjectVersioning.test_overwriting: owner DELETE must
+    /// restore the previous archive (`bbbbb` → `aaaaa`) on Hyper.
+    #[tokio::test]
+    async fn versioning_overwrite_delete_restores_previous_on_hyper() {
+        let current = Arc::new(std::sync::Mutex::new(b"bbbbb".to_vec()));
+        let archive_deletes = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningCheckAclStub {
+                    current: Arc::clone(&current),
+                    archive_deletes: Arc::clone(&archive_deletes),
+                }),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official test_overwriting DELETE restore on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let body = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            body, b"aaaaa",
+            "official test_overwriting DELETE must restore the previous archive"
+        );
+        let deleted = *archive_deletes.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            deleted, 1,
+            "official test_overwriting DELETE must consume the restored archive"
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200, "restored object GET on Hyper");
+        let got_body = got
+            .body
+            .collect_async()
+            .await
+            .expect("restored object body");
+        assert_eq!(got_body, b"aaaaa");
+    }
+
     /// Container-only TempURL keys (IsolatedIdentity TestContainerTempurl).
     struct ContainerOnlyTempUrlKeys(Vec<String>);
     impl swift_middleware::KeyProvider for ContainerOnlyTempUrlKeys {
@@ -14698,6 +14821,52 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestObjectVersioning.test_overwriting: POST metadata must
+    /// not archive a new version on the Hyper stream path.
+    #[tokio::test]
+    async fn versioning_post_does_not_archive_on_hyper() {
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningOverwriteStub {
+                    archive_puts: Arc::clone(&archive_puts),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Meta-Fu", "baz");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official test_overwriting POST on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 0,
+            "official test_overwriting POST must not archive"
+        );
+    }
+
     /// Official IsolatedIdentity `update_metadata` + Python `clean_acl`:
     /// empty `.r:` and write-ACL referrers are 400 on Hyper container POST.
     #[tokio::test]
@@ -14862,6 +15031,53 @@ mod pipeline_async_tests {
         assert_eq!(
             body, "man1-contents",
             "official test_get_manifest_document_itself returns stored bytes"
+        );
+    }
+
+    /// Official TestDlo.test_get_manifest: unconditional GET assembles
+    /// the concatenated segments (Hyper reassemble, no If-* / Range).
+    #[tokio::test]
+    async fn dlo_get_manifest_assembles_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_manifest on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("official test_get_manifest body");
+        assert_eq!(
+            body, b"onetwo",
+            "official test_get_manifest assembled segments"
         );
     }
 
