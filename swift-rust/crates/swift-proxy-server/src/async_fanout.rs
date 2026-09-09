@@ -2644,6 +2644,9 @@ impl ProxyApp {
         container: &str,
     ) -> Response {
         super::scrub_container_write_owner_headers(&mut req);
+        if let Some(denied) = super::deny_non_owner_container_versioning(&req) {
+            return denied;
+        }
         if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "container") {
             let mut r = Response::with_body(400, e.0);
             r.headers.set("Content-Type", "text/plain");
@@ -2746,6 +2749,9 @@ impl ProxyApp {
         container: &str,
     ) -> Response {
         super::scrub_container_write_owner_headers(&mut req);
+        if let Some(denied) = super::deny_non_owner_container_versioning(&req) {
+            return denied;
+        }
         if let Err(e) = swift_core::constraints::check_metadata(req.headers.iter(), "container") {
             let mut r = Response::with_body(400, e.0);
             r.headers.set("Content-Type", "text/plain");

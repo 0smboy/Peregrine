@@ -3157,18 +3157,20 @@ impl Middleware for VersionedWrites {
         let ordinary_put = req.method == "PUT"
             && !req.headers.contains_key("X-Copy-From")
             && !put_has_version_id(&req.query_string);
-        // Legacy X-Versions-Location PUTs must stream: G3 Hyper never
-        // calls sync handle_put, so copy-current would otherwise be skipped.
-        if ordinary_put
-            && (self.allow_object_versioning || self.allow_versioned_writes != Some(false))
-        {
+        // Legacy X-Versions-Location PUTs and stack/history DELETEs must
+        // stream: G3 Hyper never calls sync `handle()`, so copy-current /
+        // restore would otherwise be skipped when `allow_object_versioning`
+        // is off (IsolatedIdentity default).
+        let legacy_or_modern =
+            self.allow_object_versioning || self.allow_versioned_writes != Some(false);
+        if ordinary_put && legacy_or_modern {
+            return true;
+        }
+        if req.method == "DELETE" && legacy_or_modern {
             return true;
         }
         if !self.allow_object_versioning {
             return false;
-        }
-        if req.method == "DELETE" {
-            return true;
         }
         if req.method == "POST" {
             return true;
@@ -3539,6 +3541,22 @@ mod tests {
         assert!(vw.streams_request(&req("PUT", "/v1/AUTH_test/c/obj")));
     }
 
+    #[test]
+    fn test_legacy_delete_streams_when_object_versioning_is_off() {
+        // IsolatedIdentity `[filter:versioned_writes]` often sets only
+        // `allow_versioned_writes=true`. Hyper must still restore on DELETE
+        // (official test_versioning_container_acl last step + stack pop).
+        let vw = VersionedWrites::new();
+        assert!(!vw.allow_object_versioning, "default must stay legacy-only");
+        assert!(
+            vw.streams_request(&req("DELETE", "/v1/AUTH_test/c/obj")),
+            "legacy stack DELETE must stream on Hyper"
+        );
+        assert!(!vw.streams_request(&req("DELETE", "/v1/AUTH_test/c")));
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        assert!(vw.streams_request(&req("DELETE", "/v1/AUTH_test/c/obj")));
+    }
+
     #[tokio::test]
     async fn test_streaming_legacy_first_put_does_not_archive() {
         // Python `_copy_current`: GET current 404 → skip archive PUT.
@@ -3674,6 +3692,66 @@ mod tests {
                 .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
             "client PUT must proceed: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_acl_writer_overwrite_preauths_archive_into_write_denied_versions() {
+        // Official test_versioning_container_acl: account2 has source write
+        // ACL and X-Container-Write: '' on the versions container. Archive
+        // PUT must carry authorize-override (Python make_pre_authed_request).
+        type Call = (String, String, HeaderKeyDict);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.headers.clone(),
+                ));
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    resp.headers.set("X-Container-Write", "AUTH_other");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    let mut resp = Response::with_body(200, b"aaaaa".to_vec());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp.headers.set("Content-Length", "5");
+                    return resp;
+                }
+                Response::new(201)
+            })
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "5");
+        headers.set("X-Auth-Token", "account2");
+        let req = AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(b"bbbbb".to_vec(), 1024),
+        };
+        let vw = VersionedWrites::new();
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        let archive = calls
+            .iter()
+            .find(|(m, p, _)| m == "PUT" && p.starts_with("/v1/AUTH_test/versions/"))
+            .expect("ACL writer overwrite must archive");
+        assert_eq!(
+            archive.2.get("X-Backend-Authorize-Override"),
+            Some("true"),
+            "archive PUT must be pre-authed: {calls:?}"
+        );
+        assert_eq!(archive.2.get("X-Backend-Source"), Some("VW"));
     }
 
     fn intercept_legacy_backend(
@@ -3928,7 +4006,9 @@ mod tests {
                 Response::new(200)
             })
         });
-        let vw = VersionedWrites::new().with_object_versioning(true);
+        // IsolatedIdentity default: allow_versioned_writes only.
+        let vw = VersionedWrites::new();
+        assert!(!vw.allow_object_versioning);
         let resp = vw
             .handle_streaming_request(streaming_delete_req(), next)
             .await;
