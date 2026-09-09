@@ -9745,9 +9745,12 @@ mod pipeline_async_tests {
         let reason = match status {
             201 => "Created",
             204 => "No Content",
+            206 => "Partial Content",
             304 => "Not Modified",
             404 => "Not Found",
             412 => "Precondition Failed",
+            416 => "Range Not Satisfiable",
+            422 => "Unprocessable Entity",
             _ => "OK",
         };
         let mut hdr = format!(
@@ -14321,6 +14324,13 @@ mod pipeline_async_tests {
                         let ct = header("Content-Type")
                             .unwrap_or_else(|| "application/octet-stream".into());
                         let etag = "7265f4d211b56873a381d321f586e4a9";
+                        if let Some(client_etag) = header("ETag") {
+                            let norm = client_etag.trim_matches('"');
+                            if !norm.is_empty() && !norm.eq_ignore_ascii_case(etag) {
+                                write_backend_http_status(&mut stream, 422, &[], &[]).await;
+                                return;
+                            }
+                        }
                         let mut stored = HeaderKeyDict::new();
                         stored.set("Content-Type", &ct);
                         stored.set("ETag", etag);
@@ -14430,6 +14440,51 @@ mod pipeline_async_tests {
                                 )
                                 .await;
                                 return;
+                            }
+                        }
+                        if !is_head {
+                            if let Some(range_h) = header("Range") {
+                                if let Ok(parsed) = swift_http::Range::parse(&range_h) {
+                                    match parsed.ranges_for_length(Some(obj.len() as u64)) {
+                                        Some(ranges) if ranges.is_empty() => {
+                                            let cr = format!("bytes */{}", obj.len());
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                416,
+                                                &[
+                                                    ("ETag", etag.as_str()),
+                                                    ("Accept-Ranges", "bytes"),
+                                                    ("Content-Range", cr.as_str()),
+                                                ],
+                                                &[],
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        Some(ranges) if ranges.len() == 1 => {
+                                            let (start, end) = ranges[0];
+                                            let slice = obj[start as usize..end as usize].to_vec();
+                                            let cr = format!(
+                                                "bytes {start}-{}/{}",
+                                                end.saturating_sub(1),
+                                                obj.len()
+                                            );
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                206,
+                                                &[
+                                                    ("ETag", etag.as_str()),
+                                                    ("Accept-Ranges", "bytes"),
+                                                    ("Content-Range", cr.as_str()),
+                                                ],
+                                                &slice,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                         let send = if is_head { &[][..] } else { obj.as_slice() };
@@ -16041,6 +16096,154 @@ mod pipeline_async_tests {
                 .or_else(|| none_hit.headers.get("Etag"))
                 .map(|s| s.trim_matches('"')),
             Some(etag.as_str())
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testEtagWayoff — client ETag must reach the
+    /// object server so a body md5 mismatch is 422, not a silent 201.
+    #[tokio::test]
+    async fn file_etag_wayoff_is_422_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let resp = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/wayoff",
+            "",
+            &[
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+                ("ETag", "reallylonganddefinitelynotavalidetagvalue"),
+            ],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 422,
+            "official testEtagWayoff on Hyper, got {}",
+            resp.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testContentTypeGuessing: PUT without Content-Type
+    /// must guess from the path and publish that type on the listing.
+    #[tokio::test]
+    async fn file_content_type_guessing_updates_listing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        for name in ["tone.wav", "note.txt", "blob.zip"] {
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", "0")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testContentTypeGuessing PUT {name} on Hyper, got {}",
+                put.status
+            );
+        }
+        let listed = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        let body = listed
+            .body
+            .collect_async()
+            .await
+            .expect("content-type listing body");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let mut got = std::collections::HashMap::new();
+        for row in rows {
+            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            if !ext.is_empty() {
+                got.insert(
+                    ext.to_string(),
+                    row.get("content_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(got.get("wav").map(String::as_str), Some("audio/x-wav"));
+        assert_eq!(got.get("txt").map(String::as_str), Some("text/plain"));
+        assert_eq!(got.get("zip").map(String::as_str), Some("application/zip"));
+        backend.abort();
+    }
+
+    /// Official TestFile.testRangedGetsWithLWSinHeader plus suffix `-0` 416.
+    #[tokio::test]
+    async fn file_ranged_gets_with_lws_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let data = vec![b'x'; 10000];
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/ranged",
+            "",
+            &[("Content-Length", "10000"), ("Content-Type", "text/plain")],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        for range in [
+            "BYTES=0-999",
+            "bytes = 0-999",
+            "BYTES = 0 - 999",
+            "bytes = 0 - 999",
+            "bytes=0 - 999",
+            "bytes=0-999 ",
+        ] {
+            let got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged",
+                "",
+                &[("Range", range)],
+                Vec::new(),
+            )
+            .await;
+            let body = got.body.collect_async().await.expect("LWS Range body");
+            assert_eq!(
+                body,
+                &data[..1000],
+                "official testRangedGetsWithLWSinHeader {range:?} on Hyper, status {}",
+                got.status
+            );
+        }
+        let suffix0 = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged",
+            "",
+            &[("Range", "bytes=-0")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            suffix0.status, 416,
+            "official testRangedGets bytes=-0 on Hyper, got {}",
+            suffix0.status
+        );
+        assert_eq!(
+            suffix0
+                .headers
+                .get("ETag")
+                .or_else(|| suffix0.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some("7265f4d211b56873a381d321f586e4a9")
         );
         backend.abort();
     }
