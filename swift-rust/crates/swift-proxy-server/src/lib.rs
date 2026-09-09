@@ -14196,6 +14196,340 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestFile.test_POST: object POST must keep listing
+    /// `bytes` / `hash` and update `content_type`. App path only — listing
+    /// rows are applied when the object write carries `X-Container-Host`
+    /// (proxy CU stamp), not by an intercepting listing stub.
+    async fn spawn_file_post_listing_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (HeaderKeyDict, Vec<u8>),
+        >::new()));
+        let listings = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (u64, String, String),
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let objects = Arc::clone(&objects);
+                let listings = Arc::clone(&listings);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_post = first.starts_with("POST ");
+                    let is_get = first.starts_with("GET ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    if logical == "/AUTH_test/c" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        if is_head {
+                            write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                            return;
+                        }
+                        if is_get {
+                            let rows: Vec<serde_json::Value> = listings
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .map(|(name, (bytes, hash, ct))| {
+                                    serde_json::json!({
+                                        "name": name,
+                                        "bytes": bytes,
+                                        "hash": hash,
+                                        "content_type": ct,
+                                        "last_modified": "2010-01-01T00:00:00.000000",
+                                    })
+                                })
+                                .collect();
+                            let payload = serde_json::to_vec(&rows).unwrap();
+                            write_backend_http(
+                                &mut stream,
+                                &[("Content-Type", "application/json")],
+                                &payload,
+                            )
+                            .await;
+                            return;
+                        }
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/c/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let name = logical.trim_start_matches("/AUTH_test/c/").to_string();
+                    let header = |want: &str| -> Option<String> {
+                        text.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case(want).then(|| v.trim().to_string())
+                            })
+                        })
+                    };
+                    let has_cu = header("X-Container-Host").is_some();
+                    if is_put {
+                        let ct = header("Content-Type")
+                            .unwrap_or_else(|| "application/octet-stream".into());
+                        let etag = "7265f4d211b56873a381d321f586e4a9";
+                        let mut stored = HeaderKeyDict::new();
+                        stored.set("Content-Type", &ct);
+                        stored.set("ETag", etag);
+                        stored.set("Content-Length", body.len().to_string());
+                        for line in text.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                                    stored.set(k.trim(), v.trim());
+                                }
+                            }
+                        }
+                        objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical.clone(), (stored, body.clone()));
+                        if has_cu {
+                            listings
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(name, (body.len() as u64, etag.to_string(), ct));
+                        }
+                        write_backend_http_status(&mut stream, 201, &[("ETag", etag)], &[]).await;
+                        return;
+                    }
+                    if is_post {
+                        let mut guard = objects.lock().unwrap_or_else(|p| p.into_inner());
+                        let Some((headers, stored_body)) = guard.get_mut(&logical) else {
+                            drop(guard);
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        };
+                        if let Some(ct) = header("Content-Type") {
+                            headers.set("Content-Type", &ct);
+                            if has_cu {
+                                if let Some(row) = listings
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .get_mut(&name)
+                                {
+                                    row.2 = ct;
+                                }
+                            }
+                        }
+                        for line in text.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                                    headers.set(k.trim(), v.trim());
+                                }
+                            }
+                        }
+                        let _ = stored_body;
+                        drop(guard);
+                        write_backend_http_status(&mut stream, 202, &[], &[]).await;
+                        return;
+                    }
+                    let stored = objects
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some((headers, obj)) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        let extra: Vec<(&str, String)> =
+                            headers.iter().map(|(k, v)| (k, v.to_string())).collect();
+                        let extra_ref: Vec<(&str, &str)> =
+                            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                        write_backend_http(&mut stream, &extra_ref, send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn file_post_updates_listing_content_type_on_hyper() {
+        let (port, backend) = spawn_file_post_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        let body = vec![b'x'; 1024];
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("Content-Type", "text/foobar");
+        put_headers.set("Content-Length", "1024");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/file".into(),
+                query_string: String::new(),
+                headers: put_headers,
+                body: IncomingBody::from_bytes(body, u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestFile.test_POST PUT on Hyper, got {} {:?}",
+            put.status, put.reason
+        );
+        let head = || {
+            svc.call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c/file".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        let listing = || {
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: "format=json".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        let after_put = head().await;
+        assert!(
+            (200..300).contains(&after_put.status),
+            "official TestFile.test_POST sanity HEAD on Hyper, got {}",
+            after_put.status
+        );
+        assert_eq!(
+            after_put.headers.get("Content-Type"),
+            Some("text/foobar"),
+            "official TestFile.test_POST sanity content-type"
+        );
+        let etag = after_put
+            .headers
+            .get("ETag")
+            .or_else(|| after_put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("official TestFile.test_POST sanity etag");
+        let listed = listing().await;
+        assert_eq!(
+            listed.status, 200,
+            "official TestFile.test_POST listing after PUT, got {}",
+            listed.status
+        );
+        let listed_body = listed
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.test_POST listing body");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed_body).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some("file"))
+            .expect("official TestFile.test_POST listing must include file");
+        assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(1024));
+        assert_eq!(
+            row.get("content_type").and_then(|v| v.as_str()),
+            Some("text/foobar")
+        );
+        assert_eq!(
+            row.get("hash").and_then(|v| v.as_str()),
+            Some(etag.as_str())
+        );
+        let mut post_headers = HeaderKeyDict::new();
+        post_headers.set("Content-Type", "image/foobarbaz");
+        post_headers.set("X-Object-Meta-Test", "blah");
+        let post = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c/file".into(),
+                query_string: String::new(),
+                headers: post_headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&post.status),
+            "official TestFile.test_POST on Hyper, got {} {:?}",
+            post.status,
+            post.reason
+        );
+        let after_post = head().await;
+        assert_eq!(
+            after_post.headers.get("Content-Type"),
+            Some("image/foobarbaz"),
+            "official TestFile.test_POST object content-type after POST"
+        );
+        assert_eq!(
+            after_post.headers.get("Content-Length"),
+            Some("1024"),
+            "official TestFile.test_POST size must stay 1024"
+        );
+        let post_etag = after_post
+            .headers
+            .get("ETag")
+            .or_else(|| after_post.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("official TestFile.test_POST etag after POST");
+        assert_eq!(
+            post_etag, etag,
+            "official TestFile.test_POST etag must not change"
+        );
+        assert_eq!(
+            after_post.headers.get("X-Object-Meta-Test"),
+            Some("blah"),
+            "official TestFile.test_POST metadata"
+        );
+        let listed_after = listing().await;
+        let listed_after_body = listed_after
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.test_POST listing after POST");
+        let rows_after: Vec<serde_json::Value> =
+            serde_json::from_slice(&listed_after_body).unwrap();
+        let row_after = rows_after
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some("file"))
+            .expect("official TestFile.test_POST listing after POST must include file");
+        assert_eq!(row_after.get("bytes").and_then(|v| v.as_u64()), Some(1024));
+        assert_eq!(
+            row_after.get("hash").and_then(|v| v.as_str()),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            row_after.get("content_type").and_then(|v| v.as_str()),
+            Some("image/foobarbaz"),
+            "official TestFile.test_POST listing content_type after POST"
+        );
+        backend.abort();
+    }
+
     /// Official test_versioning_check_acl: versions container is public
     /// read, but a foreign token must not DELETE/pop the source object.
     struct VersioningCheckAclStub {
