@@ -9983,6 +9983,187 @@ mod pipeline_async_tests {
         let _ = put_headers;
     }
 
+    /// Official TestSlo.test_slo_get_the_manifest / test_slo_head_the_manifest.
+    struct SloManifestGetStub;
+    impl swift_middleware::Middleware for SloManifestGetStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest-abcde" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "/c/s2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Content-Type", "application/octet-stream");
+                    resp.headers.set("Etag", "physical-json");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return Response::with_body(200, b"aaa".to_vec());
+                }
+                if req.path == "/v1/a/c/s2" {
+                    return Response::with_body(200, b"bbb".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_the_manifest_is_json_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_the_manifest on Hyper, got {}",
+            resp.status
+        );
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8"),
+            "official test_slo_get_the_manifest Content-Type"
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+            "official test_slo_get_the_manifest body must be JSON"
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8"),
+            "official test_slo_head_the_manifest on Hyper, got {:?}",
+            head.headers.get("Content-Type")
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_ranged_get_uses_assembled_bytes_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Range", "bytes=2-4");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 206,
+            "official test_slo_ranged_get on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"abb", "assembled Range bytes=2-4 of aaabbb");
+    }
+
+    #[tokio::test]
+    async fn slo_etag_is_hash_of_etags_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled SLO Etag")
+            .trim_matches('"')
+            .to_string();
+        assert_ne!(etag, "physical-json");
+        // md5(seg1_hash || seg2_hash) — official test_slo_etag_is_hash_of_etags.
+        assert_eq!(
+            etag, "302cbafc0dfbc97f30d576a6f394dad3",
+            "official test_slo_etag_is_hash_of_etags on Hyper"
+        );
+    }
+
     /// Official listing_formats test_GET_HEAD_content_type: HEAD
     /// `?format=json` must stamp application/json even when the backend
     /// HEAD is a 204 text/plain.
