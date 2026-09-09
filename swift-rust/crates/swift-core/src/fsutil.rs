@@ -74,7 +74,20 @@ mod tests {
             space.total_bytes >= space.free_bytes,
             "total must cover free: {space:?}"
         );
-        assert_eq!(free_bytes(&std::env::temp_dir()).unwrap(), space.free_bytes);
+        // `free_bytes` is just `fs_space(..).free_bytes`, so the two agree at a
+        // single instant. They are separate `statvfs` calls, though, and the
+        // temp dir is on a live (often shared) filesystem, so the reading can
+        // drift by a few blocks between calls — assert they are close rather
+        // than bit-for-bit equal, which is enough to catch a wrong field or
+        // unit while tolerating concurrent activity.
+        let again = free_bytes(&std::env::temp_dir()).unwrap();
+        let drift = again.abs_diff(space.free_bytes);
+        let tolerance = (space.free_bytes / 100).max(64 * 1024 * 1024);
+        assert!(
+            drift <= tolerance,
+            "free_bytes drifted more than tolerance: {again} vs {} (drift {drift}, tolerance {tolerance})",
+            space.free_bytes
+        );
     }
 
     #[test]
