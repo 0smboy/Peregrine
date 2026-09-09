@@ -9379,6 +9379,224 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestSlo.test_slo_referer_on_segment_container step 2:
+    /// manifest readable, first segment 403 → 409 Conflict (not 403).
+    struct SloRefererDeniedSegmentStub;
+    impl swift_middleware::Middleware for SloRefererDeniedSegmentStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/other/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    return resp;
+                }
+                if req.path == "/v1/a/other/s1" {
+                    return Response::error(403, "Forbidden");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_referer_denied_segment_is_409_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloRefererDeniedSegmentStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 409,
+            "official test_slo_referer step 2 on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official listing_formats test_GET_HEAD_content_type: HEAD
+    /// `?format=json` must stamp application/json even when the backend
+    /// HEAD is a 204 text/plain.
+    struct ListingHeadPlainStub;
+    impl swift_middleware::Middleware for ListingHeadPlainStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD") && req.path == "/v1/a/c"
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(204)
+                } else {
+                    Response::with_body(200, b"[]".to_vec())
+                };
+                resp.headers
+                    .set("Content-Type", "text/plain; charset=utf-8");
+                resp.headers.set("Content-Length", 0);
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_formats_head_json_content_type_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::ListingFormats),
+                Arc::new(ListingHeadPlainStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c".into(),
+                query_string: "format=json".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8"),
+            "official test_GET_HEAD_content_type on Hyper"
+        );
+    }
+
+    /// Official test_versioning_dlo: empty DLO overwrite must not archive.
+    struct VersioningDloManifestStub {
+        archive_puts: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningDloManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let archive_puts = Arc::clone(&self.archive_puts);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/man" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "c/man/");
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Length", "0");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    *archive_puts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    return Response::new(201);
+                }
+                if req.method == "PUT" && req.path == "/v1/AUTH_test/c/man" {
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_dlo_empty_overwrite_does_not_archive_on_hyper() {
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningDloManifestStub {
+                    archive_puts: Arc::clone(&archive_puts),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Manifest", "c/man/");
+        headers.set("Content-Length", "0");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "DLO manifest PUT on Hyper must 201, got {}",
+            resp.status
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 0,
+            "official test_versioning_dlo must not archive the prior manifest"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";

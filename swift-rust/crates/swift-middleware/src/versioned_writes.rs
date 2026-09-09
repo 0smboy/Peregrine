@@ -28,6 +28,12 @@
 //! Container `PUT`/`POST` translates client `X-Versions-Location` /
 //! `X-History-Location` into sysmeta when `allow_versioned_writes` is true.
 //!
+//! IsolatedIdentity (Swift 2.9 `versioned_writes.py`) skips copy-current
+//! when the client PUT or the current object carries `X-Object-Manifest`
+//! (`test_versioning_dlo`: empty DLO overwrite must not bump the archive
+//! `object_count`). Master `legacy.py` dropped that skip; keep the 2.9
+//! behavior here.
+//!
 //! Deferred / wontfix:
 //! * `swift.authorize` write-ACL recheck before archive (no authorize hook).
 //! * In-proxy reverse-listing fallback for pre-2.6.0 container servers
@@ -506,6 +512,12 @@ fn hidden_container_put(path: &str, policy_index: Option<&str>) -> Request {
     req
 }
 
+/// Official Swift 2.9 `handle_obj_versions_put`: do not version a DLO
+/// manifest (`X-Object-Manifest` on the PUT or on the current object).
+fn is_dlo_manifest(headers: &swift_http::HeaderKeyDict) -> bool {
+    headers.contains_key("X-Object-Manifest")
+}
+
 impl VersionedWrites {
     fn is_enabled(&self, has_legacy_versions: bool) -> bool {
         match self.allow_versioned_writes {
@@ -523,6 +535,9 @@ impl VersionedWrites {
         versions_cont: &str,
         next: &NextFn,
     ) -> Result<Request, Response> {
+        if is_dlo_manifest(&req.headers) {
+            return Ok(req);
+        }
         let get_req = pre_authed("GET", &req.path, &req);
         let current = next(get_req);
         if current.status == 404 {
@@ -530,6 +545,9 @@ impl VersionedWrites {
         }
         if !(200..300).contains(&current.status) {
             return Err(current);
+        }
+        if is_dlo_manifest(&current.headers) {
+            return Ok(req);
         }
         let ts_source = current
             .headers
@@ -1183,6 +1201,9 @@ impl VersionedWrites {
         source_headers: &swift_http::HeaderKeyDict,
         next: &StreamingAsyncNextFn,
     ) -> Result<(), Response> {
+        if is_dlo_manifest(source_headers) {
+            return Ok(());
+        }
         let get = legacy_source_get(original_path, source_headers);
         let current = next(empty_async_request(get)).await;
         if current.status == 404 {
@@ -1190,6 +1211,9 @@ impl VersionedWrites {
         }
         if !(200..300).contains(&current.status) {
             return Err(current);
+        }
+        if is_dlo_manifest(&current.headers) {
+            return Ok(());
         }
         let ts_source = current
             .headers
@@ -3480,6 +3504,32 @@ mod tests {
             .all(|(_, p)| !p.contains("/versions/") || p.ends_with("/versions")));
     }
 
+    #[test]
+    fn test_put_dlo_manifest_skips_archive() {
+        // Official test_versioning_dlo / Swift 2.9 handle_obj_versions_put:
+        // a PUT with X-Object-Manifest must not copy-current.
+        let (log, app) = backend(true, true);
+        let vw = VersionedWrites::new();
+        let mut put = req("PUT", "/v1/AUTH_test/c/obj");
+        put.body = Body::empty();
+        put.headers.set("X-Object-Manifest", "c/obj/");
+        let resp = vw.handle(put, &app);
+        assert_eq!(resp.status, 201);
+        let calls = log.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p)| !(m == "PUT" && p.contains("/versions/"))),
+            "DLO manifest PUT must not archive: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p)| !(m == "GET" && p == "/v1/AUTH_test/c/obj")),
+            "DLO PUT must skip GET current: {calls:?}"
+        );
+    }
+
     fn streaming_legacy_backend(
         current_exists: bool,
     ) -> (
@@ -3691,6 +3741,96 @@ mod tests {
                 .iter()
                 .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
             "client PUT must proceed: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_dlo_manifest_put_does_not_archive() {
+        // Official test_versioning_dlo: empty DLO overwrite stays
+        // versions object_count == 3 (no archive of the prior manifest).
+        let (calls, next) = streaming_legacy_backend(true);
+        let vw = VersionedWrites::new();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "0");
+        headers.set("X-Object-Manifest", "c/obj/");
+        let req = AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "PUT" && p == "/v1/AUTH_test/c/obj"),
+            "client DLO PUT must proceed: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "PUT" && p.contains("/versions/"))),
+            "DLO manifest PUT must not archive: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "GET" && p == "/v1/AUTH_test/c/obj")),
+            "DLO PUT must skip GET current: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_legacy_overwrite_skips_existing_dlo_manifest() {
+        // Swift 2.9: current object already a DLO → do not archive it.
+        type Call = (String, String, String);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _body = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.query_string.clone(),
+                ));
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    let mut resp = Response::with_body(200, Vec::new());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("X-Object-Manifest", "c/obj/");
+                    resp.headers.set("Content-Length", "0");
+                    return resp;
+                }
+                Response::new(201)
+            })
+        });
+        let vw = VersionedWrites::new();
+        let resp = vw
+            .handle_streaming_request(streaming_legacy_put(), next)
+            .await;
+        assert_eq!(resp.status, 201);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p, _)| m == "GET" && p == "/v1/AUTH_test/c/obj"),
+            "non-DLO PUT must still probe current: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "PUT" && p.contains("/versions/"))),
+            "existing DLO current must not be archived: {calls:?}"
         );
     }
 
