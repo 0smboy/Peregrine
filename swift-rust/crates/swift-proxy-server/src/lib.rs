@@ -9635,6 +9635,22 @@ mod pipeline_async_tests {
             "official test_slo_if_match_head on Hyper, got {}",
             head_match.status
         );
+        let mut head_miss = HeaderKeyDict::new();
+        head_miss.set("If-Match", format!("not-{etag}"));
+        let head_412 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_412.status, 412,
+            "official test_slo_if_match_head miss on Hyper, got {}",
+            head_412.status
+        );
     }
 
     #[tokio::test]
@@ -9722,6 +9738,22 @@ mod pipeline_async_tests {
             head_304.status, 304,
             "official test_slo_if_none_match_head on Hyper, got {}",
             head_304.status
+        );
+        let mut head_miss = HeaderKeyDict::new();
+        head_miss.set("If-None-Match", format!("not-{etag}"));
+        let head_200 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_200.status, 200,
+            "official test_slo_if_none_match_head miss on Hyper, got {}",
+            head_200.status
         );
     }
 
@@ -10321,22 +10353,26 @@ mod pipeline_async_tests {
                 }),
             ],
         };
-        let mut headers = HeaderKeyDict::new();
-        headers.set("X-Object-Meta-Post", "update");
-        let post = svc
-            .call(AsyncRequest {
-                method: "POST".into(),
-                path: "/v1/a/c/manifest-post".into(),
-                query_string: "multipart-manifest=get".into(),
-                headers,
-                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
-            })
-            .await;
-        assert_eq!(
-            post.status, 202,
-            "official test_slo_post_the_manifest POST on Hyper, got {}",
-            post.status
-        );
+        // Official test_slo_post_the_manifest_metadata_update_with_qs:
+        // multipart-manifest=put|get|delete on POST is ignored.
+        for verb in ["put", "get", "delete"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Object-Meta-Post", "update");
+            let post = svc
+                .call(AsyncRequest {
+                    method: "POST".into(),
+                    path: "/v1/a/c/manifest-post".into(),
+                    query_string: format!("multipart-manifest={verb}"),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                post.status, 202,
+                "official test_slo_post_the_manifest_metadata_update_with_qs {verb} on Hyper, got {}",
+                post.status
+            );
+        }
         let head = svc
             .call(AsyncRequest {
                 method: "HEAD".into(),
@@ -10685,6 +10721,236 @@ mod pipeline_async_tests {
         assert_eq!(arr[0]["path"], "/c/s1");
         assert_eq!(arr[0]["size_bytes"], 3);
         assert_eq!(arr[0]["etag"], "c4ca4238a0b923820dcc509a6f75849b");
+    }
+
+    /// Official TestSlo.test_slo_get_the_manifest_with_details_from_server:
+    /// PUT with JSON-null etag/size_bytes fills name/bytes/hash from segment
+    /// HEAD. format=raw is test_slo_get_raw_the_manifest_with_details_from_server.
+    struct SloDetailsFromServerStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for SloDetailsFromServerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_d" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "77963b7a931377ad4ab5ad6a9cd718aa");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_b" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "08f8e0260c64418510cefb2b06eee5cd");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/seg_d" {
+                    return Response::with_body(200, b"ddd".to_vec());
+                }
+                if req.path == "/v1/a/c/seg_b" {
+                    return Response::with_body(200, b"bbb".to_vec());
+                }
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(b) => b.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_the_manifest_with_details_from_server_on_hyper() {
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloDetailsFromServerStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        let put_body = serde_json::to_vec(&serde_json::json!([
+            {
+                "path": "/c/seg_d",
+                "etag": serde_json::Value::Null,
+                "size_bytes": serde_json::Value::Null
+            },
+            {
+                "path": "/c/seg_b",
+                "etag": serde_json::Value::Null,
+                "size_bytes": serde_json::Value::Null
+            }
+        ]))
+        .unwrap();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", put_body.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-db".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers,
+                body: IncomingBody::from_bytes(put_body, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "official manifest-db PUT with null etag/size"
+        );
+
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-db".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official test_slo_get_the_manifest_with_details_from_server on Hyper, got {}",
+            got.status
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+        let listing_bytes = got
+            .body
+            .collect_async()
+            .await
+            .expect("details-from-server listing body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&listing_bytes).expect("listing JSON");
+        let arr = value.as_array().expect("listing list");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["bytes"], 3);
+        assert_eq!(arr[0]["hash"], "77963b7a931377ad4ab5ad6a9cd718aa");
+        assert_eq!(arr[0]["name"], "/c/seg_d");
+        assert_eq!(arr[1]["bytes"], 3);
+        assert_eq!(arr[1]["hash"], "08f8e0260c64418510cefb2b06eee5cd");
+        assert_eq!(arr[1]["name"], "/c/seg_b");
+
+        let mut raw = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-db".into(),
+                query_string: "multipart-manifest=get&format=raw".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            raw.status, 200,
+            "official test_slo_get_raw_the_manifest_with_details_from_server on Hyper, got {}",
+            raw.status
+        );
+        assert_eq!(
+            raw.headers.get("Content-Type"),
+            Some("application/octet-stream"),
+            "raw GET keeps object Content-Type, got {:?}",
+            raw.headers.get("Content-Type")
+        );
+        let raw_bytes = raw.body.collect_async().await.expect("raw manifest body");
+        let raw_value: serde_json::Value = serde_json::from_slice(&raw_bytes).expect("raw JSON");
+        let raw_arr = raw_value.as_array().expect("raw list");
+        let keys: std::collections::BTreeSet<_> = raw_arr[0]
+            .as_object()
+            .expect("raw segment")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["etag", "path", "size_bytes"].into_iter().collect(),
+            "official raw details-from-server keys"
+        );
+        assert_eq!(raw_arr[0]["path"], "/c/seg_d");
+        assert_eq!(raw_arr[0]["size_bytes"], 3);
+        assert_eq!(raw_arr[0]["etag"], "77963b7a931377ad4ab5ad6a9cd718aa");
+        assert_eq!(raw_arr[1]["path"], "/c/seg_b");
+        assert_eq!(raw_arr[1]["size_bytes"], 3);
+        assert_eq!(raw_arr[1]["etag"], "08f8e0260c64418510cefb2b06eee5cd");
+
+        let mut put_raw = HeaderKeyDict::new();
+        put_raw.set("Content-Length", raw_bytes.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-from-get-raw".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: put_raw,
+                body: IncomingBody::from_bytes(raw_bytes, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "official raw GET re-PUT"
+        );
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-from-get-raw".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(assembled.status, 200, "re-PUT assembled GET");
+        let assembled_body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("assembled from raw PUT");
+        assert_eq!(assembled_body, b"dddbbb");
     }
 
     #[tokio::test]
@@ -12834,6 +13100,104 @@ mod pipeline_async_tests {
         assert_eq!(
             listed, 0,
             "must not list the foreign segment container, listings={listed}"
+        );
+    }
+
+    /// Official TestTempURL.test_GET_DLO_inside_container: an account-key
+    /// TempURL of a same-container DLO must assemble the segments.
+    struct DloInsideContainerStub;
+    impl swift_middleware::Middleware for DloInsideContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/container/object" {
+                    let mut resp = Response::new(200);
+                    resp.headers
+                        .set("X-Object-Manifest", "container/get-dlo-inside-seg");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_account/container" {
+                    let listing = serde_json::json!([
+                        {
+                            "name": "get-dlo-inside-seg1",
+                            "bytes": 18,
+                            "hash": "daef64a0c87719319ea9c7c95a21e98b"
+                        },
+                        {
+                            "name": "get-dlo-inside-seg2",
+                            "bytes": 18,
+                            "hash": "fdf1d32b54e50bf56b5676e19bdea8ae"
+                        }
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-inside-seg1" {
+                    return Response::with_body(200, b"one fish two fish ".to_vec());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-inside-seg2" {
+                    return Response::with_body(200, b"red fish blue fish".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn account_tempurl_dlo_inside_container_assembles_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloInsideContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_GET_DLO_inside_container on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("account TempURL DLO body");
+        assert_eq!(
+            body, b"one fish two fish red fish blue fish",
+            "official test_GET_DLO_inside_container assembled body"
         );
     }
 
