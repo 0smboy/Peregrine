@@ -10175,6 +10175,53 @@ mod pipeline_async_tests {
         );
     }
 
+    #[tokio::test]
+    async fn slo_copy_the_manifest_account_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        headers.set("Destination-Account", "a");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_the_manifest_account same-account on Hyper, got {}",
+            resp.status
+        );
+        let (put_path, _put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_path, "/v1/a/c/copied-abcde");
+        assert!(serde_json::from_slice::<serde_json::Value>(&put_body).is_ok());
+    }
+
     /// Official TestSlo.test_slo_post_the_manifest_metadata_update: POST
     /// user-meta must keep X-Static-Large-Object and JSON on
     /// `?multipart-manifest=get`.
@@ -10690,6 +10737,115 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official TestSlo.test_slo_get_nested_manifest /
+    /// test_slo_etag_is_hash_of_etags_submanifests.
+    struct SloNestedManifestStub;
+    impl swift_middleware::Middleware for SloNestedManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest-abcde-submanifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/inner", "bytes": 6, "hash": "302cbafc0dfbc97f30d576a6f394dad3", "sub_slo": true},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-outer");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/inner" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "/c/s2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set(
+                        "X-Object-Sysmeta-Slo-Etag",
+                        "302cbafc0dfbc97f30d576a6f394dad3",
+                    );
+                    resp.headers.set("X-Object-Sysmeta-Slo-Size", "6");
+                    resp.headers.set("Etag", "physical-inner");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaa");
+                }
+                if req.path == "/v1/a/c/s2" {
+                    return stub_object_range(&req, b"bbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_nested_manifest_assembles_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloNestedManifestStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde-submanifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_nested_manifest on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"aaabbb");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-abcde-submanifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("nested SLO Etag")
+            .trim_matches('"')
+            .to_string();
+        assert_eq!(
+            etag, "efd4f115d46b3e79ee1392c343b3b433",
+            "official test_slo_etag_is_hash_of_etags_submanifests on Hyper"
+        );
+    }
+
     /// Official listing_formats test_GET_HEAD_content_type: HEAD
     /// `?format=json` must stamp application/json even when the backend
     /// HEAD is a 204 text/plain.
@@ -11031,6 +11187,113 @@ mod pipeline_async_tests {
         assert!(
             put_headers.get("X-Object-Manifest").is_none(),
             "official test_copy: dest must not carry X-Object-Manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_copy_account_destination_account_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied");
+        headers.set("Destination-Account", "a");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_copy_account COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_body, b"onetwo");
+        assert!(put_headers.get("X-Object-Manifest").is_none());
+    }
+
+    #[tokio::test]
+    async fn dlo_ranged_get_uses_assembled_bytes_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Range", "bytes=1-3");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 206,
+            "official test_get_range on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"net", "assembled DLO Range bytes=1-3 of onetwo");
+        let mut oob = HeaderKeyDict::new();
+        oob.set("Range", "bytes=50-56");
+        let miss = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers: oob,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss.status, 416,
+            "official test_get_range_out_of_range on Hyper, got {}",
+            miss.status
         );
     }
 
