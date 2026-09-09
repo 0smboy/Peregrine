@@ -372,9 +372,7 @@ impl Middleware for ContainerQuotas {
             // Uploading an object: check it against the container's quotas.
             // HEAD the container with the caller's auth headers (clone_head),
             // standing in for `get_container_info` / make_subrequest.
-            let info = next(container_head_request(
-                &req, &version, &account, &container,
-            ));
+            let info = next(container_head_request(&req, &version, &account, &container));
             if !is_success(info.status) {
                 // No usable container info; let the real request 404 later.
                 return next(req);
@@ -828,16 +826,8 @@ mod tests {
         let cq = ContainerQuotas::new();
         assert!(cq.intercepts_request(&mk("POST", "/v1/a/c", &[])));
         assert!(cq.intercepts_request(&mk("PUT", "/v1/a/c", &[])));
-        assert!(cq.intercepts_request(&mk(
-            "PUT",
-            "/v1/a/c/o",
-            &[("Content-Length", "11")]
-        )));
-        assert!(cq.streams_request(&mk(
-            "PUT",
-            "/v1/a/c/o",
-            &[("Content-Length", "11")]
-        )));
+        assert!(cq.intercepts_request(&mk("PUT", "/v1/a/c/o", &[("Content-Length", "11")])));
+        assert!(cq.streams_request(&mk("PUT", "/v1/a/c/o", &[("Content-Length", "11")])));
         assert!(!cq.intercepts_request(&mk("GET", "/v1/a/c", &[])));
         assert!(!cq.intercepts_request(&mk("GET", "/v1/a/c/o", &[])));
         assert!(!cq.streams_request(&mk("POST", "/v1/a/c", &[])));
@@ -851,7 +841,11 @@ mod tests {
     #[test]
     fn prepare_rejects_invalid_quota_set_on_hyper() {
         let cq = ContainerQuotas::new();
-        let mut req = mk("POST", "/v1/a/c", &[("X-Container-Meta-Quota-Bytes", "1TB")]);
+        let mut req = mk(
+            "POST",
+            "/v1/a/c",
+            &[("X-Container-Meta-Quota-Bytes", "1TB")],
+        );
         match cq.prepare(&mut req) {
             crate::MwPrep::ShortCircuit(resp) => {
                 assert_eq!(resp.status, 400);
@@ -863,11 +857,7 @@ mod tests {
     #[test]
     fn prepare_allows_admin_quota_set() {
         let cq = ContainerQuotas::new();
-        let mut req = mk(
-            "POST",
-            "/v1/a/c",
-            &[("X-Container-Meta-Quota-Bytes", "10")],
-        );
+        let mut req = mk("POST", "/v1/a/c", &[("X-Container-Meta-Quota-Bytes", "10")]);
         assert!(matches!(cq.prepare(&mut req), crate::MwPrep::Continue));
     }
 
@@ -885,7 +875,11 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(resp.status, 413, "over-quota object PUT must be 413, got {}", resp.status);
+        assert_eq!(
+            resp.status, 413,
+            "over-quota object PUT must be 413, got {}",
+            resp.status
+        );
         assert_eq!(
             String::from_utf8_lossy(body_bytes(&resp)),
             "Upload exceeds quota."
@@ -900,12 +894,7 @@ mod tests {
     async fn hyper_stream_object_put_over_quota_bytes_is_413() {
         let body = vec![b'x'; 11];
         let (resp, log) = run_hyper_stream(
-            mk_async(
-                "PUT",
-                "/v1/a/c/o",
-                &[("Content-Length", "11")],
-                body,
-            ),
+            mk_async("PUT", "/v1/a/c/o", &[("Content-Length", "11")], body),
             container_head(
                 204,
                 &[
@@ -952,11 +941,7 @@ mod tests {
     #[tokio::test]
     async fn hyper_admin_can_set_container_quota_bytes() {
         let (resp, log) = run_hyper(
-            mk(
-                "POST",
-                "/v1/a/c",
-                &[("X-Container-Meta-Quota-Bytes", "10")],
-            ),
+            mk("POST", "/v1/a/c", &[("X-Container-Meta-Quota-Bytes", "10")]),
             container_head(204, &[]),
         )
         .await;
