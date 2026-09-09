@@ -77,7 +77,7 @@ mod xprofile;
 pub use account_freeze::AccountFreeze;
 pub use account_quotas::AccountQuotas;
 pub use acl::{
-    acls_from_sysmeta, format_acl_v2, parse_acl_v1, parse_acl_v2, referrer_allowed,
+    acls_from_sysmeta, clean_acl, format_acl_v2, parse_acl_v1, parse_acl_v2, referrer_allowed,
     validate_account_acl_header, AccountAcls,
 };
 pub use authtoken::{

@@ -2652,6 +2652,9 @@ impl ProxyApp {
             r.headers.set("Content-Type", "text/plain");
             return r;
         }
+        if let Some(denied) = super::clean_container_acl_headers(&mut req) {
+            return denied;
+        }
         let Ok((container_part, _)) = self
             .container_ring
             .get_nodes(account, Some(container), None)
@@ -2756,6 +2759,9 @@ impl ProxyApp {
             let mut r = Response::with_body(400, e.0);
             r.headers.set("Content-Type", "text/plain");
             return r;
+        }
+        if let Some(denied) = super::clean_container_acl_headers(&mut req) {
+            return denied;
         }
         let Ok((container_part, _)) = self
             .container_ring

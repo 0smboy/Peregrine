@@ -4034,6 +4034,9 @@ impl ProxyApp {
                     if let Some(denied) = deny_non_owner_container_versioning(&write_req) {
                         return denied;
                     }
+                    if let Some(denied) = clean_container_acl_headers(&mut write_req) {
+                        return denied;
+                    }
                     &write_req
                 } else {
                     req
@@ -8276,6 +8279,22 @@ fn scrub_container_write_owner_headers(req: &mut Request) {
         .get("X-Backend-Swift-Owner")
         .is_some_and(config_true_value);
     scrub_owner_request_headers(req, swift_owner);
+}
+
+/// Python `ContainerController.PUT/POST`: after owner-header scrub,
+/// `clean_acl` rewrite/validate `X-Container-Read`/`X-Container-Write`.
+/// Invalid ACL or a write-ACL referrer is HTTP 400.
+fn clean_container_acl_headers(req: &mut Request) -> Option<Response> {
+    for name in ["X-Container-Read", "X-Container-Write"] {
+        let Some(value) = req.headers.get(name).map(str::to_string) else {
+            continue;
+        };
+        match swift_middleware::clean_acl(name, &value) {
+            Ok(cleaned) => req.headers.set(name, cleaned),
+            Err(err) => return Some(constraint_plain(400, &err)),
+        }
+    }
+    None
 }
 
 /// Client + sysmeta keys `versioned_writes.prepare()` uses to persist
@@ -13583,6 +13602,173 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Official IsolatedIdentity `update_metadata` + Python `clean_acl`:
+    /// empty `.r:` and write-ACL referrers are 400 on Hyper container POST.
+    #[tokio::test]
+    async fn container_acl_clean_empty_referer_is_400_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Container-Read", ".r:");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "owner POST X-Container-Read: .r: must 400, got {} {:?}",
+            resp.status, resp.reason
+        );
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("No host/domain value"),
+            "clean_acl empty referer body, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_acl_clean_write_referer_is_400_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Container-Write", ".r:*");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "owner POST X-Container-Write: .r:* must 400, got {} {:?}",
+            resp.status, resp.reason
+        );
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("Referrers not allowed in write ACL"),
+            "clean_acl write referer body, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_acl_clean_star_domain_is_not_400_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Container-Read", ".r:*.example.com,.rlistings");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 400,
+            "official .r:*.example.com,.rlistings is not a clean_acl 400, got {} {:?}",
+            resp.status, resp.reason
+        );
+    }
+
+    /// Official TestDlo.test_get_manifest_document_itself: GET
+    /// `?multipart-manifest=get` returns the stored manifest bytes and keeps
+    /// `X-Object-Manifest` (DLO must not assemble).
+    #[tokio::test]
+    async fn dlo_get_manifest_document_itself_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_manifest_document_itself on Hyper, got {}",
+            resp.status
+        );
+        assert_eq!(
+            resp.headers.get("X-Object-Manifest"),
+            Some("c/segs/"),
+            "official test_get_manifest_document_itself keeps X-Object-Manifest"
+        );
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert_eq!(
+            body, "man1-contents",
+            "official test_get_manifest_document_itself returns stored bytes"
+        );
+    }
+
     /// IsolatedIdentity Hyper never calls `NameCheck::handle()`. Forbidden
     /// characters must 400 from `prepare()`.
     #[tokio::test]
@@ -16204,6 +16390,75 @@ mod p1a_wiring_tests {
                 "{method} must keep unprivileged X-Remove-Container-Meta-*"
             );
         }
+    }
+
+    /// IsolatedIdentity leftover: Python `clean_acl` on container PUT/POST
+    /// rewrites `.r:*.example.com` and 400s empty / write referrers.
+    #[test]
+    fn owner_container_acl_is_cleaned_like_python() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Backend-Swift-Owner", "true");
+        req.headers
+            .set("X-Container-Read", ".r:*.example.com,.rlistings");
+        req.headers.set("X-Container-Write", "bob");
+        scrub_container_write_owner_headers(&mut req);
+        assert!(
+            clean_container_acl_headers(&mut req).is_none(),
+            "valid owner ACL must not 400"
+        );
+        assert_eq!(
+            req.headers.get("X-Container-Read"),
+            Some(".r:.example.com,.rlistings")
+        );
+        assert_eq!(req.headers.get("X-Container-Write"), Some("bob"));
+    }
+
+    #[test]
+    fn owner_container_write_referrer_acl_is_400() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Backend-Swift-Owner", "true");
+        req.headers.set("X-Container-Write", ".r:*");
+        scrub_container_write_owner_headers(&mut req);
+        let denied = clean_container_acl_headers(&mut req).expect("write referrer");
+        assert_eq!(denied.status, 400);
+        let body = match &denied.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Referrers not allowed in write ACL"),
+            "got {body:?}"
+        );
+    }
+
+    #[test]
+    fn non_owner_invalid_acl_is_scrubbed_not_400() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Container-Read", ".r:");
+        scrub_container_write_owner_headers(&mut req);
+        assert!(req.headers.get("X-Container-Read").is_none());
+        assert!(
+            clean_container_acl_headers(&mut req).is_none(),
+            "Python pops owner ACL headers before clean_acl"
+        );
     }
 
     /// Official test_versioning_container_acl: account2 / account-RW
