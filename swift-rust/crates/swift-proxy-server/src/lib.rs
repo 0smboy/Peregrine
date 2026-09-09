@@ -15039,9 +15039,24 @@ mod pipeline_async_tests {
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
                     }
+                    if logical == "/AUTH_test2/srccont" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[("X-Container-Read", "test:tester")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
                     if !logical.starts_with("/AUTH_test/c/")
                         && !logical.starts_with("/AUTH_test2/dst/")
                         && !logical.starts_with("/AUTH_test2/dst2/")
+                        && !logical.starts_with("/AUTH_test2/srccont/")
                     {
                         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                         return;
@@ -15220,6 +15235,205 @@ mod pipeline_async_tests {
                 b"png-bytes"
             );
             assert_eq!(got.headers.get("X-Object-Meta-Color"), Some("blue"));
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testCopyAccount404s / testCopyFromAccountHeader404s
+    /// plus Destination 412 leftovers. Missing source is 404; missing dest
+    /// in a foreign account is 403; same-account missing dest is 404.
+    #[tokio::test]
+    async fn file_copy_account_404s_and_destination_412_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", Some("test2:tester2"), None);
+        seed_container_rw(&app, "AUTH_test2", "dst", None, Some("test:tester"));
+        seed_container_rw(&app, "AUTH_test2", "srccont", Some("test:tester"), None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Copy::new())],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let mut put_src = HeaderKeyDict::new();
+        put_src.set("X-Auth-Token", &owner);
+        put_src.set("Content-Length", "3");
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/src".into(),
+                query_string: String::new(),
+                headers: put_src.clone(),
+                body: IncomingBody::from_bytes(b"abc".to_vec(), u64::MAX),
+            })
+            .await
+            .status,
+            201
+        );
+        put_src.set(
+            "X-Auth-Token",
+            &auth_token(&svc, "test2:tester2", "testing2").await,
+        );
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test2/srccont/src".into(),
+                query_string: String::new(),
+                headers: put_src,
+                body: IncomingBody::from_bytes(b"abc".to_vec(), u64::MAX),
+            })
+            .await
+            .status,
+            201
+        );
+
+        let copy = |dest: &str, dest_acct: Option<&str>, src: &str| {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            if !dest.is_empty() {
+                headers.set("Destination", dest);
+            }
+            if let Some(acct) = dest_acct {
+                headers.set("Destination-Account", acct);
+            }
+            svc.call(AsyncRequest {
+                method: "COPY".into(),
+                path: src.into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        for dest in ["/dst/out", "dst/out", "/c/out", "c/out"] {
+            let dest_acct = if dest.contains("dst") {
+                Some("AUTH_test2")
+            } else {
+                None
+            };
+            assert_eq!(
+                copy(dest, dest_acct, "/v1/AUTH_test/nosrc/src")
+                    .await
+                    .status,
+                404,
+                "official testCopyAccount404s missing source container {dest}"
+            );
+            assert_eq!(
+                copy(dest, dest_acct, "/v1/AUTH_test/c/missing")
+                    .await
+                    .status,
+                404,
+                "official testCopyAccount404s missing source object {dest}"
+            );
+        }
+        assert_eq!(
+            copy("/nope/out", None, "/v1/AUTH_test/c/src").await.status,
+            404,
+            "official testCopyAccount404s same-account missing dest"
+        );
+        assert_eq!(
+            copy("nope/out", None, "/v1/AUTH_test/c/src").await.status,
+            404,
+            "official testCopyAccount404s same-account missing dest noslash"
+        );
+        assert_eq!(
+            copy("/nope/out", Some("AUTH_test2"), "/v1/AUTH_test/c/src")
+                .await
+                .status,
+            403,
+            "official testCopyAccount404s foreign missing dest must 403"
+        );
+        assert_eq!(
+            copy("nope/out", Some("AUTH_test2"), "/v1/AUTH_test/c/src")
+                .await
+                .status,
+            403,
+            "official testCopyAccount404s foreign missing dest noslash must 403"
+        );
+        assert_eq!(
+            copy("", None, "/v1/AUTH_test/c/src").await.status,
+            412,
+            "official testCopyNoDestinationHeader"
+        );
+        assert_eq!(
+            copy("noslashdest", None, "/v1/AUTH_test/c/src")
+                .await
+                .status,
+            412,
+            "official testCopyDestinationSlashProblems"
+        );
+
+        for copy_from in ["/nosrc/src", "nosrc/src"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("X-Copy-From-Account", "AUTH_test2");
+            headers.set("X-Copy-From", copy_from);
+            let status = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/c/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await
+                .status;
+            assert!(
+                status == 403 || status == 404,
+                "official testCopyFromAccountHeader404s missing source container {copy_from}, got {status}"
+            );
+        }
+        for copy_from in ["/srccont/missing", "srccont/missing"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("X-Copy-From-Account", "AUTH_test2");
+            headers.set("X-Copy-From", copy_from);
+            assert_eq!(
+                svc.call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/c/from-404-obj".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await
+                .status,
+                404,
+                "official testCopyFromAccountHeader404s missing source object {copy_from}"
+            );
+        }
+        for copy_from in ["/srccont/src", "srccont/src"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("X-Copy-From-Account", "AUTH_test2");
+            headers.set("X-Copy-From", copy_from);
+            assert_eq!(
+                svc.call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/nope/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await
+                .status,
+                404,
+                "official testCopyFromAccountHeader404s missing dest {copy_from}"
+            );
         }
         backend.abort();
     }
