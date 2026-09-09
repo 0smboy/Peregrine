@@ -26,6 +26,48 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Upstream Swift only ever drives liberasurecode from a single OS thread
+/// (PyECLib runs under eventlet's cooperative green threads), so the library
+/// is not thread-safe: it keeps process-global state (an instance table keyed
+/// by descriptor, plus lazily-initialized backend/Galois-field tables), and
+/// calling it from multiple real threads — even `encode`/`decode` on distinct
+/// instances — corrupts that state. This crate's tests, and the object/proxy
+/// servers' worker threads, do run in parallel, which reproducibly triggers
+/// `double free or corruption` / SIGSEGV with liberasurecode 1.6.x.
+///
+/// This `Mutex` restores the single-threaded discipline liberasurecode
+/// assumes by serializing every FFI entry point. Each call is short and the
+/// heavy Reed-Solomon math still runs on the calling thread; only concurrent
+/// *entry* into the C library is prevented.
+///
+/// Serialization alone is not enough: `liberasurecode_instance_destroy` tears
+/// down shared backend state (the rs_vand Galois-field tables and the backend
+/// `dlopen`) that surviving instances still reference, so destroying any
+/// instance while another exists corrupts the heap even when the calls are
+/// serialized. We therefore never destroy instances — see [`resident_table`].
+static EC_FFI_LOCK: Mutex<()> = Mutex::new(());
+
+/// One created liberasurecode instance, kept resident for the process lifetime.
+#[derive(Clone, Copy)]
+struct ResidentInstance {
+    desc: c_int,
+    header_size: usize,
+}
+
+/// Process-global cache of one resident liberasurecode instance per `(k, m)`
+/// scheme. Swift keeps a single `ECDriver` per storage policy for the whole
+/// process; we do the same so that (a) the expensive instance creation happens
+/// once per scheme and (b) no instance is ever destroyed, which is what keeps
+/// the shared rs_vand backend state alive and un-corrupted (see
+/// [`EC_FFI_LOCK`]). Every [`EcDriver`] handed out is a cheap handle onto one
+/// of these resident instances; dropping a handle does nothing.
+fn resident_table() -> &'static Mutex<HashMap<(usize, usize), ResidentInstance>> {
+    static TABLE: OnceLock<Mutex<HashMap<(usize, usize), ResidentInstance>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// `EC_BACKEND_LIBERASURECODE_RS_VAND`.
 const EC_BACKEND_LIBERASURECODE_RS_VAND: c_int = 6;
@@ -155,18 +197,44 @@ pub struct EcDriver {
     header_size: usize,
 }
 
-// The liberasurecode instance descriptor is safe to move/share across threads
-// for read-only encode/decode (each call is independent); we only ever use it
-// from a single owner here.
+// An `EcDriver` is a handle onto a process-resident liberasurecode instance
+// (see `resident_table`). The descriptor is shared, and every FFI call is
+// serialized by `EC_FFI_LOCK`, so handles are safe to move/share across
+// threads.
 unsafe impl Send for EcDriver {}
+unsafe impl Sync for EcDriver {}
 
 impl EcDriver {
-    /// Create a driver for `k` data + `m` parity fragments. Fails if the
-    /// backend isn't compiled into the linked liberasurecode.
+    /// A driver for `k` data + `m` parity fragments. The first call for a given
+    /// `(k, m)` creates the underlying liberasurecode instance and keeps it
+    /// resident for the process lifetime; later calls return a fresh handle
+    /// onto that same instance. Fails if the backend isn't compiled into the
+    /// linked liberasurecode.
     pub fn new(k: usize, m: usize) -> Result<EcDriver, EcError> {
-        if unsafe { liberasurecode_backend_available(EC_BACKEND_LIBERASURECODE_RS_VAND) } != 1 {
-            return Err(EcError::BackendUnavailable);
+        let mut table = resident_table()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(resident) = table.get(&(k, m)) {
+            return Ok(EcDriver {
+                desc: resident.desc,
+                k,
+                m,
+                header_size: resident.header_size,
+            });
         }
+        let resident = Self::create_resident(k, m)?;
+        table.insert((k, m), resident);
+        Ok(EcDriver {
+            desc: resident.desc,
+            k,
+            m,
+            header_size: resident.header_size,
+        })
+    }
+
+    /// Create a never-destroyed liberasurecode instance for `(k, m)` and probe
+    /// its fixed fragment-header size.
+    fn create_resident(k: usize, m: usize) -> Result<ResidentInstance, EcError> {
         let mut args = EcArgs {
             k: k as c_int,
             m: m as c_int,
@@ -176,24 +244,36 @@ impl EcDriver {
             priv_args2: ptr::null_mut(),
             ct: CHKSUM_NONE,
         };
-        let desc =
-            unsafe { liberasurecode_instance_create(EC_BACKEND_LIBERASURECODE_RS_VAND, &mut args) };
+        // The backend probe may lazily `dlopen`/register the backend and
+        // `instance_create` mutates the global instance table. The guard is
+        // released before the header probe below so that probe's `encode` (a
+        // separate lock acquisition) does not deadlock this non-reentrant lock.
+        let desc = {
+            let _registry = EC_FFI_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if unsafe { liberasurecode_backend_available(EC_BACKEND_LIBERASURECODE_RS_VAND) } != 1 {
+                return Err(EcError::BackendUnavailable);
+            }
+            unsafe { liberasurecode_instance_create(EC_BACKEND_LIBERASURECODE_RS_VAND, &mut args) }
+        };
         if desc <= 0 {
             return Err(EcError::InstanceCreate(desc));
         }
-        let mut driver = EcDriver {
+        // A temporary handle used only to probe the fixed fragment-header size:
+        // encode a k-byte segment and compare the real fragment length to the
+        // data-only size. Dropping it is a no-op (the instance stays resident).
+        let probe_driver = EcDriver {
             desc,
             k,
             m,
             header_size: 0,
         };
-        // Probe the fixed fragment-header size: encode a k-byte segment and
-        // compare the real fragment length to the data-only size.
         let probe = vec![0u8; k];
-        let raw = driver.raw_fragment_size(k);
-        let actual = driver.encode(&probe)?[0].len();
-        driver.header_size = actual.saturating_sub(raw);
-        Ok(driver)
+        let raw = probe_driver.raw_fragment_size(k);
+        let actual = probe_driver.encode(&probe)?[0].len();
+        let header_size = actual.saturating_sub(raw);
+        Ok(ResidentInstance { desc, header_size })
     }
 
     pub fn k(&self) -> usize {
@@ -206,6 +286,9 @@ impl EcDriver {
     /// Encode `data` into `k + m` fragments (data fragments first, then
     /// parity), each including liberasurecode's fragment header.
     pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, EcError> {
+        let _registry = EC_FFI_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut enc_data: *mut *mut c_char = ptr::null_mut();
         let mut enc_parity: *mut *mut c_char = ptr::null_mut();
         let mut frag_len: u64 = 0;
@@ -243,6 +326,9 @@ impl EcDriver {
         if fragments.len() < self.k {
             return Err(EcError::NotEnoughFragments);
         }
+        let _registry = EC_FFI_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let frag_len = fragments[0].len() as u64;
         let mut ptrs: Vec<*mut c_char> = fragments
             .iter()
@@ -282,6 +368,9 @@ impl EcDriver {
         if fragments.is_empty() {
             return Err(EcError::NotEnoughFragments);
         }
+        let _registry = EC_FFI_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let frag_len = fragments[0].len();
         let mut ptrs: Vec<*mut c_char> = fragments
             .iter()
@@ -307,6 +396,9 @@ impl EcDriver {
     /// The data-only per-fragment size liberasurecode reports (excludes the
     /// fragment header).
     fn raw_fragment_size(&self, data_len: usize) -> usize {
+        let _registry = EC_FFI_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         unsafe { liberasurecode_get_fragment_size(self.desc, data_len as c_int) as usize }
     }
 
@@ -427,6 +519,9 @@ impl EcDriver {
     /// The fragment index encoded in a fragment's header (its position in the
     /// data+parity ordering), via `liberasurecode_get_fragment_metadata`.
     pub fn fragment_index(fragment: &[u8]) -> Option<i32> {
+        let _registry = EC_FFI_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut meta = FragmentMetadata::zeroed();
         let rc = unsafe {
             liberasurecode_get_fragment_metadata(fragment.as_ptr() as *const c_char, &mut meta)
@@ -439,13 +534,11 @@ impl EcDriver {
     }
 }
 
-impl Drop for EcDriver {
-    fn drop(&mut self) {
-        unsafe {
-            liberasurecode_instance_destroy(self.desc);
-        }
-    }
-}
+// No `Drop`: an `EcDriver` is only a handle onto a process-resident instance
+// held by `resident_table`, so several handles share one descriptor and the
+// instance is intentionally never destroyed. Calling
+// `liberasurecode_instance_destroy` here would tear down shared backend state
+// still used by peer handles and corrupt the heap (see `EC_FFI_LOCK`).
 
 #[cfg(test)]
 mod tests {
