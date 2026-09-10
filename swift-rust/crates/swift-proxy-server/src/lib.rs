@@ -9550,6 +9550,14 @@ mod pipeline_async_tests {
         String::from_utf8_lossy(&body).into_owned()
     }
 
+    fn leftover_object_meta_map(resp: &Response) -> std::collections::BTreeMap<String, String> {
+        resp.headers
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase().contains("meta"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     /// Official TestContainer.testContainerNameLimit /
     /// test_long_name_content_type.
     #[tokio::test]
@@ -13918,6 +13926,202 @@ mod pipeline_async_tests {
             .status,
             400,
             "official test_if_none_match If-None-Match not *"
+        );
+        backend.abort();
+    }
+
+    /// Official extra-file TestObject.test_metadata. IsolatedIdentity
+    /// Hyper leftover object POST is 202 and replaces the user-meta set;
+    /// sysmeta / transient-sysmeta are not echoed. No stub.
+    #[tokio::test]
+    async fn extra_file_object_metadata_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT meta-c"
+        );
+        let path = "/v1/AUTH_test/meta-c/test_metadata";
+        assert_eq!(
+            leftover_put_object(&svc, path, "", &[], b"").await.status,
+            201,
+            "official test_metadata empty PUT"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(got.status, 200, "official test_metadata empty GET");
+        assert_eq!(leftover_body_text(got).await, "");
+        let got = leftover_container_get(&svc, path, "").await;
+        assert!(
+            leftover_object_meta_map(&got).is_empty(),
+            "official test_metadata empty PUT must have no meta, got {:?}",
+            leftover_object_meta_map(&got)
+        );
+
+        assert_eq!(
+            file_hyper_call(&svc, "POST", path, "", &[], Vec::new())
+                .await
+                .status,
+            202,
+            "official test_metadata empty POST"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(got.status, 200);
+        assert_eq!(leftover_body_text(got).await, "");
+        let got = leftover_container_get(&svc, path, "").await;
+        assert!(
+            leftover_object_meta_map(&got).is_empty(),
+            "official test_metadata empty POST must keep no meta"
+        );
+
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                path,
+                "",
+                &[
+                    ("x-object-meta-Color", "blUe"),
+                    ("X-Object-Meta-food", "PizZa"),
+                ],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_metadata PUT Color/food"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(got.status, 200);
+        assert_eq!(leftover_body_text(got).await, "");
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [
+                ("X-Object-Meta-Color".into(), "blUe".into()),
+                ("X-Object-Meta-Food".into(), "PizZa".into()),
+            ]
+            .into_iter()
+            .collect(),
+            "official test_metadata PUT Color/Food"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                path,
+                "",
+                &[("X-Object-Meta-color", "oraNge")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202,
+            "official test_metadata POST color"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Color".into(), "oraNge".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata POST replaces user meta"
+        );
+
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                path,
+                "",
+                &[
+                    ("X-Object-Meta-Color", "Red"),
+                    ("X-Object-Sysmeta-Color", "Green"),
+                    ("X-Object-Transient-Sysmeta-Color", "Blue"),
+                ],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_metadata PUT sysmeta"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Color".into(), "Red".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata PUT must hide sysmeta"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                path,
+                "",
+                &[
+                    ("X-Object-Meta-Food", "Burger"),
+                    ("X-Object-Meta-Animal", "Cat"),
+                    ("X-Object-Sysmeta-Animal", "Cow"),
+                    ("X-Object-Transient-Sysmeta-Food", "Burger"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202,
+            "official test_metadata POST sysmeta"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [
+                ("X-Object-Meta-Animal".into(), "Cat".into()),
+                ("X-Object-Meta-Food".into(), "Burger".into()),
+            ]
+            .into_iter()
+            .collect(),
+            "official test_metadata POST must hide sysmeta"
+        );
+
+        assert_eq!(
+            leftover_put_object(&svc, path, "", &[("X-Object-Meta-Foo", "Bâr")], b"",)
+                .await
+                .status,
+            201,
+            "official test_metadata PUT unicode"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Foo".into(), "Bâr".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata PUT unicode Foo"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                path,
+                "",
+                &[("X-Object-Meta-Foo", "Båz")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202,
+            "official test_metadata POST unicode"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Foo".into(), "Båz".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata POST unicode Foo"
         );
         backend.abort();
     }
@@ -21256,9 +21460,16 @@ mod pipeline_async_tests {
                             return;
                         }
                         // Official TestObject.test_container_write_only: object
-                        // POST is 202. A leftover that answers GET-like 200
-                        // cannot lock that status.
+                        // POST is 202. Extra-file test_metadata then GETs the
+                        // replaced user-meta set; IsolatedIdentity
+                        // object-server POST replaces, it does not merge.
                         if is_post {
+                            {
+                                let mut meta =
+                                    object_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let stored = meta.entry(logical.clone()).or_default();
+                                leftover_apply_object_headers(stored, &text);
+                            }
                             write_backend_http_status(&mut stream, 202, &[], &[]).await;
                             return;
                         }
