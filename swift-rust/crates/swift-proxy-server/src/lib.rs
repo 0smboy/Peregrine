@@ -12560,6 +12560,524 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainer.test_read_only_acl_listings /
+    /// test_read_only_acl_metadata / test_read_write_acl_listings /
+    /// test_read_write_acl_metadata / test_admin_acl_listing /
+    /// test_admin_acl_metadata, plus TestAccount.test_read_only_acl /
+    /// test_read_write_acl / test_admin_acl write + revoke leftovers.
+    /// `test:tester3` has no `.admin`. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn account_acl_v2_container_listings_and_metadata_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        for name in [
+            "ro-list",
+            "rw-list",
+            "admin-list",
+            "ro-meta",
+            "rw-meta",
+            "admin-meta",
+        ] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[("X-Auth-Token", owner.as_str())],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201,
+                "owner PUT {name}"
+            );
+        }
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/ro-meta",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Meta-Test", "ro-value"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_listings before grant"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/ro-meta",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_metadata before grant"
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let (ro_status, ro_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert_eq!(
+            ro_status, 200,
+            "official test_read_only_acl_listings after grant, got {ro_status}"
+        );
+        assert!(
+            ro_names.iter().any(|n| n == "ro-list"),
+            "official test_read_only_acl_listings after grant, got {ro_names:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ro-denied",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_listings cannot create"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Test", "nope"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl cannot write account metadata"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ro-seen",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let (_, ro_seen) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert!(
+            ro_seen.iter().any(|n| n == "ro-seen"),
+            "official test_read_only_acl_listings sees owner create, got {ro_seen:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/ro-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Meta-Test", "hijack"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_metadata cannot write"
+        );
+        let ro_meta = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/ro-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&ro_meta.status),
+            "official test_read_only_acl_metadata GET, got {}",
+            ro_meta.status
+        );
+        assert_eq!(
+            ro_meta.headers.get("X-Container-Meta-Test"),
+            Some("ro-value"),
+            "official test_read_only_acl_metadata {:?}",
+            ro_meta.headers
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let (rw_status, rw_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert_eq!(
+            rw_status, 200,
+            "official test_read_write_acl_listings after grant, got {rw_status}"
+        );
+        assert!(
+            rw_names.iter().any(|n| n == "rw-list"),
+            "official test_read_write_acl_listings after grant, got {rw_names:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Test", "nope"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_write_acl cannot write account metadata"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/rw-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_read_write_acl_listings can create"
+        );
+        let (_, rw_created) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert!(
+            rw_created.iter().any(|n| n == "rw-new"),
+            "official test_read_write_acl_listings sees create, got {rw_created:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/rw-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_read_write_acl_listings can delete"
+        );
+        let (_, rw_gone) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert!(
+            !rw_gone.iter().any(|n| n == "rw-new"),
+            "official test_read_write_acl_listings after delete, got {rw_gone:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/rw-empty",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/rw-empty",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_read_write_acl_listings delete owner-created"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/rw-meta",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Meta-Test", "rw-orig"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let rw_meta = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/rw-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rw_meta.headers.get("X-Container-Meta-Test"),
+            Some("rw-orig"),
+            "official test_read_write_acl_metadata read {:?}",
+            rw_meta.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/rw-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Meta-Test", "rw-new"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_read_write_acl_metadata can write"
+        );
+        let rw_meta_new = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/rw-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rw_meta_new.headers.get("X-Container-Meta-Test"),
+            Some("rw-new")
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/rw-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Remove-Container-Meta-Test", "true"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let rw_meta_cleared = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/rw-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            rw_meta_cleared
+                .headers
+                .get("X-Container-Meta-Test")
+                .is_none(),
+            "official test_read_write_acl_metadata remove {:?}",
+            rw_meta_cleared.headers
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let (admin_list_status, admin_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert_eq!(
+            admin_list_status, 200,
+            "official test_admin_acl_listing after grant, got {admin_list_status}"
+        );
+        assert!(
+            admin_names.iter().any(|n| n == "admin-list"),
+            "official test_admin_acl_listing after grant, got {admin_names:?}"
+        );
+        let admin_acct = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            admin_acct.headers.get("X-Account-Access-Control"),
+            Some(admin.as_str()),
+            "official test_admin_acl sees ACL header"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/admin-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_admin_acl_listing can create"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/admin-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_admin_acl_listing can delete"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/admin-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Meta-Test", "admin-new"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_admin_acl_metadata can write"
+        );
+        let admin_meta = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/admin-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            admin_meta.headers.get("X-Container-Meta-Test"),
+            Some("admin-new"),
+            "official test_admin_acl_metadata {:?}",
+            admin_meta.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Test", "admin-acct"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_admin_acl can write account metadata"
+        );
+        seed_auth_test_account_acl(&svc, Some(&admin));
+        let admin_meta_acct = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            admin_meta_acct.headers.get("X-Account-Meta-Test"),
+            Some("admin-acct")
+        );
+        leftover_grant_account_acl(&svc, reader.as_str(), "{}").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_admin_acl revoke then cannot read"
+        );
+        backend.abort();
+    }
+
     /// Official TestAccountNoContainers.testInvalidUTF8Path and the
     /// invalid half of TestContainer.testUtf8Container. IsolatedIdentity
     /// `no_path_quote` puts raw / percent-decoded non-UTF-8 on the request
@@ -13563,6 +14081,61 @@ mod pipeline_async_tests {
             },
             60.0,
         );
+    }
+
+    async fn leftover_authed_listing_names(
+        svc: &ProxyAsyncService,
+        path: &str,
+        token: &str,
+    ) -> (u16, Vec<String>) {
+        let listed =
+            file_hyper_call(svc, "GET", path, "", &[("X-Auth-Token", token)], Vec::new()).await;
+        let status = listed.status;
+        if status == 204 {
+            return (status, Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            return (status, Vec::new());
+        }
+        let body = leftover_body_text(listed).await;
+        let trimmed = body.trim();
+        let names = if trimmed.starts_with('[') {
+            serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|row| {
+                    row.get("name")
+                        .or_else(|| row.get("subdir"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        } else {
+            trimmed
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        (status, names)
+    }
+
+    async fn leftover_grant_account_acl(svc: &ProxyAsyncService, owner: &str, acl: &str) {
+        assert_eq!(
+            file_hyper_call(
+                svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Auth-Token", owner), ("X-Account-Access-Control", acl),],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "account ACL POST {acl}"
+        );
+        seed_auth_test_account_acl(svc, Some(acl));
     }
 
     #[tokio::test]
