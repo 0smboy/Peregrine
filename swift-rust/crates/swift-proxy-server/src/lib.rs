@@ -9363,6 +9363,26 @@ mod pipeline_async_tests {
         }
     }
 
+    fn leftover_apply_account_sysmeta(stored: &mut HeaderKeyDict, text: &str) {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            if lk == "x-account-sysmeta-core-access-control" {
+                stored.set(k.trim(), v.trim());
+            }
+        }
+    }
+
+    fn leftover_account_sysmeta_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        stored
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("X-Account-Sysmeta-Core-Access-Control"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     fn leftover_acl_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
         stored
             .iter()
@@ -11956,6 +11976,314 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.test_invalid_acl_keys / test_invalid_acl_values /
+    /// test_protected_tempurl / test_account_acls (admin grant, RW hides ACL).
+    /// Invalid `X-Account-Access-Control` is 400 in `authorize_async` before
+    /// leftover persist. Valid ACLs rewrite to account sysmeta so leftover
+    /// HEAD can expose them. Must hit `authorize_async` (no intercepting stub).
+    #[tokio::test]
+    async fn account_acl_v2_invalid_and_protected_tempurl_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+
+        let bad_json = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", "invalid"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_json.status, 400,
+            "official test_invalid_acl_keys non-JSON, got {}",
+            bad_json.status
+        );
+        assert!(
+            bad_json.headers.get("X-Account-Access-Control").is_none(),
+            "official test_invalid_acl_keys must not echo ACL on 400"
+        );
+
+        let bad_key = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                (
+                    "X-Account-Access-Control",
+                    r#"{"admin":["test2:tester2"],"invalid_key":"invalid_value"}"#,
+                ),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_key.status, 400,
+            "official test_invalid_acl_keys unknown key, got {}",
+            bad_key.status
+        );
+        assert!(bad_key.headers.get("X-Account-Access-Control").is_none());
+
+        let bad_val = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", r#"{"admin":"invalid_value"}"#),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_val.status, 400,
+            "official test_invalid_acl_values, got {}",
+            bad_val.status
+        );
+        assert!(bad_val.headers.get("X-Account-Access-Control").is_none());
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Meta-Temp-Url-Key", "secret"),
+                    ("X-Account-Meta-Test", "acct-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", ro.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&ro));
+        let ro_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&ro_get.status),
+            "official test_protected_tempurl read-only GET, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            ro_get.headers.get("X-Account-Meta-Test"),
+            Some("acct-meta")
+        );
+        assert!(
+            ro_get.headers.get("X-Account-Meta-Temp-Url-Key").is_none(),
+            "official test_protected_tempurl RO must hide temp-url-key"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", rw.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&rw));
+        let rw_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&rw_get.status),
+            "official test_protected_tempurl read-write GET, got {}",
+            rw_get.status
+        );
+        assert_eq!(
+            rw_get.headers.get("X-Account-Meta-Test"),
+            Some("acct-meta")
+        );
+        assert!(
+            rw_get.headers.get("X-Account-Meta-Temp-Url-Key").is_none(),
+            "official test_protected_tempurl RW must hide temp-url-key"
+        );
+        assert!(
+            rw_get.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls RW must hide ACL header"
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", admin.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&admin));
+        let admin_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&admin_get.status),
+            "official test_protected_tempurl admin GET, got {}",
+            admin_get.status
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Account-Meta-Test"),
+            Some("acct-meta")
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Account-Meta-Temp-Url-Key"),
+            Some("secret"),
+            "official test_protected_tempurl admin sees temp-url-key"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Temp-Url-Key", "rotated"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&admin));
+        let rotated = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rotated.headers.get("X-Account-Meta-Temp-Url-Key"),
+            Some("rotated"),
+            "official test_protected_tempurl admin can rotate temp-url-key"
+        );
+
+        let foreign_admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test2:tester2".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", foreign_admin.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&foreign_admin));
+        let other_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&other_head.status),
+            "official test_account_acls foreign admin HEAD, got {}",
+            other_head.status
+        );
+        assert_eq!(
+            other_head.headers.get("X-Account-Access-Control"),
+            Some(foreign_admin.as_str()),
+            "official test_account_acls admin sees ACL header"
+        );
+        backend.abort();
+    }
+
     /// Official TestAccountNoContainers.testInvalidUTF8Path and the
     /// invalid half of TestContainer.testUtf8Container. IsolatedIdentity
     /// `no_path_quote` puts raw / percent-decoded non-UTF-8 on the request
@@ -12945,6 +13273,20 @@ mod pipeline_async_tests {
     ) {
         let app = svc.app.read().unwrap_or_else(|p| p.into_inner());
         seed_container_rw(&app, "AUTH_test", container, read_acl, write_acl);
+    }
+
+    fn seed_auth_test_account_acl(svc: &ProxyAsyncService, sysmeta: Option<&str>) {
+        let app = svc.app.read().unwrap_or_else(|p| p.into_inner());
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                core_access_control: sysmeta.map(str::to_string),
+                account_really_exists: true,
+                ..Default::default()
+            },
+            60.0,
+        );
     }
 
     #[tokio::test]
@@ -18224,24 +18566,22 @@ mod pipeline_async_tests {
                     };
                     if logical == "/AUTH_test" {
                         if is_post {
-                            leftover_apply_user_meta(
-                                "account",
-                                &mut account_meta.lock().unwrap_or_else(|p| p.into_inner()),
-                                &text,
-                                false,
-                            );
+                            let mut stored =
+                                account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            leftover_apply_user_meta("account", &mut stored, &text, false);
+                            leftover_apply_account_sysmeta(&mut stored, &text);
                         }
                         let (n_s, o_s, b_s) = account_counts();
-                        let meta_pairs = leftover_meta_pairs(
-                            &account_meta.lock().unwrap_or_else(|p| p.into_inner()),
-                            "account",
-                        );
+                        let stored = account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                        let meta_pairs = leftover_meta_pairs(&stored, "account");
                         let mut extra = vec![
                             ("X-Account-Container-Count".to_string(), n_s.clone()),
                             ("X-Account-Object-Count".to_string(), o_s.clone()),
                             ("X-Account-Bytes-Used".to_string(), b_s.clone()),
                         ];
                         extra.extend(meta_pairs);
+                        extra.extend(leftover_account_sysmeta_pairs(&stored));
+                        drop(stored);
                         if is_get {
                             let names: Vec<String> = containers
                                 .lock()
