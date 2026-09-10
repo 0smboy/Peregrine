@@ -9409,6 +9409,27 @@ mod pipeline_async_tests {
         }
     }
 
+    fn leftover_apply_container_sync(stored: &mut HeaderKeyDict, text: &str) {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk == "x-remove-container-sync-key" {
+                stored.remove("X-Container-Sync-Key");
+            } else if lk == "x-remove-container-sync-to" {
+                stored.remove("X-Container-Sync-To");
+            } else if lk == "x-container-sync-key" || lk == "x-container-sync-to" {
+                if val.is_empty() {
+                    stored.remove(k.trim());
+                } else {
+                    stored.set(k.trim(), val);
+                }
+            }
+        }
+    }
+
     fn leftover_apply_account_sysmeta(stored: &mut HeaderKeyDict, text: &str) {
         for line in text.lines() {
             let Some((k, v)) = line.split_once(':') else {
@@ -9435,6 +9456,17 @@ mod pipeline_async_tests {
             .filter(|(k, _)| {
                 let lk = k.to_ascii_lowercase();
                 lk == "x-container-read" || lk == "x-container-write"
+            })
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn leftover_sync_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        stored
+            .iter()
+            .filter(|(k, _)| {
+                let lk = k.to_ascii_lowercase();
+                lk == "x-container-sync-key" || lk == "x-container-sync-to"
             })
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
@@ -12746,6 +12778,409 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainer.test_protected_container_sync. Field H1:
+    /// leftover persists `X-Container-Sync-Key`; Hyper scrubs it on
+    /// `!swift_owner` POST and strips it on `!swift_owner` GET.
+    /// `test:tester3` has no `.admin`. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn protected_container_sync_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT sync-c"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Sync-Key", "secret"),
+                    ("X-Container-Meta-Test", "sync-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_sync owner POST"
+        );
+        let owner_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&owner_get.status),
+            "official test_protected_container_sync owner GET, got {}",
+            owner_get.status
+        );
+        assert_eq!(
+            owner_get.headers.get("X-Container-Sync-Key"),
+            Some("secret"),
+            "official test_protected_container_sync owner sees sync-key"
+        );
+        assert_eq!(
+            owner_get.headers.get("X-Container-Meta-Test"),
+            Some("sync-meta")
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let ro_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&ro_get.status),
+            "official test_protected_container_sync RO GET, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            ro_get.headers.get("X-Container-Meta-Test"),
+            Some("sync-meta")
+        );
+        assert!(
+            ro_get.headers.get("X-Container-Sync-Key").is_none(),
+            "official test_protected_container_sync RO must hide sync-key"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Sync-Key", "newsecret"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_protected_container_sync RO cannot write"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&rw_get.status),
+            "official test_protected_container_sync RW GET, got {}",
+            rw_get.status
+        );
+        assert_eq!(
+            rw_get.headers.get("X-Container-Meta-Test"),
+            Some("sync-meta")
+        );
+        assert!(
+            rw_get.headers.get("X-Container-Sync-Key").is_none(),
+            "official test_protected_container_sync RW must hide sync-key"
+        );
+        let owner_sanity =
+            leftover_container_get(&svc, "/v1/AUTH_test/sync-c", owner.as_str()).await;
+        assert_eq!(
+            owner_sanity.headers.get("X-Container-Sync-Key"),
+            Some("secret")
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Sync-Key", "rw-secret"),
+                    ("X-Container-Meta-Test", "rw-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_sync RW POST meta"
+        );
+        let owner_after_rw =
+            leftover_container_get(&svc, "/v1/AUTH_test/sync-c", owner.as_str()).await;
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta"),
+            "official test_protected_container_sync RW can write meta"
+        );
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Sync-Key"),
+            Some("secret"),
+            "official test_protected_container_sync RW cannot write sync-key"
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&admin_get.status),
+            "official test_protected_container_sync admin GET, got {}",
+            admin_get.status
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta")
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Sync-Key"),
+            Some("secret"),
+            "official test_protected_container_sync admin sees sync-key"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Sync-Key", "admin-secret"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_sync admin can rotate sync-key"
+        );
+        let rotated = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert_eq!(
+            rotated.headers.get("X-Container-Sync-Key"),
+            Some("admin-secret"),
+            "official test_protected_container_sync admin GET after rotate"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_protected_container_acl. Field H1:
+    /// leftover persists `X-Container-Read`/`Write`; Hyper scrubs them on
+    /// `!swift_owner` POST and strips them on `!swift_owner` GET.
+    /// `test:tester3` has no `.admin`. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn protected_container_acl_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT acl-c"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "jdoe"),
+                    ("X-Container-Write", "jdoe"),
+                    ("X-Container-Meta-Test", "acl-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_acl owner POST"
+        );
+        let owner_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&owner_get.status),
+            "official test_protected_container_acl owner GET, got {}",
+            owner_get.status
+        );
+        assert_eq!(owner_get.headers.get("X-Container-Read"), Some("jdoe"));
+        assert_eq!(owner_get.headers.get("X-Container-Write"), Some("jdoe"));
+        assert_eq!(
+            owner_get.headers.get("X-Container-Meta-Test"),
+            Some("acl-meta")
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let ro_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&ro_get.status),
+            "official test_protected_container_acl RO GET, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            ro_get.headers.get("X-Container-Meta-Test"),
+            Some("acl-meta")
+        );
+        assert!(
+            ro_get.headers.get("X-Container-Read").is_none()
+                && ro_get.headers.get("X-Container-Write").is_none(),
+            "official test_protected_container_acl RO must hide ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Read", "frank"),
+                    ("X-Container-Write", "frank"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_protected_container_acl RO cannot write"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&rw_get.status),
+            "official test_protected_container_acl RW GET, got {}",
+            rw_get.status
+        );
+        assert_eq!(
+            rw_get.headers.get("X-Container-Meta-Test"),
+            Some("acl-meta")
+        );
+        assert!(
+            rw_get.headers.get("X-Container-Read").is_none()
+                && rw_get.headers.get("X-Container-Write").is_none(),
+            "official test_protected_container_acl RW must hide ACL"
+        );
+        let owner_sanity =
+            leftover_container_get(&svc, "/v1/AUTH_test/acl-c", owner.as_str()).await;
+        assert_eq!(owner_sanity.headers.get("X-Container-Read"), Some("jdoe"));
+        assert_eq!(owner_sanity.headers.get("X-Container-Write"), Some("jdoe"));
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Read", "frank"),
+                    ("X-Container-Write", "frank"),
+                    ("X-Container-Meta-Test", "rw-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_acl RW POST meta"
+        );
+        let owner_after_rw =
+            leftover_container_get(&svc, "/v1/AUTH_test/acl-c", owner.as_str()).await;
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta"),
+            "official test_protected_container_acl RW can write meta"
+        );
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Read"),
+            Some("jdoe"),
+            "official test_protected_container_acl RW cannot write ACL"
+        );
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Write"),
+            Some("jdoe")
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&admin_get.status),
+            "official test_protected_container_acl admin GET, got {}",
+            admin_get.status
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta")
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Read"),
+            Some("jdoe"),
+            "official test_protected_container_acl admin sees ACL"
+        );
+        assert_eq!(admin_get.headers.get("X-Container-Write"), Some("jdoe"));
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Read", ".r:*"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_acl admin can rotate ACL"
+        );
+        let rotated = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert_eq!(
+            rotated.headers.get("X-Container-Read"),
+            Some(".r:*"),
+            "official test_protected_container_acl admin GET after rotate"
+        );
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
@@ -14596,6 +15031,10 @@ mod pipeline_async_tests {
             "account ACL POST {acl}"
         );
         seed_auth_test_account_acl(svc, Some(acl));
+    }
+
+    async fn leftover_container_get(svc: &ProxyAsyncService, path: &str, token: &str) -> Response {
+        file_hyper_call(svc, "GET", path, "", &[("X-Auth-Token", token)], Vec::new()).await
     }
 
     #[tokio::test]
@@ -20066,6 +20505,7 @@ mod pipeline_async_tests {
                                     } else {
                                         leftover_apply_user_meta("container", stored, &text, true);
                                         leftover_apply_container_acl(stored, &text);
+                                        leftover_apply_container_sync(stored, &text);
                                         if leftover_stored_policy_index(stored).is_none() {
                                             stored.set("X-Backend-Storage-Policy-Index", new_idx);
                                         }
@@ -20074,6 +20514,7 @@ mod pipeline_async_tests {
                                 } else {
                                     leftover_apply_user_meta("container", stored, &text, true);
                                     leftover_apply_container_acl(stored, &text);
+                                    leftover_apply_container_sync(stored, &text);
                                     if leftover_stored_policy_index(stored).is_none() {
                                         stored.set("X-Backend-Storage-Policy-Index", &default_idx);
                                     }
@@ -20082,6 +20523,7 @@ mod pipeline_async_tests {
                             } else {
                                 leftover_apply_user_meta("container", stored, &text, true);
                                 leftover_apply_container_acl(stored, &text);
+                                leftover_apply_container_sync(stored, &text);
                                 stored.set(
                                     "X-Backend-Storage-Policy-Index",
                                     incoming_idx.as_deref().unwrap_or(default_idx.as_str()),
@@ -20128,6 +20570,7 @@ mod pipeline_async_tests {
                             let stored = guard.entry(container.clone()).or_default();
                             leftover_apply_user_meta("container", stored, &text, false);
                             leftover_apply_container_acl(stored, &text);
+                            leftover_apply_container_sync(stored, &text);
                         }
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
@@ -20161,6 +20604,7 @@ mod pipeline_async_tests {
                         ];
                         extra.extend(meta_pairs);
                         extra.extend(leftover_acl_pairs(&stored));
+                        extra.extend(leftover_sync_pairs(&stored));
                         extra.extend(leftover_policy_pairs(&stored));
                         let refs = leftover_header_refs(&extra);
                         write_backend_http_status(&mut stream, 204, &refs, &[]).await;
@@ -20200,6 +20644,7 @@ mod pipeline_async_tests {
                             vec![("Content-Type".to_string(), "application/json".to_string())];
                         extra.extend(meta_pairs);
                         extra.extend(leftover_acl_pairs(&stored));
+                        extra.extend(leftover_sync_pairs(&stored));
                         extra.extend(leftover_policy_pairs(&stored));
                         let refs = leftover_header_refs(&extra);
                         write_backend_http(&mut stream, &refs, &payload).await;
@@ -20863,6 +21308,7 @@ mod pipeline_async_tests {
                                         container_meta.lock().unwrap_or_else(|p| p.into_inner());
                                     let stored = guard.entry(logical.clone()).or_default();
                                     leftover_apply_container_acl(stored, &text);
+                                    leftover_apply_container_sync(stored, &text);
                                 }
                                 write_backend_http_status(
                                     &mut stream,
@@ -20876,9 +21322,10 @@ mod pipeline_async_tests {
                             let extra = {
                                 let guard =
                                     container_meta.lock().unwrap_or_else(|p| p.into_inner());
-                                leftover_acl_pairs(
-                                    guard.get(&logical).unwrap_or(&HeaderKeyDict::new()),
-                                )
+                                let stored = guard.get(&logical).unwrap_or(&HeaderKeyDict::new());
+                                let mut extra = leftover_acl_pairs(stored);
+                                extra.extend(leftover_sync_pairs(stored));
+                                extra
                             };
                             let refs = leftover_header_refs(&extra);
                             write_backend_http_status(&mut stream, 204, &refs, &[]).await;
