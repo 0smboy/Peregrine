@@ -13464,10 +13464,17 @@ mod pipeline_async_tests {
             422 => "Unprocessable Entity",
             _ => "OK",
         };
-        let mut hdr = format!(
-            "HTTP/1.1 {status} {reason}\r\nX-Timestamp: 1000.00000\r\nContent-Length: {}\r\nConnection: close\r\n",
+        let has_ts = extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("X-Timestamp"));
+        let mut hdr = format!("HTTP/1.1 {status} {reason}\r\n");
+        if !has_ts {
+            hdr.push_str("X-Timestamp: 1000.00000\r\n");
+        }
+        hdr.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n",
             body.len()
-        );
+        ));
         for (k, v) in extra {
             hdr.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -19435,12 +19442,27 @@ mod pipeline_async_tests {
             String,
             (HeaderKeyDict, Vec<u8>),
         >::new()));
+        let container_meta = Arc::new(std::sync::Mutex::new({
+            let mut map = std::collections::HashMap::<String, HeaderKeyDict>::new();
+            let mut c = HeaderKeyDict::new();
+            c.set("X-Container-Read", "test2:tester2");
+            map.insert("/AUTH_test/c".into(), c);
+            let mut dst = HeaderKeyDict::new();
+            dst.set("X-Container-Write", "test:tester");
+            map.insert("/AUTH_test2/dst".into(), dst);
+            map.insert("/AUTH_test2/dst2".into(), HeaderKeyDict::new());
+            let mut srccont = HeaderKeyDict::new();
+            srccont.set("X-Container-Read", "test:tester");
+            map.insert("/AUTH_test2/srccont".into(), srccont);
+            map
+        }));
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
                 let objects = Arc::clone(&objects);
+                let container_meta = Arc::clone(&container_meta);
                 tokio::spawn(async move {
                     let mut stream = stream;
                     let (text, body) = read_backend_http_request(&mut stream).await;
@@ -19453,6 +19475,8 @@ mod pipeline_async_tests {
                     let is_head = first.starts_with("HEAD ");
                     let is_put = first.starts_with("PUT ");
                     let is_get = first.starts_with("GET ");
+                    let is_post = first.starts_with("POST ");
+                    let is_delete = first.starts_with("DELETE ");
                     let shard = text
                         .to_ascii_lowercase()
                         .contains("x-backend-record-type: shard");
@@ -19467,61 +19491,42 @@ mod pipeline_async_tests {
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
                     }
-                    if logical == "/AUTH_test/c" {
-                        if shard {
-                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    if logical.starts_with("/AUTH_test/") || logical.starts_with("/AUTH_test2/") {
+                        let rest = logical
+                            .trim_start_matches("/AUTH_test2/")
+                            .trim_start_matches("/AUTH_test/");
+                        if !rest.contains('/') {
+                            if shard {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            if is_put || is_post {
+                                {
+                                    let mut guard =
+                                        container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                    let stored = guard.entry(logical.clone()).or_default();
+                                    leftover_apply_container_acl(stored, &text);
+                                }
+                                write_backend_http_status(
+                                    &mut stream,
+                                    if is_put { 201 } else { 204 },
+                                    &[],
+                                    &[],
+                                )
+                                .await;
+                                return;
+                            }
+                            let extra = {
+                                let guard =
+                                    container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                leftover_acl_pairs(guard.get(&logical).unwrap_or(&HeaderKeyDict::new()))
+                            };
+                            let refs = leftover_header_refs(&extra);
+                            write_backend_http_status(&mut stream, 204, &refs, &[]).await;
                             return;
                         }
-                        write_backend_http_status(
-                            &mut stream,
-                            204,
-                            &[("X-Container-Read", "test2:tester2")],
-                            &[],
-                        )
-                        .await;
-                        return;
                     }
-                    if logical == "/AUTH_test2/dst" {
-                        if shard {
-                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-                            return;
-                        }
-                        write_backend_http_status(
-                            &mut stream,
-                            204,
-                            &[("X-Container-Write", "test:tester")],
-                            &[],
-                        )
-                        .await;
-                        return;
-                    }
-                    if logical == "/AUTH_test2/dst2" {
-                        if shard {
-                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-                            return;
-                        }
-                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
-                        return;
-                    }
-                    if logical == "/AUTH_test2/srccont" {
-                        if shard {
-                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-                            return;
-                        }
-                        write_backend_http_status(
-                            &mut stream,
-                            204,
-                            &[("X-Container-Read", "test:tester")],
-                            &[],
-                        )
-                        .await;
-                        return;
-                    }
-                    if !logical.starts_with("/AUTH_test/c/")
-                        && !logical.starts_with("/AUTH_test2/dst/")
-                        && !logical.starts_with("/AUTH_test2/dst2/")
-                        && !logical.starts_with("/AUTH_test2/srccont/")
-                    {
+                    if !logical.starts_with("/AUTH_test/") && !logical.starts_with("/AUTH_test2/") {
                         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                         return;
                     }
@@ -19535,11 +19540,29 @@ mod pipeline_async_tests {
                         if let Some(color) = header("X-Object-Meta-Color") {
                             stored.set("X-Object-Meta-Color", color);
                         }
+                        if let Some(ts) = header("X-Timestamp") {
+                            stored.set("X-Timestamp", ts);
+                        }
                         objects
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .insert(logical, (stored, body));
                         write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        return;
+                    }
+                    if is_delete {
+                        let removed = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&logical)
+                            .is_some();
+                        write_backend_http_status(
+                            &mut stream,
+                            if removed { 204 } else { 404 },
+                            &[],
+                            &[],
+                        )
+                        .await;
                         return;
                     }
                     let stored = objects
@@ -19699,6 +19722,345 @@ mod pipeline_async_tests {
                 b"png-bytes"
             );
             assert_eq!(got.headers.get("X-Object-Meta-Color"), Some("blue"));
+        }
+        backend.abort();
+    }
+
+    /// Official TestObject.test_copy_between_accounts. Account-2 cannot
+    /// X-Copy-From a private source until read ACL; account-1 cannot COPY
+    /// into AUTH_test2 until dest write ACL. Must hit `authorize_async`
+    /// (no intercepting stub). Leftover GET returns stored source bytes.
+    #[tokio::test]
+    async fn copy_between_accounts_acl_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "cba", None, None);
+        seed_container_rw(&app, "AUTH_test2", "cba", None, None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta)],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/cba",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test2/cba",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/cba/obj",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let denied_from = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "0"),
+                ("X-Copy-From-Account", "AUTH_test"),
+                ("X-Copy-From", "cba/obj"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied_from.status, 403,
+            "official test_copy_between_accounts X-Copy-From before source ACL, got {}",
+            denied_from.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/cba",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test2:tester2"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "cba", Some("test2:tester2"), None);
+        seed_container_rw(
+            &svc.app.read().unwrap_or_else(|p| p.into_inner()),
+            "AUTH_test2",
+            "cba",
+            None,
+            None,
+        );
+        let ok_from = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "0"),
+                ("X-Copy-From-Account", "AUTH_test"),
+                ("X-Copy-From", "cba/obj"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ok_from.status, 201,
+            "official test_copy_between_accounts X-Copy-From after source ACL, got {}",
+            ok_from.status
+        );
+        let dest_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(dest_get.status, 200);
+        assert_eq!(leftover_body_text(dest_get).await, "test");
+        let dest_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            dest_del.status == 204 || dest_del.status == 404,
+            "official test_copy_between_accounts DELETE dest, got {}",
+            dest_del.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test2/cba/test_copy",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            404
+        );
+
+        let denied_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/cba/obj",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("Destination-Account", "AUTH_test2"),
+                ("Destination", "cba/test_copy"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied_copy.status, 403,
+            "official test_copy_between_accounts COPY before dest write ACL, got {}",
+            denied_copy.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test2/cba",
+                "",
+                &[
+                    ("X-Auth-Token", other.as_str()),
+                    ("X-Container-Write", "test:tester"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_container_rw(
+            &svc.app.read().unwrap_or_else(|p| p.into_inner()),
+            "AUTH_test2",
+            "cba",
+            None,
+            Some("test:tester"),
+        );
+        let ok_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/cba/obj",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("Destination-Account", "AUTH_test2"),
+                ("Destination", "cba/test_copy"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ok_copy.status, 201,
+            "official test_copy_between_accounts COPY after dest write ACL, got {}",
+            ok_copy.status
+        );
+        let copied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(copied.status, 200);
+        assert_eq!(leftover_body_text(copied).await, "test");
+        backend.abort();
+    }
+
+    /// Official TestObject.test_too_small_x_timestamp /
+    /// test_too_big_x_timestamp with IsolatedIdentity gatekeeper shunt ON:
+    /// out-of-range client X-Timestamp is shunted, write uses now, HEAD
+    /// X-Timestamp is wall-clock (not 400).
+    #[tokio::test]
+    async fn file_out_of_range_x_timestamp_is_rewritten_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", None, None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Gatekeeper::default()),
+                Arc::new(ta),
+            ],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        for (name, raw) in [
+            ("too_small_x_timestamp", "-1"),
+            ("too_big_x_timestamp", "99999999999.9999999999"),
+        ] {
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "0"),
+                    ("X-Timestamp", raw),
+                ],
+                Vec::new(),
+            )
+            .await;
+            let after = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            assert_eq!(
+                put.status, 201,
+                "official {name} PUT with shunt ON, got {} body {:?}",
+                put.status, put.reason
+            );
+            let head = file_hyper_call(
+                &svc,
+                "HEAD",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&head.status),
+                "official {name} HEAD, got {}",
+                head.status
+            );
+            let ts: f64 = head
+                .headers
+                .get("X-Timestamp")
+                .expect("official HEAD X-Timestamp")
+                .parse()
+                .expect("X-Timestamp float");
+            assert!(
+                ts > before - 2.0 && ts < after + 2.0,
+                "official {name} HEAD X-Timestamp {ts} not wall-clock in {before}..{after}"
+            );
         }
         backend.abort();
     }
