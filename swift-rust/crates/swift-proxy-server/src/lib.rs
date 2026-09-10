@@ -13868,6 +13868,60 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official extra-file TestObject.test_if_none_match. IsolatedIdentity
+    /// Hyper forwards If-None-Match onto leftover object PUT; no stub.
+    #[tokio::test]
+    async fn extra_file_if_none_match_put_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/inm-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT inm-c"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/inm-c/if_none_match_test",
+                "",
+                &[("If-None-Match", "*")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_if_none_match first If-None-Match:*"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/inm-c/if_none_match_test",
+                "",
+                &[("If-None-Match", "*")],
+                b"",
+            )
+            .await
+            .status,
+            412,
+            "official test_if_none_match second If-None-Match:*"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/inm-c/if_none_match_test",
+                "",
+                &[("If-None-Match", "somethingelse")],
+                b"",
+            )
+            .await
+            .status,
+            400,
+            "official test_if_none_match If-None-Match not *"
+        );
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
@@ -21110,6 +21164,25 @@ mod pipeline_async_tests {
                             if !exists {
                                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                                 return;
+                            }
+                            // Official extra-file TestObject.test_if_none_match:
+                            // object-server owns If-None-Match. Hyper already
+                            // forwards it; leftover PUT must 400 unless `*`
+                            // and 412 when the object is already listed.
+                            if let Some(inm) = leftover_header_value(&text, "If-None-Match") {
+                                if inm.trim() != "*" {
+                                    write_backend_http_status(&mut stream, 400, &[], &[]).await;
+                                    return;
+                                }
+                                let listed = objects
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .get(container)
+                                    .is_some_and(|v| v.iter().any(|n| n == object));
+                                if listed {
+                                    write_backend_http_status(&mut stream, 412, &[], &[]).await;
+                                    return;
+                                }
                             }
                             let prev = object_bodies
                                 .lock()
