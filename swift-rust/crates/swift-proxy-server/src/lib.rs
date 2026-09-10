@@ -12560,6 +12560,84 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.test_invalid_acls. Eight admin keys each
+    /// `max_header_size/8` make `X-Account-Access-Control` exceed
+    /// `MAX_HEADER_SIZE` → 400 (`check_metadata`). Seven keys of the same
+    /// size POST 204. Must hit `authorize_async` then account POST (no stub).
+    #[tokio::test]
+    async fn account_acl_v2_oversized_header_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let max_header = swift_core::constraints::MAX_HEADER_SIZE as usize;
+        let num_keys = 8;
+        let max_key_size = max_header / num_keys;
+        let too_big: Vec<String> = "abcdefgh"
+            .chars()
+            .take(num_keys)
+            .map(|c| c.to_string().repeat(max_key_size))
+            .collect();
+        let big = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: too_big,
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert!(
+            big.len() > max_header,
+            "official test_invalid_acls 8-key ACL must exceed max_header_size, got {}",
+            big.len()
+        );
+        let denied = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", big.as_str()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied.status, 400,
+            "official test_invalid_acls oversized ACL, got {}",
+            denied.status
+        );
+        let ok_keys: Vec<String> = "abcdefg"
+            .chars()
+            .take(num_keys - 1)
+            .map(|c| c.to_string().repeat(max_key_size))
+            .collect();
+        let smaller = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: ok_keys,
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert!(
+            smaller.len() <= max_header,
+            "official test_invalid_acls 7-key ACL must fit, got {}",
+            smaller.len()
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", smaller.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_invalid_acls slightly smaller ACL"
+        );
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
