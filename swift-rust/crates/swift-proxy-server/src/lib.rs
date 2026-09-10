@@ -10052,6 +10052,35 @@ mod pipeline_async_tests {
             pref,
             "official testAccountContainerListSortingByPrefix"
         );
+        let mut exclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" < **c && **c < "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        exclusive.sort();
+        exclusive.reverse();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&marker=b1&end_marker=B2").await,
+            exclusive,
+            "official testAccountContainerListSortingByMarkersExclusive"
+        );
+        let mut inclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" <= **c && **c <= "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        inclusive.sort();
+        inclusive.reverse();
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test",
+                "reverse=on&marker=b1%00&end_marker=B1"
+            )
+            .await,
+            inclusive,
+            "official testAccountContainerListSortingByMarkersInclusive"
+        );
         let empty =
             listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&marker=B&end_marker=b1").await;
         assert!(
@@ -18225,8 +18254,22 @@ mod pipeline_async_tests {
         .await;
         assert_eq!(
             too_long.status, 400,
-            "official testNameLimit over-limit on Hyper, got {}",
+            "official testNameLimit / testTooLongName over-limit on Hyper, got {}",
             too_long.status
+        );
+        let too_long_1025 = file_hyper_call(
+            &svc,
+            "PUT",
+            &format!("/v1/AUTH_test/c/{}", "x".repeat(1025)),
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            too_long_1025.status, 400,
+            "official testTooLongName 1025-char object on Hyper, got {}",
+            too_long_1025.status
         );
         let q_put = file_hyper_call(
             &svc,
@@ -18689,6 +18732,66 @@ mod pipeline_async_tests {
                 .or_else(|| none_hit.headers.get("Etag"))
                 .map(|s| s.trim_matches('"')),
             Some(etag.as_str())
+        );
+        assert_eq!(
+            none_hit
+                .headers
+                .get("Accept-Ranges")
+                .or_else(|| none_hit.headers.get("accept-ranges")),
+            Some("bytes"),
+            "official testIfNoneMatch Accept-Ranges"
+        );
+        let none_multi_miss = {
+            let mut h = HeaderKeyDict::new();
+            h.set("If-None-Match", "\"bogus1\", \"bogus2\", \"bogus3\"");
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/cond".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert!(
+            (200..300).contains(&none_multi_miss.status),
+            "official testIfNoneMatchMultipleEtags miss on Hyper, got {}",
+            none_multi_miss.status
+        );
+        let none_multi_hit = {
+            let mut h = HeaderKeyDict::new();
+            h.set(
+                "If-None-Match",
+                format!("\"bogus1\", \"bogus2\", \"{etag}\""),
+            );
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/cond".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            none_multi_hit.status, 304,
+            "official testIfNoneMatchMultipleEtags hit on Hyper, got {}",
+            none_multi_hit.status
+        );
+        assert_eq!(
+            none_multi_hit
+                .headers
+                .get("ETag")
+                .or_else(|| none_multi_hit.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            none_multi_hit
+                .headers
+                .get("Accept-Ranges")
+                .or_else(|| none_multi_hit.headers.get("accept-ranges")),
+            Some("bytes")
         );
         backend.abort();
     }
