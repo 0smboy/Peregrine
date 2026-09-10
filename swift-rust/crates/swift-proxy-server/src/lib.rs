@@ -21322,9 +21322,9 @@ mod pipeline_async_tests {
                             let extra = {
                                 let guard =
                                     container_meta.lock().unwrap_or_else(|p| p.into_inner());
-                                let stored = guard.get(&logical).unwrap_or(&HeaderKeyDict::new());
-                                let mut extra = leftover_acl_pairs(stored);
-                                extra.extend(leftover_sync_pairs(stored));
+                                let stored = guard.get(&logical).cloned().unwrap_or_default();
+                                let mut extra = leftover_acl_pairs(&stored);
+                                extra.extend(leftover_sync_pairs(&stored));
                                 extra
                             };
                             let refs = leftover_header_refs(&extra);
