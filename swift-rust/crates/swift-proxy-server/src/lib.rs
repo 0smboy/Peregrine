@@ -19927,7 +19927,8 @@ mod pipeline_async_tests {
             Vec::new(),
         )
         .await;
-        let xml_text = String::from_utf8_lossy(&xml.body.collect_async().await.expect("xml"));
+        let xml_body = xml.body.collect_async().await.expect("xml");
+        let xml_text = String::from_utf8_lossy(&xml_body);
         assert!(
             xml_text.contains(&format!("<name>{name}</name>")),
             "official TestFileUTF8 xml listing missing {name}: {xml_text}"
