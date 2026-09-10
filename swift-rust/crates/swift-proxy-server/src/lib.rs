@@ -9461,7 +9461,7 @@ mod pipeline_async_tests {
     fn leftover_stored_policy_index(stored: &HeaderKeyDict) -> Option<String> {
         stored.iter().find_map(|(k, v)| {
             if k.eq_ignore_ascii_case("x-backend-storage-policy-index") {
-                Some(v.clone())
+                Some(v.to_string())
             } else {
                 None
             }
