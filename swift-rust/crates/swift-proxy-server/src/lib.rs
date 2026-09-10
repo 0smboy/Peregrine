@@ -16220,7 +16220,8 @@ mod pipeline_async_tests {
                         return;
                     }
                     let first = text.lines().next().unwrap_or("");
-                    let (logical, query) = backend_logical_target(first);
+                    let (raw_logical, query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
                     let is_head = first.starts_with("HEAD ");
                     let is_put = first.starts_with("PUT ");
                     let is_post = first.starts_with("POST ");
@@ -19836,6 +19837,130 @@ mod pipeline_async_tests {
                 other.status
             );
         }
+        backend.abort();
+    }
+
+    /// Official TestFileUTF8 / TestContainerUTF8 object leftovers: Base2
+    /// uses UTF-8 names. IsolatedIdentity backends percent-encode; leftover
+    /// listings must unquote so json/xml `name` is the Unicode object, not
+    /// `%E5%AF%B9%E8%B1%A1`.
+    #[tokio::test]
+    async fn file_utf8_object_crud_and_listing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let name = "héllo 对象.png";
+        let path = format!("/v1/AUTH_test/c/{name}");
+        let data = b"utf8-body".to_vec();
+        use md5::{Digest, Md5};
+        let expect_etag = format!("{:x}", Md5::digest(&data));
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            &path,
+            "",
+            &[
+                ("Content-Length", "9"),
+                ("Content-Type", "image/png"),
+                ("X-Object-Meta-Lang", "zh"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestFileUTF8 PUT on Hyper, got {}",
+            put.status
+        );
+        let got = file_hyper_call(&svc, "GET", &path, "", &[], Vec::new()).await;
+        assert_eq!(
+            got.status, 200,
+            "official TestFileUTF8 GET, got {}",
+            got.status
+        );
+        assert_eq!(got.body.collect_async().await.expect("GET body"), data);
+        let head = file_hyper_call(&svc, "HEAD", &path, "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestFileUTF8 HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers
+                .get("ETag")
+                .or_else(|| head.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str())
+        );
+        assert_eq!(
+            head.headers.get("X-Object-Meta-Lang"),
+            Some("zh"),
+            "official TestFileUTF8 metadata {:?}",
+            head.headers
+        );
+        let listed = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&listed.body.collect_async().await.expect("json")).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(name))
+            .unwrap_or_else(|| {
+                panic!("official TestFileUTF8 json listing missing {name}: {rows:?}")
+            });
+        assert_eq!(
+            row.get("hash").and_then(|v| v.as_str()),
+            Some(expect_etag.as_str())
+        );
+        let xml = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=xml",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        let xml_text = String::from_utf8_lossy(&xml.body.collect_async().await.expect("xml"));
+        assert!(
+            xml_text.contains(&format!("<name>{name}</name>")),
+            "official TestFileUTF8 xml listing missing {name}: {xml_text}"
+        );
+        let post = file_hyper_call(
+            &svc,
+            "POST",
+            &path,
+            "",
+            &[("X-Object-Meta-Lang", "ja")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            post.status == 202 || post.status == 201,
+            "official TestFileUTF8 POST, got {}",
+            post.status
+        );
+        let after = file_hyper_call(&svc, "HEAD", &path, "", &[], Vec::new()).await;
+        assert_eq!(after.headers.get("X-Object-Meta-Lang"), Some("ja"));
+        assert_eq!(
+            file_hyper_call(&svc, "DELETE", &path, "", &[], Vec::new())
+                .await
+                .status,
+            204,
+            "official TestFileUTF8 DELETE"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "GET", &path, "", &[], Vec::new())
+                .await
+                .status,
+            404
+        );
         backend.abort();
     }
 
