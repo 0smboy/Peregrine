@@ -13503,7 +13503,7 @@ mod pipeline_async_tests {
             "official test_manifest bytes=5-, got {}",
             range_mid.status
         );
-        assert_eq!(leftover_body_text(range_mid).await, "threefourfive");
+        assert_eq!(leftover_body_text(range_mid).await, "othreefourfive");
 
         let range_span = file_hyper_call(
             &svc,
@@ -13519,7 +13519,7 @@ mod pipeline_async_tests {
             "official test_manifest bytes=5-10, got {}",
             range_span.status
         );
-        assert_eq!(leftover_body_text(range_span).await, "threef");
+        assert_eq!(leftover_body_text(range_span).await, "othree");
 
         let segments2 = ["six", "seven", "eight"];
         for (i, seg) in segments2.iter().enumerate() {
