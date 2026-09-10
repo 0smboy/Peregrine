@@ -6682,14 +6682,18 @@ fn constraint_plain(status: u16, body: &str) -> Response {
 /// Python container PUT: `Container name length of N longer than M`.
 pub(crate) fn check_container_name_length(container: &str) -> Option<Response> {
     if container.len() as i64 > swift_core::constraints::MAX_CONTAINER_NAME_LENGTH {
-        Some(constraint_plain(
+        // Official TestContainer.test_long_name_content_type reads swob's
+        // HTTPBadRequest Content-Type, not constraint_plain's text/plain.
+        let mut resp = constraint_plain(
             400,
             &format!(
                 "Container name length of {} longer than {}",
                 container.len(),
                 swift_core::constraints::MAX_CONTAINER_NAME_LENGTH
             ),
-        ))
+        );
+        resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+        Some(resp)
     } else {
         None
     }
@@ -9303,7 +9307,64 @@ mod pipeline_async_tests {
             .collect()
     }
 
-    /// Official TestContainer.testContainerNameLimit.
+    fn leftover_apply_user_meta(
+        target: &str,
+        stored: &mut HeaderKeyDict,
+        text: &str,
+        replace: bool,
+    ) {
+        let prefix = format!("x-{target}-meta-");
+        let remove_prefix = format!("x-remove-{target}-meta-");
+        if replace {
+            let stale: Vec<String> = stored
+                .iter()
+                .filter(|(k, _)| k.to_ascii_lowercase().starts_with(&prefix))
+                .map(|(k, _)| k.to_string())
+                .collect();
+            for key in stale {
+                stored.remove(&key);
+            }
+        }
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk.starts_with(&remove_prefix) {
+                let rest = &lk[remove_prefix.len()..];
+                if !rest.is_empty() {
+                    stored.remove(&format!("{prefix}{rest}"));
+                }
+            } else if lk.starts_with(&prefix) && lk.len() > prefix.len() && !val.is_empty() {
+                stored.set(k.trim(), val);
+            }
+        }
+    }
+
+    fn leftover_meta_pairs(stored: &HeaderKeyDict, target: &str) -> Vec<(String, String)> {
+        let prefix = format!("x-{target}-meta-");
+        stored
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase().starts_with(&prefix))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn leftover_header_refs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    async fn leftover_body_text(resp: Response) -> String {
+        let body = resp.body.collect_async().await.expect("leftover body");
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// Official TestContainer.testContainerNameLimit /
+    /// test_long_name_content_type.
     #[tokio::test]
     async fn container_name_limit_on_hyper() {
         let (svc, backend) = container_func_hyper_svc().await;
@@ -9341,7 +9402,33 @@ mod pipeline_async_tests {
                 "official testContainerNameLimit over-limit len={n} on Hyper, got {}",
                 put.status
             );
+            assert_eq!(
+                put.headers.get("Content-Type"),
+                Some("text/html; charset=UTF-8"),
+                "official test_long_name_content_type Content-Type {:?}",
+                put.headers
+            );
         }
+        let official_long = file_hyper_call(
+            &svc,
+            "PUT",
+            &format!("/v1/AUTH_test/{}", "X".repeat(2048)),
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            official_long.status, 400,
+            "official test_long_name_content_type on Hyper, got {}",
+            official_long.status
+        );
+        assert_eq!(
+            official_long.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8"),
+            "official test_long_name_content_type 2048 Content-Type {:?}",
+            official_long.headers
+        );
         backend.abort();
     }
 
@@ -10224,6 +10311,130 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.test_unicode_metadata / test_multi_metadata /
+    /// test_bad_metadata.
+    #[tokio::test]
+    async fn account_metadata_post_and_limits_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let one = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Account-Meta-One", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            one.status, 204,
+            "official test_multi_metadata first POST, got {}",
+            one.status
+        );
+        let head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official test_multi_metadata HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers.get("X-Account-Meta-One"),
+            Some("1"),
+            "official test_multi_metadata one {:?}",
+            head.headers
+        );
+        let uni = "uni\u{0E12}";
+        let two = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Account-Meta-Two", "2"), ("X-Account-Meta-Uni", uni)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            two.status, 204,
+            "official test_unicode_metadata account POST, got {}",
+            two.status
+        );
+        let after = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(after.headers.get("X-Account-Meta-One"), Some("1"));
+        assert_eq!(after.headers.get("X-Account-Meta-Two"), Some("2"));
+        assert_eq!(
+            after.headers.get("X-Account-Meta-Uni"),
+            Some(uni),
+            "official test_unicode_metadata account {:?}",
+            after.headers
+        );
+        let name_ok = format!(
+            "X-Account-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize)
+        );
+        let name_bad = format!(
+            "X-Account-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize + 1)
+        );
+        let value_ok = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize);
+        let value_bad = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize + 1);
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[(name_ok.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_bad_metadata at-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[(name_bad.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_bad_metadata over-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Account-Meta-Too-Long", value_ok.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_bad_metadata at-limit value"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Account-Meta-Too-Long", value_bad.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_bad_metadata over-limit value"
+        );
+        backend.abort();
+    }
+
     /// Official TestAccount.testContainerListing / testMarkerLimitContainerList
     /// / testLastContainerMarker across plaintext, json, and xml.
     #[tokio::test]
@@ -10573,6 +10784,400 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestContainer.test_PUT_metadata / test_POST_metadata /
+    /// test_unicode_metadata / test_multi_metadata / test_PUT_bad_metadata /
+    /// test_POST_bad_metadata.
+    #[tokio::test]
+    async fn container_metadata_put_post_and_limits_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/meta-c",
+            "",
+            &[("X-Container-Meta-Test", "Value")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official test_PUT_metadata first PUT, got {}",
+            put.status
+        );
+        for method in ["HEAD", "GET"] {
+            let resp =
+                file_hyper_call(&svc, method, "/v1/AUTH_test/meta-c", "", &[], Vec::new()).await;
+            assert!(
+                (200..300).contains(&resp.status),
+                "official test_PUT_metadata {method}, got {}",
+                resp.status
+            );
+            assert_eq!(
+                resp.headers.get("X-Container-Meta-Test"),
+                Some("Value"),
+                "official test_PUT_metadata {method} header {:?}",
+                resp.headers
+            );
+        }
+        let empty = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/meta-empty",
+            "",
+            &[("X-Container-Meta-Test", "")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            empty.status, 201,
+            "official test_PUT_metadata empty value PUT, got {}",
+            empty.status
+        );
+        let empty_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/meta-empty",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&empty_head.status),
+            "official test_PUT_metadata empty HEAD, got {}",
+            empty_head.status
+        );
+        assert_eq!(
+            empty_head.headers.get("X-Container-Meta-Test"),
+            None,
+            "official test_PUT_metadata empty value must omit the header {:?}",
+            empty_head.headers
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-post", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let before =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(
+            before.headers.get("X-Container-Meta-Test"),
+            None,
+            "official test_POST_metadata before POST {:?}",
+            before.headers
+        );
+        let post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/meta-post",
+            "",
+            &[("X-Container-Meta-Test", "Value")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            post.status, 204,
+            "official test_POST_metadata, got {}",
+            post.status
+        );
+        let after =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(
+            after.headers.get("X-Container-Meta-Test"),
+            Some("Value"),
+            "official test_POST_metadata HEAD {:?}",
+            after.headers
+        );
+        let uni = "uni\u{0E12}";
+        let uni_post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/meta-post",
+            "",
+            &[("X-Container-Meta-Uni", uni), ("X-Container-Meta-One", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            uni_post.status, 204,
+            "official test_unicode_metadata / test_multi_metadata, got {}",
+            uni_post.status
+        );
+        let uni_head =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(
+            uni_head.headers.get("X-Container-Meta-Uni"),
+            Some(uni),
+            "official test_unicode_metadata {:?}",
+            uni_head.headers
+        );
+        assert_eq!(
+            uni_head.headers.get("X-Container-Meta-One"),
+            Some("1"),
+            "official test_multi_metadata one {:?}",
+            uni_head.headers
+        );
+        assert_eq!(
+            uni_head.headers.get("X-Container-Meta-Test"),
+            Some("Value"),
+            "official test_multi_metadata keeps prior {:?}",
+            uni_head.headers
+        );
+        let two = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/meta-post",
+            "",
+            &[("X-Container-Meta-Two", "2")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(two.status, 204);
+        let multi =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(multi.headers.get("X-Container-Meta-One"), Some("1"));
+        assert_eq!(multi.headers.get("X-Container-Meta-Two"), Some("2"));
+        let name_ok = format!(
+            "X-Container-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize)
+        );
+        let name_bad = format!(
+            "X-Container-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize + 1)
+        );
+        let value_ok = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize);
+        let value_bad = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize + 1);
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-ok-name",
+                "",
+                &[(name_ok.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_PUT_bad_metadata at-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-bad-name",
+                "",
+                &[(name_bad.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_PUT_bad_metadata over-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-ok-value",
+                "",
+                &[("X-Container-Meta-Too-Long", value_ok.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_PUT_bad_metadata at-limit value"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-bad-value",
+                "",
+                &[("X-Container-Meta-Too-Long", value_bad.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_PUT_bad_metadata over-limit value"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-post",
+                "",
+                &[(name_ok.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_POST_bad_metadata at-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-post",
+                "",
+                &[(name_bad.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_POST_bad_metadata over-limit name"
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_cors (strict IsolatedIdentity Hyper).
+    #[tokio::test]
+    async fn object_cors_allow_origin_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/corsc",
+                "",
+                &[("X-Container-Meta-Access-Control-Allow-Origin", "*")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/corsc/cat",
+                "",
+                &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let options_bare = file_hyper_call(
+            &svc,
+            "OPTIONS",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[("Origin", "http://m.com")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            options_bare.status, 401,
+            "official test_cors OPTIONS without request-method, got {}",
+            options_bare.status
+        );
+        let options_ok = file_hyper_call(
+            &svc,
+            "OPTIONS",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[
+                ("Origin", "http://m.com"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            options_ok.status, 200,
+            "official test_cors OPTIONS GET, got {}",
+            options_ok.status
+        );
+        assert_eq!(
+            options_ok.headers.get("Access-Control-Allow-Origin"),
+            Some("*"),
+            "official test_cors OPTIONS ACAO {:?}",
+            options_ok.headers
+        );
+        let get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[("Origin", "http://m.com")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            get.status, 200,
+            "official test_cors GET, got {}",
+            get.status
+        );
+        assert_eq!(
+            get.headers.get("Access-Control-Allow-Origin"),
+            Some("*"),
+            "official test_cors GET ACAO {:?}",
+            get.headers
+        );
+        let web = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[("Origin", "http://m.com"), ("X-Web-Mode", "True")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            web.status, 200,
+            "official test_cors X-Web-Mode GET, got {}",
+            web.status
+        );
+        assert_eq!(
+            web.headers.get("Access-Control-Allow-Origin"),
+            Some("*"),
+            "official test_cors X-Web-Mode ACAO {:?}",
+            web.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/corsc",
+                "",
+                &[(
+                    "X-Container-Meta-Access-Control-Allow-Origin",
+                    "http://secret.com"
+                )],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202
+        );
+        let denied = file_hyper_call(
+            &svc,
+            "OPTIONS",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[
+                ("Origin", "http://m.com"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied.status, 401,
+            "official test_cors secret origin OPTIONS, got {}",
+            denied.status
+        );
+        backend.abort();
+    }
+
     /// Official TestAccountNoContainers.testInvalidUTF8Path and the
     /// invalid half of TestContainer.testUtf8Container. IsolatedIdentity
     /// `no_path_quote` puts raw / percent-decoded non-UTF-8 on the request
@@ -10659,6 +11264,59 @@ mod pipeline_async_tests {
             .join()
             .unwrap()
             .expect("official testInvalidUTF8Path Hyper serve");
+    }
+
+    /// Official TestContainer.test_null_name / TestObject.test_null_name.
+    /// IsolatedIdentity Hyper unquotes `%00` then `check_utf8` is 412 unless
+    /// `X-Backend-Allow-Reserved-Names` (InternalClient reserved names).
+    #[tokio::test]
+    async fn null_name_is_412_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let container = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/abc\u{0}def",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            container.status, 412,
+            "official test_null_name container on Hyper, got {}",
+            container.status
+        );
+        assert_eq!(
+            leftover_body_text(container).await,
+            "Invalid UTF8 or contains NULL",
+            "official test_null_name container body"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/nullc", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let object = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/nullc/abc\u{0}def",
+            "",
+            &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+            b"test".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            object.status, 412,
+            "official test_null_name object on Hyper, got {}",
+            object.status
+        );
+        assert_eq!(
+            leftover_body_text(object).await,
+            "Invalid UTF8 or contains NULL",
+            "official test_null_name object body"
+        );
+        backend.abort();
     }
 
     /// Official TestContainer.testFileThenContainerDelete /
@@ -16404,6 +17062,18 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_delete {
+                        if let Some(raw) = header("X-If-Delete-At") {
+                            if super::parse_int_like(&raw).is_none() {
+                                write_backend_http_status(
+                                    &mut stream,
+                                    400,
+                                    &[],
+                                    b"Bad X-If-Delete-At header value",
+                                )
+                                .await;
+                                return;
+                            }
+                        }
                         let found = objects
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -16715,6 +17385,11 @@ mod pipeline_async_tests {
             String,
             (u64, u64),
         >::new()));
+        let container_meta = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            HeaderKeyDict,
+        >::new()));
+        let account_meta = Arc::new(std::sync::Mutex::new(HeaderKeyDict::new()));
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -16723,6 +17398,8 @@ mod pipeline_async_tests {
                 let containers = Arc::clone(&containers);
                 let objects = Arc::clone(&objects);
                 let stats = Arc::clone(&stats);
+                let container_meta = Arc::clone(&container_meta);
+                let account_meta = Arc::clone(&account_meta);
                 tokio::spawn(async move {
                     let mut stream = stream;
                     let (text, body) = read_backend_http_request(&mut stream).await;
@@ -16734,6 +17411,7 @@ mod pipeline_async_tests {
                     let logical = swift_http::unquote(&raw_logical);
                     let is_head = first.starts_with("HEAD ");
                     let is_put = first.starts_with("PUT ");
+                    let is_post = first.starts_with("POST ");
                     let is_get = first.starts_with("GET ");
                     let is_delete = first.starts_with("DELETE ");
                     let shard = text
@@ -16757,7 +17435,25 @@ mod pipeline_async_tests {
                         (n.to_string(), objects_n.to_string(), bytes_n.to_string())
                     };
                     if logical == "/AUTH_test" {
+                        if is_post {
+                            leftover_apply_user_meta(
+                                "account",
+                                &mut account_meta.lock().unwrap_or_else(|p| p.into_inner()),
+                                &text,
+                                false,
+                            );
+                        }
                         let (n_s, o_s, b_s) = account_counts();
+                        let meta_pairs = leftover_meta_pairs(
+                            &account_meta.lock().unwrap_or_else(|p| p.into_inner()),
+                            "account",
+                        );
+                        let mut extra = vec![
+                            ("X-Account-Container-Count".to_string(), n_s.clone()),
+                            ("X-Account-Object-Count".to_string(), o_s.clone()),
+                            ("X-Account-Bytes-Used".to_string(), b_s.clone()),
+                        ];
+                        extra.extend(meta_pairs);
                         if is_get {
                             let names: Vec<String> = containers
                                 .lock()
@@ -16793,31 +17489,15 @@ mod pipeline_async_tests {
                                     }
                                 }
                             }
+                            extra
+                                .push(("Content-Type".to_string(), "application/json".to_string()));
                             let payload = serde_json::to_vec(&rows).unwrap();
-                            write_backend_http(
-                                &mut stream,
-                                &[
-                                    ("Content-Type", "application/json"),
-                                    ("X-Account-Container-Count", n_s.as_str()),
-                                    ("X-Account-Object-Count", o_s.as_str()),
-                                    ("X-Account-Bytes-Used", b_s.as_str()),
-                                ],
-                                &payload,
-                            )
-                            .await;
+                            let refs = leftover_header_refs(&extra);
+                            write_backend_http(&mut stream, &refs, &payload).await;
                             return;
                         }
-                        write_backend_http_status(
-                            &mut stream,
-                            204,
-                            &[
-                                ("X-Account-Container-Count", n_s.as_str()),
-                                ("X-Account-Object-Count", o_s.as_str()),
-                                ("X-Account-Bytes-Used", b_s.as_str()),
-                            ],
-                            &[],
-                        )
-                        .await;
+                        let refs = leftover_header_refs(&extra);
+                        write_backend_http_status(&mut stream, 204, &refs, &[]).await;
                         return;
                     }
                     if !logical.starts_with("/AUTH_test/") {
@@ -16895,7 +17575,17 @@ mod pipeline_async_tests {
                         let inserted = containers
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .insert(container);
+                            .insert(container.clone());
+                        leftover_apply_user_meta(
+                            "container",
+                            container_meta
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .entry(container.clone())
+                                .or_default(),
+                            &text,
+                            true,
+                        );
                         write_backend_http_status(
                             &mut stream,
                             if inserted { 201 } else { 202 },
@@ -16927,6 +17617,24 @@ mod pipeline_async_tests {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .remove(&container);
+                        container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&container);
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if is_post {
+                        leftover_apply_user_meta(
+                            "container",
+                            container_meta
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .entry(container.clone())
+                                .or_default(),
+                            &text,
+                            false,
+                        );
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
                     }
@@ -16946,16 +17654,20 @@ mod pipeline_async_tests {
                                 .unwrap_or(0);
                             (count.to_string(), bytes.to_string())
                         };
-                        write_backend_http_status(
-                            &mut stream,
-                            204,
-                            &[
-                                ("X-Container-Object-Count", count_s.as_str()),
-                                ("X-Container-Bytes-Used", bytes_s.as_str()),
-                            ],
-                            &[],
-                        )
-                        .await;
+                        let stored = container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_default();
+                        let meta_pairs = leftover_meta_pairs(&stored, "container");
+                        let mut extra = vec![
+                            ("X-Container-Object-Count".to_string(), count_s),
+                            ("X-Container-Bytes-Used".to_string(), bytes_s),
+                        ];
+                        extra.extend(meta_pairs);
+                        let refs = leftover_header_refs(&extra);
+                        write_backend_http_status(&mut stream, 204, &refs, &[]).await;
                         return;
                     }
                     if is_get {
@@ -16981,12 +17693,18 @@ mod pipeline_async_tests {
                             path.as_deref(),
                         );
                         let payload = serde_json::to_vec(&rows).unwrap();
-                        write_backend_http(
-                            &mut stream,
-                            &[("Content-Type", "application/json")],
-                            &payload,
-                        )
-                        .await;
+                        let stored = container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_default();
+                        let meta_pairs = leftover_meta_pairs(&stored, "container");
+                        let mut extra =
+                            vec![("Content-Type".to_string(), "application/json".to_string())];
+                        extra.extend(meta_pairs);
+                        let refs = leftover_header_refs(&extra);
+                        write_backend_http(&mut stream, &refs, &payload).await;
                         return;
                     }
                     write_backend_http_status(&mut stream, 204, &[], &[]).await;
@@ -18221,6 +18939,83 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestObject.test_non_integer_x_delete_after /
+    /// test_non_integer_x_delete_at / test_x_delete_at_in_the_past.
+    #[tokio::test]
+    async fn file_delete_at_validation_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let after = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/non_integer_x_delete_after",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Delete-After", "*"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            after.status, 400,
+            "official test_non_integer_x_delete_after on Hyper, got {}",
+            after.status
+        );
+        assert_eq!(
+            leftover_body_text(after).await,
+            "Non-integer X-Delete-After",
+            "official test_non_integer_x_delete_after body"
+        );
+        let at = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/non_integer_x_delete_at",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Delete-At", "*"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            at.status, 400,
+            "official test_non_integer_x_delete_at on Hyper, got {}",
+            at.status
+        );
+        assert_eq!(
+            leftover_body_text(at).await,
+            "Non-integer X-Delete-At",
+            "official test_non_integer_x_delete_at body"
+        );
+        let past = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/x_delete_at_in_the_past",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Delete-At", "0"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            past.status, 400,
+            "official test_x_delete_at_in_the_past on Hyper, got {}",
+            past.status
+        );
+        assert_eq!(
+            leftover_body_text(past).await,
+            "X-Delete-At in past",
+            "official test_x_delete_at_in_the_past body"
+        );
+        backend.abort();
+    }
+
     /// Official TestFile.testNameLimit / testQuestionMarkInName.
     #[tokio::test]
     async fn file_name_limit_and_question_mark_on_hyper() {
@@ -18622,6 +19417,66 @@ mod pipeline_async_tests {
                 resp.status
             );
         }
+        backend.abort();
+    }
+
+    /// Official TestObject.test_delete_content_type /
+    /// test_delete_if_delete_at_bad.
+    #[tokio::test]
+    async fn file_delete_content_type_and_if_delete_at_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/hi",
+                "",
+                &[("Content-Length", "5"), ("Content-Type", "text/plain")],
+                b"there".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let del = file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/c/hi", "", &[], Vec::new()).await;
+        assert!(
+            del.status == 204 || del.status == 404,
+            "official test_delete_content_type, got {}",
+            del.status
+        );
+        assert_eq!(
+            del.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8"),
+            "official test_delete_content_type Content-Type {:?}",
+            del.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/hi-delete-bad",
+                "",
+                &[("Content-Length", "5"), ("Content-Type", "text/plain")],
+                b"there".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let bad = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/c/hi",
+            "",
+            &[("X-If-Delete-At", "bad")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad.status, 400,
+            "official test_delete_if_delete_at_bad on Hyper, got {}",
+            bad.status
+        );
         backend.abort();
     }
 

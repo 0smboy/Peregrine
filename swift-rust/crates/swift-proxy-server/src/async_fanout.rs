@@ -3534,16 +3534,23 @@ impl ProxyApp {
             percent_encode(container),
             percent_encode(object)
         );
-        self.make_write_async(
-            object_nodes,
-            node_number,
-            object_part,
-            "DELETE",
-            &path,
-            &req.query_string,
-            per_node,
-        )
-        .await
+        let mut resp = self
+            .make_write_async(
+                object_nodes,
+                node_number,
+                object_part,
+                "DELETE",
+                &path,
+                &req.query_string,
+                per_node,
+            )
+            .await;
+        // Official TestObject.test_delete_content_type: swob HTTPNoContent
+        // stamps text/html even when the leftover body is empty.
+        if (200..300).contains(&resp.status) && resp.headers.get("Content-Type").is_none() {
+            resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+        }
+        resp
     }
 
     pub(crate) async fn container_delete_async(
