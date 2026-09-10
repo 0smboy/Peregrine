@@ -18572,16 +18572,19 @@ mod pipeline_async_tests {
                             leftover_apply_account_sysmeta(&mut stored, &text);
                         }
                         let (n_s, o_s, b_s) = account_counts();
-                        let stored = account_meta.lock().unwrap_or_else(|p| p.into_inner());
-                        let meta_pairs = leftover_meta_pairs(&stored, "account");
-                        let mut extra = vec![
-                            ("X-Account-Container-Count".to_string(), n_s.clone()),
-                            ("X-Account-Object-Count".to_string(), o_s.clone()),
-                            ("X-Account-Bytes-Used".to_string(), b_s.clone()),
-                        ];
-                        extra.extend(meta_pairs);
-                        extra.extend(leftover_account_sysmeta_pairs(&stored));
-                        drop(stored);
+                        let extra = {
+                            let stored = account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let meta_pairs = leftover_meta_pairs(&stored, "account");
+                            let mut extra = vec![
+                                ("X-Account-Container-Count".to_string(), n_s.clone()),
+                                ("X-Account-Object-Count".to_string(), o_s.clone()),
+                                ("X-Account-Bytes-Used".to_string(), b_s.clone()),
+                            ];
+                            extra.extend(meta_pairs);
+                            extra.extend(leftover_account_sysmeta_pairs(&stored));
+                            extra
+                        };
+                        let mut extra = extra;
                         if is_get {
                             let names: Vec<String> = containers
                                 .lock()
