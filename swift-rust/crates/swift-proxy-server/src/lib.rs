@@ -11237,6 +11237,9 @@ mod pipeline_async_tests {
         let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
         ta.add_user("test", "tester", "testing", &[".admin"]);
         ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        // Official IsolatedIdentity tempauth user_test_tester3 — no .admin,
+        // so AUTH_test is not in the group list (write-only / nonadmin).
+        ta.add_user("test", "tester3", "testing3", &[]);
         let svc = ProxyAsyncService {
             app: Arc::new(RwLock::new(app)),
             filters: vec![Arc::new(ta)],
@@ -11445,6 +11448,510 @@ mod pipeline_async_tests {
             foreign_again.status, 403,
             "official test_cross_account_container after revoke, got {}",
             foreign_again.status
+        );
+
+        // Official TestContainer.test_cross_account_public_container:
+        // `.r:*,.rlistings` allows a foreign listing but not a foreign PUT
+        // until X-Container-Write names that user.
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/xpubc",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let xpub_denied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/xpubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            xpub_denied.status, 403,
+            "official test_cross_account_public_container before ACL, got {}",
+            xpub_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/xpubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ".r:*,.rlistings"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let xpub_list = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/xpubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&xpub_list.status),
+            "official test_cross_account_public_container public listing, got {}",
+            xpub_list.status
+        );
+        let xpub_put_denied = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/xpubc/object",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            xpub_put_denied.status, 403,
+            "official test_cross_account_public_container public-read PUT, got {}",
+            xpub_put_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/xpubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Write", "test2:tester2"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let xpub_put_ok = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/xpubc/object",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            xpub_put_ok.status, 201,
+            "official test_cross_account_public_container after write ACL, got {}",
+            xpub_put_ok.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_container_write_only /
+    /// TestObject.test_private_object / TestContainer.test_nonadmin_user.
+    /// IsolatedIdentity Hyper COPY authorizes the dest PUT, then
+    /// `object_copy_async` authorizes a source GET. Write ACL does not
+    /// grant source read. Must hit `authorize_async` (no intercepting stub).
+    #[tokio::test]
+    async fn write_only_copy_and_private_object_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let writer = auth_token(&svc, "test:tester3", "testing3").await;
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/wonly",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/wonly/obj1",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let wonly_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            wonly_get.status, 403,
+            "official test_container_write_only GET before write ACL, got {}",
+            wonly_get.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/wonly",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Write", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "wonly", None, Some("test:tester3"));
+        let wonly_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            wonly_put.status, 201,
+            "official test_container_write_only PUT, got {}",
+            wonly_put.status
+        );
+        let wonly_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Destination", "wonly/obj2"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            wonly_copy.status, 403,
+            "official test_container_write_only COPY, got {}",
+            wonly_copy.status
+        );
+        let wonly_post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("X-Object-Meta-Color", "blue"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            wonly_post.status, 202,
+            "official test_container_write_only POST, got {}",
+            wonly_post.status
+        );
+        let wonly_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            wonly_del.status == 204 || wonly_del.status == 404,
+            "official test_container_write_only DELETE, got {}",
+            wonly_del.status
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/privc",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/privc/obj",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        seed_auth_test_rw(&svc, "privc", None, None);
+        let priv_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/privc/obj",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            priv_get.status, 403,
+            "official test_private_object GET, got {}",
+            priv_get.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/shared",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                    ("X-Container-Write", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        seed_auth_test_rw(&svc, "shared", Some("test:tester3"), Some("test:tester3"));
+        let priv_copy_from = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/shared/private_object",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "0"),
+                ("X-Copy-From", "privc/obj"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            priv_copy_from.status, 403,
+            "official test_private_object X-Copy-From, got {}",
+            priv_copy_from.status
+        );
+        let shared_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/shared/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            shared_put.status, 201,
+            "official test_private_object shared PUT, got {}",
+            shared_put.status
+        );
+        seed_auth_test_rw(&svc, "shared", Some("test:tester3"), Some("test:tester3"));
+        let shared_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/shared/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Destination", "shared/obj1"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            shared_copy.status, 201,
+            "official test_private_object shared COPY, got {}",
+            shared_copy.status
+        );
+        seed_auth_test_rw(&svc, "privc", None, None);
+        seed_auth_test_rw(&svc, "shared", Some("test:tester3"), Some("test:tester3"));
+        let priv_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/privc/obj",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Destination", "shared/private_object"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            priv_copy.status, 403,
+            "official test_private_object COPY from private, got {}",
+            priv_copy.status
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/nonadmin",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        seed_auth_test_rw(&svc, "nonadmin", None, None);
+        let na_denied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/nonadmin",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            na_denied.status, 403,
+            "official test_nonadmin_user before ACL, got {}",
+            na_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/nonadmin",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "nonadmin", Some("test:tester3"), None);
+        let na_list = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/nonadmin",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&na_list.status),
+            "official test_nonadmin_user after read ACL, got {}",
+            na_list.status
+        );
+        let na_put_denied = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/nonadmin/object",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            na_put_denied.status, 403,
+            "official test_nonadmin_user read-only PUT, got {}",
+            na_put_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/nonadmin",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Write", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "nonadmin", Some("test:tester3"), Some("test:tester3"));
+        let na_put_ok = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/nonadmin/object",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            na_put_ok.status, 201,
+            "official test_nonadmin_user after write ACL, got {}",
+            na_put_ok.status
         );
         backend.abort();
     }
@@ -12428,6 +12935,16 @@ mod pipeline_async_tests {
             },
             60.0,
         );
+    }
+
+    fn seed_auth_test_rw(
+        svc: &ProxyAsyncService,
+        container: &str,
+        read_acl: Option<&str>,
+        write_acl: Option<&str>,
+    ) {
+        let app = svc.app.read().unwrap_or_else(|p| p.into_inner());
+        seed_container_rw(&app, "AUTH_test", container, read_acl, write_acl);
     }
 
     #[tokio::test]
@@ -17832,6 +18349,13 @@ mod pipeline_async_tests {
                             } else {
                                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                             }
+                            return;
+                        }
+                        // Official TestObject.test_container_write_only: object
+                        // POST is 202. A leftover that answers GET-like 200
+                        // cannot lock that status.
+                        if is_post {
+                            write_backend_http_status(&mut stream, 202, &[], &[]).await;
                             return;
                         }
                         write_backend_http_status(&mut stream, 200, &[], b"x").await;
