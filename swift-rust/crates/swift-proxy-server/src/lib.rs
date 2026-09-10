@@ -9225,6 +9225,49 @@ mod pipeline_async_tests {
         (svc, backend)
     }
 
+    /// Official TestContainer storage-policy leftovers. `gold` is default (0);
+    /// `silver` is the non-default policy. Do not flip `auth_enabled`.
+    async fn storage_policy_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let mut names = std::collections::HashMap::new();
+        names.insert("gold".to_string(), 0i64);
+        names.insert("silver".to_string(), 1i64);
+        let mut index_names = std::collections::HashMap::new();
+        index_names.insert(0i64, "gold".to_string());
+        index_names.insert(1i64, "silver".to_string());
+        let app = Arc::new(
+            ProxyApp::with_object_ring(
+                ring.clone(),
+                ring.clone(),
+                ring,
+                ProxyConfig {
+                    auth_enabled: false,
+                    conn_timeout: Duration::from_millis(200),
+                    node_timeout: Duration::from_millis(400),
+                    request_node_count_factor: 1,
+                    ..Default::default()
+                },
+            )
+            .with_policy_names(names)
+            .with_policy_index_names(index_names),
+        );
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        (svc, backend)
+    }
+
     fn xml_listing_names(text: &str) -> Vec<String> {
         let mut names = Vec::new();
         let mut rest = text;
@@ -9403,6 +9446,34 @@ mod pipeline_async_tests {
             .collect()
     }
 
+    fn leftover_header_value(text: &str, name: &str) -> Option<String> {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn leftover_stored_policy_index(stored: &HeaderKeyDict) -> Option<String> {
+        stored.iter().find_map(|(k, v)| {
+            if k.eq_ignore_ascii_case("x-backend-storage-policy-index") {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn leftover_policy_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        leftover_stored_policy_index(stored)
+            .map(|v| vec![("X-Backend-Storage-Policy-Index".into(), v)])
+            .unwrap_or_default()
+    }
+
     fn leftover_header_refs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
         pairs
             .iter()
@@ -9480,6 +9551,217 @@ mod pipeline_async_tests {
             Some("text/html; charset=UTF-8"),
             "official test_long_name_content_type 2048 Content-Type {:?}",
             official_long.headers
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_create_container_gets_default_policy_by_default /
+    /// test_error_invalid_storage_policy_name /
+    /// test_create_non_default_storage_policy_container /
+    /// test_conflict_change_storage_policy_with_put /
+    /// test_noop_change_storage_policy_with_post.
+    /// IsolatedIdentity Hyper stamps `X-Backend-Storage-Policy-Index` only for
+    /// a known non-empty name (unknown → 400). Empty `X-Storage-Policy` uses
+    /// `X-Backend-Storage-Policy-Default`. 409-on-policy-change is leftover
+    /// container-server, not Hyper. POST policy headers are not transferred.
+    #[tokio::test]
+    async fn container_storage_policy_on_hyper() {
+        let (svc, backend) = storage_policy_hyper_svc().await;
+        let invalid = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/bad-policy",
+            "",
+            &[("X-Storage-Policy", "taco-not-a-policy")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            invalid.status, 400,
+            "official test_error_invalid_storage_policy_name on Hyper, got {}",
+            invalid.status
+        );
+
+        let default_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/default-pol",
+            "",
+            &[("X-Storage-Policy", "")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            default_put.status / 100,
+            2,
+            "official test_create_container_gets_default_policy_by_default PUT, got {}",
+            default_put.status
+        );
+        let default_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/default-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            default_head.headers.get("X-Storage-Policy"),
+            Some("gold"),
+            "official test_create_container_gets_default_policy_by_default HEAD {:?}",
+            default_head.headers
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/silver-pol",
+                "",
+                &[("X-Storage-Policy", "silver")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_create_non_default_storage_policy_container PUT"
+        );
+        let silver_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            silver_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official test_create_non_default_storage_policy_container HEAD {:?}",
+            silver_head.headers
+        );
+
+        let recreate =
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/silver-pol", "", &[], Vec::new()).await;
+        assert_eq!(
+            recreate.status, 202,
+            "official test_create_non_default_storage_policy_container recreate, got {}",
+            recreate.status
+        );
+        let recreate_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            recreate_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official recreate keeps silver {:?}",
+            recreate_head.headers
+        );
+
+        let conflict = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[("X-Storage-Policy", "gold")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            conflict.status, 409,
+            "official test_conflict_change_storage_policy_with_put, got {}",
+            conflict.status
+        );
+        let conflict_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            conflict_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official conflict PUT keeps original policy {:?}",
+            conflict_head.headers
+        );
+
+        for header in ["X-Storage-Policy", "X-Storage-Policy-Index"] {
+            let post = file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/silver-pol",
+                "",
+                &[(header, "gold")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                post.status, 204,
+                "official test_noop_change_storage_policy_with_post {header}, got {}",
+                post.status
+            );
+        }
+        let post_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            post_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official POST policy headers are no-ops {:?}",
+            post_head.headers
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/silver-pol",
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official non-default policy container DELETE"
+        );
+        let gone = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(
+            gone.status / 100,
+            2,
+            "official deleted container HEAD is not 2xx, got {}",
+            gone.status
+        );
+        assert_eq!(
+            gone.headers.get("X-Storage-Policy"),
+            None,
+            "official deleted container HEAD has no X-Storage-Policy {:?}",
+            gone.headers
         );
         backend.abort();
     }
@@ -12104,10 +12386,7 @@ mod pipeline_async_tests {
             "official test_protected_tempurl read-only GET, got {}",
             ro_get.status
         );
-        assert_eq!(
-            ro_get.headers.get("X-Account-Meta-Test"),
-            Some("acct-meta")
-        );
+        assert_eq!(ro_get.headers.get("X-Account-Meta-Test"), Some("acct-meta"));
         assert!(
             ro_get.headers.get("X-Account-Meta-Temp-Url-Key").is_none(),
             "official test_protected_tempurl RO must hide temp-url-key"
@@ -12149,10 +12428,7 @@ mod pipeline_async_tests {
             "official test_protected_tempurl read-write GET, got {}",
             rw_get.status
         );
-        assert_eq!(
-            rw_get.headers.get("X-Account-Meta-Test"),
-            Some("acct-meta")
-        );
+        assert_eq!(rw_get.headers.get("X-Account-Meta-Test"), Some("acct-meta"));
         assert!(
             rw_get.headers.get("X-Account-Meta-Temp-Url-Key").is_none(),
             "official test_protected_tempurl RW must hide temp-url-key"
@@ -18573,8 +18849,7 @@ mod pipeline_async_tests {
                     };
                     if logical == "/AUTH_test" {
                         if is_post {
-                            let mut stored =
-                                account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut stored = account_meta.lock().unwrap_or_else(|p| p.into_inner());
                             leftover_apply_user_meta("account", &mut stored, &text, false);
                             leftover_apply_account_sysmeta(&mut stored, &text);
                         }
@@ -18717,24 +18992,51 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_put {
-                        let inserted = containers
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(container.clone());
-                        {
-                            let mut guard =
-                                container_meta.lock().unwrap_or_else(|p| p.into_inner());
-                            let stored = guard.entry(container.clone()).or_default();
-                            leftover_apply_user_meta("container", stored, &text, true);
-                            leftover_apply_container_acl(stored, &text);
-                        }
-                        write_backend_http_status(
-                            &mut stream,
-                            if inserted { 201 } else { 202 },
-                            &[],
-                            &[],
-                        )
-                        .await;
+                        let incoming_idx =
+                            leftover_header_value(&text, "X-Backend-Storage-Policy-Index");
+                        let default_idx =
+                            leftover_header_value(&text, "X-Backend-Storage-Policy-Default")
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| "0".into());
+                        let status = {
+                            let mut containers =
+                                containers.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut meta = container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let inserted = containers.insert(container.clone());
+                            let stored = meta.entry(container.clone()).or_default();
+                            if !inserted {
+                                if let Some(ref new_idx) = incoming_idx {
+                                    if leftover_stored_policy_index(stored)
+                                        .is_some_and(|old| old != *new_idx)
+                                    {
+                                        409
+                                    } else {
+                                        leftover_apply_user_meta("container", stored, &text, true);
+                                        leftover_apply_container_acl(stored, &text);
+                                        if leftover_stored_policy_index(stored).is_none() {
+                                            stored.set("X-Backend-Storage-Policy-Index", new_idx);
+                                        }
+                                        202
+                                    }
+                                } else {
+                                    leftover_apply_user_meta("container", stored, &text, true);
+                                    leftover_apply_container_acl(stored, &text);
+                                    if leftover_stored_policy_index(stored).is_none() {
+                                        stored.set("X-Backend-Storage-Policy-Index", &default_idx);
+                                    }
+                                    202
+                                }
+                            } else {
+                                leftover_apply_user_meta("container", stored, &text, true);
+                                leftover_apply_container_acl(stored, &text);
+                                stored.set(
+                                    "X-Backend-Storage-Policy-Index",
+                                    incoming_idx.as_deref().unwrap_or(default_idx.as_str()),
+                                );
+                                201
+                            }
+                        };
+                        write_backend_http_status(&mut stream, status, &[], &[]).await;
                         return;
                     }
                     let exists = containers
@@ -18806,6 +19108,7 @@ mod pipeline_async_tests {
                         ];
                         extra.extend(meta_pairs);
                         extra.extend(leftover_acl_pairs(&stored));
+                        extra.extend(leftover_policy_pairs(&stored));
                         let refs = leftover_header_refs(&extra);
                         write_backend_http_status(&mut stream, 204, &refs, &[]).await;
                         return;
@@ -18844,6 +19147,7 @@ mod pipeline_async_tests {
                             vec![("Content-Type".to_string(), "application/json".to_string())];
                         extra.extend(meta_pairs);
                         extra.extend(leftover_acl_pairs(&stored));
+                        extra.extend(leftover_policy_pairs(&stored));
                         let refs = leftover_header_refs(&extra);
                         write_backend_http(&mut stream, &refs, &payload).await;
                         return;
@@ -19519,7 +19823,9 @@ mod pipeline_async_tests {
                             let extra = {
                                 let guard =
                                     container_meta.lock().unwrap_or_else(|p| p.into_inner());
-                                leftover_acl_pairs(guard.get(&logical).unwrap_or(&HeaderKeyDict::new()))
+                                leftover_acl_pairs(
+                                    guard.get(&logical).unwrap_or(&HeaderKeyDict::new()),
+                                )
                             };
                             let refs = leftover_header_refs(&extra);
                             write_backend_http_status(&mut stream, 204, &refs, &[]).await;
