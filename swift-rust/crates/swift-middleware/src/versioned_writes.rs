@@ -1072,6 +1072,35 @@ impl VersionedWrites {
         req
     }
 
+    /// Client-auth subrequest to a hidden versions object.
+    ///
+    /// Official `test_container_acls`: X-Container-Read on the public
+    /// container allows GET current, but GET `?version-id=` is a request
+    /// against the reserved versions container and still requires a
+    /// swift_owner. Pre-authing that GET (Authorize-Override) is the IsolatedIdentity
+    /// hole that made `assertRaises(ResponseError)` fail.
+    fn modern_client_version_request(
+        method: &str,
+        path: String,
+        query_string: &str,
+        source_headers: &swift_http::HeaderKeyDict,
+    ) -> Request {
+        let mut req = Request {
+            method: method.to_string(),
+            path,
+            query_string: query_string.to_string(),
+            headers: source_headers.clone(),
+            body: Body::empty(),
+        };
+        req.headers.remove("Content-Length");
+        req.headers.remove("Transfer-Encoding");
+        req.headers.remove("X-Backend-Authorize-Override");
+        if req.path.contains('\0') {
+            req.headers.set("X-Backend-Allow-Reserved-Names", "true");
+        }
+        req
+    }
+
     fn modern_authorization_probe(req: &AsyncRequest) -> Request {
         let mut authorize = Request {
             method: req.method.clone(),
@@ -2012,7 +2041,7 @@ impl VersionedWrites {
                     // public request; archive subrequest must not drop
                     // symlink=get or the archive user-symlink is followed).
                     let rest = query_without_param(&req.query_string, "version-id");
-                    let archive = Self::modern_internal_request(
+                    let archive = Self::modern_client_version_request(
                         &req.method,
                         archive_path,
                         &rest,
@@ -3825,6 +3854,68 @@ mod tests {
                 .iter()
                 .all(|(m, p, _)| !(m == "GET" && p == "/v1/AUTH_test/c/obj")),
             "403 PUT must not GET current: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_id_get_does_not_preauth_archive() {
+        // Official test_container_acls: container read ACL allows GET current
+        // but GET ?version-id= is against the reserved versions container and
+        // must keep the client token (no Authorize-Override).
+        type Call = (String, String, HeaderKeyDict);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.headers.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_ENABLED, "true");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if req
+                    .headers
+                    .get("X-Backend-Authorize-Override")
+                    .is_some_and(config_true_value)
+                {
+                    return Response::new(200);
+                }
+                Response::new(403)
+            })
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", "user3");
+        let req = AsyncRequest {
+            method: "GET".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: "version-id=1751500000.00000".to_string(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 403);
+        let calls = calls.lock().unwrap();
+        let archive = calls.iter().find(|(m, p, _)| {
+            m == "GET" && p.contains("versions") && !p.ends_with("/c/obj")
+        });
+        assert!(archive.is_some(), "must GET archive: {calls:?}");
+        assert_ne!(
+            archive.unwrap().2.get("X-Backend-Authorize-Override"),
+            Some("true"),
+            "version-id GET must not be pre-authed: {calls:?}"
         );
     }
 
