@@ -14126,6 +14126,81 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official extra-file TestContainer.test_container_quota_bytes.
+    /// ContainerQuotas is outer leftover (no stub). Do not flip
+    /// `container_func_hyper_svc`.
+    #[tokio::test]
+    async fn extra_file_container_quota_bytes_on_hyper() {
+        let (mut svc, backend) = container_func_hyper_svc().await;
+        svc.filters
+            .insert(0, Arc::new(swift_middleware::ContainerQuotas::new()));
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/quota-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT quota-c"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/quota-c",
+                "",
+                &[("X-Container-Meta-Quota-Bytes", "10")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_container_quota_bytes POST quota"
+        );
+        let head =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/quota-c", "", &[], Vec::new()).await;
+        assert!(
+            matches!(head.status, 200 | 204),
+            "official test_container_quota_bytes HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers.get("X-Container-Meta-Quota-Bytes"),
+            Some("10"),
+            "official test_container_quota_bytes HEAD quota"
+        );
+        let over = leftover_put_object(
+            &svc,
+            "/v1/AUTH_test/quota-c/object",
+            "",
+            &[],
+            b"01234567890",
+        )
+        .await;
+        assert_eq!(
+            over.status, 413,
+            "official test_container_quota_bytes PUT 11 bytes"
+        );
+        assert_eq!(
+            leftover_body_text(over).await,
+            "Upload exceeds quota.",
+            "official test_container_quota_bytes 413 body"
+        );
+        assert_eq!(
+            leftover_put_object(&svc, "/v1/AUTH_test/quota-c/object", "", &[], b"0123456789",)
+                .await
+                .status,
+            201,
+            "official test_container_quota_bytes PUT 10 bytes"
+        );
+        let got = leftover_container_get(&svc, "/v1/AUTH_test/quota-c/object", "").await;
+        assert_eq!(got.status, 200);
+        assert_eq!(
+            leftover_body_text(got).await,
+            "0123456789",
+            "official test_container_quota_bytes GET body"
+        );
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
