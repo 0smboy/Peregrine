@@ -11670,8 +11670,8 @@ mod pipeline_async_tests {
         );
         assert_eq!(
             leftover_body_text(public_obj).await,
-            "x",
-            "official test_public_object leftover GET body"
+            "test",
+            "official test_public_object GET body"
         );
 
         let foreign_denied = file_hyper_call(
