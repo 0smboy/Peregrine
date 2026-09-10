@@ -9748,7 +9748,12 @@ mod pipeline_async_tests {
             names.sort();
             names.into_iter().map(str::to_string).collect()
         };
-        let qpath = |p: &str| format!("path={}", p.replace(' ', "%20"));
+        let qpath = |p: &str| {
+            format!(
+                "path={}",
+                p.replace('+', "%2B").replace(' ', "%20")
+            )
+        };
         assert_eq!(
             listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/")).await,
             expect(vec!["/dir1/", "/dir2/", "/file1", "/file A"]),
@@ -9800,6 +9805,16 @@ mod pipeline_async_tests {
             .await,
             expect(vec!["dir1/subdir with spaces/file B"]),
             "official testStructure path=dir1/subdir with spaces/"
+        );
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/paths",
+                &qpath("dir1/subdir+with{whatever/")
+            )
+            .await,
+            expect(vec!["dir1/subdir+with{whatever/file D"]),
+            "official testStructure path=dir1/subdir+with{whatever/"
         );
         assert!(
             listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1/subdir2"))
@@ -9869,7 +9884,7 @@ mod pipeline_async_tests {
                 let q = if path.is_empty() {
                     "path=".to_string()
                 } else {
-                    format!("path={}", path.replace(' ', "%20"))
+                    format!("path={}", path.replace('+', "%2B").replace(' ', "%20"))
                 };
                 for item in listing_plain_names(svc, "/v1/AUTH_test/paths", &q).await {
                     assert!(
