@@ -13685,6 +13685,78 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.test_swift_account_acls /
+    /// test_swift_prohibits_garbage_account_acls. TempAuth rejects
+    /// non-JSON ACL with 400 in `authorize_async` before leftover persist,
+    /// so a later GET still shows `{"admin":["bob"]}`, never `yuck`.
+    /// Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn swift_account_acls_garbage_does_not_persist_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        let empty = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&empty.status),
+            "official test_swift_account_acls empty GET, got {}",
+            empty.status
+        );
+        assert!(
+            empty.headers.get("X-Account-Access-Control").is_none(),
+            "official test_swift_account_acls empty ACL must not echo"
+        );
+
+        let acl_json = r#"{"admin":["bob"]}"#;
+        leftover_grant_account_acl(&svc, owner.as_str(), acl_json).await;
+        let stored = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&stored.status),
+            "official test_swift_account_acls GET after POST, got {}",
+            stored.status
+        );
+        assert_eq!(
+            stored.headers.get("X-Account-Access-Control"),
+            Some(acl_json),
+            "official test_swift_account_acls GET must echo compact v2 ACL"
+        );
+
+        let garbage = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", "yuck"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            garbage.status, 400,
+            "official test_swift_account_acls TempAuth yuck is 400, got {}",
+            garbage.status
+        );
+        let after = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&after.status),
+            "official test_swift_account_acls GET after yuck, got {}",
+            after.status
+        );
+        assert_eq!(
+            after.headers.get("X-Account-Access-Control"),
+            Some(acl_json),
+            "official test_swift_account_acls GET must keep bob, not yuck"
+        );
+        assert_ne!(
+            after.headers.get("X-Account-Access-Control"),
+            Some("yuck"),
+            "official test_swift_prohibits_garbage_account_acls"
+        );
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
