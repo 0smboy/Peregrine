@@ -13078,6 +13078,280 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestObject.test_read_only / test_read_write / test_admin.
+    /// Leftover object GET returns stored PUT bytes (not the stub `x`).
+    /// Official RO "delete" is a PUT with an empty body (403 because RO
+    /// cannot PUT). Must hit `authorize_async` (no intercepting stub).
+    #[tokio::test]
+    async fn account_acl_v2_object_crud_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/src",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/objacl",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only listing before grant"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/objacl/src",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only GET before grant"
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let (ro_list_status, ro_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert_eq!(
+            ro_list_status, 200,
+            "official test_read_only listing after grant, got {ro_list_status}"
+        );
+        assert!(
+            ro_names.iter().any(|n| n == "src"),
+            "official test_read_only listing contains src, got {ro_names:?}"
+        );
+        let ro_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/objacl/src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ro_get.status, 200,
+            "official test_read_only GET after grant, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            leftover_body_text(ro_get).await,
+            "test",
+            "official test_read_only GET body"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/ro-denied",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only cannot PUT"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/src",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "0"),
+                    ("Content-Type", "text/plain"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only cannot PUT-as-delete"
+        );
+        let (_, ro_still) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert!(ro_still.iter().any(|n| n == "src"));
+        assert!(!ro_still.iter().any(|n| n == "ro-denied"));
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/objacl/src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(rw_get.status, 200);
+        assert_eq!(leftover_body_text(rw_get).await, "test");
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/rw-new",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_read_write can PUT"
+        );
+        let rw_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/objacl/src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            rw_del.status == 204 || rw_del.status == 404,
+            "official test_read_write DELETE, got {}",
+            rw_del.status
+        );
+        let (_, rw_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert!(
+            rw_names.iter().any(|n| n == "rw-new"),
+            "official test_read_write listing has new object, got {rw_names:?}"
+        );
+        assert!(!rw_names.iter().any(|n| n == "src"));
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/admin-src",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/objacl/admin-src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(admin_get.status, 200);
+        assert_eq!(leftover_body_text(admin_get).await, "test");
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/admin-new",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_admin can PUT"
+        );
+        let admin_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/objacl/admin-src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            admin_del.status == 204 || admin_del.status == 404,
+            "official test_admin DELETE, got {}",
+            admin_del.status
+        );
+        let (_, admin_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert!(admin_names.iter().any(|n| n == "admin-new"));
+        assert!(!admin_names.iter().any(|n| n == "admin-src"));
+        backend.abort();
+    }
+
     /// Official TestAccountNoContainers.testInvalidUTF8Path and the
     /// invalid half of TestContainer.testUtf8Container. IsolatedIdentity
     /// `no_path_quote` puts raw / percent-decoded non-UTF-8 on the request
@@ -19376,6 +19650,10 @@ mod pipeline_async_tests {
             HeaderKeyDict,
         >::new()));
         let account_meta = Arc::new(std::sync::Mutex::new(HeaderKeyDict::new()));
+        let object_bodies = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Vec<u8>,
+        >::new()));
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -19386,6 +19664,7 @@ mod pipeline_async_tests {
                 let stats = Arc::clone(&stats);
                 let container_meta = Arc::clone(&container_meta);
                 let account_meta = Arc::clone(&account_meta);
+                let object_bodies = Arc::clone(&object_bodies);
                 tokio::spawn(async move {
                     let mut stream = stream;
                     let (text, body) = read_backend_http_request(&mut stream).await;
@@ -19507,6 +19786,10 @@ mod pipeline_async_tests {
                                 .entry(container.to_string())
                                 .or_default()
                                 .push(object.to_string());
+                            object_bodies
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(logical.clone(), body.clone());
                             {
                                 let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
                                 let entry = st.entry(container.to_string()).or_insert((0, 0));
@@ -19543,6 +19826,10 @@ mod pipeline_async_tests {
                                 }
                             };
                             if removed {
+                                object_bodies
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&logical);
                                 write_backend_http_status(&mut stream, 204, &[], &[]).await;
                             } else {
                                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
@@ -19556,7 +19843,14 @@ mod pipeline_async_tests {
                             write_backend_http_status(&mut stream, 202, &[], &[]).await;
                             return;
                         }
-                        write_backend_http_status(&mut stream, 200, &[], b"x").await;
+                        let payload = object_bodies
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&logical)
+                            .cloned()
+                            .unwrap_or_else(|| b"x".to_vec());
+                        let send = if is_head { &[][..] } else { payload.as_slice() };
+                        write_backend_http_status(&mut stream, 200, &[], send).await;
                         return;
                     }
                     let container = rest.to_string();
