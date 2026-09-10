@@ -36,13 +36,88 @@ pub fn parse_acl_v1(acl_string: &str) -> (Vec<String>, Vec<String>) {
     if !acl_string.is_empty() {
         for value in acl_string.split(',') {
             if let Some(rest) = value.strip_prefix(".r:") {
-                referrers.push(rest.to_string());
+                // Python clean_acl: `.r:*.example.com` → `.r:.example.com`
+                // (leading `*.` is a domain wildcard). IsolatedIdentity
+                // TestSlo/TestDlo referer tests POST that form.
+                referrers.push(normalize_referrer_designation(rest));
             } else {
                 groups.push(unquote(value));
             }
         }
     }
     (referrers, groups)
+}
+
+/// Python `swift.common.middleware.acl.clean_acl`: validate and rewrite a
+/// container ACL header. `.ref`/`.referer`/`.referrer` become `.r`; a
+/// leading `*.` domain is shortened to `.` (`*.example.com` → `.example.com`).
+/// Write ACLs may not contain referrer designations.
+pub fn clean_acl(name: &str, value: &str) -> Result<String, String> {
+    let name_l = name.to_ascii_lowercase();
+    let mut values = Vec::new();
+    for raw_value in value.split(',') {
+        let raw_value = raw_value.trim();
+        if raw_value.is_empty() {
+            continue;
+        }
+        if !raw_value.contains(':') {
+            values.push(raw_value.to_string());
+            continue;
+        }
+        let Some((first, second)) = raw_value.split_once(':') else {
+            values.push(raw_value.to_string());
+            continue;
+        };
+        let first = first.trim();
+        let mut second = second.trim().to_string();
+        if first.is_empty() || !first.starts_with('.') {
+            values.push(raw_value.to_string());
+            continue;
+        }
+        if matches!(first, ".r" | ".ref" | ".referer" | ".referrer") {
+            if name_l.contains("write") {
+                return Err(format!("Referrers not allowed in write ACL: '{raw_value}'"));
+            }
+            let mut negate = false;
+            if second.starts_with('-') {
+                negate = true;
+                second = second[1..].trim().to_string();
+            }
+            if !second.is_empty() && second != "*" && second.starts_with('*') {
+                second = second[1..].trim().to_string();
+            }
+            if second.is_empty() || second == "." {
+                return Err(format!(
+                    "No host/domain value after referrer designation in ACL: '{raw_value}'"
+                ));
+            }
+            values.push(format!(".r:{}{second}", if negate { "-" } else { "" }));
+        } else {
+            return Err(format!(
+                "Unknown designator '{first}' in ACL: '{raw_value}'"
+            ));
+        }
+    }
+    Ok(values.join(","))
+}
+
+/// Python `clean_acl` star-domain rewrite on a `.r:` payload (`*.example.com`
+/// → `.example.com`; `-*.example.com` → `-.example.com`). Bare `*` is kept.
+fn normalize_referrer_designation(rest: &str) -> String {
+    let (negated, host) = match rest.strip_prefix('-') {
+        Some(host) => (true, host),
+        None => (false, rest),
+    };
+    let host = if host != "*" && host.starts_with('*') {
+        host.trim_start_matches('*')
+    } else {
+        host
+    };
+    if negated {
+        format!("-{host}")
+    } else {
+        host.to_string()
+    }
 }
 
 /// `referrer_allowed`: whether `referrer` is permitted by `referrer_acl` (the
@@ -307,6 +382,36 @@ mod tests {
         let suffix = vec![".example.com".to_string()];
         assert!(referrer_allowed(Some("http://www.example.com/"), &suffix));
         assert!(!referrer_allowed(Some("http://example.com/"), &suffix));
+
+        let (star_domain, groups) = parse_acl_v1(".r:*.example.com,.rlistings");
+        assert_eq!(star_domain, vec![".example.com"]);
+        assert_eq!(groups, vec![".rlistings"]);
+        assert!(referrer_allowed(
+            Some("http://blah.example.com"),
+            &star_domain
+        ));
+    }
+
+    #[test]
+    fn test_clean_acl_star_domain_and_aliases() {
+        assert_eq!(
+            clean_acl("X-Container-Read", ".r:*.example.com,.rlistings").unwrap(),
+            ".r:.example.com,.rlistings"
+        );
+        assert_eq!(
+            clean_acl("X-Container-Read", ".ref:*.example.com").unwrap(),
+            ".r:.example.com"
+        );
+        assert_eq!(
+            clean_acl("X-Container-Read", "bob , sue,,.r: *").unwrap(),
+            "bob,sue,.r:*"
+        );
+        assert!(clean_acl("X-Container-Write", ".r:*")
+            .unwrap_err()
+            .contains("Referrers not allowed in write ACL"));
+        assert!(clean_acl("X-Container-Read", ".r:")
+            .unwrap_err()
+            .contains("No host/domain value"));
     }
 
     #[test]

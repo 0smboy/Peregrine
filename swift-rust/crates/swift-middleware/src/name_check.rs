@@ -37,7 +37,7 @@
 
 use swift_http::{Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 /// Default forbidden characters (`FORBIDDEN_CHARS`): single-quote,
 /// double-quote, backtick, `<`, `>`.
@@ -101,31 +101,46 @@ impl NameCheck {
     fn forbidden_chars_display(&self) -> String {
         self.forbidden_chars.iter().collect()
     }
-}
 
-impl Middleware for NameCheck {
-    fn handle(&self, req: Request, next: &NextFn) -> Response {
-        if self.check_character(&req.path) {
-            return bad_request(format!(
+    /// First matching check in Python order (character, length, regexp).
+    /// IsolatedIdentity Hyper never calls `handle()`; `prepare` must 400.
+    fn reject(&self, path: &str) -> Option<Response> {
+        if self.check_character(path) {
+            return Some(bad_request(format!(
                 "Object/Container/Account name contains forbidden chars from {}",
                 self.forbidden_chars_display()
-            ));
+            )));
         }
-        if self.check_length(&req.path) {
-            return bad_request(format!(
+        if self.check_length(path) {
+            return Some(bad_request(format!(
                 "Object/Container/Account name longer than the allowed maximum {}",
                 self.maximum_length
-            ));
+            )));
         }
-        if self.check_regexp(&req.path) {
-            return bad_request(format!(
+        if self.check_regexp(path) {
+            return Some(bad_request(format!(
                 "Object/Container/Account name contains a forbidden substring \
                  from regular expression {}",
                 self.forbidden_regexp.as_deref().unwrap_or("")
-            ));
+            )));
         }
-        // Pass on to the downstream component.
-        next(req)
+        None
+    }
+}
+
+impl Middleware for NameCheck {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
+        match self.reject(&req.path) {
+            Some(resp) => MwPrep::ShortCircuit(resp),
+            None => MwPrep::Continue,
+        }
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => resp,
+            MwPrep::Continue => next(req),
+        }
     }
 }
 
@@ -340,6 +355,31 @@ mod tests {
         // 256 chars: rejected
         let path: String = "é".repeat(MAX_LENGTH + 1);
         assert_eq!(run(&nc, &path).status, 400);
+    }
+
+    // IsolatedIdentity Hyper only calls prepare(); it must 400 the same
+    // forbidden-char body as handle().
+    #[test]
+    fn test_prepare_rejects_forbidden_character() {
+        let nc = NameCheck::default();
+        let mut request = req("/V1.0/1234\"5");
+        match nc.prepare(&mut request) {
+            MwPrep::ShortCircuit(mut resp) => {
+                resp.body.materialize(u64::MAX).unwrap();
+                assert_eq!(resp.status, 400);
+                assert_eq!(
+                    body_bytes(&resp),
+                    format!(
+                        "Object/Container/Account name contains forbidden chars from {}",
+                        FORBIDDEN_CHARS
+                    )
+                    .as_bytes()
+                );
+            }
+            MwPrep::Continue => panic!("prepare must short-circuit forbidden chars"),
+        }
+        let mut ok = req("/V1.0/ok");
+        assert!(matches!(nc.prepare(&mut ok), MwPrep::Continue));
     }
 
     // Fidelity to Python's `$`: it also anchors just before a single

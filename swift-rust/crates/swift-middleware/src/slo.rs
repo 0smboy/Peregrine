@@ -128,6 +128,17 @@ fn manifest_object_delete_query(req: &Request) -> String {
 
 fn slo_override(req: &Request) -> bool {
     config_true_value(req.headers.get("X-Backend-Slo-Override").unwrap_or(""))
+        || req
+            .headers
+            .contains_key(crate::versioned_writes::AUTHORIZE_ONLY_HEADER)
+}
+
+/// IsolatedIdentity `versioned_writes._get_source_object` / `_put_versioned_obj`
+/// (swift.source=`VW`). Official `test_slo_manifest_version` archives the
+/// stored SLO JSON, not the assembled bytes. Hyper `reassemble_async` would
+/// otherwise expand the captured GET before VW PUTs the version.
+fn is_versioned_writes_source(req: &Request) -> bool {
+    req.headers.get("X-Backend-Source") == Some("VW")
 }
 
 /// One entry in a validated SLO manifest, as far as the Etag/size calculation
@@ -409,7 +420,10 @@ fn expand_segments(
                     "There was a conflict when trying to complete your request.",
                 ));
             }
-            let path = format!("/{version}/{account}{}", seg.name);
+            if let Some(denied) = slo_tempurl_scope_denied(orig, version, account, &seg.name) {
+                return Err(denied);
+            }
+            let path = slo_segment_path(version, account, &seg.name);
             let sub = slo_subreq(orig, path.clone(), None);
             let mut sresp = next(sub);
             if !(200..300).contains(&sresp.status) {
@@ -497,7 +511,10 @@ async fn expand_segments_async(
                     "There was a conflict when trying to complete your request.",
                 ));
             }
-            let path = format!("/{version}/{account}{}", seg.name);
+            if let Some(denied) = slo_tempurl_scope_denied(&orig, &version, &account, &seg.name) {
+                return Err(denied);
+            }
+            let path = slo_segment_path(&version, &account, &seg.name);
             let sub = slo_subreq(&orig, path.clone(), None);
             let sresp = next(sub).await;
             if !(200..300).contains(&sresp.status) {
@@ -567,6 +584,53 @@ fn first_segment_failure(status: u16) -> Response {
     }
 }
 
+/// Stored / leaf segment path as issued to `next` (`/{api}/{account}{name}`).
+fn slo_segment_path(version: &str, account: &str, name: &str) -> String {
+    format!("/{version}/{account}{name}")
+}
+
+/// Container-scoped TempURL (OSSA 2015-016): refuse a segment whose path
+/// is outside `X-Backend-Tempurl-Allowed-Prefix` *before* the GET. Account
+/// TempURL (no prefix) still assembles cross-container SLOs.
+fn slo_tempurl_scope_denied(
+    orig: &Request,
+    version: &str,
+    account: &str,
+    name: &str,
+) -> Option<Response> {
+    if name.is_empty() {
+        return None;
+    }
+    let path = slo_segment_path(version, account, name);
+    if crate::tempurl_path_in_scope(orig, &path) {
+        None
+    } else {
+        Some(crate::tempurl_out_of_scope(&orig.method))
+    }
+}
+
+fn slo_reject_out_of_scope_stored(
+    orig: &Request,
+    version: &str,
+    account: &str,
+    segments: &[StoredSeg],
+) -> Option<Response> {
+    segments
+        .iter()
+        .find_map(|seg| slo_tempurl_scope_denied(orig, version, account, &seg.name))
+}
+
+fn slo_reject_out_of_scope_leaves(
+    orig: &Request,
+    version: &str,
+    account: &str,
+    leaves: &[LeafSeg],
+) -> Option<Response> {
+    leaves
+        .iter()
+        .find_map(|leaf| slo_tempurl_scope_denied(orig, version, account, &leaf.name))
+}
+
 async fn collect_ranged_leaves_async(
     orig: Request,
     version: String,
@@ -610,7 +674,10 @@ fn prefetch_first_leaf(
     if leaf.raw_data.is_some() {
         return Ok(None);
     }
-    let path = format!("/{version}/{account}{}", leaf.name);
+    if let Some(denied) = slo_tempurl_scope_denied(orig, version, account, &leaf.name) {
+        return Err(denied);
+    }
+    let path = slo_segment_path(version, account, &leaf.name);
     let response = next(slo_subreq(orig, path, leaf.range.as_deref()));
     if !(200..300).contains(&response.status) {
         return Err(first_segment_failure(response.status));
@@ -631,7 +698,10 @@ async fn prefetch_first_leaf_async(
     if leaf.raw_data.is_some() {
         return Ok(None);
     }
-    let path = format!("/{version}/{account}{}", leaf.name);
+    if let Some(denied) = slo_tempurl_scope_denied(&orig, &version, &account, &leaf.name) {
+        return Err(denied);
+    }
+    let path = slo_segment_path(&version, &account, &leaf.name);
     let response = next(slo_subreq(&orig, path, leaf.range.as_deref())).await;
     if !(200..300).contains(&response.status) {
         return Err(first_segment_failure(response.status));
@@ -1376,6 +1446,9 @@ fn slo_subreq(orig: &Request, path: String, range: Option<&str>) -> Request {
 
 impl Slo {
     fn handle_get_head(&self, mut req: Request, next: &NextFn) -> Response {
+        if is_versioned_writes_source(&req) {
+            return next(req);
+        }
         ignore_range(&mut req.headers, SLO_HEADER);
         let orig = req.clone_head();
         // Backend ETag is the physical JSON; evaluate If-* against the SLO
@@ -1451,6 +1524,7 @@ impl Slo {
                 let mut get_req = orig.clone_head();
                 get_req.method = "GET".to_string();
                 ignore_range(&mut get_req.headers, SLO_HEADER);
+                strip_conditionals(&mut get_req.headers);
                 resp = next(get_req);
                 if !resp
                     .headers
@@ -1510,6 +1584,13 @@ impl Slo {
         };
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
+        if is_get {
+            if let Some(denied) =
+                slo_reject_out_of_scope_stored(&orig, &version, &account, &segments)
+            {
+                return denied;
+            }
+        }
 
         let part_num = match parse_part_number(&orig) {
             Ok(p) => p,
@@ -1577,6 +1658,12 @@ impl Slo {
         } else {
             Vec::new()
         };
+        if is_get {
+            if let Some(denied) = slo_reject_out_of_scope_leaves(&orig, &version, &account, &leaves)
+            {
+                return denied;
+            }
+        }
 
         let (status, body, content_len) = if let Some((first, last_excl)) = byte_range {
             let ranged = if is_get {
@@ -1677,6 +1764,9 @@ impl Slo {
     }
 
     async fn handle_get_head_async(&self, mut req: Request, next: AsyncNextFn) -> Response {
+        if is_versioned_writes_source(&req) {
+            return next(req).await;
+        }
         ignore_range(&mut req.headers, SLO_HEADER);
         let orig = req.clone_head();
         strip_conditionals(&mut req.headers);
@@ -1766,6 +1856,7 @@ impl Slo {
                 let mut get_req = orig.clone_head();
                 get_req.method = "GET".to_string();
                 ignore_range(&mut get_req.headers, SLO_HEADER);
+                strip_conditionals(&mut get_req.headers);
                 resp = next(get_req).await;
                 if !resp
                     .headers
@@ -1825,6 +1916,13 @@ impl Slo {
         };
         let version = parts[0].clone().unwrap_or_default();
         let account = parts[1].clone().unwrap_or_default();
+        if is_get {
+            if let Some(denied) =
+                slo_reject_out_of_scope_stored(&orig, &version, &account, &segments)
+            {
+                return denied;
+            }
+        }
 
         let part_num = match parse_part_number(&orig) {
             Ok(p) => p,
@@ -1897,6 +1995,12 @@ impl Slo {
         } else {
             Vec::new()
         };
+        if is_get {
+            if let Some(denied) = slo_reject_out_of_scope_leaves(&orig, &version, &account, &leaves)
+            {
+                return denied;
+            }
+        }
 
         let (status, body, content_len) = if let Some((first, last_excl)) = byte_range {
             let ranged = if is_get {
@@ -3105,6 +3209,21 @@ fn validate_put_entries(
             errors.push(format!("Index {i}: extraneous keys {}", extras.join(", ")));
             continue;
         }
+        // IsolatedIdentity Swift 2.9: keys are required, values may be null
+        // (official test_slo_missing_etag / test_slo_unspecified_etag).
+        let missing: Vec<&str> = ["etag", "path", "size_bytes"]
+            .into_iter()
+            .filter(|key| !e.contains_key(*key))
+            .collect();
+        if !missing.is_empty() {
+            let listed = missing
+                .iter()
+                .map(|key| format!("\"{key}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            errors.push(format!("Index {i}: missing keys {listed}"));
+            continue;
+        }
         has_object_backed = true;
         let stripped_path = path.trim_matches('/');
         let valid_path = stripped_path
@@ -3766,6 +3885,9 @@ impl Middleware for Slo {
             if slo_override(&req) {
                 return next(req).await;
             }
+            if is_versioned_writes_source(&req) {
+                return next(req).await;
+            }
             if split_path(&req.path, 4, 4, true).is_err() {
                 if req.method == "GET" && split_path(&req.path, 3, 3, false).is_ok() {
                     let mut resp = next(req).await;
@@ -3819,6 +3941,9 @@ impl Middleware for Slo {
         }
         // GET/HEAD reassembles unless ?multipart-manifest=get asked for raw.
         if is_get_head {
+            if is_versioned_writes_source(&req) {
+                return next(req);
+            }
             return self.handle_get_head(req, next);
         }
         next(req)
@@ -4047,6 +4172,98 @@ mod tests {
             resp.headers.get(MANIFEST_ETAG_HEADER),
             Some(manifest_etag(&two_segment_manifest_json()).as_str())
         );
+    }
+
+    fn other_container_slo_backend() -> NextFn {
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/other/s1", "bytes": 3, "hash": md5_hex(b"one")},
+        ]))
+        .unwrap();
+        let mut manifest = Response::with_body(200, manifest_json);
+        manifest.headers.set("X-Static-Large-Object", "True");
+        manifest.headers.set("Content-Type", "text/plain");
+        backend(vec![
+            ("GET", "/v1/a/c/manifest", manifest),
+            (
+                "GET",
+                "/v1/a/other/s1",
+                Response::with_body(200, b"one".to_vec()),
+            ),
+        ])
+    }
+
+    /// Same OSSA as TestContainerTempurl.test_GET_DLO_outside_container:
+    /// a container-scoped TempURL must 401 before fetching another container.
+    #[test]
+    fn test_container_tempurl_slo_outside_container_is_401() {
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let inner = other_container_slo_backend();
+        let be: NextFn = Arc::new(move |req: Request| {
+            log2.lock()
+                .unwrap()
+                .push((req.method.clone(), req.path.clone()));
+            inner(req)
+        });
+        let mut req = slo_get("/v1/a/c/manifest", None);
+        req.headers
+            .set(crate::TEMPURL_ALLOWED_PREFIX_HEADER, "/v1/a/c");
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 401);
+        assert!(
+            String::from_utf8_lossy(&body_of(&mut resp)).contains("Temp URL invalid"),
+            "container-scope SLO must use TempURL 401 body"
+        );
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.iter().all(|(_, path)| path != "/v1/a/other/s1"),
+            "must not GET the foreign segment, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_account_tempurl_slo_outside_container_still_assembles() {
+        let be = other_container_slo_backend();
+        let mut resp = Slo::new().handle(slo_get("/v1/a/c/manifest", None), &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), b"one");
+    }
+
+    #[tokio::test]
+    async fn test_async_container_tempurl_slo_outside_container_is_401() {
+        let inner = other_container_slo_backend();
+        let next: crate::AsyncNextFn = Arc::new(move |request| {
+            let inner = Arc::clone(&inner);
+            Box::pin(async move { inner(request) })
+        });
+        let mut req = slo_get("/v1/a/c/manifest", None);
+        req.headers
+            .set(crate::TEMPURL_ALLOWED_PREFIX_HEADER, "/v1/a/c");
+        let mut resp = Slo::new().reassemble_async(req, next).await;
+        assert_eq!(resp.status, 401);
+        assert!(
+            String::from_utf8_lossy(&body_of(&mut resp)).contains("Temp URL invalid"),
+            "Hyper SLO must 401 before assembling a foreign segment"
+        );
+    }
+
+    /// Official TestSlo.test_slo_referer_on_segment_container: manifest
+    /// readable, first segment 403 → 409 Conflict (not 403).
+    #[test]
+    fn test_slo_referer_denied_on_segment_is_409() {
+        let manifest_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/other/s1", "bytes": 3, "hash": md5_hex(b"one")},
+        ]))
+        .unwrap();
+        let mut manifest = Response::with_body(200, manifest_json);
+        manifest.headers.set("X-Static-Large-Object", "True");
+        let be = backend(vec![
+            ("GET", "/v1/a/c/manifest", manifest),
+            ("GET", "/v1/a/other/s1", Response::error(403, "Forbidden")),
+        ]);
+        let resp = Slo::new().handle(slo_get("/v1/a/c/manifest", None), &be);
+        assert_eq!(resp.status, 409);
     }
 
     #[test]
@@ -4374,6 +4591,34 @@ mod tests {
         let err = reader.read_to_end(&mut out).unwrap_err();
         assert!(err.to_string().contains("/v1/a/c/missing"), "{err}");
         assert_eq!(out, b"one");
+    }
+
+    #[test]
+    fn test_vw_source_get_keeps_stored_manifest_json() {
+        // Official test_slo_manifest_version: versioned_writes copy-current
+        // must archive the stored JSON, not assembled bytes.
+        let manifest = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/s1", "bytes": 3, "hash": "abc"},
+        ]))
+        .unwrap();
+        let expected = manifest.clone();
+        let be: NextFn = Arc::new(move |_req: Request| {
+            let mut resp = Response::with_body(200, manifest.clone());
+            resp.headers.set("X-Static-Large-Object", "True");
+            resp
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Source", "VW");
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_of(&mut resp), expected);
     }
 
     #[test]

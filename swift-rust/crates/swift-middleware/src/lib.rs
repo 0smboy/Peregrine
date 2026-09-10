@@ -77,7 +77,7 @@ mod xprofile;
 pub use account_freeze::AccountFreeze;
 pub use account_quotas::AccountQuotas;
 pub use acl::{
-    acls_from_sysmeta, format_acl_v2, parse_acl_v1, parse_acl_v2, referrer_allowed,
+    acls_from_sysmeta, clean_acl, format_acl_v2, parse_acl_v1, parse_acl_v2, referrer_allowed,
     validate_account_acl_header, AccountAcls,
 };
 pub use authtoken::{
@@ -139,7 +139,10 @@ pub use slo::{
 pub use staticweb::{build_listing_html, html_escape, human_readable, ListingItem, StaticWeb};
 pub use symlink::Symlink;
 pub use tempauth::{TempAuth, UserRecord};
-pub use tempurl::{ClosureKeyProvider, KeyProvider, TempUrl};
+pub use tempurl::{
+    tempurl_out_of_scope, tempurl_path_in_scope, ClosureKeyProvider, KeyProvider,
+    ScopedTempUrlKeys, TempUrl, TEMPURL_ALLOWED_PREFIX_HEADER,
+};
 pub use versioned_writes::{
     versions_object_name, VersionedWrites,
     AUTHORIZE_ONLY_HEADER as VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER,

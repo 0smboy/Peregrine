@@ -34,14 +34,16 @@
 //!   bytes — we enforce the cap before issuing the subrequest body (buffer
 //!   up to `max_file_size + 1`).
 
+use std::future::Future;
 use std::io::Read;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use swift_http::{split_path, Body, HeaderKeyDict, MimeDocs, Request, Response};
 
 use crate::tempurl::{extract_digest_and_algorithm, hmac_hex, KeyProvider};
-use crate::{Middleware, NextFn};
+use crate::{AsyncNextFn, Middleware, NextFn};
 
 /// Default digests (`digest.DEFAULT_ALLOWED_DIGESTS`).
 pub const DEFAULT_ALLOWED_DIGESTS: &[&str] = &["sha1", "sha256", "sha512"];
@@ -336,7 +338,9 @@ impl FormPost {
                         file_attributes.insert("content-encoding".into(), ce.clone());
                     }
                 }
-                match self.perform_subrequest(&path, &file_attributes, &mut mime, &keys, next) {
+                match self
+                    .perform_subrequest(&path, &file_attributes, &mut mime, &keys, |put| next(put))
+                {
                     Ok((st, hdrs, body)) => {
                         status = st;
                         subheaders = hdrs;
@@ -376,69 +380,16 @@ impl FormPost {
             }
         }
 
-        if status == 0 {
-            status = 400;
-            message = "no files to process".into();
-        }
-
-        let mut headers = HeaderKeyDict::new();
-        for (k, v) in subheaders.iter() {
-            if k.to_ascii_lowercase().starts_with("access-control") {
-                headers.set(k, v);
-            }
-        }
-
-        let redirect = attributes.get("redirect").cloned().unwrap_or_default();
-        if redirect.is_empty() {
-            let mut body = format!("{status} {}", reason(status));
-            if !message.is_empty() {
-                body = format!(
-                    "{status} {}\r\nFormPost: {}",
-                    reason(status),
-                    title_case_words(&message)
-                );
-            }
-            let mut body_bytes = body.into_bytes();
-            if !is_success(status) {
-                if let Some(rb) = resp_body {
-                    if !rb.is_empty() {
-                        body_bytes = rb;
-                    }
-                }
-            }
-            let mut resp = Response::with_body(status, body_bytes);
-            for (k, v) in headers.iter() {
-                resp.headers.set(k, v);
-            }
-            resp.headers.set("Content-Type", "text/plain");
-            return resp;
-        }
-
-        let sep = if redirect.contains('?') { '&' } else { '?' };
-        let location = format!(
-            "{redirect}{sep}status={}&message={}",
-            quote_query(&status.to_string()),
-            quote_query(&message)
-        );
-        let html = format!(
-            "<html><body><p><a href=\"{location}\">Click to continue...</a></p></body></html>"
-        );
-        let mut resp = Response::with_body(303, html.into_bytes());
-        for (k, v) in headers.iter() {
-            resp.headers.set(k, v);
-        }
-        resp.headers.set("Location", location);
-        resp
+        finish_formpost(status, message, subheaders, resp_body, &attributes)
     }
 
-    fn perform_subrequest(
+    fn build_put_request(
         &self,
         orig_path: &str,
         attributes: &std::collections::HashMap<String, String>,
         mime: &mut MimeDocs,
         keys: &[String],
-        next: &NextFn,
-    ) -> Result<(u16, HeaderKeyDict, Vec<u8>), FormError> {
+    ) -> Result<Request, FormError> {
         let max_file_size: u64 = attributes
             .get("max_file_size")
             .map(|s| s.as_str())
@@ -556,11 +507,235 @@ impl FormPost {
         if let Some(ce) = attributes.get("content-encoding") {
             put.headers.set("Content-Encoding", ce);
         }
-
-        let mut resp = next(put);
-        let body = resp.body.take().into_vec(64 * 1024).unwrap_or_default();
-        Ok((resp.status, resp.headers, body))
+        Ok(put)
     }
+
+    fn perform_subrequest<F>(
+        &self,
+        orig_path: &str,
+        attributes: &std::collections::HashMap<String, String>,
+        mime: &mut MimeDocs,
+        keys: &[String],
+        next: F,
+    ) -> Result<(u16, HeaderKeyDict, Vec<u8>), FormError>
+    where
+        F: FnOnce(Request) -> Response,
+    {
+        let put = self.build_put_request(orig_path, attributes, mime, keys)?;
+        Ok(put_result(next(put)))
+    }
+
+    async fn translate_form_async(
+        &self,
+        mut req: Request,
+        boundary: &str,
+        next: AsyncNextFn,
+    ) -> Response {
+        let path = req.path.clone();
+        let parts = match split_path(&path, 3, 4, true) {
+            Ok(p) => p,
+            Err(_) => return unauthorized("invalid signature"),
+        };
+        let account = parts[1].clone().unwrap_or_default();
+        let container = parts[2].clone().unwrap_or_default();
+        if account.is_empty() || container.is_empty() {
+            return unauthorized("invalid signature");
+        }
+        let keys = self.key_provider.keys_for(&account, &container);
+        if keys.is_empty() {
+            return unauthorized("invalid signature");
+        }
+
+        let (reader, _) = req.body.take().into_reader();
+        let mut mime = MimeDocs::new(reader, boundary.as_bytes());
+
+        let mut attributes: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut status: u16 = 0;
+        let mut message = String::new();
+        let mut subheaders = HeaderKeyDict::new();
+        let mut resp_body: Option<Vec<u8>> = None;
+        let mut file_count: u64 = 0;
+
+        loop {
+            let headers = match mime.next_document() {
+                Ok(Some(h)) => h,
+                Ok(None) => break,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::InvalidData
+                        && e.to_string().contains("invalid starting boundary")
+                    {
+                        return bad_request("invalid starting boundary");
+                    }
+                    return bad_request(&e.to_string());
+                }
+            };
+            let disposition = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("Content-Disposition"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            let (disp, attrs) = parse_content_disposition(disposition);
+            if disp == "form-data" && attrs.contains_key("filename") {
+                file_count += 1;
+                let max_count: u64 = match attributes
+                    .get("max_file_count")
+                    .map(|s| s.as_str())
+                    .unwrap_or("0")
+                    .parse()
+                {
+                    Ok(n) => n,
+                    Err(_) => return bad_request("max_file_count not an integer"),
+                };
+                if file_count > max_count {
+                    status = 400;
+                    message = "max file count exceeded".into();
+                    break;
+                }
+                let mut file_attributes = attributes.clone();
+                let filename = attrs
+                    .get("filename")
+                    .cloned()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "filename".into());
+                file_attributes.insert("filename".into(), filename);
+                if !file_attributes.contains_key("content-type") {
+                    if let Some((_, ct)) = headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+                    {
+                        file_attributes.insert(
+                            "content-type".into(),
+                            if ct.is_empty() {
+                                "application/octet-stream".into()
+                            } else {
+                                ct.clone()
+                            },
+                        );
+                    }
+                }
+                if !file_attributes.contains_key("content-encoding") {
+                    if let Some((_, ce)) = headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Encoding"))
+                    {
+                        file_attributes.insert("content-encoding".into(), ce.clone());
+                    }
+                }
+                match self.build_put_request(&path, &file_attributes, &mut mime, &keys) {
+                    Ok(put) => {
+                        let (st, hdrs, body) = put_result(next(put).await);
+                        status = st;
+                        subheaders = hdrs;
+                        resp_body = Some(body);
+                        if !is_success(st) {
+                            break;
+                        }
+                    }
+                    Err(FormError::Unauthorized(m)) => return unauthorized(&m),
+                    Err(FormError::Invalid(m)) => return bad_request(&m),
+                    Err(FormError::Eof(m)) => return bad_request(&m),
+                }
+            } else {
+                let mut data = Vec::new();
+                let mut remaining = MAX_VALUE_LENGTH;
+                let mut buf = [0u8; READ_CHUNK_SIZE];
+                while remaining > 0 {
+                    let n = match mime.read(&mut buf[..remaining.min(READ_CHUNK_SIZE)]) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => return bad_request(&e.to_string()),
+                    };
+                    data.extend_from_slice(&buf[..n]);
+                    remaining = remaining.saturating_sub(n);
+                }
+                let mut sink = [0u8; READ_CHUNK_SIZE];
+                while mime.read(&mut sink).unwrap_or(0) > 0 {}
+                let mut text = String::from_utf8_lossy(&data).into_owned();
+                while text.ends_with('\r') || text.ends_with('\n') || text.ends_with('-') {
+                    text.pop();
+                }
+                if let Some(name) = attrs.get("name") {
+                    attributes.insert(name.to_ascii_lowercase(), text);
+                }
+            }
+        }
+
+        finish_formpost(status, message, subheaders, resp_body, &attributes)
+    }
+}
+
+fn put_result(mut resp: Response) -> (u16, HeaderKeyDict, Vec<u8>) {
+    let body = resp.body.take().into_vec(64 * 1024).unwrap_or_default();
+    (resp.status, resp.headers, body)
+}
+
+fn finish_formpost(
+    mut status: u16,
+    mut message: String,
+    subheaders: HeaderKeyDict,
+    resp_body: Option<Vec<u8>>,
+    attributes: &std::collections::HashMap<String, String>,
+) -> Response {
+    if status == 0 {
+        status = 400;
+        message = "no files to process".into();
+    }
+
+    let mut headers = HeaderKeyDict::new();
+    for (k, v) in subheaders.iter() {
+        if k.to_ascii_lowercase().starts_with("access-control") {
+            headers.set(k, v);
+        }
+    }
+
+    let redirect = attributes.get("redirect").cloned().unwrap_or_default();
+    if redirect.is_empty() {
+        let mut body = format!("{status} {}", reason(status));
+        if !message.is_empty() {
+            body = format!(
+                "{status} {}\r\nFormPost: {}",
+                reason(status),
+                title_case_words(&message)
+            );
+        }
+        let mut body_bytes = body.into_bytes();
+        if !is_success(status) {
+            if let Some(rb) = resp_body {
+                if !rb.is_empty() {
+                    body_bytes = rb;
+                }
+            }
+        }
+        let mut resp = Response::with_body(status, body_bytes);
+        for (k, v) in headers.iter() {
+            resp.headers.set(k, v);
+        }
+        resp.headers.set("Content-Type", "text/plain");
+        return resp;
+    }
+
+    let sep = if redirect.contains('?') { '&' } else { '?' };
+    let location = format!(
+        "{redirect}{sep}status={}&message={}",
+        quote_query(&status.to_string()),
+        quote_query(&message)
+    );
+    let html =
+        format!("<html><body><p><a href=\"{location}\">Click to continue...</a></p></body></html>");
+    let mut resp = Response::with_body(303, html.into_bytes());
+    for (k, v) in headers.iter() {
+        resp.headers.set(k, v);
+    }
+    resp.headers.set("Location", location);
+    resp
+}
+
+fn formpost_boundary(req: &Request) -> Option<String> {
+    if req.method != "POST" {
+        return None;
+    }
+    multipart_boundary(req.headers.get("Content-Type").unwrap_or(""))
 }
 
 enum FormError {
@@ -574,15 +749,28 @@ fn reason(status: u16) -> &'static str {
 }
 
 impl Middleware for FormPost {
+    fn intercepts_request(&self, req: &Request) -> bool {
+        formpost_boundary(req).is_some()
+    }
+
+    fn handle_request_async(
+        &self,
+        req: Request,
+        next: AsyncNextFn,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + '_>> {
+        Box::pin(async move {
+            match formpost_boundary(&req) {
+                Some(boundary) => self.translate_form_async(req, &boundary, next).await,
+                None => next(req).await,
+            }
+        })
+    }
+
     fn handle(&self, req: Request, next: &NextFn) -> Response {
-        if req.method != "POST" {
-            return next(req);
+        match formpost_boundary(&req) {
+            Some(boundary) => self.translate_form(req, &boundary, next),
+            None => next(req),
         }
-        let content_type = req.headers.get("Content-Type").unwrap_or("").to_string();
-        let Some(boundary) = multipart_boundary(&content_type) else {
-            return next(req);
-        };
-        self.translate_form(req, &boundary, next)
     }
 }
 
@@ -793,6 +981,60 @@ mod tests {
         req.headers
             .set("Content-Type", "multipart/form-data; boundary=BOUND");
         assert_eq!(fp.handle(req, &app).status, 401);
+    }
+
+    #[tokio::test]
+    async fn test_formpost_hyper_handle_request_async_uploads() {
+        let key = "form-key";
+        let path = "/v1/AUTH_test/c/prefix_";
+        let attrs = FormPostAttributes {
+            path: path.into(),
+            redirect: String::new(),
+            max_file_size: 1024,
+            max_file_count: 2,
+            expires: 2000000000,
+        };
+        let sig = formpost_hmac("sha256", key.as_bytes(), &attrs).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app: AsyncNextFn = Arc::new(move |r: Request| {
+            let log2 = log2.clone();
+            Box::pin(async move {
+                log2.lock()
+                    .unwrap()
+                    .push((r.method.clone(), r.path.clone()));
+                Response::new(201)
+            })
+        });
+        let provider = Arc::new(ClosureKeyProvider::new(|_, _| vec![key.to_string()]));
+        let fp = FormPost::new(provider);
+        let body = multipart_body(
+            &[
+                ("redirect", ""),
+                ("max_file_size", "1024"),
+                ("max_file_count", "2"),
+                ("expires", "2000000000"),
+                ("signature", &sig),
+            ],
+            &[("file1", "hello.txt", b"hi")],
+        );
+        let mut req = Request {
+            method: "POST".into(),
+            path: path.into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::from(body),
+        };
+        req.headers
+            .set("Content-Type", "multipart/form-data; boundary=BOUND");
+        assert!(fp.intercepts_request(&req));
+        let resp = fp.handle_request_async(req, app).await;
+        assert_eq!(resp.status, 201, "got {}", resp.status);
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            ("PUT".into(), "/v1/AUTH_test/c/prefix_hello.txt".into())
+        );
     }
 
     #[test]

@@ -3755,6 +3755,9 @@ impl ProxyApp {
         let path = format!("/{}", percent_encode(account));
         match req.method.as_str() {
             "GET" | "HEAD" => {
+                if let Err(resp) = constrain_account_listing_limit(req) {
+                    return resp;
+                }
                 let headers = self.backend_headers(req, false, "account");
                 let nodes = self.iter_nodes(&self.account_ring, part);
                 match self.get_or_head(
@@ -3987,6 +3990,11 @@ impl ProxyApp {
                 resp
             }
             "PUT" | "POST" | "DELETE" => {
+                if matches!(req.method.as_str(), "PUT" | "POST") {
+                    if let Some(denied) = check_container_name_length(container) {
+                        return denied;
+                    }
+                }
                 // account existence / autocreate
                 let Ok((account_part, _)) = self.account_ring.get_nodes(account, None, None) else {
                     return swob_response(503);
@@ -4032,6 +4040,9 @@ impl ProxyApp {
                     write_req = req.clone_head();
                     scrub_container_write_owner_headers(&mut write_req);
                     if let Some(denied) = deny_non_owner_container_versioning(&write_req) {
+                        return denied;
+                    }
+                    if let Some(denied) = clean_container_acl_headers(&mut write_req) {
                         return denied;
                     }
                     &write_req
@@ -5118,11 +5129,26 @@ impl ProxyApp {
     /// backend is visible to TempURL validation on another without waiting
     /// for a stale per-process TTL.
     pub fn temp_url_keys(&self, account: &str, container: &str) -> Vec<String> {
-        let mut keys = self.account_info(account).temp_url_keys;
-        if !container.is_empty() {
-            keys.extend(self.container_info(account, container).temp_url_keys);
-        }
+        let scoped = self.temp_url_keys_scoped(account, container);
+        let mut keys = scoped.account;
+        keys.extend(scoped.container);
         keys
+    }
+
+    /// Account vs container Temp-URL keys (Python `_get_keys` scopes).
+    pub fn temp_url_keys_scoped(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> swift_middleware::ScopedTempUrlKeys {
+        swift_middleware::ScopedTempUrlKeys {
+            account: self.account_info(account).temp_url_keys,
+            container: if container.is_empty() {
+                Vec::new()
+            } else {
+                self.container_info(account, container).temp_url_keys
+            },
+        }
     }
 
     /// `get_container_info`-lite: the container's storage-policy index only.
@@ -6653,12 +6679,41 @@ fn constraint_plain(status: u16, body: &str) -> Response {
     resp
 }
 
+/// Python container PUT: `Container name length of N longer than M`.
+pub(crate) fn check_container_name_length(container: &str) -> Option<Response> {
+    if container.len() as i64 > swift_core::constraints::MAX_CONTAINER_NAME_LENGTH {
+        // Official TestContainer.test_long_name_content_type reads swob's
+        // HTTPBadRequest Content-Type, not constraint_plain's text/plain.
+        let mut resp = constraint_plain(
+            400,
+            &format!(
+                "Container name length of {} longer than {}",
+                container.len(),
+                swift_core::constraints::MAX_CONTAINER_NAME_LENGTH
+            ),
+        );
+        resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+        Some(resp)
+    } else {
+        None
+    }
+}
+
 /// Python `constrain_req_limit` / `validate_container_params`: listing
-/// `limit=` above CONTAINER_LISTING_LIMIT is 412 `Maximum limit is N`
-/// (probe test_sharding_listing L583). Must run in the proxy — sharded
-/// fan-out never forwards the oversized limit to the container-server.
+/// `limit=` above the listing max is 412 `Maximum limit is N`.
+/// Account GET uses `ACCOUNT_LISTING_LIMIT`; container GET uses
+/// `CONTAINER_LISTING_LIMIT`. IsolatedIdentity Hyper used to skip the
+/// account check (`account_get_head_async`), so official
+/// `TestAccount.testListingLimit` over-limit was not 412.
 pub(crate) fn constrain_listing_limit(req: &Request) -> Result<usize, Response> {
-    let max = swift_core::constraints::CONTAINER_LISTING_LIMIT;
+    constrain_listing_limit_max(req, swift_core::constraints::CONTAINER_LISTING_LIMIT)
+}
+
+pub(crate) fn constrain_account_listing_limit(req: &Request) -> Result<usize, Response> {
+    constrain_listing_limit_max(req, swift_core::constraints::ACCOUNT_LISTING_LIMIT)
+}
+
+fn constrain_listing_limit_max(req: &Request, max: i64) -> Result<usize, Response> {
     match req.param("limit") {
         Some(given) if !given.is_empty() && given.bytes().all(|b| b.is_ascii_digit()) => {
             let limit: i64 = given.parse().unwrap_or(max + 1);
@@ -8218,6 +8273,16 @@ const SWIFT_OWNER_HEADERS: &[&str] = &[
     "X-Account-Access-Control",
 ];
 
+/// Python container-server translates `X-Remove-Container-*` into an empty
+/// ACL/meta write. IsolatedIdentity account-RW can POST those remove keys
+/// even after the matching `swift_owner_headers` values are popped.
+fn owner_remove_header(name: &str) -> String {
+    match name.strip_prefix("X-") {
+        Some(rest) => format!("X-Remove-{rest}"),
+        None => format!("X-Remove-{name}"),
+    }
+}
+
 /// Strip privileged account/container headers for non-owners (Python
 /// `swift_owner_headers`).
 fn strip_owner_headers(resp: &mut Response, swift_owner: bool) {
@@ -8238,6 +8303,7 @@ fn scrub_owner_request_headers(req: &mut Request, swift_owner: bool) {
     }
     for name in SWIFT_OWNER_HEADERS {
         req.headers.remove(name);
+        req.headers.remove(&owner_remove_header(name));
     }
 }
 
@@ -8250,6 +8316,22 @@ fn scrub_container_write_owner_headers(req: &mut Request) {
         .get("X-Backend-Swift-Owner")
         .is_some_and(config_true_value);
     scrub_owner_request_headers(req, swift_owner);
+}
+
+/// Python `ContainerController.PUT/POST`: after owner-header scrub,
+/// `clean_acl` rewrite/validate `X-Container-Read`/`X-Container-Write`.
+/// Invalid ACL or a write-ACL referrer is HTTP 400.
+fn clean_container_acl_headers(req: &mut Request) -> Option<Response> {
+    for name in ["X-Container-Read", "X-Container-Write"] {
+        let Some(value) = req.headers.get(name).map(str::to_string) else {
+            continue;
+        };
+        match swift_middleware::clean_acl(name, &value) {
+            Ok(cleaned) => req.headers.set(name, cleaned),
+            Err(err) => return Some(constraint_plain(400, &err)),
+        }
+    }
+    None
 }
 
 /// Client + sysmeta keys `versioned_writes.prepare()` uses to persist
@@ -8886,7 +8968,39 @@ pub fn serve_with_core_filters_and_config(
 #[cfg(test)]
 mod pipeline_async_tests {
     use super::*;
+    use swift_core::hashing::HashPathConfig;
     use swift_http::IncomingBody;
+    use swift_ring::{RingData, RingDevice};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Object-server Range on a stub segment (inclusive `bytes=start-end`).
+    fn stub_object_range(req: &Request, body: &[u8]) -> Response {
+        let Some(spec) = req
+            .headers
+            .get("Range")
+            .and_then(|r| r.strip_prefix("bytes="))
+        else {
+            return Response::with_body(200, body.to_vec());
+        };
+        let Some((start, end)) = spec.split_once('-') else {
+            return Response::with_body(200, body.to_vec());
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) else {
+            return Response::with_body(200, body.to_vec());
+        };
+        if body.is_empty() || start >= body.len() || start > end {
+            return Response::error(416, "Requested Range Not Satisfiable");
+        }
+        let end = end.min(body.len() - 1);
+        let slice = body[start..=end].to_vec();
+        let mut resp = Response::with_body(206, slice);
+        resp.headers.set(
+            "Content-Range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        );
+        resp
+    }
 
     #[tokio::test]
     async fn tempauth_prepare_runs_on_hyper_path_so_auth_endpoint_is_not_404() {
@@ -8934,6 +9048,6602 @@ mod pipeline_async_tests {
             resp.headers.get("X-Trans-Id").is_some(),
             "catch_errors must stamp X-Trans-Id on the async path"
         );
+    }
+
+    fn quote_www_authenticate_realm(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                b => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    fn account_tempauth_hyper_app() -> (Arc<ProxyApp>, swift_middleware::TempAuth) {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                allow_account_management: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        (app, ta)
+    }
+
+    /// Official TestAccount.testNoAuthToken / testInvalidAuthToken /
+    /// testQuotedWWWAuthenticateHeader / testPUTError / testListingLimit.
+    #[tokio::test]
+    async fn account_auth_and_listing_limit_on_hyper() {
+        let (app, ta) = account_tempauth_hyper_app();
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![Arc::new(ta)],
+        };
+        let no_tok = file_hyper_call(&svc, "GET", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert!(
+            no_tok.status == 401 || no_tok.status == 412,
+            "official testNoAuthToken account GET on Hyper, got {}",
+            no_tok.status
+        );
+        let no_tok_head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert!(
+            no_tok_head.status == 401 || no_tok_head.status == 412,
+            "official testNoAuthToken account HEAD on Hyper, got {}",
+            no_tok_head.status
+        );
+        let bogus = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", "bogus_auth_token")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bogus.status, 401,
+            "official testInvalidAuthToken on Hyper, got {}",
+            bogus.status
+        );
+        let hax = "AUTH_haxx\"\nContent-Length: 14\n\n<b>Hello World";
+        app.info_cache.set_account(
+            hax.to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let quoted = file_hyper_call(&svc, "GET", &format!("/v1/{hax}"), "", &[], Vec::new()).await;
+        assert_eq!(
+            quoted.status, 401,
+            "official testQuotedWWWAuthenticateHeader on Hyper, got {}",
+            quoted.status
+        );
+        let www = quoted
+            .headers
+            .get("Www-Authenticate")
+            .or_else(|| quoted.headers.get("WWW-Authenticate"))
+            .unwrap_or("");
+        let expected = format!("Swift realm=\"{}\"", quote_www_authenticate_realm(hax));
+        assert!(
+            www.split(',').any(|part| part.trim() == expected),
+            "official testQuotedWWWAuthenticateHeader realm, got {www:?} want {expected}"
+        );
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", &owner)],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            put.status == 403 || put.status == 405,
+            "official testPUTError on Hyper, got {}",
+            put.status
+        );
+        let over = swift_core::constraints::ACCOUNT_LISTING_LIMIT + 1;
+        let limited = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            &format!("limit={over}"),
+            &[("X-Auth-Token", &owner)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            limited.status, 412,
+            "official testListingLimit over-limit on Hyper, got {}",
+            limited.status
+        );
+        let at_limit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            &format!("limit={}", swift_core::constraints::ACCOUNT_LISTING_LIMIT),
+            &[("X-Auth-Token", &owner)],
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(
+            at_limit.status, 412,
+            "official testListingLimit at-limit must not 412, got {}",
+            at_limit.status
+        );
+    }
+
+    async fn container_func_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        (svc, backend)
+    }
+
+    /// Official TestContainer storage-policy leftovers. `gold` is default (0);
+    /// `silver` is the non-default policy. Do not flip `auth_enabled`.
+    async fn storage_policy_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let mut names = std::collections::HashMap::new();
+        names.insert("gold".to_string(), 0i64);
+        names.insert("silver".to_string(), 1i64);
+        let mut index_names = std::collections::HashMap::new();
+        index_names.insert(0i64, "gold".to_string());
+        index_names.insert(1i64, "silver".to_string());
+        let mut object_rings = std::collections::HashMap::new();
+        object_rings.insert(1i64, ring.clone());
+        let app = Arc::new(
+            ProxyApp::with_policy_object_rings(
+                ring.clone(),
+                ring.clone(),
+                ring,
+                object_rings,
+                ProxyConfig {
+                    auth_enabled: false,
+                    conn_timeout: Duration::from_millis(200),
+                    node_timeout: Duration::from_millis(400),
+                    request_node_count_factor: 1,
+                    ..Default::default()
+                },
+            )
+            .with_policy_names(names)
+            .with_policy_index_names(index_names),
+        );
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        (svc, backend)
+    }
+
+    fn xml_listing_names(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = text;
+        loop {
+            let sub = rest.find("<subdir name=\"");
+            let nm = rest.find("<name>");
+            match (sub, nm) {
+                (Some(s), Some(n)) if s < n => {
+                    let after = &rest[s + "<subdir name=\"".len()..];
+                    let end = after.find('"').unwrap_or(0);
+                    names.push(after[..end].to_string());
+                    rest = &after[end..];
+                    if let Some(close) = rest.find("</subdir>") {
+                        rest = &rest[close + "</subdir>".len()..];
+                    } else if let Some(close) = rest.find("/>") {
+                        rest = &rest[close + 2..];
+                    } else {
+                        break;
+                    }
+                }
+                (Some(s), None) => {
+                    let after = &rest[s + "<subdir name=\"".len()..];
+                    let end = after.find('"').unwrap_or(0);
+                    names.push(after[..end].to_string());
+                    rest = &after[end..];
+                    if let Some(close) = rest.find("/>") {
+                        rest = &rest[close + 2..];
+                    } else {
+                        break;
+                    }
+                }
+                (_, Some(n)) => {
+                    let after = &rest[n + "<name>".len()..];
+                    if let Some(end) = after.find("</name>") {
+                        names.push(after[..end].to_string());
+                        rest = &after[end + "</name>".len()..];
+                    } else {
+                        break;
+                    }
+                }
+                (None, None) => break,
+            }
+        }
+        names
+    }
+
+    async fn listing_plain_names(svc: &ProxyAsyncService, path: &str, query: &str) -> Vec<String> {
+        let listed = file_hyper_call(svc, "GET", path, query, &[], Vec::new()).await;
+        if listed.status == 204 {
+            return Vec::new();
+        }
+        assert_eq!(
+            listed.status, 200,
+            "listing {path}?{query} got {}",
+            listed.status
+        );
+        let body = listed.body.collect_async().await.expect("listing body");
+        let text = String::from_utf8_lossy(&body);
+        let trimmed = text.trim();
+        if trimmed.starts_with('[') {
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(trimmed).unwrap_or_else(|_| Vec::new());
+            return rows
+                .into_iter()
+                .filter_map(|row| {
+                    row.get("name")
+                        .or_else(|| row.get("subdir"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect();
+        }
+        if trimmed.starts_with("<?xml") || trimmed.starts_with('<') {
+            return xml_listing_names(trimmed);
+        }
+        trimmed
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn leftover_apply_user_meta(
+        target: &str,
+        stored: &mut HeaderKeyDict,
+        text: &str,
+        replace: bool,
+    ) {
+        let prefix = format!("x-{target}-meta-");
+        let remove_prefix = format!("x-remove-{target}-meta-");
+        if replace {
+            let stale: Vec<String> = stored
+                .iter()
+                .filter(|(k, _)| k.to_ascii_lowercase().starts_with(&prefix))
+                .map(|(k, _)| k.to_string())
+                .collect();
+            for key in stale {
+                stored.remove(&key);
+            }
+        }
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk.starts_with(&remove_prefix) {
+                let rest = &lk[remove_prefix.len()..];
+                if !rest.is_empty() {
+                    stored.remove(&format!("{prefix}{rest}"));
+                }
+            } else if lk.starts_with(&prefix) && lk.len() > prefix.len() && !val.is_empty() {
+                stored.set(k.trim(), val);
+            }
+        }
+    }
+
+    /// IsolatedIdentity account/container-server validate merged stored
+    /// user-meta (official extra-file test_bad_metadata3 last POST).
+    fn leftover_user_meta_over_limit(target: &str, stored: &HeaderKeyDict) -> bool {
+        let prefix = format!("x-{target}-meta-");
+        let mut count = 0i64;
+        let mut size = 0i64;
+        for (k, v) in stored.iter() {
+            let lk = k.to_ascii_lowercase();
+            if !lk.starts_with(&prefix) || lk.len() <= prefix.len() {
+                continue;
+            }
+            let key = &lk[prefix.len()..];
+            count += 1;
+            size += key.chars().count() as i64 + v.chars().count() as i64;
+            if count > swift_core::constraints::MAX_META_COUNT
+                || size > swift_core::constraints::MAX_META_OVERALL_SIZE
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn leftover_apply_container_acl(stored: &mut HeaderKeyDict, text: &str) {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk == "x-remove-container-read" {
+                stored.remove("X-Container-Read");
+            } else if lk == "x-remove-container-write" {
+                stored.remove("X-Container-Write");
+            } else if lk == "x-container-read" || lk == "x-container-write" {
+                if val.is_empty() {
+                    stored.remove(k.trim());
+                } else {
+                    stored.set(k.trim(), val);
+                }
+            }
+        }
+    }
+
+    fn leftover_apply_container_sync(stored: &mut HeaderKeyDict, text: &str) {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk == "x-remove-container-sync-key" {
+                stored.remove("X-Container-Sync-Key");
+            } else if lk == "x-remove-container-sync-to" {
+                stored.remove("X-Container-Sync-To");
+            } else if lk == "x-container-sync-key" || lk == "x-container-sync-to" {
+                if val.is_empty() {
+                    stored.remove(k.trim());
+                } else {
+                    stored.set(k.trim(), val);
+                }
+            }
+        }
+    }
+
+    fn leftover_apply_account_sysmeta(stored: &mut HeaderKeyDict, text: &str) {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            if lk == "x-account-sysmeta-core-access-control" {
+                stored.set(k.trim(), v.trim());
+            }
+        }
+    }
+
+    fn leftover_account_sysmeta_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        stored
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("X-Account-Sysmeta-Core-Access-Control"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn leftover_acl_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        stored
+            .iter()
+            .filter(|(k, _)| {
+                let lk = k.to_ascii_lowercase();
+                lk == "x-container-read" || lk == "x-container-write"
+            })
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn leftover_sync_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        stored
+            .iter()
+            .filter(|(k, _)| {
+                let lk = k.to_ascii_lowercase();
+                lk == "x-container-sync-key" || lk == "x-container-sync-to"
+            })
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn leftover_apply_object_headers(stored: &mut HeaderKeyDict, text: &str) {
+        leftover_apply_user_meta("object", stored, text, true);
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk == "x-object-manifest" || lk == "content-type" {
+                if val.is_empty() {
+                    stored.remove(k.trim());
+                } else {
+                    stored.set(k.trim(), val);
+                }
+            }
+        }
+    }
+
+    fn leftover_object_header_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        let mut pairs = leftover_meta_pairs(stored, "object");
+        for (k, v) in stored.iter() {
+            let lk = k.to_ascii_lowercase();
+            if lk == "x-object-manifest" || lk == "content-type" {
+                pairs.push((k.to_string(), v.to_string()));
+            }
+        }
+        pairs
+    }
+
+    fn leftover_meta_pairs(stored: &HeaderKeyDict, target: &str) -> Vec<(String, String)> {
+        let prefix = format!("x-{target}-meta-");
+        stored
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase().starts_with(&prefix))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn leftover_header_value(text: &str, name: &str) -> Option<String> {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn leftover_stored_policy_index(stored: &HeaderKeyDict) -> Option<String> {
+        stored.iter().find_map(|(k, v)| {
+            if k.eq_ignore_ascii_case("x-backend-storage-policy-index") {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn leftover_policy_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        leftover_stored_policy_index(stored)
+            .map(|v| vec![("X-Backend-Storage-Policy-Index".into(), v)])
+            .unwrap_or_default()
+    }
+
+    fn leftover_header_refs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    async fn leftover_body_text(resp: Response) -> String {
+        let body = resp.body.collect_async().await.expect("leftover body");
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    fn leftover_object_meta_map(resp: &Response) -> std::collections::BTreeMap<String, String> {
+        resp.headers
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase().contains("meta"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Official TestContainer.testContainerNameLimit /
+    /// test_long_name_content_type.
+    #[tokio::test]
+    async fn container_name_limit_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let limit = swift_core::constraints::MAX_CONTAINER_NAME_LENGTH as usize;
+        for n in [limit - 1, limit] {
+            let name = "a".repeat(n);
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/{name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testContainerNameLimit len={n} on Hyper, got {}",
+                put.status
+            );
+        }
+        for n in [limit + 1, limit + 10] {
+            let name = "a".repeat(n);
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/{name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 400,
+                "official testContainerNameLimit over-limit len={n} on Hyper, got {}",
+                put.status
+            );
+            assert_eq!(
+                put.headers.get("Content-Type"),
+                Some("text/html; charset=UTF-8"),
+                "official test_long_name_content_type Content-Type {:?}",
+                put.headers
+            );
+        }
+        let official_long = file_hyper_call(
+            &svc,
+            "PUT",
+            &format!("/v1/AUTH_test/{}", "X".repeat(2048)),
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            official_long.status, 400,
+            "official test_long_name_content_type on Hyper, got {}",
+            official_long.status
+        );
+        assert_eq!(
+            official_long.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8"),
+            "official test_long_name_content_type 2048 Content-Type {:?}",
+            official_long.headers
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_create_container_gets_default_policy_by_default /
+    /// test_error_invalid_storage_policy_name /
+    /// test_create_non_default_storage_policy_container /
+    /// test_conflict_change_storage_policy_with_put /
+    /// test_noop_change_storage_policy_with_post.
+    /// IsolatedIdentity Hyper stamps `X-Backend-Storage-Policy-Index` only for
+    /// a known non-empty name (unknown → 400). Empty `X-Storage-Policy` uses
+    /// `X-Backend-Storage-Policy-Default`. 409-on-policy-change is leftover
+    /// container-server, not Hyper. POST policy headers are not transferred.
+    #[tokio::test]
+    async fn container_storage_policy_on_hyper() {
+        let (svc, backend) = storage_policy_hyper_svc().await;
+        let invalid = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/bad-policy",
+            "",
+            &[("X-Storage-Policy", "taco-not-a-policy")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            invalid.status, 400,
+            "official test_error_invalid_storage_policy_name on Hyper, got {}",
+            invalid.status
+        );
+
+        let default_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/default-pol",
+            "",
+            &[("X-Storage-Policy", "")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            default_put.status / 100,
+            2,
+            "official test_create_container_gets_default_policy_by_default PUT, got {}",
+            default_put.status
+        );
+        let default_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/default-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            default_head.headers.get("X-Storage-Policy"),
+            Some("gold"),
+            "official test_create_container_gets_default_policy_by_default HEAD {:?}",
+            default_head.headers
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/silver-pol",
+                "",
+                &[("X-Storage-Policy", "silver")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_create_non_default_storage_policy_container PUT"
+        );
+        let silver_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            silver_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official test_create_non_default_storage_policy_container HEAD {:?}",
+            silver_head.headers
+        );
+
+        let recreate =
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/silver-pol", "", &[], Vec::new()).await;
+        assert_eq!(
+            recreate.status, 202,
+            "official test_create_non_default_storage_policy_container recreate, got {}",
+            recreate.status
+        );
+        let recreate_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            recreate_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official recreate keeps silver {:?}",
+            recreate_head.headers
+        );
+
+        let conflict = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[("X-Storage-Policy", "gold")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            conflict.status, 409,
+            "official test_conflict_change_storage_policy_with_put, got {}",
+            conflict.status
+        );
+        let conflict_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            conflict_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official conflict PUT keeps original policy {:?}",
+            conflict_head.headers
+        );
+
+        for header in ["X-Storage-Policy", "X-Storage-Policy-Index"] {
+            let post = file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/silver-pol",
+                "",
+                &[(header, "gold")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                post.status, 204,
+                "official test_noop_change_storage_policy_with_post {header}, got {}",
+                post.status
+            );
+        }
+        let post_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            post_head.headers.get("X-Storage-Policy"),
+            Some("silver"),
+            "official POST policy headers are no-ops {:?}",
+            post_head.headers
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/silver-pol",
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official non-default policy container DELETE"
+        );
+        let gone = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/silver-pol",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(
+            gone.status / 100,
+            2,
+            "official deleted container HEAD is not 2xx, got {}",
+            gone.status
+        );
+        assert_eq!(
+            gone.headers.get("X-Storage-Policy"),
+            None,
+            "official deleted container HEAD has no X-Storage-Policy {:?}",
+            gone.headers
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_cross_policy_copy. IsolatedIdentity Hyper
+    /// `object_copy_async` (not `Copy::handle`). Dest PUT uses the dest
+    /// container policy ring; leftover object GET returns stored source
+    /// bytes. Policy 1 must have an object ring (no silent fallback to 0).
+    #[tokio::test]
+    async fn cross_policy_copy_on_hyper() {
+        let (svc, backend) = storage_policy_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/goldc",
+                "",
+                &[("X-Storage-Policy", "gold")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/silverc",
+                "",
+                &[("X-Storage-Policy", "silver")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let gold_body = "goldc/gobj";
+        let silver_body = "silverc/sobj";
+        let gold_cl = gold_body.len().to_string();
+        let silver_cl = silver_body.len().to_string();
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/goldc/gobj",
+                "",
+                &[
+                    ("Content-Length", gold_cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
+                gold_body.as_bytes().to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_cross_policy_copy gold object PUT"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/silverc/sobj",
+                "",
+                &[
+                    ("Content-Length", silver_cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
+                silver_body.as_bytes().to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_cross_policy_copy silver object PUT"
+        );
+        let copies = [
+            ("/v1/AUTH_test/goldc/sobj", "silverc/sobj", silver_body),
+            ("/v1/AUTH_test/silverc/gobj", "goldc/gobj", gold_body),
+        ];
+        for (dest, source, expect) in copies {
+            let copied = file_hyper_call(
+                &svc,
+                "PUT",
+                dest,
+                "",
+                &[("Content-Length", "0"), ("X-Copy-From", source)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                copied.status, 201,
+                "official test_cross_policy_copy X-Copy-From {source} -> {dest}, got {}",
+                copied.status
+            );
+            let got = file_hyper_call(&svc, "GET", dest, "", &[], Vec::new()).await;
+            assert_eq!(
+                got.status, 200,
+                "official test_cross_policy_copy GET {dest}, got {}",
+                got.status
+            );
+            assert_eq!(
+                leftover_body_text(got).await,
+                expect,
+                "official test_cross_policy_copy body {dest} from {source}"
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestContainer.testListDelimiter / testListDelimiterAndPrefix /
+    /// testLeadingDelimiter.
+    #[tokio::test]
+    async fn container_list_delimiter_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/delim", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for name in ["test", "test-bar", "test-foo"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/delim/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "PUT {name}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-").await,
+            vec!["test".to_string(), "test-".to_string()]
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/delim", "delimiter=-&reverse=yes").await,
+            vec!["test-".to_string(), "test".to_string()]
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/pre", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for name in ["bar", "bazar"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/pre/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/pre", "delimiter=a&prefix=ba").await,
+            vec!["bar".to_string(), "baza".to_string()]
+        );
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/pre",
+                "delimiter=a&prefix=ba&reverse=yes"
+            )
+            .await,
+            vec!["baza".to_string(), "bar".to_string()]
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/lead", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for path in [
+            "/v1/AUTH_test/lead/test",
+            "/v1/AUTH_test/lead//test/bar",
+            "/v1/AUTH_test/lead//test/bar/foo",
+        ] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    path,
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "official testLeadingDelimiter PUT {path}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/lead", "delimiter=/").await,
+            vec!["/".to_string(), "test".to_string()]
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.testFileListingLimitMarkerPrefix /
+    /// testLastFileMarker / testContainerFileListWithLimit.
+    #[tokio::test]
+    async fn container_list_marker_limit_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/marks", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let files: Vec<String> = (0..10).map(|i| format!("f{i:02}")).collect();
+        for name in &files {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/marks/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "PUT {name}"
+            );
+        }
+        for i in 0..files.len() {
+            let marker = &files[i];
+            for j in 1..(files.len() - i) {
+                let q = format!("marker={marker}&limit={j}");
+                assert_eq!(
+                    listing_plain_names(&svc, "/v1/AUTH_test/marks", &q).await,
+                    files[i + 1..i + j + 1],
+                    "official testFileListingLimitMarkerPrefix {q}"
+                );
+            }
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/marks", &format!("marker={marker}")).await,
+                files[i + 1..],
+                "official testFileListingLimitMarkerPrefix marker={marker}"
+            );
+            assert_eq!(
+                listing_plain_names(
+                    &svc,
+                    "/v1/AUTH_test/marks",
+                    &format!("marker={marker}&prefix={marker}")
+                )
+                .await,
+                Vec::<String>::new(),
+                "official testFileListingLimitMarkerPrefix marker+prefix={marker}"
+            );
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/marks", &format!("prefix={marker}")).await,
+                vec![marker.clone()],
+                "official testFileListingLimitMarkerPrefix prefix={marker}"
+            );
+        }
+        let limited = listing_plain_names(&svc, "/v1/AUTH_test/marks", "limit=2").await;
+        assert_eq!(
+            limited,
+            files[..2],
+            "official testContainerFileListWithLimit on Hyper"
+        );
+        let last = files.last().unwrap();
+        let past =
+            listing_plain_names(&svc, "/v1/AUTH_test/marks", &format!("marker={last}")).await;
+        assert!(
+            past.is_empty(),
+            "official testLastFileMarker plaintext on Hyper, got {past:?}"
+        );
+        for format_type in ["json", "xml"] {
+            let past = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/marks",
+                &format!("format={format_type}&marker={last}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                past.status, 200,
+                "official testLastFileMarker {format_type} empty is 200, got {}",
+                past.status
+            );
+            assert!(
+                listing_plain_names(
+                    &svc,
+                    "/v1/AUTH_test/marks",
+                    &format!("format={format_type}&marker={last}")
+                )
+                .await
+                .is_empty(),
+                "official testLastFileMarker {format_type} names empty"
+            );
+            for marker in ["0", "A", "f04", "z"] {
+                let listed = listing_plain_names(
+                    &svc,
+                    "/v1/AUTH_test/marks",
+                    &format!("format={format_type}&marker={marker}&limit=3"),
+                )
+                .await;
+                assert!(
+                    listed.len() <= 3,
+                    "official testMarkerLimitFileList {format_type} {marker} len {}",
+                    listed.len()
+                );
+                if let Some(first) = listed.first() {
+                    assert!(
+                        first.as_str() > marker,
+                        "official testMarkerLimitFileList {format_type} first {first} vs {marker}"
+                    );
+                }
+            }
+        }
+        backend.abort();
+    }
+
+    /// Official TestContainerSorting: reverse truthy set, prefix, exclusive
+    /// / inclusive markers, and reversed-marker empty 204.
+    #[tokio::test]
+    async fn container_list_sorting_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/sort", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let items = ["a1", "a2", "A3", "b1", "B2", "a10", "b10", "zz"];
+        for name in items {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/sort/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201,
+                "PUT {name}"
+            );
+        }
+        let mut forward: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        forward.sort();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        for rev in ["true", "1", "yes", "on", "t", "y"] {
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/sort", &format!("reverse={rev}")).await,
+                reversed,
+                "official testContainerFileListSortingReversed reverse={rev}"
+            );
+        }
+        for off in ["off", "false", "no", "", "foo", "hai", "o=[]::::>"] {
+            let q = if off.is_empty() {
+                "reverse=".to_string()
+            } else {
+                format!("reverse={off}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/sort", &q).await,
+                forward,
+                "official testContainerFileListSorting reverse={off:?}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/sort", "").await,
+            forward
+        );
+        let mut pref: Vec<String> = items
+            .iter()
+            .filter(|c| c.starts_with('a'))
+            .map(|s| (*s).to_string())
+            .collect();
+        pref.sort();
+        pref.reverse();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/sort", "reverse=on&prefix=a").await,
+            pref,
+            "official testContainerFileSortingByPrefixReversed"
+        );
+        let mut exclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" < **c && **c < "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        exclusive.sort();
+        exclusive.reverse();
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/sort",
+                "reverse=on&marker=b1&end_marker=B2"
+            )
+            .await,
+            exclusive,
+            "official testContainerFileSortingByMarkersExclusiveReversed"
+        );
+        let mut inclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" <= **c && **c <= "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        inclusive.sort();
+        inclusive.reverse();
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/sort",
+                "reverse=on&marker=b1%00&end_marker=B1"
+            )
+            .await,
+            inclusive,
+            "official testContainerFileSortingByMarkersInclusiveReversed"
+        );
+        let empty = listing_plain_names(
+            &svc,
+            "/v1/AUTH_test/sort",
+            "reverse=on&marker=B&end_marker=b1",
+        )
+        .await;
+        assert!(
+            empty.is_empty(),
+            "official testContainerFileSortingByReversedMarkersReversed, got {empty:?}"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainerPaths.testStructure (normalized_urls off).
+    #[tokio::test]
+    async fn container_list_path_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/paths", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let files = [
+            "/file1",
+            "/file A",
+            "/dir1/",
+            "/dir2/",
+            "/dir1/file2",
+            "/dir1/subdir1/",
+            "/dir1/subdir2/",
+            "/dir1/subdir1/file2",
+            "/dir1/subdir1/file3",
+            "/dir1/subdir1/file4",
+            "/dir1/subdir1/subsubdir1/",
+            "/dir1/subdir1/subsubdir1/file5",
+            "/dir1/subdir1/subsubdir1/file6",
+            "/dir1/subdir1/subsubdir1/file7",
+            "/dir1/subdir1/subsubdir1/file8",
+            "/dir1/subdir1/subsubdir2/",
+            "/dir1/subdir1/subsubdir2/file9",
+            "/dir1/subdir1/subsubdir2/file0",
+            "file1",
+            "dir1/",
+            "dir2/",
+            "dir1/file2",
+            "dir1/subdir1/",
+            "dir1/subdir2/",
+            "dir1/subdir1/file2",
+            "dir1/subdir1/file3",
+            "dir1/subdir1/file4",
+            "dir1/subdir1/subsubdir1/",
+            "dir1/subdir1/subsubdir1/file5",
+            "dir1/subdir1/subsubdir1/file6",
+            "dir1/subdir1/subsubdir1/file7",
+            "dir1/subdir1/subsubdir1/file8",
+            "dir1/subdir1/subsubdir2/",
+            "dir1/subdir1/subsubdir2/file9",
+            "dir1/subdir1/subsubdir2/file0",
+            "dir1/subdir with spaces/",
+            "dir1/subdir with spaces/file B",
+            "dir1/subdir+with{whatever/",
+            "dir1/subdir+with{whatever/file D",
+        ];
+        for name in files {
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/paths/{name}"),
+                "",
+                &[("Content-Length", "1")],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(put.status, 201, "PUT {name:?} got {}", put.status);
+        }
+        let expect = |mut names: Vec<&str>| -> Vec<String> {
+            names.sort();
+            names.into_iter().map(str::to_string).collect()
+        };
+        let qpath = |p: &str| format!("path={}", p.replace('+', "%2B").replace(' ', "%20"));
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/")).await,
+            expect(vec!["/dir1/", "/dir2/", "/file1", "/file A"]),
+            "official testStructure path=/"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1")).await,
+            expect(vec!["/dir1/file2", "/dir1/subdir1/", "/dir1/subdir2/"]),
+            "official testStructure path=/dir1"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1/")).await,
+            expect(vec!["/dir1/file2", "/dir1/subdir1/", "/dir1/subdir2/"]),
+            "official testStructure path=/dir1/"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("")).await,
+            expect(vec!["file1", "dir1/", "dir2/"]),
+            "official testStructure path="
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("dir1")).await,
+            expect(vec![
+                "dir1/file2",
+                "dir1/subdir1/",
+                "dir1/subdir2/",
+                "dir1/subdir with spaces/",
+                "dir1/subdir+with{whatever/",
+            ]),
+            "official testStructure path=dir1"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("dir1/subdir1")).await,
+            expect(vec![
+                "dir1/subdir1/file4",
+                "dir1/subdir1/subsubdir2/",
+                "dir1/subdir1/file2",
+                "dir1/subdir1/file3",
+                "dir1/subdir1/subsubdir1/",
+            ]),
+            "official testStructure path=dir1/subdir1"
+        );
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/paths",
+                &qpath("dir1/subdir with spaces/")
+            )
+            .await,
+            expect(vec!["dir1/subdir with spaces/file B"]),
+            "official testStructure path=dir1/subdir with spaces/"
+        );
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/paths",
+                &qpath("dir1/subdir+with{whatever/")
+            )
+            .await,
+            expect(vec!["dir1/subdir+with{whatever/file D"]),
+            "official testStructure path=dir1/subdir+with{{whatever/"
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1/subdir2"))
+                .await
+                .is_empty(),
+            "official testStructure path=/dir1/subdir2 empty"
+        );
+        let mut stored: Vec<String> = files.iter().map(|s| (*s).to_string()).collect();
+        stored.sort();
+        for format_type in ["", "json", "xml"] {
+            let query = if format_type.is_empty() {
+                String::new()
+            } else {
+                format!("format={format_type}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/paths", &query).await,
+                stored,
+                "official TestContainerPaths.testContainerListing format={format_type:?}"
+            );
+        }
+        let json = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/paths",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(json.status, 200);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&json.body.collect_async().await.expect("paths json listing"))
+                .unwrap();
+        for row in &rows {
+            assert!(
+                row.get("last_modified").and_then(|v| v.as_str()).is_some(),
+                "official TestContainerPaths.testContainerListing last_modified {row}"
+            );
+            assert!(
+                row.get("bytes").and_then(|v| v.as_i64()).unwrap_or(-1) >= 0,
+                "official TestContainerPaths.testContainerListing bytes {row}"
+            );
+            if row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.ends_with('/'))
+            {
+                assert_eq!(
+                    row.get("content_type").and_then(|v| v.as_str()),
+                    Some("application/directory"),
+                    "official TestContainerPaths.testContainerListing directory {row}"
+                );
+            }
+        }
+        async fn traverse_from(svc: &ProxyAsyncService, path: &str) -> (Vec<String>, Vec<String>) {
+            let mut found_files = Vec::new();
+            let mut found_dirs = Vec::new();
+            async fn walk(
+                svc: &ProxyAsyncService,
+                path: &str,
+                depth: usize,
+                files: &mut Vec<String>,
+                dirs: &mut Vec<String>,
+            ) {
+                assert!(depth <= 10, "official testTraverseContainer too deep");
+                let q = if path.is_empty() {
+                    "path=".to_string()
+                } else {
+                    format!("path={}", path.replace('+', "%2B").replace(' ', "%20"))
+                };
+                for item in listing_plain_names(svc, "/v1/AUTH_test/paths", &q).await {
+                    assert!(
+                        item.starts_with(path),
+                        "official testTraverseContainer {item} vs path={path:?}"
+                    );
+                    if item.ends_with('/') {
+                        Box::pin(walk(svc, &item, depth + 1, files, dirs)).await;
+                        dirs.push(item);
+                    } else {
+                        files.push(item);
+                    }
+                }
+            }
+            walk(svc, path, 0, &mut found_files, &mut found_dirs).await;
+            (found_files, found_dirs)
+        }
+        let (found_files, found_dirs) = traverse_from(&svc, "").await;
+        for name in files {
+            if name.starts_with('/') {
+                assert!(
+                    !found_dirs.iter().any(|n| n == name) && !found_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path='' must omit {name}"
+                );
+            } else if name.ends_with('/') {
+                assert!(
+                    found_dirs.iter().any(|n| n == name),
+                    "official testTraverseContainer path='' missing dir {name}"
+                );
+            } else {
+                assert!(
+                    found_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path='' missing file {name}"
+                );
+            }
+        }
+        let (slash_files, slash_dirs) = traverse_from(&svc, "/").await;
+        for name in files {
+            if !name.starts_with('/') {
+                assert!(
+                    !slash_dirs.iter().any(|n| n == name) && !slash_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path=/ must omit {name}"
+                );
+            } else if name.ends_with('/') {
+                assert!(
+                    slash_dirs.iter().any(|n| n == name),
+                    "official testTraverseContainer path=/ missing dir {name}"
+                );
+            } else {
+                assert!(
+                    slash_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path=/ missing file {name}"
+                );
+            }
+        }
+        backend.abort();
+    }
+
+    /// Official TestAccount.testListDelimiter / testLastContainerMarker /
+    /// TestAccountSorting reverse + marker leftovers.
+    #[tokio::test]
+    async fn account_list_delimiter_and_sorting_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        for name in ["test", "test-bar", "test-foo"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201,
+                "PUT container {name}"
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "delimiter=-").await,
+            vec!["test".to_string(), "test-".to_string()],
+            "official testListDelimiter account"
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "delimiter=-&reverse=yes").await,
+            vec!["test-".to_string(), "test".to_string()],
+            "official testListDelimiter account reverse"
+        );
+        for name in ["bar", "bazar"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "delimiter=a&prefix=ba").await,
+            vec!["bar".to_string(), "baza".to_string()],
+            "official testListDelimiterAndPrefix account"
+        );
+        let last = listing_plain_names(&svc, "/v1/AUTH_test", "").await;
+        let last_name = last.last().expect("account listing");
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test", &format!("marker={last_name}"))
+                .await
+                .is_empty(),
+            "official testLastContainerMarker plaintext"
+        );
+
+        for name in ["a1", "a2", "A3", "b1", "B2", "a10", "b10", "zz"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        let items = [
+            "test", "test-bar", "test-foo", "bar", "bazar", "a1", "a2", "A3", "b1", "B2", "a10",
+            "b10", "zz",
+        ];
+        let mut forward: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        forward.sort();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        for rev in ["true", "1", "yes", "on", "t", "y"] {
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &format!("reverse={rev}")).await,
+                reversed,
+                "official testAccountContainerListSortingReverse reverse={rev}"
+            );
+        }
+        for off in ["false", "no", "off", "", "garbage"] {
+            let q = if off.is_empty() {
+                "reverse=".to_string()
+            } else {
+                format!("reverse={off}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &q).await,
+                forward,
+                "official testAccountContainerListSorting reverse={off:?}"
+            );
+        }
+        let mut pref: Vec<String> = items
+            .iter()
+            .filter(|c| c.starts_with('a'))
+            .map(|s| (*s).to_string())
+            .collect();
+        pref.sort();
+        pref.reverse();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&prefix=a").await,
+            pref,
+            "official testAccountContainerListSortingByPrefix"
+        );
+        let mut exclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" < **c && **c < "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        exclusive.sort();
+        exclusive.reverse();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&marker=b1&end_marker=B2").await,
+            exclusive,
+            "official testAccountContainerListSortingByMarkersExclusive"
+        );
+        let mut inclusive: Vec<String> = items
+            .iter()
+            .filter(|c| "B2" <= **c && **c <= "b1")
+            .map(|s| (*s).to_string())
+            .collect();
+        inclusive.sort();
+        inclusive.reverse();
+        assert_eq!(
+            listing_plain_names(
+                &svc,
+                "/v1/AUTH_test",
+                "reverse=on&marker=b1%00&end_marker=B1"
+            )
+            .await,
+            inclusive,
+            "official testAccountContainerListSortingByMarkersInclusive"
+        );
+        let empty =
+            listing_plain_names(&svc, "/v1/AUTH_test", "reverse=on&marker=B&end_marker=b1").await;
+        assert!(
+            empty.is_empty(),
+            "official testAccountContainerListSortingByReversedMarkers, got {empty:?}"
+        );
+        backend.abort();
+    }
+
+    /// Official TestAccountNoContainers.testGetRequest / testAccountHead /
+    /// testContainerSerializedInfo.
+    #[tokio::test]
+    async fn account_empty_get_head_and_serialized_info_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let plain = file_hyper_call(&svc, "GET", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(
+            plain.status, 204,
+            "official testGetRequest no format on empty account, got {}",
+            plain.status
+        );
+        for format_type in ["json", "xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                &format!("format={format_type}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                listed.status, 200,
+                "official testGetRequest format={format_type} empty account, got {}",
+                listed.status
+            );
+            let ct = listed
+                .headers
+                .get("Content-Type")
+                .or_else(|| listed.headers.get("content-type"))
+                .unwrap_or("");
+            assert_eq!(
+                ct,
+                format!("application/{format_type}; charset=utf-8"),
+                "official testGetRequest {format_type} Content-Type"
+            );
+        }
+        for name in ["ser-a", "ser-b"] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ser-a/obj1",
+                "",
+                &[("Content-Length", "4")],
+                b"abcd".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(
+            head.status, 204,
+            "official testAccountHead on Hyper, got {}",
+            head.status
+        );
+        let count: i64 = head
+            .headers
+            .get("X-Account-Container-Count")
+            .or_else(|| head.headers.get("x-account-container-count"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        assert_eq!(
+            count, 2,
+            "official testAccountHead container_count, headers {:?}",
+            head.headers
+        );
+        for field in ["X-Account-Object-Count", "X-Account-Bytes-Used"] {
+            let v: i64 = head
+                .headers
+                .get(field)
+                .or_else(|| head.headers.get(&field.to_ascii_lowercase()))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            assert!(
+                v >= 0,
+                "official testAccountHead {field} missing/negative: {:?}",
+                head.headers
+            );
+        }
+        for format_type in ["json", "xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                &format!("format={format_type}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(listed.status, 200);
+            let ct = listed
+                .headers
+                .get("Content-Type")
+                .or_else(|| listed.headers.get("content-type"))
+                .unwrap_or("");
+            assert_eq!(
+                ct,
+                format!("application/{format_type}; charset=utf-8"),
+                "official testContainerSerializedInfo {format_type} Content-Type"
+            );
+            if format_type == "json" {
+                let body = listed.body.collect_async().await.expect("account json");
+                let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                for row in &rows {
+                    assert!(
+                        row.get("count").and_then(|v| v.as_i64()).unwrap_or(-1) >= 0,
+                        "official testContainerSerializedInfo count {row}"
+                    );
+                    assert!(
+                        row.get("bytes").and_then(|v| v.as_i64()).unwrap_or(-1) >= 0,
+                        "official testContainerSerializedInfo bytes {row}"
+                    );
+                }
+            }
+        }
+        backend.abort();
+    }
+
+    /// Official TestAccount.test_unicode_metadata / test_multi_metadata /
+    /// test_bad_metadata.
+    #[tokio::test]
+    async fn account_metadata_post_and_limits_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let one = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Account-Meta-One", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            one.status, 204,
+            "official test_multi_metadata first POST, got {}",
+            one.status
+        );
+        let head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official test_multi_metadata HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers.get("X-Account-Meta-One"),
+            Some("1"),
+            "official test_multi_metadata one {:?}",
+            head.headers
+        );
+        let uni = "uni\u{0E12}";
+        let two = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Account-Meta-Two", "2"), ("X-Account-Meta-Uni", uni)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            two.status, 204,
+            "official test_unicode_metadata account POST, got {}",
+            two.status
+        );
+        let after = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(after.headers.get("X-Account-Meta-One"), Some("1"));
+        assert_eq!(after.headers.get("X-Account-Meta-Two"), Some("2"));
+        assert_eq!(
+            after.headers.get("X-Account-Meta-Uni"),
+            Some(uni),
+            "official test_unicode_metadata account {:?}",
+            after.headers
+        );
+        let name_ok = format!(
+            "X-Account-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize)
+        );
+        let name_bad = format!(
+            "X-Account-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize + 1)
+        );
+        let value_ok = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize);
+        let value_bad = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize + 1);
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[(name_ok.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_bad_metadata at-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[(name_bad.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_bad_metadata over-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Account-Meta-Too-Long", value_ok.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_bad_metadata at-limit value"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Account-Meta-Too-Long", value_bad.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_bad_metadata over-limit value"
+        );
+        backend.abort();
+    }
+
+    /// Official TestAccount.testContainerListing / testMarkerLimitContainerList
+    /// / testLastContainerMarker across plaintext, json, and xml.
+    #[tokio::test]
+    async fn account_container_listing_and_marker_limit_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let mut expected: Vec<String> = (0..8).map(|i| format!("acct{i}")).collect();
+        expected.sort();
+        for name in &expected {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201,
+                "PUT container {name}"
+            );
+        }
+        for format_type in ["", "json", "xml"] {
+            let query = if format_type.is_empty() {
+                String::new()
+            } else {
+                format!("format={format_type}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &query).await,
+                expected,
+                "official testContainerListing format={format_type:?}"
+            );
+            for marker in ["0", "A", "acct3", "z"] {
+                let q = if query.is_empty() {
+                    format!("marker={marker}&limit=3")
+                } else {
+                    format!("{query}&marker={marker}&limit=3")
+                };
+                let listed = listing_plain_names(&svc, "/v1/AUTH_test", &q).await;
+                assert!(
+                    listed.len() <= 3,
+                    "official testMarkerLimitContainerList {format_type} {marker} len {}",
+                    listed.len()
+                );
+                if let Some(first) = listed.first() {
+                    assert!(
+                        first.as_str() > marker,
+                        "official testMarkerLimitContainerList first {first} vs {marker}"
+                    );
+                }
+            }
+            let last = expected.last().expect("account names");
+            let past_q = if query.is_empty() {
+                format!("marker={last}")
+            } else {
+                format!("{query}&marker={last}")
+            };
+            let past =
+                file_hyper_call(&svc, "GET", "/v1/AUTH_test", &past_q, &[], Vec::new()).await;
+            if format_type.is_empty() {
+                assert!(
+                    past.status == 204 || past.status == 200,
+                    "official testLastContainerMarker plaintext, got {}",
+                    past.status
+                );
+            } else {
+                assert_eq!(
+                    past.status, 200,
+                    "official testLastContainerMarker {format_type} empty is 200, got {}",
+                    past.status
+                );
+            }
+            assert!(
+                listing_plain_names(&svc, "/v1/AUTH_test", &past_q)
+                    .await
+                    .is_empty(),
+                "official testLastContainerMarker {format_type:?} names empty"
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestContainer.testCreateOnExisting / testDelete /
+    /// testDeleteOnContainerWithFiles / testFileCreateInContainerThatDoesNotExist
+    /// / testContainerFileListOnContainerThatDoesNotExist / testSlashInName.
+    #[tokio::test]
+    async fn container_create_delete_and_missing_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let first = file_hyper_call(&svc, "PUT", "/v1/AUTH_test/exists", "", &[], Vec::new()).await;
+        assert_eq!(
+            first.status, 201,
+            "official testCreateOnExisting first PUT, got {}",
+            first.status
+        );
+        let second =
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/exists", "", &[], Vec::new()).await;
+        assert_eq!(
+            second.status, 202,
+            "official testCreateOnExisting second PUT, got {}",
+            second.status
+        );
+        let empty =
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
+        assert_eq!(empty.status, 201);
+        let deleted =
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/empty-c", "", &[], Vec::new()).await;
+        assert_eq!(
+            deleted.status, 204,
+            "official testDelete empty container, got {}",
+            deleted.status
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/with-files", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/with-files/obj",
+                "",
+                &[("Content-Length", "1")],
+                b"x".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let conflict = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/with-files",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            conflict.status, 409,
+            "official testDeleteOnContainerWithFiles, got {}",
+            conflict.status
+        );
+        let missing_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/no-such-cont/obj",
+            "",
+            &[("Content-Length", "1")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            missing_put.status, 404,
+            "official testFileCreateInContainerThatDoesNotExist, got {}",
+            missing_put.status
+        );
+        for format_type in ["", "format=json", "format=xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/missing-list",
+                format_type,
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                listed.status, 404,
+                "official testContainerFileListOnContainerThatDoesNotExist {format_type:?}, got {}",
+                listed.status
+            );
+        }
+        let slash = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/ab/cd",
+            "",
+            &[("Content-Length", "0")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            slash.status, 404,
+            "official testSlashInName unquoted slash is object PUT to a missing container, got {}",
+            slash.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/no-such-del",
+                "",
+                &[],
+                Vec::new()
+            )
+            .await
+            .status,
+            404,
+            "official testDeleteOnContainerThatDoesNotExist"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "HEAD",
+                "/v1/AUTH_test/no-such-info",
+                "",
+                &[],
+                Vec::new()
+            )
+            .await
+            .status,
+            404,
+            "official testContainerInfoOnContainerThatDoesNotExist"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/created", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "")
+                .await
+                .iter()
+                .any(|n| n == "created"),
+            "official testCreate must list the new container"
+        );
+        let utf8_name = "héllo-容器";
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/{utf8_name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official testUtf8Container valid name"
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test", "")
+                .await
+                .iter()
+                .any(|n| n == utf8_name),
+            "official testUtf8Container listed"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                &format!("/v1/AUTH_test/{utf8_name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official testUtf8Container empty listing"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                &format!("/v1/AUTH_test/{utf8_name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official testUtf8Container delete"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/info-c", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        for i in 0..3 {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/info-c/o{i}"),
+                    "",
+                    &[("Content-Length", "4")],
+                    b"abcd".to_vec(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        let info = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/info-c", "", &[], Vec::new()).await;
+        assert_eq!(
+            info.status, 204,
+            "official testContainerInfo on Hyper, got {}",
+            info.status
+        );
+        assert_eq!(
+            info.headers
+                .get("X-Container-Object-Count")
+                .or_else(|| info.headers.get("x-container-object-count")),
+            Some("3"),
+            "official testContainerInfo object_count {:?}",
+            info.headers
+        );
+        assert_eq!(
+            info.headers
+                .get("X-Container-Bytes-Used")
+                .or_else(|| info.headers.get("x-container-bytes-used")),
+            Some("12"),
+            "official testContainerInfo bytes_used {:?}",
+            info.headers
+        );
+        let version_only = file_hyper_call(&svc, "PUT", "/v1", "", &[], Vec::new()).await;
+        assert_eq!(
+            version_only.status, 412,
+            "official testVersionOnlyPath on Hyper, got {}",
+            version_only.status
+        );
+        let body = version_only
+            .body
+            .collect_async()
+            .await
+            .expect("Bad URL body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Bad URL"),
+            "official testVersionOnlyPath body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let invalid = file_hyper_call(&svc, "GET", "//v1/AUTH_test", "", &[], Vec::new()).await;
+        assert_eq!(
+            invalid.status, 404,
+            "official testInvalidPath on Hyper, got {}",
+            invalid.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_PUT_metadata / test_POST_metadata /
+    /// test_unicode_metadata / test_multi_metadata / test_PUT_bad_metadata /
+    /// test_POST_bad_metadata.
+    #[tokio::test]
+    async fn container_metadata_put_post_and_limits_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/meta-c",
+            "",
+            &[("X-Container-Meta-Test", "Value")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official test_PUT_metadata first PUT, got {}",
+            put.status
+        );
+        for method in ["HEAD", "GET"] {
+            let resp =
+                file_hyper_call(&svc, method, "/v1/AUTH_test/meta-c", "", &[], Vec::new()).await;
+            assert!(
+                (200..300).contains(&resp.status),
+                "official test_PUT_metadata {method}, got {}",
+                resp.status
+            );
+            assert_eq!(
+                resp.headers.get("X-Container-Meta-Test"),
+                Some("Value"),
+                "official test_PUT_metadata {method} header {:?}",
+                resp.headers
+            );
+        }
+        let empty = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/meta-empty",
+            "",
+            &[("X-Container-Meta-Test", "")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            empty.status, 201,
+            "official test_PUT_metadata empty value PUT, got {}",
+            empty.status
+        );
+        let empty_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/meta-empty",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&empty_head.status),
+            "official test_PUT_metadata empty HEAD, got {}",
+            empty_head.status
+        );
+        assert_eq!(
+            empty_head.headers.get("X-Container-Meta-Test"),
+            None,
+            "official test_PUT_metadata empty value must omit the header {:?}",
+            empty_head.headers
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-post", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let before =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(
+            before.headers.get("X-Container-Meta-Test"),
+            None,
+            "official test_POST_metadata before POST {:?}",
+            before.headers
+        );
+        let post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/meta-post",
+            "",
+            &[("X-Container-Meta-Test", "Value")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            post.status, 204,
+            "official test_POST_metadata, got {}",
+            post.status
+        );
+        let after =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(
+            after.headers.get("X-Container-Meta-Test"),
+            Some("Value"),
+            "official test_POST_metadata HEAD {:?}",
+            after.headers
+        );
+        let uni = "uni\u{0E12}";
+        let uni_post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/meta-post",
+            "",
+            &[("X-Container-Meta-Uni", uni), ("X-Container-Meta-One", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            uni_post.status, 204,
+            "official test_unicode_metadata / test_multi_metadata, got {}",
+            uni_post.status
+        );
+        let uni_head =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(
+            uni_head.headers.get("X-Container-Meta-Uni"),
+            Some(uni),
+            "official test_unicode_metadata {:?}",
+            uni_head.headers
+        );
+        assert_eq!(
+            uni_head.headers.get("X-Container-Meta-One"),
+            Some("1"),
+            "official test_multi_metadata one {:?}",
+            uni_head.headers
+        );
+        assert_eq!(
+            uni_head.headers.get("X-Container-Meta-Test"),
+            Some("Value"),
+            "official test_multi_metadata keeps prior {:?}",
+            uni_head.headers
+        );
+        let two = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/meta-post",
+            "",
+            &[("X-Container-Meta-Two", "2")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(two.status, 204);
+        let multi =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/meta-post", "", &[], Vec::new()).await;
+        assert_eq!(multi.headers.get("X-Container-Meta-One"), Some("1"));
+        assert_eq!(multi.headers.get("X-Container-Meta-Two"), Some("2"));
+        let name_ok = format!(
+            "X-Container-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize)
+        );
+        let name_bad = format!(
+            "X-Container-Meta-{}",
+            "k".repeat(swift_core::constraints::MAX_META_NAME_LENGTH as usize + 1)
+        );
+        let value_ok = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize);
+        let value_bad = "k".repeat(swift_core::constraints::MAX_META_VALUE_LENGTH as usize + 1);
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-ok-name",
+                "",
+                &[(name_ok.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_PUT_bad_metadata at-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-bad-name",
+                "",
+                &[(name_bad.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_PUT_bad_metadata over-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-ok-value",
+                "",
+                &[("X-Container-Meta-Too-Long", value_ok.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_PUT_bad_metadata at-limit value"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/meta-bad-value",
+                "",
+                &[("X-Container-Meta-Too-Long", value_bad.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_PUT_bad_metadata over-limit value"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-post",
+                "",
+                &[(name_ok.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_POST_bad_metadata at-limit name"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-post",
+                "",
+                &[(name_bad.as_str(), "v")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            400,
+            "official test_POST_bad_metadata over-limit name"
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_cors (strict IsolatedIdentity Hyper).
+    #[tokio::test]
+    async fn object_cors_allow_origin_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/corsc",
+                "",
+                &[("X-Container-Meta-Access-Control-Allow-Origin", "*")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/corsc/cat",
+                "",
+                &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let options_bare = file_hyper_call(
+            &svc,
+            "OPTIONS",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[("Origin", "http://m.com")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            options_bare.status, 401,
+            "official test_cors OPTIONS without request-method, got {}",
+            options_bare.status
+        );
+        let options_ok = file_hyper_call(
+            &svc,
+            "OPTIONS",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[
+                ("Origin", "http://m.com"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            options_ok.status, 200,
+            "official test_cors OPTIONS GET, got {}",
+            options_ok.status
+        );
+        assert_eq!(
+            options_ok.headers.get("Access-Control-Allow-Origin"),
+            Some("*"),
+            "official test_cors OPTIONS ACAO {:?}",
+            options_ok.headers
+        );
+        let get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[("Origin", "http://m.com")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            get.status, 200,
+            "official test_cors GET, got {}",
+            get.status
+        );
+        assert_eq!(
+            get.headers.get("Access-Control-Allow-Origin"),
+            Some("*"),
+            "official test_cors GET ACAO {:?}",
+            get.headers
+        );
+        let web = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[("Origin", "http://m.com"), ("X-Web-Mode", "True")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            web.status, 200,
+            "official test_cors X-Web-Mode GET, got {}",
+            web.status
+        );
+        assert_eq!(
+            web.headers.get("Access-Control-Allow-Origin"),
+            Some("*"),
+            "official test_cors X-Web-Mode ACAO {:?}",
+            web.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/corsc",
+                "",
+                &[(
+                    "X-Container-Meta-Access-Control-Allow-Origin",
+                    "http://secret.com"
+                )],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202
+        );
+        let denied = file_hyper_call(
+            &svc,
+            "OPTIONS",
+            "/v1/AUTH_test/corsc/cat",
+            "",
+            &[
+                ("Origin", "http://m.com"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied.status, 401,
+            "official test_cors secret origin OPTIONS, got {}",
+            denied.status
+        );
+        backend.abort();
+    }
+
+    async fn public_acl_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        // Official IsolatedIdentity tempauth user_test_tester3 — no .admin,
+        // so AUTH_test is not in the group list (write-only / nonadmin).
+        ta.add_user("test", "tester3", "testing3", &[]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta)],
+        };
+        (svc, backend)
+    }
+
+    /// Official TestObject.test_manifest leftover path: TempAuth + DLO
+    /// on leftover (no intercepting stub). `test:tester3` has no `.admin`.
+    async fn dlo_func_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        ta.add_user("test", "tester3", "testing3", &[]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+            ],
+        };
+        (svc, backend)
+    }
+
+    /// Official TestContainer.test_public_container /
+    /// TestObject.test_public_object / TestContainer.test_cross_account_container.
+    #[tokio::test]
+    async fn public_and_cross_account_container_acl_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let anon_list =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc", "", &[], Vec::new()).await;
+        assert_eq!(
+            anon_list.status, 401,
+            "official test_public_container before ACL, got {}",
+            anon_list.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ".r:*,.rlistings"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_public_container POST .r:*"
+        );
+        let public_list =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&public_list.status),
+            "official test_public_container after ACL, got {}",
+            public_list.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[("X-Auth-Token", owner.as_str()), ("X-Container-Read", ""),],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let private_again =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc", "", &[], Vec::new()).await;
+        assert_eq!(
+            private_again.status, 401,
+            "official test_public_container after revoke, got {}",
+            private_again.status
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/pubc/obj",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let anon_obj =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc/obj", "", &[], Vec::new()).await;
+        assert_eq!(
+            anon_obj.status, 401,
+            "official test_public_object before ACL, got {}",
+            anon_obj.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ".r:*"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let public_obj =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc/obj", "", &[], Vec::new()).await;
+        assert_eq!(
+            public_obj.status, 200,
+            "official test_public_object after ACL, got {}",
+            public_obj.status
+        );
+        assert_eq!(
+            leftover_body_text(public_obj).await,
+            "test",
+            "official test_public_object GET body"
+        );
+
+        let foreign_denied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/pubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        // `.r:*` without `.rlistings` still denies a foreign listing.
+        assert_eq!(
+            foreign_denied.status, 403,
+            "official test_cross_account_container listing without write/read user ACL, got {}",
+            foreign_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test2:tester2"),
+                    ("X-Container-Write", "test2:tester2"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let foreign_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/pubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&foreign_ok.status),
+            "official test_cross_account_container after user ACL, got {}",
+            foreign_ok.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ""),
+                    ("X-Container-Write", ""),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let foreign_again = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/pubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            foreign_again.status, 403,
+            "official test_cross_account_container after revoke, got {}",
+            foreign_again.status
+        );
+
+        // Official TestContainer.test_cross_account_public_container:
+        // `.r:*,.rlistings` allows a foreign listing but not a foreign PUT
+        // until X-Container-Write names that user.
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/xpubc",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let xpub_denied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/xpubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            xpub_denied.status, 403,
+            "official test_cross_account_public_container before ACL, got {}",
+            xpub_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/xpubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ".r:*,.rlistings"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let xpub_list = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/xpubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&xpub_list.status),
+            "official test_cross_account_public_container public listing, got {}",
+            xpub_list.status
+        );
+        let xpub_put_denied = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/xpubc/object",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            xpub_put_denied.status, 403,
+            "official test_cross_account_public_container public-read PUT, got {}",
+            xpub_put_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/xpubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Write", "test2:tester2"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let xpub_put_ok = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/xpubc/object",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            xpub_put_ok.status, 201,
+            "official test_cross_account_public_container after write ACL, got {}",
+            xpub_put_ok.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_container_write_only /
+    /// TestObject.test_private_object / TestContainer.test_nonadmin_user.
+    /// IsolatedIdentity Hyper COPY authorizes the dest PUT, then
+    /// `object_copy_async` authorizes a source GET. Write ACL does not
+    /// grant source read. Must hit `authorize_async` (no intercepting stub).
+    #[tokio::test]
+    async fn write_only_copy_and_private_object_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let writer = auth_token(&svc, "test:tester3", "testing3").await;
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/wonly",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/wonly/obj1",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let wonly_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            wonly_get.status, 403,
+            "official test_container_write_only GET before write ACL, got {}",
+            wonly_get.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/wonly",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Write", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "wonly", None, Some("test:tester3"));
+        let wonly_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            wonly_put.status, 201,
+            "official test_container_write_only PUT, got {}",
+            wonly_put.status
+        );
+        let wonly_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Destination", "wonly/obj2"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            wonly_copy.status, 403,
+            "official test_container_write_only COPY, got {}",
+            wonly_copy.status
+        );
+        let wonly_post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("X-Object-Meta-Color", "blue"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            wonly_post.status, 202,
+            "official test_container_write_only POST, got {}",
+            wonly_post.status
+        );
+        let wonly_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/wonly/obj1",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            wonly_del.status == 204 || wonly_del.status == 404,
+            "official test_container_write_only DELETE, got {}",
+            wonly_del.status
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/privc",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/privc/obj",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        seed_auth_test_rw(&svc, "privc", None, None);
+        let priv_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/privc/obj",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            priv_get.status, 403,
+            "official test_private_object GET, got {}",
+            priv_get.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/shared",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                    ("X-Container-Write", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        seed_auth_test_rw(&svc, "shared", Some("test:tester3"), Some("test:tester3"));
+        let priv_copy_from = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/shared/private_object",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "0"),
+                ("X-Copy-From", "privc/obj"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            priv_copy_from.status, 403,
+            "official test_private_object X-Copy-From, got {}",
+            priv_copy_from.status
+        );
+        let shared_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/shared/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            shared_put.status, 201,
+            "official test_private_object shared PUT, got {}",
+            shared_put.status
+        );
+        seed_auth_test_rw(&svc, "shared", Some("test:tester3"), Some("test:tester3"));
+        let shared_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/shared/obj1",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Destination", "shared/obj1"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            shared_copy.status, 201,
+            "official test_private_object shared COPY, got {}",
+            shared_copy.status
+        );
+        seed_auth_test_rw(&svc, "privc", None, None);
+        seed_auth_test_rw(&svc, "shared", Some("test:tester3"), Some("test:tester3"));
+        let priv_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/privc/obj",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Destination", "shared/private_object"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            priv_copy.status, 403,
+            "official test_private_object COPY from private, got {}",
+            priv_copy.status
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/nonadmin",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        seed_auth_test_rw(&svc, "nonadmin", None, None);
+        let na_denied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/nonadmin",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            na_denied.status, 403,
+            "official test_nonadmin_user before ACL, got {}",
+            na_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/nonadmin",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "nonadmin", Some("test:tester3"), None);
+        let na_list = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/nonadmin",
+            "",
+            &[("X-Auth-Token", writer.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&na_list.status),
+            "official test_nonadmin_user after read ACL, got {}",
+            na_list.status
+        );
+        let na_put_denied = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/nonadmin/object",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            na_put_denied.status, 403,
+            "official test_nonadmin_user read-only PUT, got {}",
+            na_put_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/nonadmin",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Write", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "nonadmin", Some("test:tester3"), Some("test:tester3"));
+        let na_put_ok = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/nonadmin/object",
+            "",
+            &[
+                ("X-Auth-Token", writer.as_str()),
+                ("Content-Length", "11"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"test object".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            na_put_ok.status, 201,
+            "official test_nonadmin_user after write ACL, got {}",
+            na_put_ok.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestAccount.test_invalid_acl_keys / test_invalid_acl_values /
+    /// test_protected_tempurl / test_account_acls (admin grant, RW hides ACL).
+    /// Invalid `X-Account-Access-Control` is 400 in `authorize_async` before
+    /// leftover persist. Valid ACLs rewrite to account sysmeta so leftover
+    /// HEAD can expose them. Must hit `authorize_async` (no intercepting stub).
+    #[tokio::test]
+    async fn account_acl_v2_invalid_and_protected_tempurl_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+
+        let bad_json = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", "invalid"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_json.status, 400,
+            "official test_invalid_acl_keys non-JSON, got {}",
+            bad_json.status
+        );
+        assert!(
+            bad_json.headers.get("X-Account-Access-Control").is_none(),
+            "official test_invalid_acl_keys must not echo ACL on 400"
+        );
+
+        let bad_key = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                (
+                    "X-Account-Access-Control",
+                    r#"{"admin":["test2:tester2"],"invalid_key":"invalid_value"}"#,
+                ),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_key.status, 400,
+            "official test_invalid_acl_keys unknown key, got {}",
+            bad_key.status
+        );
+        assert!(bad_key.headers.get("X-Account-Access-Control").is_none());
+
+        let bad_val = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", r#"{"admin":"invalid_value"}"#),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_val.status, 400,
+            "official test_invalid_acl_values, got {}",
+            bad_val.status
+        );
+        assert!(bad_val.headers.get("X-Account-Access-Control").is_none());
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Meta-Temp-Url-Key", "secret"),
+                    ("X-Account-Meta-Test", "acct-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", ro.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&ro));
+        let ro_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&ro_get.status),
+            "official test_protected_tempurl read-only GET, got {}",
+            ro_get.status
+        );
+        assert_eq!(ro_get.headers.get("X-Account-Meta-Test"), Some("acct-meta"));
+        assert!(
+            ro_get.headers.get("X-Account-Meta-Temp-Url-Key").is_none(),
+            "official test_protected_tempurl RO must hide temp-url-key"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", rw.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&rw));
+        let rw_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&rw_get.status),
+            "official test_protected_tempurl read-write GET, got {}",
+            rw_get.status
+        );
+        assert_eq!(rw_get.headers.get("X-Account-Meta-Test"), Some("acct-meta"));
+        assert!(
+            rw_get.headers.get("X-Account-Meta-Temp-Url-Key").is_none(),
+            "official test_protected_tempurl RW must hide temp-url-key"
+        );
+        assert!(
+            rw_get.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls RW must hide ACL header"
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", admin.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&admin));
+        let admin_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&admin_get.status),
+            "official test_protected_tempurl admin GET, got {}",
+            admin_get.status
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Account-Meta-Test"),
+            Some("acct-meta")
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Account-Meta-Temp-Url-Key"),
+            Some("secret"),
+            "official test_protected_tempurl admin sees temp-url-key"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Temp-Url-Key", "rotated"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&admin));
+        let rotated = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rotated.headers.get("X-Account-Meta-Temp-Url-Key"),
+            Some("rotated"),
+            "official test_protected_tempurl admin can rotate temp-url-key"
+        );
+
+        let foreign_admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test2:tester2".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", foreign_admin.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_account_acl(&svc, Some(&foreign_admin));
+        let other_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&other_head.status),
+            "official test_account_acls foreign admin HEAD, got {}",
+            other_head.status
+        );
+        assert_eq!(
+            other_head.headers.get("X-Account-Access-Control"),
+            Some(foreign_admin.as_str()),
+            "official test_account_acls admin sees ACL header"
+        );
+        backend.abort();
+    }
+
+    /// Official TestAccount.test_invalid_acls. Eight admin keys each
+    /// `max_header_size/8` make `X-Account-Access-Control` exceed
+    /// `MAX_HEADER_SIZE` → 400 (`check_metadata`). Seven keys of the same
+    /// size POST 204. Must hit `authorize_async` then account POST (no stub).
+    #[tokio::test]
+    async fn account_acl_v2_oversized_header_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let max_header = swift_core::constraints::MAX_HEADER_SIZE as usize;
+        let num_keys = 8;
+        let max_key_size = max_header / num_keys;
+        let too_big: Vec<String> = "abcdefgh"
+            .chars()
+            .take(num_keys)
+            .map(|c| c.to_string().repeat(max_key_size))
+            .collect();
+        let big = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: too_big,
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert!(
+            big.len() > max_header,
+            "official test_invalid_acls 8-key ACL must exceed max_header_size, got {}",
+            big.len()
+        );
+        let denied = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", big.as_str()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied.status, 400,
+            "official test_invalid_acls oversized ACL, got {}",
+            denied.status
+        );
+        let ok_keys: Vec<String> = "abcdefg"
+            .chars()
+            .take(num_keys - 1)
+            .map(|c| c.to_string().repeat(max_key_size))
+            .collect();
+        let smaller = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: ok_keys,
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        assert!(
+            smaller.len() <= max_header,
+            "official test_invalid_acls 7-key ACL must fit, got {}",
+            smaller.len()
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Account-Access-Control", smaller.as_str()),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_invalid_acls slightly smaller ACL"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_protected_container_sync. Field H1:
+    /// leftover persists `X-Container-Sync-Key`; Hyper scrubs it on
+    /// `!swift_owner` POST and strips it on `!swift_owner` GET.
+    /// `test:tester3` has no `.admin`. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn protected_container_sync_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT sync-c"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Sync-Key", "secret"),
+                    ("X-Container-Meta-Test", "sync-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_sync owner POST"
+        );
+        let owner_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&owner_get.status),
+            "official test_protected_container_sync owner GET, got {}",
+            owner_get.status
+        );
+        assert_eq!(
+            owner_get.headers.get("X-Container-Sync-Key"),
+            Some("secret"),
+            "official test_protected_container_sync owner sees sync-key"
+        );
+        assert_eq!(
+            owner_get.headers.get("X-Container-Meta-Test"),
+            Some("sync-meta")
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let ro_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&ro_get.status),
+            "official test_protected_container_sync RO GET, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            ro_get.headers.get("X-Container-Meta-Test"),
+            Some("sync-meta")
+        );
+        assert!(
+            ro_get.headers.get("X-Container-Sync-Key").is_none(),
+            "official test_protected_container_sync RO must hide sync-key"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Sync-Key", "newsecret"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_protected_container_sync RO cannot write"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&rw_get.status),
+            "official test_protected_container_sync RW GET, got {}",
+            rw_get.status
+        );
+        assert_eq!(
+            rw_get.headers.get("X-Container-Meta-Test"),
+            Some("sync-meta")
+        );
+        assert!(
+            rw_get.headers.get("X-Container-Sync-Key").is_none(),
+            "official test_protected_container_sync RW must hide sync-key"
+        );
+        let owner_sanity =
+            leftover_container_get(&svc, "/v1/AUTH_test/sync-c", owner.as_str()).await;
+        assert_eq!(
+            owner_sanity.headers.get("X-Container-Sync-Key"),
+            Some("secret")
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Sync-Key", "rw-secret"),
+                    ("X-Container-Meta-Test", "rw-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_sync RW POST meta"
+        );
+        let owner_after_rw =
+            leftover_container_get(&svc, "/v1/AUTH_test/sync-c", owner.as_str()).await;
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta"),
+            "official test_protected_container_sync RW can write meta"
+        );
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Sync-Key"),
+            Some("secret"),
+            "official test_protected_container_sync RW cannot write sync-key"
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_get = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&admin_get.status),
+            "official test_protected_container_sync admin GET, got {}",
+            admin_get.status
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta")
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Sync-Key"),
+            Some("secret"),
+            "official test_protected_container_sync admin sees sync-key"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/sync-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Sync-Key", "admin-secret"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_sync admin can rotate sync-key"
+        );
+        let rotated = leftover_container_get(&svc, "/v1/AUTH_test/sync-c", reader.as_str()).await;
+        assert_eq!(
+            rotated.headers.get("X-Container-Sync-Key"),
+            Some("admin-secret"),
+            "official test_protected_container_sync admin GET after rotate"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_protected_container_acl. Field H1:
+    /// leftover persists `X-Container-Read`/`Write`; Hyper scrubs them on
+    /// `!swift_owner` POST and strips them on `!swift_owner` GET.
+    /// `test:tester3` has no `.admin`. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn protected_container_acl_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT acl-c"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "jdoe"),
+                    ("X-Container-Write", "jdoe"),
+                    ("X-Container-Meta-Test", "acl-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_acl owner POST"
+        );
+        let owner_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&owner_get.status),
+            "official test_protected_container_acl owner GET, got {}",
+            owner_get.status
+        );
+        assert_eq!(owner_get.headers.get("X-Container-Read"), Some("jdoe"));
+        assert_eq!(owner_get.headers.get("X-Container-Write"), Some("jdoe"));
+        assert_eq!(
+            owner_get.headers.get("X-Container-Meta-Test"),
+            Some("acl-meta")
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let ro_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&ro_get.status),
+            "official test_protected_container_acl RO GET, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            ro_get.headers.get("X-Container-Meta-Test"),
+            Some("acl-meta")
+        );
+        assert!(
+            ro_get.headers.get("X-Container-Read").is_none()
+                && ro_get.headers.get("X-Container-Write").is_none(),
+            "official test_protected_container_acl RO must hide ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Read", "frank"),
+                    ("X-Container-Write", "frank"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_protected_container_acl RO cannot write"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&rw_get.status),
+            "official test_protected_container_acl RW GET, got {}",
+            rw_get.status
+        );
+        assert_eq!(
+            rw_get.headers.get("X-Container-Meta-Test"),
+            Some("acl-meta")
+        );
+        assert!(
+            rw_get.headers.get("X-Container-Read").is_none()
+                && rw_get.headers.get("X-Container-Write").is_none(),
+            "official test_protected_container_acl RW must hide ACL"
+        );
+        let owner_sanity =
+            leftover_container_get(&svc, "/v1/AUTH_test/acl-c", owner.as_str()).await;
+        assert_eq!(owner_sanity.headers.get("X-Container-Read"), Some("jdoe"));
+        assert_eq!(owner_sanity.headers.get("X-Container-Write"), Some("jdoe"));
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Read", "frank"),
+                    ("X-Container-Write", "frank"),
+                    ("X-Container-Meta-Test", "rw-meta"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_acl RW POST meta"
+        );
+        let owner_after_rw =
+            leftover_container_get(&svc, "/v1/AUTH_test/acl-c", owner.as_str()).await;
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta"),
+            "official test_protected_container_acl RW can write meta"
+        );
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Read"),
+            Some("jdoe"),
+            "official test_protected_container_acl RW cannot write ACL"
+        );
+        assert_eq!(
+            owner_after_rw.headers.get("X-Container-Write"),
+            Some("jdoe")
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_get = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert!(
+            (200..300).contains(&admin_get.status),
+            "official test_protected_container_acl admin GET, got {}",
+            admin_get.status
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Meta-Test"),
+            Some("rw-meta")
+        );
+        assert_eq!(
+            admin_get.headers.get("X-Container-Read"),
+            Some("jdoe"),
+            "official test_protected_container_acl admin sees ACL"
+        );
+        assert_eq!(admin_get.headers.get("X-Container-Write"), Some("jdoe"));
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/acl-c",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Read", ".r:*"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_protected_container_acl admin can rotate ACL"
+        );
+        let rotated = leftover_container_get(&svc, "/v1/AUTH_test/acl-c", reader.as_str()).await;
+        assert_eq!(
+            rotated.headers.get("X-Container-Read"),
+            Some(".r:*"),
+            "official test_protected_container_acl admin GET after rotate"
+        );
+        backend.abort();
+    }
+
+    /// Official TestAccount.test_account_acls User2 path. `test2:tester2`
+    /// is `.admin` of AUTH_test2, not AUTH_test — before grant GET is 403;
+    /// admin HEAD sees the ACL; RW can PUT+DELETE a container; RO cannot
+    /// PUT. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn account_acl_v2_user2_container_crud_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        let owner_get = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&owner_get.status),
+            "official test_account_acls owner GET empty ACL, got {}",
+            owner_get.status
+        );
+        assert!(
+            owner_get.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls empty ACL must not echo"
+        );
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test", other.as_str())
+                .await
+                .status,
+            403,
+            "official test_account_acls User2 GET before grant"
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test2:tester2".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&admin_head.status),
+            "official test_account_acls User2 admin HEAD, got {}",
+            admin_head.status
+        );
+        assert_eq!(
+            admin_head.headers.get("X-Account-Access-Control"),
+            Some(admin.as_str()),
+            "official test_account_acls User2 admin sees ACL"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test2:tester2".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rw_head.status, 204,
+            "official test_account_acls User2 RW HEAD, got {}",
+            rw_head.status
+        );
+        assert!(
+            rw_head.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls User2 RW must hide ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/mycontainer",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_account_acls User2 RW PUT container"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/mycontainer",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_account_acls User2 RW DELETE container"
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test2:tester2".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let ro_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ro_head.status, 204,
+            "official test_account_acls User2 RO HEAD, got {}",
+            ro_head.status
+        );
+        assert!(
+            ro_head.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls User2 RO must hide ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/mycontainer",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_account_acls User2 RO cannot PUT container"
+        );
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        backend.abort();
+    }
+
+    /// Official TestObject.test_manifest. Leftover persists
+    /// `X-Object-Manifest` + `Content-Type` and listing `bytes` so Hyper
+    /// DLO can assemble `onetwothreefourfive`, honor ranges, remanifest,
+    /// and deny tester3 until both the manifest and segment containers
+    /// grant read. Must hit DLO `reassemble_async` (no stub).
+    #[tokio::test]
+    async fn extra_file_dlo_manifest_on_hyper() {
+        let (svc, backend) = dlo_func_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/dlo-c",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT dlo-c"
+        );
+        let segments1 = ["one", "two", "three", "four", "five"];
+        for (i, seg) in segments1.iter().enumerate() {
+            assert_eq!(
+                leftover_put_object(
+                    &svc,
+                    &format!("/v1/AUTH_test/dlo-c/segments1/{i}"),
+                    owner.as_str(),
+                    &[],
+                    seg.as_bytes(),
+                )
+                .await
+                .status,
+                201,
+                "official test_manifest PUT segments1/{i}"
+            );
+        }
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/dlo-c/manifest",
+                owner.as_str(),
+                &[
+                    ("X-Object-Manifest", "dlo-c/segments1/"),
+                    ("Content-Type", "text/jibberish"),
+                ],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_manifest PUT manifest"
+        );
+        let assembled =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            assembled.status, 200,
+            "official test_manifest GET assembled, got {}",
+            assembled.status
+        );
+        assert_eq!(
+            assembled.headers.get("Content-Type"),
+            Some("text/jibberish"),
+            "official test_manifest content-type"
+        );
+        assert_eq!(
+            leftover_body_text(assembled).await,
+            "onetwothreefourfive",
+            "official test_manifest assembled body"
+        );
+
+        let range_start = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/dlo-c/manifest",
+            "",
+            &[("X-Auth-Token", owner.as_str()), ("Range", "bytes=3-")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            range_start.status, 206,
+            "official test_manifest bytes=3-, got {}",
+            range_start.status
+        );
+        assert_eq!(leftover_body_text(range_start).await, "twothreefourfive");
+
+        let range_mid = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/dlo-c/manifest",
+            "",
+            &[("X-Auth-Token", owner.as_str()), ("Range", "bytes=5-")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            range_mid.status, 206,
+            "official test_manifest bytes=5-, got {}",
+            range_mid.status
+        );
+        assert_eq!(leftover_body_text(range_mid).await, "othreefourfive");
+
+        let range_span = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/dlo-c/manifest",
+            "",
+            &[("X-Auth-Token", owner.as_str()), ("Range", "bytes=5-10")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            range_span.status, 206,
+            "official test_manifest bytes=5-10, got {}",
+            range_span.status
+        );
+        assert_eq!(leftover_body_text(range_span).await, "othree");
+
+        let segments2 = ["six", "seven", "eight"];
+        for (i, seg) in segments2.iter().enumerate() {
+            assert_eq!(
+                leftover_put_object(
+                    &svc,
+                    &format!("/v1/AUTH_test/dlo-c/segments2/{i}"),
+                    owner.as_str(),
+                    &[],
+                    seg.as_bytes(),
+                )
+                .await
+                .status,
+                201,
+                "official test_manifest PUT segments2/{i}"
+            );
+        }
+        let still_first =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            leftover_body_text(still_first).await,
+            "onetwothreefourfive",
+            "official test_manifest GET still first segments"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/dlo-c/manifest",
+                owner.as_str(),
+                &[("X-Object-Manifest", "dlo-c/segments2/")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_manifest remanifest segments2"
+        );
+        let second =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            leftover_body_text(second).await,
+            "sixseveneight",
+            "official test_manifest GET second segments"
+        );
+
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str())
+                .await
+                .status,
+            403,
+            "official test_manifest tester3 before ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/dlo-c",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_manifest grant tester3 read"
+        );
+        seed_auth_test_rw(&svc, "dlo-c", Some("test:tester3"), None);
+        let reader_second =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str()).await;
+        assert_eq!(
+            reader_second.status, 200,
+            "official test_manifest tester3 after ACL, got {}",
+            reader_second.status
+        );
+        assert_eq!(leftover_body_text(reader_second).await, "sixseveneight");
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/dlo-segs",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT dlo-segs"
+        );
+        let segments3 = ["nine", "ten", "eleven"];
+        for (i, seg) in segments3.iter().enumerate() {
+            assert_eq!(
+                leftover_put_object(
+                    &svc,
+                    &format!("/v1/AUTH_test/dlo-segs/segments3/{i}"),
+                    owner.as_str(),
+                    &[],
+                    seg.as_bytes(),
+                )
+                .await
+                .status,
+                201,
+                "official test_manifest PUT segments3/{i}"
+            );
+        }
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/dlo-c/manifest",
+                owner.as_str(),
+                &[("X-Object-Manifest", "dlo-segs/segments3/")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_manifest remanifest other container"
+        );
+        let third =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            leftover_body_text(third).await,
+            "nineteneleven",
+            "official test_manifest GET third segments"
+        );
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str())
+                .await
+                .status,
+            403,
+            "official test_manifest tester3 denied foreign segments"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/dlo-segs",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_manifest grant tester3 segment container"
+        );
+        seed_auth_test_rw(&svc, "dlo-segs", Some("test:tester3"), None);
+        let reader_third =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str()).await;
+        assert_eq!(
+            reader_third.status, 200,
+            "official test_manifest tester3 after both ACLs, got {}",
+            reader_third.status
+        );
+        assert_eq!(leftover_body_text(reader_third).await, "nineteneleven");
+        backend.abort();
+    }
+
+    /// Official TestAccount.test_swift_account_acls /
+    /// test_swift_prohibits_garbage_account_acls. TempAuth rejects
+    /// non-JSON ACL with 400 in `authorize_async` before leftover persist,
+    /// so a later GET still shows `{"admin":["bob"]}`, never `yuck`.
+    /// Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn swift_account_acls_garbage_does_not_persist_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        let empty = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&empty.status),
+            "official test_swift_account_acls empty GET, got {}",
+            empty.status
+        );
+        assert!(
+            empty.headers.get("X-Account-Access-Control").is_none(),
+            "official test_swift_account_acls empty ACL must not echo"
+        );
+
+        let acl_json = r#"{"admin":["bob"]}"#;
+        leftover_grant_account_acl(&svc, owner.as_str(), acl_json).await;
+        let stored = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&stored.status),
+            "official test_swift_account_acls GET after POST, got {}",
+            stored.status
+        );
+        assert_eq!(
+            stored.headers.get("X-Account-Access-Control"),
+            Some(acl_json),
+            "official test_swift_account_acls GET must echo compact v2 ACL"
+        );
+
+        let garbage = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("X-Account-Access-Control", "yuck"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            garbage.status, 400,
+            "official test_swift_account_acls TempAuth yuck is 400, got {}",
+            garbage.status
+        );
+        let after = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&after.status),
+            "official test_swift_account_acls GET after yuck, got {}",
+            after.status
+        );
+        assert_eq!(
+            after.headers.get("X-Account-Access-Control"),
+            Some(acl_json),
+            "official test_swift_account_acls GET must keep bob, not yuck"
+        );
+        assert_ne!(
+            after.headers.get("X-Account-Access-Control"),
+            Some("yuck"),
+            "official test_swift_prohibits_garbage_account_acls"
+        );
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        backend.abort();
+    }
+
+    /// Official TestObject.test_copy_object. Extra-file identity: source
+    /// body `test`, X-Copy-From then COPY, DELETE dest is 404, and COPY
+    /// `Range: bytes=1-2` dest body is `es`. IsolatedIdentity Hyper never
+    /// calls `Copy::handle()` — leftover hits `object_copy_async` (no stub).
+    #[tokio::test]
+    async fn extra_file_copy_object_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/copy-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT copy-c"
+        );
+        assert_eq!(
+            leftover_put_object(&svc, "/v1/AUTH_test/copy-c/src", "", &[], b"test")
+                .await
+                .status,
+            201,
+            "official test_copy_object PUT source"
+        );
+        let src = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/src", "").await;
+        assert_eq!(src.status, 200, "official test_copy_object GET source");
+        assert_eq!(leftover_body_text(src).await, "test");
+
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/copy-c/test_copy",
+                "",
+                &[("X-Copy-From", "copy-c/src")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_copy_object X-Copy-From"
+        );
+        let copied = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "").await;
+        assert_eq!(copied.status, 200);
+        assert_eq!(
+            leftover_body_text(copied).await,
+            "test",
+            "official test_copy_object dest equals source"
+        );
+
+        assert!(
+            matches!(
+                file_hyper_call(
+                    &svc,
+                    "DELETE",
+                    "/v1/AUTH_test/copy-c/test_copy",
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                204 | 404
+            ),
+            "official test_copy_object DELETE dest"
+        );
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "")
+                .await
+                .status,
+            404,
+            "official test_copy_object GET dest after DELETE"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "COPY",
+                "/v1/AUTH_test/copy-c/src",
+                "",
+                &[("Destination", "copy-c/test_copy")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_copy_object COPY"
+        );
+        let copied = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "").await;
+        assert_eq!(leftover_body_text(copied).await, "test");
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "COPY",
+                "/v1/AUTH_test/copy-c/src",
+                "",
+                &[("Destination", "copy-c/test_copy"), ("Range", "bytes=1-2")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_copy_object COPY Range"
+        );
+        let ranged = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "").await;
+        assert_eq!(ranged.status, 200);
+        assert_eq!(
+            leftover_body_text(ranged).await,
+            "es",
+            "official test_copy_object COPY Range bytes=1-2 of test"
+        );
+        backend.abort();
+    }
+
+    /// Official extra-file TestObject.test_if_none_match. IsolatedIdentity
+    /// Hyper forwards If-None-Match onto leftover object PUT; no stub.
+    #[tokio::test]
+    async fn extra_file_if_none_match_put_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/inm-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT inm-c"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/inm-c/if_none_match_test",
+                "",
+                &[("If-None-Match", "*")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_if_none_match first If-None-Match:*"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/inm-c/if_none_match_test",
+                "",
+                &[("If-None-Match", "*")],
+                b"",
+            )
+            .await
+            .status,
+            412,
+            "official test_if_none_match second If-None-Match:*"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/inm-c/if_none_match_test",
+                "",
+                &[("If-None-Match", "somethingelse")],
+                b"",
+            )
+            .await
+            .status,
+            400,
+            "official test_if_none_match If-None-Match not *"
+        );
+        backend.abort();
+    }
+
+    /// Official extra-file TestObject.test_metadata. IsolatedIdentity
+    /// Hyper leftover object POST is 202 and replaces the user-meta set;
+    /// sysmeta / transient-sysmeta are not echoed. No stub.
+    #[tokio::test]
+    async fn extra_file_object_metadata_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT meta-c"
+        );
+        let path = "/v1/AUTH_test/meta-c/test_metadata";
+        assert_eq!(
+            leftover_put_object(&svc, path, "", &[], b"").await.status,
+            201,
+            "official test_metadata empty PUT"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(got.status, 200, "official test_metadata empty GET");
+        assert_eq!(leftover_body_text(got).await, "");
+        let got = leftover_container_get(&svc, path, "").await;
+        assert!(
+            leftover_object_meta_map(&got).is_empty(),
+            "official test_metadata empty PUT must have no meta, got {:?}",
+            leftover_object_meta_map(&got)
+        );
+
+        assert_eq!(
+            file_hyper_call(&svc, "POST", path, "", &[], Vec::new())
+                .await
+                .status,
+            202,
+            "official test_metadata empty POST"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(got.status, 200);
+        assert_eq!(leftover_body_text(got).await, "");
+        let got = leftover_container_get(&svc, path, "").await;
+        assert!(
+            leftover_object_meta_map(&got).is_empty(),
+            "official test_metadata empty POST must keep no meta"
+        );
+
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                path,
+                "",
+                &[
+                    ("x-object-meta-Color", "blUe"),
+                    ("X-Object-Meta-food", "PizZa"),
+                ],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_metadata PUT Color/food"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(got.status, 200);
+        assert_eq!(leftover_body_text(got).await, "");
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [
+                ("X-Object-Meta-Color".into(), "blUe".into()),
+                ("X-Object-Meta-Food".into(), "PizZa".into()),
+            ]
+            .into_iter()
+            .collect(),
+            "official test_metadata PUT Color/Food"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                path,
+                "",
+                &[("X-Object-Meta-color", "oraNge")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202,
+            "official test_metadata POST color"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Color".into(), "oraNge".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata POST replaces user meta"
+        );
+
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                path,
+                "",
+                &[
+                    ("X-Object-Meta-Color", "Red"),
+                    ("X-Object-Sysmeta-Color", "Green"),
+                    ("X-Object-Transient-Sysmeta-Color", "Blue"),
+                ],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_metadata PUT sysmeta"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Color".into(), "Red".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata PUT must hide sysmeta"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                path,
+                "",
+                &[
+                    ("X-Object-Meta-Food", "Burger"),
+                    ("X-Object-Meta-Animal", "Cat"),
+                    ("X-Object-Sysmeta-Animal", "Cow"),
+                    ("X-Object-Transient-Sysmeta-Food", "Burger"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202,
+            "official test_metadata POST sysmeta"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [
+                ("X-Object-Meta-Animal".into(), "Cat".into()),
+                ("X-Object-Meta-Food".into(), "Burger".into()),
+            ]
+            .into_iter()
+            .collect(),
+            "official test_metadata POST must hide sysmeta"
+        );
+
+        assert_eq!(
+            leftover_put_object(&svc, path, "", &[("X-Object-Meta-Foo", "Bâr")], b"",)
+                .await
+                .status,
+            201,
+            "official test_metadata PUT unicode"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Foo".into(), "Bâr".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata PUT unicode Foo"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                path,
+                "",
+                &[("X-Object-Meta-Foo", "Båz")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            202,
+            "official test_metadata POST unicode"
+        );
+        let got = leftover_container_get(&svc, path, "").await;
+        assert_eq!(
+            leftover_object_meta_map(&got),
+            [("X-Object-Meta-Foo".into(), "Båz".into())]
+                .into_iter()
+                .collect(),
+            "official test_metadata POST unicode Foo"
+        );
+        backend.abort();
+    }
+
+    /// Official extra-file TestContainer.test_container_quota_bytes.
+    /// ContainerQuotas is outer leftover (no stub). Do not flip
+    /// `container_func_hyper_svc`.
+    #[tokio::test]
+    async fn extra_file_container_quota_bytes_on_hyper() {
+        let (mut svc, backend) = container_func_hyper_svc().await;
+        svc.filters
+            .insert(0, Arc::new(swift_middleware::ContainerQuotas::new()));
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/quota-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT quota-c"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/quota-c",
+                "",
+                &[("X-Container-Meta-Quota-Bytes", "10")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_container_quota_bytes POST quota"
+        );
+        let head =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/quota-c", "", &[], Vec::new()).await;
+        assert!(
+            matches!(head.status, 200 | 204),
+            "official test_container_quota_bytes HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers.get("X-Container-Meta-Quota-Bytes"),
+            Some("10"),
+            "official test_container_quota_bytes HEAD quota"
+        );
+        let over = leftover_put_object(
+            &svc,
+            "/v1/AUTH_test/quota-c/object",
+            "",
+            &[],
+            b"01234567890",
+        )
+        .await;
+        assert_eq!(
+            over.status, 413,
+            "official test_container_quota_bytes PUT 11 bytes"
+        );
+        assert_eq!(
+            leftover_body_text(over).await,
+            "Upload exceeds quota.",
+            "official test_container_quota_bytes 413 body"
+        );
+        assert_eq!(
+            leftover_put_object(&svc, "/v1/AUTH_test/quota-c/object", "", &[], b"0123456789",)
+                .await
+                .status,
+            201,
+            "official test_container_quota_bytes PUT 10 bytes"
+        );
+        let got = leftover_container_get(&svc, "/v1/AUTH_test/quota-c/object", "").await;
+        assert_eq!(got.status, 200);
+        assert_eq!(
+            leftover_body_text(got).await,
+            "0123456789",
+            "official test_container_quota_bytes GET body"
+        );
+        backend.abort();
+    }
+
+    async fn leftover_hyper_headers(
+        svc: &ProxyAsyncService,
+        method: &str,
+        path: &str,
+        headers: HeaderKeyDict,
+    ) -> Response {
+        svc.call(AsyncRequest {
+            method: method.into(),
+            path: path.into(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+        })
+        .await
+    }
+
+    fn leftover_meta_count_headers(prefix: &str, n: usize) -> HeaderKeyDict {
+        let mut headers = HeaderKeyDict::new();
+        for x in 0..n {
+            headers.set(&format!("{prefix}{x}"), "v");
+        }
+        headers
+    }
+
+    fn leftover_meta_overall_fill(prefix: &str) -> (HeaderKeyDict, i64) {
+        let max_val = swift_core::constraints::MAX_META_VALUE_LENGTH as i64;
+        let max_all = swift_core::constraints::MAX_META_OVERALL_SIZE;
+        let header_value = "k".repeat(max_val as usize);
+        let mut size = 0i64;
+        let mut x = 0i64;
+        let mut headers = HeaderKeyDict::new();
+        while size < (max_all - 4 - max_val) {
+            size += 4 + max_val;
+            headers.set(&format!("{prefix}{x:04}"), &header_value);
+            x += 1;
+        }
+        if max_all - size > 1 {
+            headers.set(
+                &format!("{prefix}k"),
+                "v".repeat((max_all - size - 1) as usize),
+            );
+        }
+        (headers, size)
+    }
+
+    /// Official extra-file TestAccount.test_bad_metadata2 / test_bad_metadata3.
+    #[tokio::test]
+    async fn extra_file_account_bad_metadata_count_and_overall_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let count = swift_core::constraints::MAX_META_COUNT as usize;
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                leftover_meta_count_headers("X-Account-Meta-", count),
+            )
+            .await
+            .status,
+            204,
+            "official test_bad_metadata2 at-limit count"
+        );
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                leftover_meta_count_headers("X-Account-Meta-", count + 1),
+            )
+            .await
+            .status,
+            400,
+            "official test_bad_metadata2 over-limit count"
+        );
+        backend.abort();
+        let (svc, backend) = container_func_hyper_svc().await;
+        let (fill, size) = leftover_meta_overall_fill("X-Account-Meta-");
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", fill.clone())
+                .await
+                .status,
+            204,
+            "official test_bad_metadata3 at-limit overall"
+        );
+        let mut over_req = fill;
+        over_req.set(
+            "X-Account-Meta-k",
+            "x".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", over_req)
+                .await
+                .status,
+            400,
+            "official test_bad_metadata3 over-limit overall request"
+        );
+        let mut border = HeaderKeyDict::new();
+        border.set(
+            "X-Account-Meta-k",
+            "y".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size - 1) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", border)
+                .await
+                .status,
+            204,
+            "official test_bad_metadata3 aggregate on the border"
+        );
+        let mut over_agg = HeaderKeyDict::new();
+        over_agg.set(
+            "X-Account-Meta-k",
+            "z".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", over_agg)
+                .await
+                .status,
+            400,
+            "official test_bad_metadata3 aggregate over limit"
+        );
+        backend.abort();
+    }
+
+    /// Official extra-file TestContainer.test_POST_bad_metadata2 /
+    /// test_POST_bad_metadata3.
+    #[tokio::test]
+    async fn extra_file_container_post_bad_metadata_count_and_overall_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-c2", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT meta-c2"
+        );
+        let count = swift_core::constraints::MAX_META_COUNT as usize;
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-c2",
+                leftover_meta_count_headers("X-Container-Meta-", count),
+            )
+            .await
+            .status,
+            204,
+            "official test_POST_bad_metadata2 at-limit count"
+        );
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-c2",
+                leftover_meta_count_headers("X-Container-Meta-", count + 1),
+            )
+            .await
+            .status,
+            400,
+            "official test_POST_bad_metadata2 over-limit count"
+        );
+        backend.abort();
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-c2", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT meta-c2 for overall"
+        );
+        let (fill, size) = leftover_meta_overall_fill("X-Container-Meta-");
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", fill.clone())
+                .await
+                .status,
+            204,
+            "official test_POST_bad_metadata3 at-limit overall"
+        );
+        let mut over_req = fill;
+        over_req.set(
+            "X-Container-Meta-k",
+            "x".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", over_req)
+                .await
+                .status,
+            400,
+            "official test_POST_bad_metadata3 over-limit overall request"
+        );
+        let mut border = HeaderKeyDict::new();
+        border.set(
+            "X-Container-Meta-k",
+            "y".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size - 1) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", border)
+                .await
+                .status,
+            204,
+            "official test_POST_bad_metadata3 aggregate on the border"
+        );
+        let mut over_agg = HeaderKeyDict::new();
+        over_agg.set(
+            "X-Container-Meta-k",
+            "z".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", over_agg)
+                .await
+                .status,
+            400,
+            "official test_POST_bad_metadata3 aggregate over limit"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.test_read_only_acl_listings /
+    /// test_read_only_acl_metadata / test_read_write_acl_listings /
+    /// test_read_write_acl_metadata / test_admin_acl_listing /
+    /// test_admin_acl_metadata, plus TestAccount.test_read_only_acl /
+    /// test_read_write_acl / test_admin_acl write + revoke leftovers.
+    /// `test:tester3` has no `.admin`. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn account_acl_v2_container_listings_and_metadata_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        for name in [
+            "ro-list",
+            "rw-list",
+            "admin-list",
+            "ro-meta",
+            "rw-meta",
+            "admin-meta",
+        ] {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/{name}"),
+                    "",
+                    &[("X-Auth-Token", owner.as_str())],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                201,
+                "owner PUT {name}"
+            );
+        }
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/ro-meta",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Meta-Test", "ro-value"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_listings before grant"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/ro-meta",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_metadata before grant"
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let (ro_status, ro_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert_eq!(
+            ro_status, 200,
+            "official test_read_only_acl_listings after grant, got {ro_status}"
+        );
+        assert!(
+            ro_names.iter().any(|n| n == "ro-list"),
+            "official test_read_only_acl_listings after grant, got {ro_names:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ro-denied",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_listings cannot create"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Test", "nope"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl cannot write account metadata"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ro-seen",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let (_, ro_seen) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert!(
+            ro_seen.iter().any(|n| n == "ro-seen"),
+            "official test_read_only_acl_listings sees owner create, got {ro_seen:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/ro-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Meta-Test", "hijack"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only_acl_metadata cannot write"
+        );
+        let ro_meta = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/ro-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&ro_meta.status),
+            "official test_read_only_acl_metadata GET, got {}",
+            ro_meta.status
+        );
+        assert_eq!(
+            ro_meta.headers.get("X-Container-Meta-Test"),
+            Some("ro-value"),
+            "official test_read_only_acl_metadata {:?}",
+            ro_meta.headers
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let (rw_status, rw_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert_eq!(
+            rw_status, 200,
+            "official test_read_write_acl_listings after grant, got {rw_status}"
+        );
+        assert!(
+            rw_names.iter().any(|n| n == "rw-list"),
+            "official test_read_write_acl_listings after grant, got {rw_names:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Test", "nope"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_write_acl cannot write account metadata"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/rw-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_read_write_acl_listings can create"
+        );
+        let (_, rw_created) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert!(
+            rw_created.iter().any(|n| n == "rw-new"),
+            "official test_read_write_acl_listings sees create, got {rw_created:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/rw-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_read_write_acl_listings can delete"
+        );
+        let (_, rw_gone) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert!(
+            !rw_gone.iter().any(|n| n == "rw-new"),
+            "official test_read_write_acl_listings after delete, got {rw_gone:?}"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/rw-empty",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/rw-empty",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_read_write_acl_listings delete owner-created"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/rw-meta",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Meta-Test", "rw-orig"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let rw_meta = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/rw-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rw_meta.headers.get("X-Container-Meta-Test"),
+            Some("rw-orig"),
+            "official test_read_write_acl_metadata read {:?}",
+            rw_meta.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/rw-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Meta-Test", "rw-new"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_read_write_acl_metadata can write"
+        );
+        let rw_meta_new = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/rw-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rw_meta_new.headers.get("X-Container-Meta-Test"),
+            Some("rw-new")
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/rw-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Remove-Container-Meta-Test", "true"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let rw_meta_cleared = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/rw-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            rw_meta_cleared
+                .headers
+                .get("X-Container-Meta-Test")
+                .is_none(),
+            "official test_read_write_acl_metadata remove {:?}",
+            rw_meta_cleared.headers
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let (admin_list_status, admin_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test", reader.as_str()).await;
+        assert_eq!(
+            admin_list_status, 200,
+            "official test_admin_acl_listing after grant, got {admin_list_status}"
+        );
+        assert!(
+            admin_names.iter().any(|n| n == "admin-list"),
+            "official test_admin_acl_listing after grant, got {admin_names:?}"
+        );
+        let admin_acct = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            admin_acct.headers.get("X-Account-Access-Control"),
+            Some(admin.as_str()),
+            "official test_admin_acl sees ACL header"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/admin-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_admin_acl_listing can create"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/admin-new",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_admin_acl_listing can delete"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/admin-meta",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Container-Meta-Test", "admin-new"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_admin_acl_metadata can write"
+        );
+        let admin_meta = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/admin-meta",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            admin_meta.headers.get("X-Container-Meta-Test"),
+            Some("admin-new"),
+            "official test_admin_acl_metadata {:?}",
+            admin_meta.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("X-Account-Meta-Test", "admin-acct"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_admin_acl can write account metadata"
+        );
+        seed_auth_test_account_acl(&svc, Some(&admin));
+        let admin_meta_acct = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            admin_meta_acct.headers.get("X-Account-Meta-Test"),
+            Some("admin-acct")
+        );
+        leftover_grant_account_acl(&svc, reader.as_str(), "{}").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_admin_acl revoke then cannot read"
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_read_only / test_read_write / test_admin.
+    /// Leftover object GET returns stored PUT bytes (not the stub `x`).
+    /// Official RO "delete" is a PUT with an empty body (403 because RO
+    /// cannot PUT). Must hit `authorize_async` (no intercepting stub).
+    #[tokio::test]
+    async fn account_acl_v2_object_crud_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/src",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/objacl",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only listing before grant"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/objacl/src",
+                "",
+                &[("X-Auth-Token", reader.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only GET before grant"
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test:tester3".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let (ro_list_status, ro_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert_eq!(
+            ro_list_status, 200,
+            "official test_read_only listing after grant, got {ro_list_status}"
+        );
+        assert!(
+            ro_names.iter().any(|n| n == "src"),
+            "official test_read_only listing contains src, got {ro_names:?}"
+        );
+        let ro_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/objacl/src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ro_get.status, 200,
+            "official test_read_only GET after grant, got {}",
+            ro_get.status
+        );
+        assert_eq!(
+            leftover_body_text(ro_get).await,
+            "test",
+            "official test_read_only GET body"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/ro-denied",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only cannot PUT"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/src",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "0"),
+                    ("Content-Type", "text/plain"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_read_only cannot PUT-as-delete"
+        );
+        let (_, ro_still) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert!(ro_still.iter().any(|n| n == "src"));
+        assert!(!ro_still.iter().any(|n| n == "ro-denied"));
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test:tester3".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/objacl/src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(rw_get.status, 200);
+        assert_eq!(leftover_body_text(rw_get).await, "test");
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/rw-new",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_read_write can PUT"
+        );
+        let rw_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/objacl/src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            rw_del.status == 204 || rw_del.status == 404,
+            "official test_read_write DELETE, got {}",
+            rw_del.status
+        );
+        let (_, rw_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert!(
+            rw_names.iter().any(|n| n == "rw-new"),
+            "official test_read_write listing has new object, got {rw_names:?}"
+        );
+        assert!(!rw_names.iter().any(|n| n == "src"));
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/admin-src",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test:tester3".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/objacl/admin-src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(admin_get.status, 200);
+        assert_eq!(leftover_body_text(admin_get).await, "test");
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/objacl/admin-new",
+                "",
+                &[
+                    ("X-Auth-Token", reader.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_admin can PUT"
+        );
+        let admin_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/objacl/admin-src",
+            "",
+            &[("X-Auth-Token", reader.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            admin_del.status == 204 || admin_del.status == 404,
+            "official test_admin DELETE, got {}",
+            admin_del.status
+        );
+        let (_, admin_names) =
+            leftover_authed_listing_names(&svc, "/v1/AUTH_test/objacl", reader.as_str()).await;
+        assert!(admin_names.iter().any(|n| n == "admin-new"));
+        assert!(!admin_names.iter().any(|n| n == "admin-src"));
+        backend.abort();
+    }
+
+    /// Official TestAccountNoContainers.testInvalidUTF8Path and the
+    /// invalid half of TestContainer.testUtf8Container. IsolatedIdentity
+    /// `no_path_quote` puts raw / percent-decoded non-UTF-8 on the request
+    /// line; Hyper `request_line_precondition` is 412 before `AsyncRequest`
+    /// (a Rust `String` cannot hold those bytes).
+    #[tokio::test]
+    async fn invalid_utf8_path_is_412_on_hyper_wire() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || {
+            let config = swift_http::ServerConfig {
+                worker_threads: 1,
+                shutdown: Some(flag),
+                head_deadline_secs: 5,
+                client_timeout_secs: 5,
+                ..swift_http::ServerConfig::default()
+            };
+            let handler: swift_http::Handler = Arc::new(|_req| Response::new(200));
+            swift_http::serve_forever_with_config(listener, handler, config)
+        });
+        let wire = |request: &[u8]| -> Vec<u8> {
+            let mut last = None;
+            for _ in 0..50 {
+                match std::net::TcpStream::connect(addr) {
+                    Ok(mut client) => {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        client.write_all(request).unwrap();
+                        let _ = client.shutdown(std::net::Shutdown::Write);
+                        let mut response = Vec::new();
+                        client.read_to_end(&mut response).unwrap();
+                        return response;
+                    }
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            panic!("official testInvalidUTF8Path connect {last:?}");
+        };
+        let encoded = wire(
+            b"PUT /v1/AUTH_test/%FF HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let encoded_text = String::from_utf8_lossy(&encoded);
+        assert!(
+            encoded_text.contains("412"),
+            "official testInvalidUTF8Path percent-encoded on Hyper, got {encoded_text}"
+        );
+        assert!(
+            encoded_text.contains("Invalid UTF8 or contains NULL"),
+            "official testInvalidUTF8Path body {encoded_text}"
+        );
+        let mut raw = b"PUT /v1/AUTH_test/".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        raw.extend_from_slice(b" HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let raw_resp = wire(&raw);
+        let raw_text = String::from_utf8_lossy(&raw_resp);
+        assert!(
+            raw_text.contains("412"),
+            "official testUtf8Container invalid name on Hyper, got {raw_text}"
+        );
+        assert!(
+            raw_text.contains("Invalid UTF8 or contains NULL"),
+            "official testUtf8Container invalid body {raw_text}"
+        );
+        let listing = wire(b"GET /v1/AUTH_test/%FF HTTP/1.1\r\nConnection: close\r\n\r\n");
+        let listing_text = String::from_utf8_lossy(&listing);
+        assert!(
+            listing_text.contains("412"),
+            "official testUtf8Container invalid listing on Hyper, got {listing_text}"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        server
+            .join()
+            .unwrap()
+            .expect("official testInvalidUTF8Path Hyper serve");
+    }
+
+    /// Official TestContainer.test_null_name / TestObject.test_null_name.
+    /// IsolatedIdentity Hyper unquotes `%00` then `check_utf8` is 412 unless
+    /// `X-Backend-Allow-Reserved-Names` (InternalClient reserved names).
+    #[tokio::test]
+    async fn null_name_is_412_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let container = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/abc\u{0}def",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            container.status, 412,
+            "official test_null_name container on Hyper, got {}",
+            container.status
+        );
+        assert_eq!(
+            leftover_body_text(container).await,
+            "Invalid UTF8 or contains NULL",
+            "official test_null_name container body"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/nullc", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let object = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/nullc/abc\u{0}def",
+            "",
+            &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+            b"test".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            object.status, 412,
+            "official test_null_name object on Hyper, got {}",
+            object.status
+        );
+        assert_eq!(
+            leftover_body_text(object).await,
+            "Invalid UTF8 or contains NULL",
+            "official test_null_name object body"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.testFileThenContainerDelete /
+    /// testContainerExistenceCachingProblem / testPrefixAndLimit /
+    /// testFileOrder / testContainerJsonFileList.
+    #[tokio::test]
+    async fn container_file_then_delete_cache_and_prefix_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let missing =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/cache-c", "", &[], Vec::new()).await;
+        assert_eq!(
+            missing.status, 404,
+            "official testContainerExistenceCachingProblem listing before create, got {}",
+            missing.status
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/cache-c", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let after =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/cache-c", "", &[], Vec::new()).await;
+        assert!(
+            after.status == 204 || after.status == 200,
+            "official testContainerExistenceCachingProblem listing after create, got {}",
+            after.status
+        );
+
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/ftd", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/ftd/obj",
+                "",
+                &[("Content-Length", "1")],
+                b"x".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/ftd", "").await,
+            vec!["obj".to_string()]
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/ftd/obj", "", &[], Vec::new())
+                .await
+                .status,
+            204,
+            "official testFileThenContainerDelete object DELETE"
+        );
+        assert!(
+            listing_plain_names(&svc, "/v1/AUTH_test/ftd", "")
+                .await
+                .is_empty(),
+            "official testFileThenContainerDelete object must leave the listing"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/ftd", "", &[], Vec::new())
+                .await
+                .status,
+            204,
+            "official testFileThenContainerDelete container DELETE"
+        );
+        assert!(
+            !listing_plain_names(&svc, "/v1/AUTH_test", "")
+                .await
+                .iter()
+                .any(|n| n == "ftd"),
+            "official testFileThenContainerDelete container must leave the account listing"
+        );
+
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/pref", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let mut expected = std::collections::HashMap::<&str, Vec<String>>::new();
+        for prefix in ["alpha/", "beta/", "kappa/"] {
+            let mut names = Vec::new();
+            for i in 0..10 {
+                let name = format!("{prefix}f{i:02}");
+                assert_eq!(
+                    file_hyper_call(
+                        &svc,
+                        "PUT",
+                        &format!("/v1/AUTH_test/pref/{name}"),
+                        "",
+                        &[("Content-Length", "0")],
+                        Vec::new(),
+                    )
+                    .await
+                    .status,
+                    201,
+                    "PUT {name}"
+                );
+                names.push(name);
+            }
+            names.sort();
+            expected.insert(prefix, names);
+        }
+        for prefix in ["alpha/", "beta/", "kappa/"] {
+            let listed =
+                listing_plain_names(&svc, "/v1/AUTH_test/pref", &format!("prefix={prefix}")).await;
+            assert_eq!(
+                listed, expected[prefix],
+                "official testPrefixAndLimit prefix={prefix}"
+            );
+            let limited = listing_plain_names(
+                &svc,
+                "/v1/AUTH_test/pref",
+                &format!("prefix={prefix}&limit=2"),
+            )
+            .await;
+            assert_eq!(
+                limited.len(),
+                2,
+                "official testPrefixAndLimit limit=2 {prefix}"
+            );
+            assert!(
+                limited.iter().all(|n| n.starts_with(prefix)),
+                "official testPrefixAndLimit prefix filter {limited:?}"
+            );
+        }
+
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/order", "", &[], Vec::new())
+                .await
+                .status,
+            201
+        );
+        let items = ["zz", "a10", "B2", "a1", "b1", "A3", "a2", "b10"];
+        for name in items {
+            assert_eq!(
+                file_hyper_call(
+                    &svc,
+                    "PUT",
+                    &format!("/v1/AUTH_test/order/{name}"),
+                    "",
+                    &[("Content-Length", "1")],
+                    b"x".to_vec(),
+                )
+                .await
+                .status,
+                201
+            );
+        }
+        let mut sorted: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        sorted.sort();
+        assert_eq!(
+            listing_plain_names(&svc, "/v1/AUTH_test/order", "").await,
+            sorted,
+            "official testFileOrder / testContainersOrderedByName byte order"
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainer.testContainerJsonFileList /
+    /// testContainerXmlFileList: listing hash / content_type / bytes match HEAD.
+    #[tokio::test]
+    async fn container_json_file_list_matches_head_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let files = [
+            ("j1", b"aa".as_slice(), "text/j1"),
+            ("j2", b"bbbb".as_slice(), "image/j2"),
+            ("j3", b"c".as_slice(), "application/j3"),
+        ];
+        let mut expect = std::collections::HashMap::new();
+        for (name, body, ct) in files {
+            use md5::{Digest, Md5};
+            let etag = format!("{:x}", Md5::digest(body));
+            let cl = body.len().to_string();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", cl.as_str()), ("Content-Type", ct)],
+                body.to_vec(),
+            )
+            .await;
+            assert_eq!(put.status, 201, "PUT {name}");
+            let head = file_hyper_call(
+                &svc,
+                "HEAD",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&head.status),
+                "HEAD {name} got {}",
+                head.status
+            );
+            expect.insert(name, (etag, ct.to_string(), body.len() as u64));
+        }
+        let listed = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        let body = listed.body.collect_async().await.expect("json listing");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        for (name, (etag, ct, bytes)) in &expect {
+            let row = rows
+                .iter()
+                .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(*name))
+                .unwrap_or_else(|| panic!("official testContainerJsonFileList missing {name}"));
+            assert_eq!(
+                row.get("hash").and_then(|v| v.as_str()),
+                Some(etag.as_str())
+            );
+            assert_eq!(
+                row.get("content_type").and_then(|v| v.as_str()),
+                Some(ct.as_str())
+            );
+            assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(*bytes));
+        }
+        let xml = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=xml",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            xml.status, 200,
+            "official testContainerXmlFileList on Hyper, got {}",
+            xml.status
+        );
+        let xml_body = xml.body.collect_async().await.expect("xml listing");
+        let xml_text = String::from_utf8_lossy(&xml_body);
+        for (name, (etag, ct, bytes)) in &expect {
+            assert!(
+                xml_text.contains(&format!("<name>{name}</name>")),
+                "official testContainerXmlFileList missing name {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains(&format!("<hash>{etag}</hash>")),
+                "official testContainerXmlFileList hash {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains(&format!("<bytes>{bytes}</bytes>")),
+                "official testContainerXmlFileList bytes {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains(&format!("<content_type>{ct}</content_type>")),
+                "official testContainerXmlFileList content_type {name}: {xml_text}"
+            );
+            assert!(
+                xml_text.contains("<last_modified>"),
+                "official testContainerXmlFileList last_modified {name}: {xml_text}"
+            );
+        }
+        backend.abort();
     }
 
     /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
@@ -9023,6 +15733,10536 @@ mod pipeline_async_tests {
         );
     }
 
+    /// Container GET that looks like IsolatedIdentity after
+    /// `X-Remove-Container-Meta-Web-Listings`: live HEAD has object-count
+    /// and no web-listings.
+    struct ListingsOffContainerStub;
+    impl swift_middleware::Middleware for ListingsOffContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD")
+                && (req.path == "/v1/AUTH_account/container"
+                    || req.path == "/v1/AUTH_account/container/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Object-Count", "4");
+                    resp.headers.set("X-Timestamp", "1000.00000");
+                    return resp;
+                }
+                let mut resp = Response::with_body(200, b"[]".to_vec());
+                resp.headers.set("Content-Type", "application/json");
+                resp.headers.set("X-Container-Object-Count", "4");
+                resp
+            })
+        }
+    }
+
+    /// Official TestStaticWebTempurl.test_staticweb_off: prefix="" TempURL
+    /// of the container is 401 when listings are off (no staticweb
+    /// Content-Generator). Hyper must run TempURL.finish after StaticWeb.
+    #[tokio::test]
+    async fn staticweb_off_prefix_tempurl_is_401_on_hyper_path() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        // sha256 HMAC over GET\n4102444800\nprefix:/v1/AUTH_account/container/
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsOffContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix="
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 401,
+            "listings-off prefix TempURL must 401 on Hyper, got {}",
+            resp.status
+        );
+        let mut resp = resp;
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Temp URL invalid"),
+            "official test_staticweb_off body, got {body:?}"
+        );
+    }
+
+    /// Object-server apply_conditional on the physical manifest ETag.
+    /// Official TestDlo.test_dlo_if_match_get uses the assembled DLO ETag.
+    struct DloIfMatchObjectServerStub;
+    impl swift_middleware::Middleware for DloIfMatchObjectServerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if (req.method == "GET" || req.method == "HEAD")
+                    && req.path == "/v1/a/c/manifest"
+                    && req.headers.get("If-Match").is_some()
+                {
+                    return Response::error(412, "Precondition Failed");
+                }
+                if req.path == "/v1/a/c/manifest" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "c/segs/");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/a/c" {
+                    let listing = serde_json::json!([
+                        {"name": "segs/1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "segs/2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/a/c/segs/1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                if req.path == "/v1/a/c/segs/2" {
+                    return Response::with_body(200, b"two".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlo_if_match_assembled_etag_is_200_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head.status, 200,
+            "HEAD DLO must assemble, got {}",
+            head.status
+        );
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled DLO Etag")
+            .to_string();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-Match", &etag);
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_dlo_if_match_get on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"onetwo");
+        let mut head_ok = HeaderKeyDict::new();
+        head_ok.set("If-Match", &etag);
+        let head_match = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_ok,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_match.status, 200,
+            "official test_dlo_if_match_head on Hyper, got {}",
+            head_match.status
+        );
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-Match", format!("not-{etag}"));
+        let miss_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_head.status, 412,
+            "official test_dlo_if_match_head miss on Hyper, got {}",
+            miss_head.status
+        );
+    }
+
+    /// Official TestDlo.test_dlo_referer_on_segment_container step 2:
+    /// manifest readable, segment-container listing 403, relayed as 403.
+    struct DloRefererDeniedListingStub;
+    impl swift_middleware::Middleware for DloRefererDeniedListingStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "other/segs/");
+                    return resp;
+                }
+                if req.path == "/v1/a/other" {
+                    return Response::error(403, "Forbidden");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlo_referer_denied_listing_is_403_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloRefererDeniedListingStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "official test_dlo_referer step 2 on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_get_root: listings on, prefix=""
+    /// TempURL of the container without a trailing slash is 301.
+    struct ListingsOnContainerStub;
+    impl swift_middleware::Middleware for ListingsOnContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD")
+                && (req.path == "/v1/AUTH_account/container"
+                    || req.path == "/v1/AUTH_account/container/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(204)
+                } else {
+                    Response::with_body(200, b"[]".to_vec())
+                };
+                resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                resp.headers.set("X-Container-Object-Count", "1");
+                resp.headers.set("X-Timestamp", "1000.00000");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_without_slash_is_301_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsOnContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix="
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 301,
+            "official test_get_root no-slash prefix TempURL must 301, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestSlo.test_slo_referer_on_segment_container step 2:
+    /// manifest readable, first segment 403 → 409 Conflict (not 403).
+    struct SloRefererDeniedSegmentStub;
+    impl swift_middleware::Middleware for SloRefererDeniedSegmentStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/other/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    return resp;
+                }
+                if req.path == "/v1/a/other/s1" {
+                    return Response::error(403, "Forbidden");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_referer_denied_segment_is_409_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloRefererDeniedSegmentStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 409,
+            "official test_slo_referer step 2 on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestSlo.test_slo_referer_on_segment_container step 1 and
+    /// TestDlo.test_dlo_referer_on_segment_container step 1: a foreign
+    /// TempAuth token plus Referer is 403 until the container read ACL
+    /// allows `.r:*.example.com` (Python `clean_acl` → `.r:.example.com`).
+    /// authorize_async must run on Hyper.
+    async fn foreign_referer_token(svc: &ProxyAsyncService) -> String {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-User", "other:tester3");
+        headers.set("X-Auth-Key", "otherpass");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/auth/v1.0".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200, "tester3 token");
+        resp.headers.get("X-Auth-Token").unwrap().to_string()
+    }
+
+    fn seed_container_acl(app: &ProxyApp, account: &str, container: &str, acl: Option<&str>) {
+        seed_container_rw(app, account, container, acl, None);
+    }
+
+    fn seed_container_rw(
+        app: &ProxyApp,
+        account: &str,
+        container: &str,
+        read_acl: Option<&str>,
+        write_acl: Option<&str>,
+    ) {
+        app.info_cache.set_container(
+            format!("{account}/{container}"),
+            ContainerInfo {
+                status: 204,
+                read_acl: read_acl.map(str::to_string),
+                write_acl: write_acl.map(str::to_string),
+                ..Default::default()
+            },
+            60.0,
+        );
+        app.info_cache.set_account(
+            account.to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+    }
+
+    fn seed_auth_test_rw(
+        svc: &ProxyAsyncService,
+        container: &str,
+        read_acl: Option<&str>,
+        write_acl: Option<&str>,
+    ) {
+        let app = svc.app.read().unwrap_or_else(|p| p.into_inner());
+        seed_container_rw(&app, "AUTH_test", container, read_acl, write_acl);
+    }
+
+    fn seed_auth_test_account_acl(svc: &ProxyAsyncService, sysmeta: Option<&str>) {
+        let app = svc.app.read().unwrap_or_else(|p| p.into_inner());
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                core_access_control: sysmeta.map(str::to_string),
+                account_really_exists: true,
+                ..Default::default()
+            },
+            60.0,
+        );
+    }
+
+    async fn leftover_authed_listing_names(
+        svc: &ProxyAsyncService,
+        path: &str,
+        token: &str,
+    ) -> (u16, Vec<String>) {
+        let listed =
+            file_hyper_call(svc, "GET", path, "", &[("X-Auth-Token", token)], Vec::new()).await;
+        let status = listed.status;
+        if status == 204 {
+            return (status, Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            return (status, Vec::new());
+        }
+        let body = leftover_body_text(listed).await;
+        let trimmed = body.trim();
+        let names = if trimmed.starts_with('[') {
+            serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|row| {
+                    row.get("name")
+                        .or_else(|| row.get("subdir"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        } else {
+            trimmed
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        (status, names)
+    }
+
+    async fn leftover_grant_account_acl(svc: &ProxyAsyncService, owner: &str, acl: &str) {
+        assert_eq!(
+            file_hyper_call(
+                svc,
+                "POST",
+                "/v1/AUTH_test",
+                "",
+                &[("X-Auth-Token", owner), ("X-Account-Access-Control", acl),],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "account ACL POST {acl}"
+        );
+        seed_auth_test_account_acl(svc, Some(acl));
+    }
+
+    async fn leftover_container_get(svc: &ProxyAsyncService, path: &str, token: &str) -> Response {
+        file_hyper_call(svc, "GET", path, "", &[("X-Auth-Token", token)], Vec::new()).await
+    }
+
+    async fn leftover_put_object(
+        svc: &ProxyAsyncService,
+        path: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
+        let cl = body.len().to_string();
+        let mut headers: Vec<(&str, &str)> =
+            vec![("X-Auth-Token", token), ("Content-Length", cl.as_str())];
+        headers.extend_from_slice(extra);
+        file_hyper_call(svc, "PUT", path, "", &headers, body.to_vec()).await
+    }
+
+    #[tokio::test]
+    async fn slo_referer_foreign_token_is_403_until_acl_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c2", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Slo::new())],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", &token);
+        headers.set("Referer", "http://blah.example.com");
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 403,
+            "official test_slo_referer step 1 on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
+        let after_acl = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            after_acl.status, 403,
+            "official test_slo_referer after container ACL must pass authorize, got {}",
+            after_acl.status
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_referer_foreign_token_is_403_until_acl_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+            ],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", &token);
+        headers.set("Referer", "http://blah.example.com");
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 403,
+            "official test_dlo_referer step 1 on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
+        let after_acl = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            after_acl.status, 403,
+            "official test_dlo_referer after container ACL must pass authorize, got {}",
+            after_acl.status
+        );
+    }
+
+    fn ring_on_127(port: u16) -> Ring {
+        let dev = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".into(),
+            port: port as u32,
+            replication_ip: None,
+            replication_port: None,
+            device: "sda".into(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let data = RingData::from_parts(vec![Some(dev)], 32, vec![vec![0]]);
+        Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
+    }
+
+    fn object_etag_listed(header: &str, etag: &str) -> bool {
+        let etag = etag.trim_matches('"');
+        header.split(',').any(|token| {
+            let token = token.trim().trim_matches('"');
+            token == "*" || token.eq_ignore_ascii_case(etag)
+        })
+    }
+
+    fn backend_logical_target(first_line: &str) -> (String, String) {
+        let target = first_line.split_whitespace().nth(1).unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let trimmed = path.trim_start_matches('/');
+        let mut parts = trimmed.splitn(3, '/');
+        let _dev = parts.next();
+        let _part = parts.next();
+        let logical = parts.next().unwrap_or("");
+        (format!("/{logical}"), query.to_string())
+    }
+
+    async fn write_backend_http(
+        stream: &mut tokio::net::TcpStream,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) {
+        write_backend_http_status(stream, 200, extra, body).await;
+    }
+
+    async fn write_backend_http_status(
+        stream: &mut tokio::net::TcpStream,
+        status: u16,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) {
+        let reason = match status {
+            201 => "Created",
+            202 => "Accepted",
+            204 => "No Content",
+            206 => "Partial Content",
+            304 => "Not Modified",
+            404 => "Not Found",
+            409 => "Conflict",
+            412 => "Precondition Failed",
+            416 => "Range Not Satisfiable",
+            422 => "Unprocessable Entity",
+            _ => "OK",
+        };
+        let has_ts = extra
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("X-Timestamp"));
+        let mut hdr = format!("HTTP/1.1 {status} {reason}\r\n");
+        if !has_ts {
+            hdr.push_str("X-Timestamp: 1000.00000\r\n");
+        }
+        hdr.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        ));
+        for (k, v) in extra {
+            hdr.push_str(&format!("{k}: {v}\r\n"));
+        }
+        hdr.push_str("\r\n");
+        let _ = stream.write_all(hdr.as_bytes()).await;
+        if !body.is_empty() {
+            let _ = stream.write_all(body).await;
+        }
+        let _ = stream.flush().await;
+    }
+
+    async fn read_http_chunked_body(
+        stream: &mut tokio::net::TcpStream,
+        mut buf: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut i = 0usize;
+        let mut tmp = [0u8; 512];
+        loop {
+            let crlf = loop {
+                if let Some(rel) = buf[i..].windows(2).position(|w| w == b"\r\n") {
+                    break i + rel;
+                }
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return body,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let size_line = String::from_utf8_lossy(&buf[i..crlf]);
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+                return body;
+            };
+            i = crlf + 2;
+            if size == 0 {
+                return body;
+            }
+            while buf.len() < i + size + 2 {
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return body,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            body.extend_from_slice(&buf[i..i + size]);
+            i += size + 2;
+        }
+    }
+
+    async fn read_backend_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut head = Vec::new();
+        let mut tmp = [0u8; 512];
+        loop {
+            let n = match stream.read(&mut tmp).await {
+                Ok(0) | Err(_) => return (String::new(), Vec::new()),
+                Ok(n) => n,
+            };
+            head.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_end = pos + 4;
+                let header_text = String::from_utf8_lossy(&head[..header_end]).into_owned();
+                let lower = header_text.to_ascii_lowercase();
+                let cl = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if lower.contains("expect: 100-continue") {
+                    let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                    let _ = stream.flush().await;
+                }
+                let leftover = head[header_end..].to_vec();
+                if lower.contains("transfer-encoding:") && lower.contains("chunked") {
+                    let body = read_http_chunked_body(stream, leftover).await;
+                    return (header_text, body);
+                }
+                let mut body = leftover;
+                while body.len() < cl {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(cl);
+                return (header_text, body);
+            }
+            if head.len() > 64 * 1024 {
+                return (String::new(), Vec::new());
+            }
+        }
+    }
+
+    /// Path-dispatching object/container backend for official referer step 3.
+    /// Client GET must hit `authorize_async` (no intercepting stub).
+    async fn spawn_referer_assemble_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&tmp[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let empty = [];
+                    let body: &[u8];
+                    let extra: Vec<(&str, &str)>;
+                    if logical == "/AUTH_test/c2/manifest-abcde" {
+                        extra = vec![("X-Static-Large-Object", "True")];
+                        body = br#"[{"name":"/c/s1","bytes":3,"hash":"c4ca4238a0b923820dcc509a6f75849b"},{"name":"/c/s2","bytes":3,"hash":"c81e728d9d4c2f636f067f89cc14862c"}]"#;
+                    } else if logical == "/AUTH_test/c/s1" {
+                        extra = vec![];
+                        body = b"aaa";
+                    } else if logical == "/AUTH_test/c/s2" {
+                        extra = vec![];
+                        body = b"bbb";
+                    } else if logical == "/AUTH_test/c/mancont2" {
+                        extra = vec![("X-Object-Manifest", "c2/segs/")];
+                        body = b"mancont2-contents";
+                    } else if logical == "/AUTH_test/c2" {
+                        // Container HEAD 200 would make maybe_sharded treat
+                        // the object listing JSON as shard ranges and fold
+                        // to an empty listing. 404 the probe; GET lists.
+                        if is_head
+                            || text
+                                .to_ascii_lowercase()
+                                .contains("x-backend-record-type: shard")
+                        {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        extra = vec![("Content-Type", "application/json")];
+                        body = br#"[{"name":"segs/1","bytes":10,"hash":"x","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"},{"name":"segs/2","bytes":10,"hash":"y","content_type":"text/plain","last_modified":"2010-01-01T00:00:00.000000"}]"#;
+                    } else if logical == "/AUTH_test/c2/segs/1"
+                        || logical == "/AUTH_test/c2/segs%2F1"
+                    {
+                        extra = vec![];
+                        body = b"ffffffffff";
+                    } else if logical == "/AUTH_test/c2/segs/2"
+                        || logical == "/AUTH_test/c2/segs%2F2"
+                    {
+                        extra = vec![];
+                        body = b"gggggggggg";
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let send = if is_head { &empty[..] } else { body };
+                    write_backend_http(&mut stream, &extra, send).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    fn referer_acl_headers(token: &str) -> HeaderKeyDict {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", token);
+        headers.set("Referer", "http://blah.example.com");
+        headers
+    }
+
+    /// Official TestSlo.test_slo_referer_on_segment_container steps 2–3:
+    /// authorize_async must run (no stub). Manifest ACL alone is 409;
+    /// both container ACLs assemble.
+    #[tokio::test]
+    async fn slo_referer_assembles_after_both_acls_on_hyper() {
+        let (port, backend) = spawn_referer_assemble_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Slo::new())],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let headers = referer_acl_headers(&token);
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 409,
+            "official test_slo_referer step 2 authorize+assemble on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c2/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            assembled.status, 200,
+            "official test_slo_referer step 3 on Hyper, got {} {:?}",
+            assembled.status, assembled.reason
+        );
+        let body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("SLO referer assembled body");
+        assert_eq!(
+            body, b"aaabbb",
+            "official test_slo_referer step 3 assembled body"
+        );
+        backend.abort();
+    }
+
+    /// Official TestDlo.test_dlo_referer_on_segment_container steps 2–3.
+    #[tokio::test]
+    async fn dlo_referer_assembles_after_both_acls_on_hyper() {
+        let (port, backend) = spawn_referer_assemble_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", Some(".r:*.example.com,.rlistings"));
+        seed_container_acl(&app, "AUTH_test", "c2", None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(Arc::clone(&app))),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+            ],
+        };
+        let token = foreign_referer_token(&svc).await;
+        let headers = referer_acl_headers(&token);
+        let denied = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers: headers.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            denied.status, 403,
+            "official test_dlo_referer step 2 authorize+listing on Hyper, got {}",
+            denied.status
+        );
+        seed_container_acl(&app, "AUTH_test", "c2", Some(".r:*.example.com,.rlistings"));
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/mancont2".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            assembled.status, 200,
+            "official test_dlo_referer step 3 on Hyper, got {} {:?}",
+            assembled.status, assembled.reason
+        );
+        let body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("DLO referer assembled body");
+        assert_eq!(
+            body, b"ffffffffffgggggggggg",
+            "official test_dlo_referer step 3 assembled body"
+        );
+        backend.abort();
+    }
+
+    /// Official TestSloTempurl.test_GET: a signed GET of an SLO assembles,
+    /// and the same TempURL also authorizes HEAD. No intercepting stub —
+    /// authorize_async must see X-Backend-Authorize-Override.
+    async fn spawn_slo_tempurl_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&tmp[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let empty = [];
+                    let body: &[u8];
+                    let extra: Vec<(&str, &str)>;
+                    if logical == "/AUTH_account/container/object" {
+                        extra = vec![("X-Static-Large-Object", "True")];
+                        body = br#"[{"name":"/container/s1","bytes":3,"hash":"c4ca4238a0b923820dcc509a6f75849b"},{"name":"/container/s2","bytes":3,"hash":"c81e728d9d4c2f636f067f89cc14862c"}]"#;
+                    } else if logical == "/AUTH_account/container/s1" {
+                        extra = vec![];
+                        body = b"aaa";
+                    } else if logical == "/AUTH_account/container/s2" {
+                        extra = vec![];
+                        body = b"bbb";
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let send = if is_head { &empty[..] } else { body };
+                    write_backend_http(&mut stream, &extra, send).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    async fn spawn_container_tempurl_key_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        head.extend_from_slice(&tmp[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 64 * 1024 {
+                            return;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    if logical == "/AUTH_test/c"
+                        && !text
+                            .to_ascii_lowercase()
+                            .contains("x-backend-record-type: shard")
+                    {
+                        write_backend_http(
+                            &mut stream,
+                            &[
+                                ("X-Backend-Sharding-State", "unsharded"),
+                                ("X-Container-Meta-Temp-Url-Key", "mykey"),
+                                ("X-Container-Meta-Temp-Url-Key-2", "mykey2"),
+                            ],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// Regular-object backend for official TestTempurl.test_GET / test_PUT
+    /// / test_HEAD / test_different_object. No intercepting stub — authorize
+    /// override must reach the app.
+    async fn spawn_plain_object_tempurl_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+            (
+                "/AUTH_account/container/object".to_string(),
+                b"obj contents".to_vec(),
+            ),
+            (
+                "/AUTH_account/container/other".to_string(),
+                b"other obj contents".to_vec(),
+            ),
+        ])));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    if is_put && logical.starts_with("/AUTH_account/container/") {
+                        store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical, body);
+                        write_backend_http_status(
+                            &mut stream,
+                            201,
+                            &[("ETag", "\"put-etag\"")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let stored = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some(obj) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        write_backend_http(&mut stream, &[], send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    fn official_tempurl_hyper_svc(app: Arc<ProxyApp>, keys: Vec<String>) -> ProxyAsyncService {
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(move |_a, _c| keys.clone()),
+        ));
+        ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        }
+    }
+
+    async fn official_tempurl_hyper_app() -> (Arc<ProxyApp>, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_plain_object_tempurl_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_account", "container", None);
+        (app, backend)
+    }
+
+    async fn auth_token(svc: &ProxyAsyncService, user: &str, key: &str) -> String {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-User", user);
+        headers.set("X-Auth-Key", key);
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/auth/v1.0".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200, "token for {user}");
+        resp.headers.get("X-Auth-Token").unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn slo_tempurl_get_assembles_and_head_is_allowed_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let (port, backend) = spawn_slo_tempurl_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_account", "container", None);
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu), Arc::new(swift_middleware::Slo::new())],
+        };
+        let qs = format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}");
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            assembled.status, 200,
+            "official TestSloTempurl.test_GET on Hyper, got {} {:?}",
+            assembled.status, assembled.reason
+        );
+        let body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("SLO TempURL assembled body");
+        assert_eq!(
+            body, b"aaabbb",
+            "official TestSloTempurl.test_GET assembled"
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestSloTempurl.test_GET HEAD on same TempURL, got {}",
+            head.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainerTempurl.test_tempurl_keys_visible_to_account_owner
+    /// and test_tempurl_keys_hidden_from_acl_readonly. Must run
+    /// `finish_container_resp` on the Hyper app path (a stub is a false pass).
+    #[tokio::test]
+    async fn tempurl_keys_visible_to_owner_hidden_from_acl_readonly_on_hyper() {
+        let (port, backend) = spawn_container_tempurl_key_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", Some("AUTH_other"));
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta)],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let mut owner_headers = HeaderKeyDict::new();
+        owner_headers.set("X-Auth-Token", &owner);
+        let owner_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers: owner_headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&owner_head.status),
+            "official test_tempurl_keys_visible_to_account_owner on Hyper, got {}",
+            owner_head.status
+        );
+        assert_eq!(
+            owner_head.headers.get("X-Container-Meta-Temp-Url-Key"),
+            Some("mykey")
+        );
+        assert_eq!(
+            owner_head.headers.get("X-Container-Meta-Temp-Url-Key-2"),
+            Some("mykey2")
+        );
+        let reader = auth_token(&svc, "other:tester3", "otherpass").await;
+        let mut reader_headers = HeaderKeyDict::new();
+        reader_headers.set("X-Auth-Token", &reader);
+        let hidden = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers: reader_headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&hidden.status),
+            "readonly ACL HEAD must be allowed, got {}",
+            hidden.status
+        );
+        assert!(
+            hidden
+                .headers
+                .get("X-Container-Meta-Temp-Url-Key")
+                .is_none(),
+            "official test_tempurl_keys_hidden_from_acl_readonly leaked key"
+        );
+        assert!(
+            hidden
+                .headers
+                .get("X-Container-Meta-Temp-Url-Key-2")
+                .is_none(),
+            "official test_tempurl_keys_hidden_from_acl_readonly leaked key-2"
+        );
+        backend.abort();
+    }
+
+    /// Official TestTempurl.test_GET / test_GET_with_key_2: a signed GET of
+    /// a regular object returns the body, and the same GET TempURL also
+    /// authorizes HEAD. Key-2 is a second account Temp-URL key.
+    #[tokio::test]
+    async fn tempurl_get_and_head_and_key2_on_hyper() {
+        const KEY: &str = "mykey";
+        const KEY2: &str = "otherkey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        const SIG_GET_KEY2: &str =
+            "e0e563761d385fd5fb26cc47c932343e2cccb28da6597a7872fdc43fd1de590e";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let svc = official_tempurl_hyper_svc(app, vec![KEY.to_string(), KEY2.to_string()]);
+        let qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestTempurl.test_GET on Hyper, got {} {:?}",
+            got.status, got.reason
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestTempurl.test_GET body");
+        assert_eq!(body, b"obj contents", "official TestTempurl.test_GET body");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestTempurl.test_GET HEAD on same TempURL, got {}",
+            head.status
+        );
+        let key2 = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG_GET_KEY2}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            key2.status, 200,
+            "official TestTempurl.test_GET_with_key_2 on Hyper, got {}",
+            key2.status
+        );
+        let key2_body = key2
+            .body
+            .collect_async()
+            .await
+            .expect("official TestTempurl.test_GET_with_key_2 body");
+        assert_eq!(key2_body, b"obj contents");
+        backend.abort();
+    }
+
+    /// Official TestTempurl.test_HEAD / test_different_object /
+    /// test_changing_sig / test_changing_expires: HEAD-only sig allows HEAD;
+    /// GET with that sig is 401; a GET sig for `object` does not authorize
+    /// `other`; flipping the first HMAC char or mutating expires is 401.
+    #[tokio::test]
+    async fn tempurl_head_scope_and_expires_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        const SIG_HEAD: &str = "22036d1f61977422e6422ac9f9580781a8fb9b457768c27a93374f407ca94851";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let svc = official_tempurl_hyper_svc(app, vec![KEY.to_string()]);
+        let head_qs = format!("temp_url_sig={SIG_HEAD}&temp_url_expires={EXPIRES}");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestTempurl.test_HEAD on Hyper, got {}",
+            head.status
+        );
+        let get_with_head = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            get_with_head.status, 401,
+            "official TestTempurl.test_HEAD GET with HEAD sig must 401, got {}",
+            get_with_head.status
+        );
+        let get_qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let other = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/other".into(),
+                query_string: get_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            other.status, 401,
+            "official TestTempurl.test_different_object on Hyper, got {}",
+            other.status
+        );
+        let put_other = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/other".into(),
+                query_string: get_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(b"new contents".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put_other.status, 401,
+            "official TestTempurl.test_HEAD PUT other object must 401, got {}",
+            put_other.status
+        );
+        let bad_expires = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG_GET}&temp_url_expires=4102444801"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_expires.status, 401,
+            "official TestTempurl.test_changing_expires on Hyper, got {}",
+            bad_expires.status
+        );
+        let flipped = if SIG_GET.as_bytes()[0] == b'a' {
+            format!("b{}", &SIG_GET[1..])
+        } else {
+            format!("a{}", &SIG_GET[1..])
+        };
+        let bad_sig = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={flipped}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_sig.status, 401,
+            "official TestTempurl.test_changing_sig on Hyper, got {}",
+            bad_sig.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestTempurl.test_PUT: a PUT TempURL writes the object and
+    /// the same PUT sig authorizes HEAD. GET uses a GET sig of the new name.
+    #[tokio::test]
+    async fn tempurl_put_then_head_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_PUT: &str = "d340717b5dff896550ef70a3dcfb90136f11e783be4259d921d2c32fa15b3008";
+        const SIG_GET: &str = "4b4c6b6bca8afdcbdc5f8ee87a4f037471b871c99a63c212c16f68132248bd55";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let svc = official_tempurl_hyper_svc(app, vec![KEY.to_string()]);
+        let put_qs = format!("temp_url_sig={SIG_PUT}&temp_url_expires={EXPIRES}");
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("Content-Type", "application/octet-stream");
+        put_headers.set("Content-Length", "16");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs.clone(),
+                headers: put_headers,
+                body: IncomingBody::from_bytes(b"new obj contents".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestTempurl.test_PUT on Hyper, got {} {:?}",
+            put.status, put.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestTempurl.test_PUT read-after-write on Hyper, got {}",
+            got.status
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestTempurl.test_PUT body");
+        assert_eq!(body, b"new obj contents");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestTempurl.test_PUT HEAD on PUT TempURL, got {}",
+            head.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainerTempurl.test_GET: container-key TempURL of a
+    /// regular object returns the body; the same GET sig also allows HEAD.
+    #[tokio::test]
+    async fn container_tempurl_get_and_head_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        };
+        let qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestContainerTempurl.test_GET on Hyper, got {} {:?}",
+            got.status, got.reason
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestContainerTempurl.test_GET body");
+        assert_eq!(body, b"obj contents");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestContainerTempurl.test_GET HEAD on same TempURL, got {}",
+            head.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestContainerTempurl.test_PUT / test_HEAD /
+    /// test_different_object / test_changing_sig / test_changing_expires.
+    /// Container-key HMAC is the same message as account-key; only
+    /// `scoped_keys_for` differs. Must hit the app (no stub).
+    #[tokio::test]
+    async fn container_tempurl_put_head_scope_and_sig_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG_GET: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        const SIG_HEAD: &str = "22036d1f61977422e6422ac9f9580781a8fb9b457768c27a93374f407ca94851";
+        const SIG_PUT: &str = "d340717b5dff896550ef70a3dcfb90136f11e783be4259d921d2c32fa15b3008";
+        const SIG_GET_NEW: &str =
+            "4b4c6b6bca8afdcbdc5f8ee87a4f037471b871c99a63c212c16f68132248bd55";
+        let (app, backend) = official_tempurl_hyper_app().await;
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        };
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("Content-Type", "application/octet-stream");
+        put_headers.set("Content-Length", "16");
+        let put_qs = format!("temp_url_sig={SIG_PUT}&temp_url_expires={EXPIRES}");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs.clone(),
+                headers: put_headers,
+                body: IncomingBody::from_bytes(b"new obj contents".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestContainerTempurl.test_PUT on Hyper, got {} {:?}",
+            put.status, put.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: format!("temp_url_sig={SIG_GET_NEW}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestContainerTempurl.test_PUT read-after-write on Hyper, got {}",
+            got.status
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestContainerTempurl.test_PUT body");
+        assert_eq!(body, b"new obj contents");
+        let put_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/newobj".into(),
+                query_string: put_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&put_head.status),
+            "official TestContainerTempurl.test_PUT HEAD on PUT TempURL, got {}",
+            put_head.status
+        );
+        let head_qs = format!("temp_url_sig={SIG_HEAD}&temp_url_expires={EXPIRES}");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestContainerTempurl.test_HEAD on Hyper, got {}",
+            head.status
+        );
+        let get_with_head = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: head_qs,
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            get_with_head.status, 401,
+            "official TestContainerTempurl.test_HEAD GET with HEAD sig must 401, got {}",
+            get_with_head.status
+        );
+        let get_qs = format!("temp_url_sig={SIG_GET}&temp_url_expires={EXPIRES}");
+        let other = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/other".into(),
+                query_string: get_qs.clone(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            other.status, 401,
+            "official TestContainerTempurl.test_different_object on Hyper, got {}",
+            other.status
+        );
+        let flipped = if SIG_GET.as_bytes()[0] == b'a' {
+            format!("b{}", &SIG_GET[1..])
+        } else {
+            format!("a{}", &SIG_GET[1..])
+        };
+        let bad_sig = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={flipped}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_sig.status, 401,
+            "official TestContainerTempurl.test_changing_sig on Hyper, got {}",
+            bad_sig.status
+        );
+        let bad_expires = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG_GET}&temp_url_expires=4102444801"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_expires.status, 401,
+            "official TestContainerTempurl.test_changing_expires on Hyper, got {}",
+            bad_expires.status
+        );
+        backend.abort();
+    }
+
+    /// Object-server apply_conditional on the physical SLO JSON ETag.
+    /// Official TestSlo.test_slo_if_match_get uses the assembled SLO ETag.
+    struct SloIfMatchObjectServerStub;
+    impl swift_middleware::Middleware for SloIfMatchObjectServerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if (req.method == "GET" || req.method == "HEAD")
+                    && req.path == "/v1/a/c/manifest"
+                    && (req.headers.get("If-Match").is_some()
+                        || req.headers.get("If-None-Match").is_some())
+                {
+                    return Response::error(412, "Precondition Failed");
+                }
+                if req.path == "/v1/a/c/manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-json");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_if_match_assembled_etag_is_200_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head.status, 200,
+            "HEAD SLO must assemble, got {}",
+            head.status
+        );
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled SLO Etag")
+            .to_string();
+        assert_ne!(etag, "physical-json", "must not leak physical JSON etag");
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-Match", &etag);
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_if_match_get on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"one");
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-Match", format!("not-{etag}"));
+        let miss_resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_resp.status, 412,
+            "official test_slo_if_match_get miss on Hyper, got {}",
+            miss_resp.status
+        );
+        let mut head_ok = HeaderKeyDict::new();
+        head_ok.set("If-Match", &etag);
+        let head_match = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_ok,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_match.status, 200,
+            "official test_slo_if_match_head on Hyper, got {}",
+            head_match.status
+        );
+        let mut head_miss = HeaderKeyDict::new();
+        head_miss.set("If-Match", format!("not-{etag}"));
+        let head_412 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_412.status, 412,
+            "official test_slo_if_match_head miss on Hyper, got {}",
+            head_412.status
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_if_none_match_assembled_etag_is_304_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled SLO Etag")
+            .to_string();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", &etag);
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 304,
+            "official test_slo_if_none_match_get on Hyper, got {}",
+            resp.status
+        );
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-None-Match", format!("not-{etag}"));
+        let mut miss_resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_resp.status, 200,
+            "official test_slo_if_none_match_get miss on Hyper, got {}",
+            miss_resp.status
+        );
+        miss_resp.body.materialize(u64::MAX).unwrap();
+        let body = match &miss_resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"one");
+        let mut head_inm = HeaderKeyDict::new();
+        head_inm.set("If-None-Match", &etag);
+        let head_304 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_inm,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_304.status, 304,
+            "official test_slo_if_none_match_head on Hyper, got {}",
+            head_304.status
+        );
+        let mut head_miss = HeaderKeyDict::new();
+        head_miss.set("If-None-Match", format!("not-{etag}"));
+        let head_200 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_200.status, 200,
+            "official test_slo_if_none_match_head miss on Hyper, got {}",
+            head_200.status
+        );
+    }
+
+    /// Official TestSlo.test_slo_if_none_match_put: non-`*` is 400;
+    /// first `*` creates; second `*` is object-server 412.
+    struct SloIfNoneMatchPutStub {
+        created: std::sync::Mutex<bool>,
+    }
+    impl swift_middleware::Middleware for SloIfNoneMatchPutStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_a" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "e");
+                    resp.headers.set("Content-Length", "1");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path == "/v1/a/c/manifest-if-none-match" {
+                    let _ = req.body.materialize(u64::MAX);
+                    if req.headers.get("If-None-Match") == Some("*") {
+                        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+                        if *created {
+                            return Response::error(412, "Precondition Failed");
+                        }
+                        *created = true;
+                    }
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_if_none_match_put_is_400_then_201_then_412_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloIfNoneMatchPutStub {
+                    created: std::sync::Mutex::new(false),
+                }),
+            ],
+        };
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "size_bytes": 1,
+            "etag": serde_json::Value::Null,
+            "path": "/c/seg_a"
+        }]))
+        .unwrap();
+        let mut bad = HeaderKeyDict::new();
+        bad.set("If-None-Match", "\"not-star\"");
+        bad.set("Content-Length", manifest.len().to_string());
+        let bad_resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-if-none-match".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: bad,
+                body: IncomingBody::from_bytes(manifest.clone(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            bad_resp.status, 400,
+            "official test_slo_if_none_match_put not-star on Hyper, got {}",
+            bad_resp.status
+        );
+        let mut first = HeaderKeyDict::new();
+        first.set("If-None-Match", "*");
+        first.set("Content-Length", manifest.len().to_string());
+        let first_resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-if-none-match".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: first,
+                body: IncomingBody::from_bytes(manifest.clone(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            first_resp.status, 201,
+            "official test_slo_if_none_match_put first * on Hyper, got {}",
+            first_resp.status
+        );
+        let mut second = HeaderKeyDict::new();
+        second.set("If-None-Match", "*");
+        second.set("Content-Length", manifest.len().to_string());
+        let second_resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-if-none-match".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: second,
+                body: IncomingBody::from_bytes(manifest, u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            second_resp.status, 412,
+            "official test_slo_if_none_match_put second * on Hyper, got {}",
+            second_resp.status
+        );
+    }
+
+    /// Official TestSlo.test_slo_copy: COPY an SLO must persist assembled
+    /// bytes. Dest GET `?multipart-manifest=get` then returns that body
+    /// (not a JSON remanifest).
+    struct SloCopyAssembleStub {
+        dest: Arc<std::sync::Mutex<Option<(String, HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for SloCopyAssembleStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let dest = Arc::clone(&self.dest);
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest-abcde" && req.method != "PUT" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-json");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                if req.method == "PUT" && req.path.ends_with("/c/copied-abcde") {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(b) => b.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    *dest.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some((req.path.clone(), headers, body));
+                    return Response::new(201);
+                }
+                if req.path.ends_with("/c/copied-abcde") {
+                    if let Some((_path, headers, body)) =
+                        dest.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                    {
+                        let mut resp = if req.method == "HEAD" {
+                            Response::new(200)
+                        } else {
+                            Response::with_body(200, body)
+                        };
+                        for key in [
+                            "X-Static-Large-Object",
+                            "Content-Type",
+                            "X-Object-Meta-Test",
+                            "X-Object-Sysmeta-Slo-Etag",
+                            "X-Object-Sysmeta-Slo-Size",
+                            "Etag",
+                        ] {
+                            if let Some(v) = headers.get(key) {
+                                resp.headers.set(key, v);
+                            }
+                        }
+                        return resp;
+                    }
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_copy_assembles_without_slo_header_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy COPY on Hyper, got {}",
+            resp.status
+        );
+        let (_put_path, put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_body, b"one", "COPY must persist assembled SLO bytes");
+        assert!(
+            put_headers.get("X-Static-Large-Object").is_none(),
+            "official test_slo_copy: dest must not carry X-Static-Large-Object"
+        );
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/copied-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"one",
+            "official test_slo_copy dest multipart-manifest=get is assembled"
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_copy_the_manifest_reputs_json_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_the_manifest COPY on Hyper, got {}",
+            resp.status
+        );
+        let (_put_path, put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&put_body).is_ok(),
+            "official test_slo_copy_the_manifest dest must be JSON, got {:?}",
+            String::from_utf8_lossy(&put_body)
+        );
+        assert_ne!(
+            put_body, b"one",
+            "remanifest must not persist assembled bytes"
+        );
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/copied-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        let got_json: serde_json::Value =
+            serde_json::from_slice(&body).expect("copied manifest JSON");
+        assert!(
+            got_json.is_array(),
+            "official test_slo_copy_the_manifest GET must be JSON list"
+        );
+        let _ = put_headers;
+    }
+
+    #[tokio::test]
+    async fn slo_copy_the_manifest_updating_metadata_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        headers.set("Content-Type", "image/jpeg");
+        headers.set("X-Object-Meta-Test", "updated");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_the_manifest_updating_metadata COPY on Hyper, got {}",
+            resp.status
+        );
+        let (_put_path, put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&put_body).is_ok(),
+            "remanifest dest must be JSON"
+        );
+        assert_eq!(
+            put_headers.get("X-Object-Meta-Test"),
+            Some("updated"),
+            "COPY request metadata must win"
+        );
+        let ct = put_headers.get("Content-Type").unwrap_or("");
+        assert!(
+            ct.starts_with("image/jpeg"),
+            "official updating_metadata dest PUT Content-Type, got {ct}"
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/copied-abcde".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        assert_eq!(
+            head.headers.get("Content-Type"),
+            Some("image/jpeg"),
+            "official updating_metadata assembled HEAD Content-Type, got {:?}",
+            head.headers.get("Content-Type")
+        );
+        assert_eq!(head.headers.get("X-Object-Meta-Test"), Some("updated"));
+    }
+
+    #[tokio::test]
+    async fn slo_copy_account_destination_account_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        headers.set("Destination-Account", "a2");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_account COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_path, put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(
+            put_path, "/v1/a2/c/copied-abcde",
+            "Destination-Account must rewrite dest PUT path"
+        );
+        assert_eq!(
+            put_body, b"one",
+            "cross-account COPY must persist assembled SLO"
+        );
+        assert!(put_headers.get("X-Static-Large-Object").is_none());
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a2/c/copied-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"one",
+            "official test_slo_copy_account dest multipart-manifest=get is assembled"
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_copy_the_manifest_account_on_hyper_path() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied-abcde");
+        headers.set("Destination-Account", "a");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_slo_copy_the_manifest_account same-account on Hyper, got {}",
+            resp.status
+        );
+        let (put_path, _put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_path, "/v1/a/c/copied-abcde");
+        assert!(serde_json::from_slice::<serde_json::Value>(&put_body).is_ok());
+    }
+
+    /// Official TestSlo.test_slo_post_the_manifest_metadata_update: POST
+    /// user-meta must keep X-Static-Large-Object and JSON on
+    /// `?multipart-manifest=get`.
+    struct SloPostManifestStub {
+        meta: std::sync::Mutex<HeaderKeyDict>,
+    }
+    impl swift_middleware::Middleware for SloPostManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path == "/v1/a/c/manifest-post"
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "POST" {
+                    let mut meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+                    for (k, v) in req.headers.iter() {
+                        if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                            meta.set(k, v);
+                        }
+                    }
+                    return Response::new(202);
+                }
+                let manifest = serde_json::json!([
+                    {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                ]);
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(200)
+                } else {
+                    Response::with_body(200, serde_json::to_vec(&manifest).unwrap())
+                };
+                resp.headers.set("X-Static-Large-Object", "True");
+                resp.headers.set("Content-Type", "application/octet-stream");
+                resp.headers.set("Etag", "physical-json");
+                let meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+                for (k, v) in meta.iter() {
+                    resp.headers.set(k, v);
+                }
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_post_the_manifest_keeps_slo_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloPostManifestStub {
+                    meta: std::sync::Mutex::new(HeaderKeyDict::new()),
+                }),
+            ],
+        };
+        // Official test_slo_post_the_manifest_metadata_update_with_qs:
+        // multipart-manifest=put|get|delete on POST is ignored.
+        for verb in ["put", "get", "delete"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Object-Meta-Post", "update");
+            let post = svc
+                .call(AsyncRequest {
+                    method: "POST".into(),
+                    path: "/v1/a/c/manifest-post".into(),
+                    query_string: format!("multipart-manifest={verb}"),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                post.status, 202,
+                "official test_slo_post_the_manifest_metadata_update_with_qs {verb} on Hyper, got {}",
+                post.status
+            );
+        }
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-post".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        assert!(
+            head.headers
+                .get("X-Static-Large-Object")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true")),
+            "POST must not drop X-Static-Large-Object, got {:?}",
+            head.headers.get("X-Static-Large-Object")
+        );
+        assert_eq!(head.headers.get("X-Object-Meta-Post"), Some("update"));
+        let mut got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-post".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200);
+        got.body.materialize(u64::MAX).unwrap();
+        let body = match &got.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+            "official test_slo_post_the_manifest GET must stay JSON"
+        );
+    }
+
+    /// Official TestSlo PUT validation: segment HEAD etag/size, required keys,
+    /// and no self-segment (IsolatedIdentity Swift 2.9).
+    struct SloPutValidationStub;
+    impl swift_middleware::Middleware for SloPutValidationStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_a" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "actual");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.method == "PUT" {
+                    let _ = req.body.materialize(u64::MAX);
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    async fn slo_put_manifest_on_hyper(path: &str, body: Vec<u8>) -> Response {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloPutValidationStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", body.len().to_string());
+        svc.call(AsyncRequest {
+            method: "PUT".into(),
+            path: path.into(),
+            query_string: "multipart-manifest=put".into(),
+            headers,
+            body: IncomingBody::from_bytes(body, u64::MAX),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn slo_put_validation_official_matrix_on_hyper_path() {
+        let etag_mismatch = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "not it",
+            "size_bytes": 3
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-bad-etag", etag_mismatch)
+                .await
+                .status,
+            400,
+            "official test_slo_etag_mismatch"
+        );
+        let size_mismatch = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "actual",
+            "size_bytes": 2
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-bad-size", size_mismatch)
+                .await
+                .status,
+            400,
+            "official test_slo_size_mismatch"
+        );
+        let missing_etag = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "size_bytes": 3
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-missing-etag", missing_etag)
+                .await
+                .status,
+            400,
+            "official test_slo_missing_etag"
+        );
+        let missing_size = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "actual"
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-missing-size", missing_size)
+                .await
+                .status,
+            400,
+            "official test_slo_missing_size"
+        );
+        let null_etag = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": serde_json::Value::Null,
+            "size_bytes": 3
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-unspecified-etag", null_etag)
+                .await
+                .status,
+            201,
+            "official test_slo_unspecified_etag"
+        );
+        let null_size = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": "actual",
+            "size_bytes": serde_json::Value::Null
+        }]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/manifest-a-unspecified-size", null_size)
+                .await
+                .status,
+            201,
+            "official test_slo_unspecified_size"
+        );
+        let self_seg = serde_json::to_vec(&serde_json::json!([
+            {"path": "/c/seg_a", "etag": "actual", "size_bytes": 3},
+            {"path": "/c/seg_b", "etag": "actual", "size_bytes": 3}
+        ]))
+        .unwrap();
+        assert_eq!(
+            slo_put_manifest_on_hyper("/v1/a/c/seg_b", self_seg)
+                .await
+                .status,
+            400,
+            "official test_slo_overwrite_segment_with_manifest"
+        );
+    }
+
+    /// Official TestSlo.test_slo_get_the_manifest / test_slo_head_the_manifest.
+    struct SloManifestGetStub;
+    impl swift_middleware::Middleware for SloManifestGetStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest-abcde" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "/c/s2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Content-Type", "application/octet-stream");
+                    resp.headers.set("Etag", "physical-json");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaa");
+                }
+                if req.path == "/v1/a/c/s2" {
+                    return stub_object_range(&req, b"bbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_the_manifest_is_json_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_the_manifest on Hyper, got {}",
+            resp.status
+        );
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8"),
+            "official test_slo_get_the_manifest Content-Type"
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+            "official test_slo_get_the_manifest body must be JSON"
+        );
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8"),
+            "official test_slo_head_the_manifest on Hyper, got {:?}",
+            head.headers.get("Content-Type")
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_get_raw_the_manifest_is_client_shaped_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: "multipart-manifest=get&format=raw".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_raw_the_manifest on Hyper, got {}",
+            resp.status
+        );
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/octet-stream"),
+            "official test_slo_get_raw_the_manifest keeps object Content-Type, got {:?}",
+            resp.headers.get("Content-Type")
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("raw manifest JSON");
+        let arr = value.as_array().expect("raw manifest list");
+        assert_eq!(arr.len(), 2);
+        let keys: std::collections::BTreeSet<_> = arr[0]
+            .as_object()
+            .expect("raw segment")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["etag", "path", "size_bytes"].into_iter().collect(),
+            "official test_slo_get_raw_the_manifest keys"
+        );
+        assert_eq!(arr[0]["path"], "/c/s1");
+        assert_eq!(arr[0]["size_bytes"], 3);
+        assert_eq!(arr[0]["etag"], "c4ca4238a0b923820dcc509a6f75849b");
+    }
+
+    /// Official TestSlo.test_slo_get_the_manifest_with_details_from_server:
+    /// PUT with JSON-null etag/size_bytes fills name/bytes/hash from segment
+    /// HEAD. format=raw is test_slo_get_raw_the_manifest_with_details_from_server.
+    struct SloDetailsFromServerStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for SloDetailsFromServerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_d" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "77963b7a931377ad4ab5ad6a9cd718aa");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/a/c/seg_b" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Etag", "08f8e0260c64418510cefb2b06eee5cd");
+                    resp.headers.set("Content-Length", "3");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/seg_d" {
+                    return Response::with_body(200, b"ddd".to_vec());
+                }
+                if req.path == "/v1/a/c/seg_b" {
+                    return Response::with_body(200, b"bbb".to_vec());
+                }
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(b) => b.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_the_manifest_with_details_from_server_on_hyper() {
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloDetailsFromServerStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        let put_body = serde_json::to_vec(&serde_json::json!([
+            {
+                "path": "/c/seg_d",
+                "etag": serde_json::Value::Null,
+                "size_bytes": serde_json::Value::Null
+            },
+            {
+                "path": "/c/seg_b",
+                "etag": serde_json::Value::Null,
+                "size_bytes": serde_json::Value::Null
+            }
+        ]))
+        .unwrap();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", put_body.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-db".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers,
+                body: IncomingBody::from_bytes(put_body, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "official manifest-db PUT with null etag/size"
+        );
+
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-db".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official test_slo_get_the_manifest_with_details_from_server on Hyper, got {}",
+            got.status
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+        let listing_bytes = got
+            .body
+            .collect_async()
+            .await
+            .expect("details-from-server listing body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&listing_bytes).expect("listing JSON");
+        let arr = value.as_array().expect("listing list");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["bytes"], 3);
+        assert_eq!(arr[0]["hash"], "77963b7a931377ad4ab5ad6a9cd718aa");
+        assert_eq!(arr[0]["name"], "/c/seg_d");
+        assert_eq!(arr[1]["bytes"], 3);
+        assert_eq!(arr[1]["hash"], "08f8e0260c64418510cefb2b06eee5cd");
+        assert_eq!(arr[1]["name"], "/c/seg_b");
+
+        let raw = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-db".into(),
+                query_string: "multipart-manifest=get&format=raw".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            raw.status, 200,
+            "official test_slo_get_raw_the_manifest_with_details_from_server on Hyper, got {}",
+            raw.status
+        );
+        assert_eq!(
+            raw.headers.get("Content-Type"),
+            Some("application/octet-stream"),
+            "raw GET keeps object Content-Type, got {:?}",
+            raw.headers.get("Content-Type")
+        );
+        let raw_bytes = raw.body.collect_async().await.expect("raw manifest body");
+        let raw_value: serde_json::Value = serde_json::from_slice(&raw_bytes).expect("raw JSON");
+        let raw_arr = raw_value.as_array().expect("raw list");
+        let keys: std::collections::BTreeSet<_> = raw_arr[0]
+            .as_object()
+            .expect("raw segment")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["etag", "path", "size_bytes"].into_iter().collect(),
+            "official raw details-from-server keys"
+        );
+        assert_eq!(raw_arr[0]["path"], "/c/seg_d");
+        assert_eq!(raw_arr[0]["size_bytes"], 3);
+        assert_eq!(raw_arr[0]["etag"], "77963b7a931377ad4ab5ad6a9cd718aa");
+        assert_eq!(raw_arr[1]["path"], "/c/seg_b");
+        assert_eq!(raw_arr[1]["size_bytes"], 3);
+        assert_eq!(raw_arr[1]["etag"], "08f8e0260c64418510cefb2b06eee5cd");
+
+        let mut put_raw = HeaderKeyDict::new();
+        put_raw.set("Content-Length", raw_bytes.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/a/c/manifest-from-get-raw".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers: put_raw,
+                body: IncomingBody::from_bytes(raw_bytes, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "official raw GET re-PUT"
+        );
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-from-get-raw".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(assembled.status, 200, "re-PUT assembled GET");
+        let assembled_body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("assembled from raw PUT");
+        assert_eq!(assembled_body, b"dddbbb");
+    }
+
+    #[tokio::test]
+    async fn slo_ranged_get_uses_assembled_bytes_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Range", "bytes=2-4");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 206,
+            "official test_slo_ranged_get on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"abb", "assembled Range bytes=2-4 of aaabbb");
+    }
+
+    /// Official TestSlo.test_slo_get_ranged_manifest: stored `range` slices
+    /// the backing object. Same object twice is
+    /// test_slo_get_ranged_manifest_repeated_segment.
+    struct SloRangedManifestStub;
+    impl swift_middleware::Middleware for SloRangedManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/ranged-manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "2-4"},
+                        {"name": "/c/s1", "bytes": 2, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "0-1"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-ranged");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaabbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_ranged_manifest_slices_segments_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloRangedManifestStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", "not-ranged");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/ranged-manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_ranged_manifest on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"abbaa",
+            "range 2-4 then 0-1 of aaabbb (repeated segment)"
+        );
+    }
+
+    /// Official TestSlo.test_slo_get_ranged_submanifest: outer references
+    /// a ranged `sub_slo` window of an already-ranged inner assemble.
+    struct SloRangedSubmanifestStub;
+    impl swift_middleware::Middleware for SloRangedSubmanifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/ranged-submanifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/cseg", "bytes": 1, "hash": "4a8a08f09d37b73795649038408b5f33"},
+                        {"name": "/c/ranged-manifest", "bytes": 5, "hash": "inner-ranged", "sub_slo": true},
+                        {"name": "/c/ranged-manifest", "bytes": 5, "hash": "inner-ranged", "range": "1-3", "sub_slo": true},
+                        {"name": "/c/ranged-manifest", "bytes": 5, "hash": "inner-ranged", "range": "3-4", "sub_slo": true},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-ranged-sub");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/ranged-manifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 6, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "2-4"},
+                        {"name": "/c/s1", "bytes": 6, "hash": "c4ca4238a0b923820dcc509a6f75849b", "range": "0-1"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("X-Object-Sysmeta-Slo-Size", "5");
+                    resp.headers.set("Etag", "physical-ranged");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/cseg" {
+                    return stub_object_range(&req, b"c");
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaabbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_ranged_submanifest_slices_nested_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloRangedSubmanifestStub),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", "not-ranged-sub");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/ranged-submanifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_ranged_submanifest on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            body, b"cabbaabbaaa",
+            "c + abbaa + bba + aa (ranged sub_slo of ranged inner)"
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_etag_is_hash_of_etags_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled SLO Etag")
+            .trim_matches('"')
+            .to_string();
+        assert_ne!(etag, "physical-json");
+        // md5(seg1_hash || seg2_hash) — official test_slo_etag_is_hash_of_etags.
+        assert_eq!(
+            etag, "302cbafc0dfbc97f30d576a6f394dad3",
+            "official test_slo_etag_is_hash_of_etags on Hyper"
+        );
+    }
+
+    #[tokio::test]
+    async fn slo_get_simple_manifest_assembles_without_conditionals_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestGetStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_simple_manifest on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("unconditional SLO GET body");
+        assert_eq!(body, b"aaabbb");
+    }
+
+    /// Official TestSlo.test_slo_container_listing: listing `bytes` is the
+    /// assembled size (`swift_bytes`), `hash` is the physical manifest etag.
+    struct SloContainerListingStub;
+    impl swift_middleware::Middleware for SloContainerListingStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.method == "GET" && req.path == "/v1/a/c"
+        }
+        fn handle_request_async(
+            &self,
+            _req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let listing = serde_json::json!([{
+                    "name": "manifest-a",
+                    "bytes": 1,
+                    "hash": "c4ca4238a0b923820dcc509a6f75849b; slo_etag=slohash",
+                    "content_type": "application/octet-stream;swift_bytes=3",
+                }]);
+                let mut resp = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                resp.headers
+                    .set("Content-Type", "application/json; charset=utf-8");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_container_listing_uses_slo_size_and_manifest_etag_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloContainerListingStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c".into(),
+                query_string: "format=json".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200);
+        let body = resp.body.collect_async().await.expect("listing body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("listing JSON");
+        assert_eq!(
+            v[0]["bytes"], 3,
+            "official test_slo_container_listing bytes=assembled"
+        );
+        assert_eq!(
+            v[0]["hash"], "c4ca4238a0b923820dcc509a6f75849b",
+            "official test_slo_container_listing hash=manifest-get etag"
+        );
+        assert_eq!(
+            v[0]["content_type"], "application/octet-stream",
+            "listing must strip swift_bytes"
+        );
+    }
+
+    /// Official TestSlo.test_slo_get_nested_manifest /
+    /// test_slo_etag_is_hash_of_etags_submanifests.
+    struct SloNestedManifestStub;
+    impl swift_middleware::Middleware for SloNestedManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/a/c/manifest-abcde-submanifest" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/inner", "bytes": 6, "hash": "302cbafc0dfbc97f30d576a6f394dad3", "sub_slo": true},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set("Etag", "physical-outer");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/inner" {
+                    let manifest = serde_json::json!([
+                        {"name": "/c/s1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "/c/s2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&manifest).unwrap());
+                    resp.headers.set("X-Static-Large-Object", "True");
+                    resp.headers.set(
+                        "X-Object-Sysmeta-Slo-Etag",
+                        "302cbafc0dfbc97f30d576a6f394dad3",
+                    );
+                    resp.headers.set("X-Object-Sysmeta-Slo-Size", "6");
+                    resp.headers.set("Etag", "physical-inner");
+                    return resp;
+                }
+                if req.path == "/v1/a/c/s1" {
+                    return stub_object_range(&req, b"aaa");
+                }
+                if req.path == "/v1/a/c/s2" {
+                    return stub_object_range(&req, b"bbb");
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_get_nested_manifest_assembles_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloNestedManifestStub),
+            ],
+        };
+        // Hyper reassemble's first next() is captured; nested segment GETs
+        // only reach the stub when SLO intercepts_request (If-*).
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", "not-nested");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde-submanifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_slo_get_nested_manifest on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"aaabbb");
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest-abcde-submanifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("nested SLO Etag")
+            .trim_matches('"')
+            .to_string();
+        assert_eq!(
+            etag, "efd4f115d46b3e79ee1392c343b3b433",
+            "official test_slo_etag_is_hash_of_etags_submanifests on Hyper"
+        );
+        let mut ranged = HeaderKeyDict::new();
+        ranged.set("Range", "bytes=2-4");
+        let mut slice = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest-abcde-submanifest".into(),
+                query_string: String::new(),
+                headers: ranged,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            slice.status, 206,
+            "official test_slo_ranged_submanifest on Hyper, got {}",
+            slice.status
+        );
+        slice.body.materialize(u64::MAX).unwrap();
+        let slice_body = match &slice.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            slice_body, b"abb",
+            "client Range bytes=2-4 of nested aaabbb"
+        );
+    }
+
+    /// Official listing_formats test_GET_HEAD_content_type: HEAD
+    /// `?format=json` must stamp application/json even when the backend
+    /// HEAD is a 204 text/plain.
+    struct ListingHeadPlainStub;
+    impl swift_middleware::Middleware for ListingHeadPlainStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD") && req.path == "/v1/a/c"
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(204)
+                } else {
+                    Response::with_body(200, b"[]".to_vec())
+                };
+                resp.headers
+                    .set("Content-Type", "text/plain; charset=utf-8");
+                resp.headers.set("Content-Length", 0);
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_formats_head_json_content_type_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::ListingFormats),
+                Arc::new(ListingHeadPlainStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c".into(),
+                query_string: "format=json".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8"),
+            "official test_GET_HEAD_content_type on Hyper"
+        );
+    }
+
+    /// Official test_versioning_dlo: empty DLO overwrite must not archive.
+    struct VersioningDloManifestStub {
+        archive_puts: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningDloManifestStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let archive_puts = Arc::clone(&self.archive_puts);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/man" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "c/man/");
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Length", "0");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    *archive_puts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    return Response::new(201);
+                }
+                if req.method == "PUT" && req.path == "/v1/AUTH_test/c/man" {
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_dlo_empty_overwrite_does_not_archive_on_hyper() {
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningDloManifestStub {
+                    archive_puts: Arc::clone(&archive_puts),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Manifest", "c/man/");
+        headers.set("Content-Length", "0");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "DLO manifest PUT on Hyper must 201, got {}",
+            resp.status
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 0,
+            "official test_versioning_dlo must not archive the prior manifest"
+        );
+    }
+
+    /// Official TestObjectVersioning overwrite: a non-DLO PUT must archive
+    /// the current object into versions-location on the Hyper stream path.
+    struct VersioningOverwriteStub {
+        archive_puts: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningOverwriteStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let archive_puts = Arc::clone(&self.archive_puts);
+            Box::pin(async move {
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    let mut resp = Response::with_body(200, b"aaaaa".to_vec());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp.headers.set("Content-Length", "5");
+                    return resp;
+                }
+                if req.method == "PUT" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    *archive_puts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    return Response::new(201);
+                }
+                if req.method == "PUT" && req.path == "/v1/AUTH_test/c/obj" {
+                    return Response::new(201);
+                }
+                if req.method == "POST" && req.path == "/v1/AUTH_test/c/obj" {
+                    return Response::new(202);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_overwrite_archives_current_on_hyper() {
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningOverwriteStub {
+                    archive_puts: Arc::clone(&archive_puts),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "5");
+        headers.set("Content-Type", "text/plain");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(b"bbbbb".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "versioned overwrite PUT on Hyper must 201, got {}",
+            resp.status
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 1,
+            "official versioning overwrite must archive current on Hyper"
+        );
+    }
+
+    /// Official TestSloWithVersioning.test_slo_manifest_version.
+    struct SloManifestVersionStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for SloManifestVersionStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            Box::pin(async move {
+                if req
+                    .headers
+                    .get(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+                    == Some("true")
+                {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/versions" {
+                    return Response::new(204);
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/versions" {
+                    let prefix = req
+                        .query_string
+                        .split('&')
+                        .find_map(|part| part.strip_prefix("prefix="))
+                        .unwrap_or("");
+                    let prefix = swift_http::unquote(prefix);
+                    let mut names: Vec<String> = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .keys()
+                        .filter_map(|path| path.strip_prefix("/v1/AUTH_test/versions/"))
+                        .filter(|name| prefix.is_empty() || name.starts_with(&prefix))
+                        .map(str::to_string)
+                        .collect();
+                    names.sort();
+                    names.reverse();
+                    let listing: Vec<serde_json::Value> = names
+                        .into_iter()
+                        .map(|name| {
+                            serde_json::json!({
+                                "name": name,
+                                "bytes": 1,
+                                "hash": "x",
+                                "content_type": "application/octet-stream",
+                            })
+                        })
+                        .collect();
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(b) => b.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    return resp;
+                }
+                if req.method == "DELETE" {
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&req.path);
+                    return Response::new(204);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn slo_manifest_version_archives_slo_on_hyper_path() {
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(swift_middleware::Slo::new()),
+                Arc::new(SloManifestVersionStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        let mut seg_a = HeaderKeyDict::new();
+        seg_a.set("Etag", "47bce5c74f589f4867dbd57e9ca9f808");
+        seg_a.set("Content-Length", "3");
+        store
+            .lock()
+            .unwrap()
+            .insert("/v1/AUTH_test/c/seg_a".into(), (seg_a, b"aaa".to_vec()));
+        let mut seg_b = HeaderKeyDict::new();
+        seg_b.set("Etag", "08f8e0260c6441850a3e202c8d8c4a70");
+        seg_b.set("Content-Length", "3");
+        store
+            .lock()
+            .unwrap()
+            .insert("/v1/AUTH_test/c/seg_b".into(), (seg_b, b"bbb".to_vec()));
+
+        let first = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_a",
+            "etag": serde_json::Value::Null,
+            "size_bytes": serde_json::Value::Null
+        }]))
+        .unwrap();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", first.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers,
+                body: IncomingBody::from_bytes(first, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "first SLO PUT"
+        );
+
+        let second = serde_json::to_vec(&serde_json::json!([{
+            "path": "/c/seg_b",
+            "etag": serde_json::Value::Null,
+            "size_bytes": serde_json::Value::Null
+        }]))
+        .unwrap();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", second.len().to_string());
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: "multipart-manifest=put".into(),
+                headers,
+                body: IncomingBody::from_bytes(second, u64::MAX),
+            })
+            .await
+            .status,
+            201,
+            "second SLO PUT must archive the previous manifest"
+        );
+
+        let archived: Vec<String> = store
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|p| p.starts_with("/v1/AUTH_test/versions/"))
+            .cloned()
+            .collect();
+        assert_eq!(archived.len(), 1, "exactly one archived SLO: {archived:?}");
+        let version_path = archived[0].clone();
+        let (ver_headers, ver_body) = store.lock().unwrap().get(&version_path).unwrap().clone();
+        assert!(
+            ver_headers
+                .get("X-Static-Large-Object")
+                .is_some_and(config_true_value),
+            "archived version must stay an SLO, headers={ver_headers:?}"
+        );
+        let ver_json: serde_json::Value = serde_json::from_slice(&ver_body).unwrap_or_default();
+        assert!(
+            ver_json.is_array(),
+            "archived body must be stored manifest JSON, got {}",
+            String::from_utf8_lossy(&ver_body)
+        );
+
+        let get = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: version_path.clone(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(get.status, 200, "version multipart-manifest=get");
+        let got = get.body.collect_async().await.expect("version JSON body");
+        let listing: serde_json::Value = serde_json::from_slice(&got).expect("version JSON");
+        assert_eq!(listing[0]["name"], "/c/seg_a");
+
+        let mut ranged = HeaderKeyDict::new();
+        ranged.set("If-None-Match", "not-version");
+        let assembled = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: version_path,
+                query_string: String::new(),
+                headers: ranged,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(assembled.status, 200, "version assembled GET");
+        let assembled_body = assembled
+            .body
+            .collect_async()
+            .await
+            .expect("version assembled body");
+        assert_eq!(assembled_body, b"aaa");
+
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+            .status,
+            204,
+            "DELETE current restores the archived SLO"
+        );
+        let mut restored_hdrs = HeaderKeyDict::new();
+        restored_hdrs.set("If-None-Match", "not-restored");
+        let restored = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/my-slo-manifest".into(),
+                query_string: String::new(),
+                headers: restored_hdrs,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        let restored_body = restored
+            .body
+            .collect_async()
+            .await
+            .expect("restored assembled body");
+        assert_eq!(
+            restored_body, b"aaa",
+            "official test_slo_manifest_version restore on Hyper"
+        );
+    }
+
+    /// Official TestDlo.test_copy: COPY a DLO manifest must PUT the
+    /// assembled bytes and must not persist `X-Object-Manifest`.
+    struct DloCopyAssembleStub {
+        dest: Arc<std::sync::Mutex<Option<(HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for DloCopyAssembleStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/a/c")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let dest = Arc::clone(&self.dest);
+            Box::pin(async move {
+                if req.path == "/v1/a/c/man" && req.method != "PUT" {
+                    let mut resp = Response::with_body(200, b"man1-contents".to_vec());
+                    resp.headers.set("X-Object-Manifest", "c/segs/");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/a/c" {
+                    let listing = serde_json::json!([
+                        {"name": "segs/1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"},
+                        {"name": "segs/2", "bytes": 3, "hash": "c81e728d9d4c2f636f067f89cc14862c"},
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/a/c/segs/1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                if req.path == "/v1/a/c/segs/2" {
+                    return Response::with_body(200, b"two".to_vec());
+                }
+                if req.method == "PUT" && req.path == "/v1/a/c/copied" {
+                    let headers = req.headers.clone();
+                    let body = match req.body {
+                        swift_http::Body::Buffered(b) => b,
+                        _ => Vec::new(),
+                    };
+                    *dest.lock().unwrap_or_else(|p| p.into_inner()) = Some((headers, body));
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlo_copy_assembles_without_manifest_header_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_copy COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_body, b"onetwo", "COPY must persist assembled DLO bytes");
+        assert!(
+            put_headers.get("X-Object-Manifest").is_none(),
+            "official test_copy: dest must not carry X-Object-Manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_copy_account_destination_account_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied");
+        headers.set("Destination-Account", "a");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_copy_account COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(put_body, b"onetwo");
+        assert!(put_headers.get("X-Object-Manifest").is_none());
+    }
+
+    #[tokio::test]
+    async fn dlo_ranged_get_uses_assembled_bytes_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Range", "bytes=1-3");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 206,
+            "official test_get_range on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => b.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(body, b"net", "assembled DLO Range bytes=1-3 of onetwo");
+        let mut oob = HeaderKeyDict::new();
+        oob.set("Range", "bytes=50-56");
+        let miss = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers: oob,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss.status, 416,
+            "official test_get_range_out_of_range on Hyper, got {}",
+            miss.status
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_if_none_match_assembled_etag_is_304_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloIfMatchObjectServerStub),
+            ],
+        };
+        let head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(head.status, 200);
+        let etag = head
+            .headers
+            .get("Etag")
+            .expect("assembled DLO Etag")
+            .to_string();
+        let mut headers = HeaderKeyDict::new();
+        headers.set("If-None-Match", &etag);
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 304,
+            "official test_dlo_if_none_match_get on Hyper, got {}",
+            resp.status
+        );
+        let mut head_match = HeaderKeyDict::new();
+        head_match.set("If-None-Match", &etag);
+        let head_304 = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: head_match,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            head_304.status, 304,
+            "official test_dlo_if_none_match_head on Hyper, got {}",
+            head_304.status
+        );
+        let mut miss = HeaderKeyDict::new();
+        miss.set("If-None-Match", format!("not-{etag}"));
+        let miss_head = svc
+            .call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/a/c/manifest".into(),
+                query_string: String::new(),
+                headers: miss,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            miss_head.status, 200,
+            "official test_dlo_if_none_match_head miss on Hyper, got {}",
+            miss_head.status
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_get_dir: listings on, prefix=""
+    /// TempURL of `/container/dir/` is 200 with parent `href="..` and
+    /// TempURL query on object hrefs.
+    struct ListingsDirContainerStub;
+    impl swift_middleware::Middleware for ListingsDirContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/container")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/container/dir"
+                    || req.path == "/v1/AUTH_account/container/dir/"
+                {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("Content-Type", "application/directory");
+                    resp.headers.set("Content-Length", "0");
+                    return resp;
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_account/container" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                    resp.headers.set("X-Container-Object-Count", "2");
+                    resp.headers.set("X-Timestamp", "1000.00000");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_account/container" {
+                    let listing = serde_json::json!([
+                        {"name": "dir/obj", "bytes": 3, "hash": "x", "content_type": "text/plain", "last_modified": "2010-01-01T00:00:00.000000"},
+                        {"subdir": "dir/subdir/"}
+                    ]);
+                    let mut resp = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                    resp.headers.set("Content-Type", "application/json");
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_dir_is_200_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix="
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_dir on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Listing of /v1/"),
+            "official test_get_dir listing title, got {body}"
+        );
+        assert!(
+            body.contains("href=\".."),
+            "official test_get_dir parent href, got {body}"
+        );
+        assert!(
+            body.contains(&format!("temp_url_sig={SIG}")),
+            "official test_get_dir must keep TempURL query on hrefs, got {body}"
+        );
+        assert!(
+            body.contains("<a href=\"./obj"),
+            "official test_get_dir object href, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_dir_inline_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix=&inline=1"
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_dir_with_inline on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("&amp;inline"),
+            "official test_get_dir_with_inline href must include inline, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn staticweb_limited_dir_prefix_tempurl_hides_parent_on_hyper() {
+        // Official test_get_limited_dir: prefix scoped to dir/ must not
+        // emit href=".." (would escape the signed prefix).
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "19f889cf626f10a4dda11a2474f8906430efd3a4d63ad77f893aa0bbc03646bd";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!(
+                    "temp_url_sig={SIG}&temp_url_expires={EXPIRES}&temp_url_prefix=dir/"
+                ),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_limited_dir on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            !body.contains("href=\".."),
+            "limited prefix TempURL must hide parent ../, got {body}"
+        );
+        assert!(
+            body.contains("<a href=\"./obj"),
+            "limited dir listing still lists objects, got {body}"
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_get_dir_with_iso_expiry: HMAC is
+    /// over the numeric epoch, but listing hrefs must keep the ISO8601
+    /// `temp_url_expires` the client presented (`quote` encodes `:`).
+    #[tokio::test]
+    async fn staticweb_listings_on_prefix_tempurl_iso_expiry_on_hyper() {
+        const KEY: &str = "mykey";
+        const ISO: &str = "2100-01-01T00:00:00Z";
+        const SIG: &str = "f13df77135f801a28d05f2b3ec2f3558fa9f5858d9218bc6c84b09fccffd5fa6";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsDirContainerStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/dir/".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={ISO}&temp_url_prefix="),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_dir_with_iso_expiry on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("temp_url_expires=2100-01-01T00%3A00%3A00Z"),
+            "official test_get_dir_with_iso_expiry href must keep ISO expires, got {body}"
+        );
+        assert!(
+            !body.contains("temp_url_expires=4102444800"),
+            "ISO TempURL listing must not rewrite expires to epoch, got {body}"
+        );
+    }
+
+    /// Official TestStaticWebTempurl.test_unauthed: container GET with no
+    /// token and no TempURL is 401 even when listings are on.
+    struct ListingsOnAuthRequiredStub;
+    impl swift_middleware::Middleware for ListingsOnAuthRequiredStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/container")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                let authed = req.headers.get("X-Auth-Token").is_some()
+                    || req.headers.get("X-Backend-Authorize-Override") == Some("true");
+                if !authed {
+                    return Response::error(401, "Unauthorized");
+                }
+                let mut resp = if req.method == "HEAD" {
+                    Response::new(204)
+                } else {
+                    Response::with_body(200, b"[]".to_vec())
+                };
+                resp.headers.set("X-Container-Meta-Web-Listings", "true");
+                resp.headers.set("X-Container-Object-Count", "1");
+                resp.headers.set("X-Timestamp", "1000.00000");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn staticweb_listings_on_unauthed_container_get_is_401_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec!["mykey".to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::StaticWeb::new()),
+                Arc::new(ListingsOnAuthRequiredStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 401,
+            "official test_unauthed on Hyper, got {}",
+            resp.status
+        );
+    }
+
+    /// Official TestTempURL.test_PUT_manifest_access: a signed PUT/POST
+    /// carrying `X-Object-Manifest` is 400 in `prepare()` (Hyper never
+    /// calls `handle()`).
+    struct TempurlWriteWouldSucceedStub;
+    impl swift_middleware::Middleware for TempurlWriteWouldSucceedStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "PUT" | "POST")
+                && req.path == "/v1/AUTH_account/container/object"
+        }
+        fn handle_request_async(
+            &self,
+            _req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move { Response::new(201) })
+        }
+    }
+
+    #[tokio::test]
+    async fn tempurl_put_manifest_is_400_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "075253051197618a0ba40c0cb27954ab7774acea82b34cb7ffb6198c64f7e6cb";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu), Arc::new(TempurlWriteWouldSucceedStub)],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Manifest", "some_random_container/foo");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "official test_PUT_manifest_access PUT on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            body, "The header 'X-Object-Manifest' is not allowed in this tempurl",
+            "official test_PUT_manifest_access body, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tempurl_post_manifest_is_400_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "47ba39ae5b07dde742ab515bb632b910eaa9a0b1343acde4face2efda13982a9";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu), Arc::new(TempurlWriteWouldSucceedStub)],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Manifest", "other/foo");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "official test_PUT_manifest_access POST on Hyper, got {}",
+            resp.status
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            body,
+            "The header 'X-Object-Manifest' is not allowed in this tempurl"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlo_copy_manifest_keeps_x_object_manifest_on_hyper() {
+        // Official TestDlo.test_copy_manifest: COPY ?multipart-manifest=get
+        // remanifests. Dest PUT must keep X-Object-Manifest and the raw
+        // manifest bytes (not the assembled segments).
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/copied");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 201,
+            "official test_copy_manifest COPY on Hyper, got {}",
+            resp.status
+        );
+        let (put_headers, put_body) = dest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("dest PUT");
+        assert_eq!(
+            put_body, b"man1-contents",
+            "official test_copy_manifest must persist raw manifest bytes"
+        );
+        assert_eq!(
+            put_headers.get("X-Object-Manifest"),
+            Some("c/segs/"),
+            "official test_copy_manifest dest must keep X-Object-Manifest"
+        );
+    }
+
+    /// Official listing_formats test_GET_HEAD_content_type: GET
+    /// `?format=xml` stamps application/xml on a JSON container listing.
+    struct ListingJsonArrayStub;
+    impl swift_middleware::Middleware for ListingJsonArrayStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            matches!(req.method.as_str(), "GET" | "HEAD") && req.path == "/v1/a/c"
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("Content-Type", "text/plain; charset=utf-8");
+                    return resp;
+                }
+                let listing = serde_json::json!([
+                    {"name": "o", "bytes": 1, "hash": "x", "content_type": "text/plain",
+                     "last_modified": "2010-01-01T00:00:00.000000"}
+                ]);
+                let mut resp = Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                resp.headers.set("Content-Type", "application/json");
+                resp
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_formats_get_xml_content_type_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::ListingFormats),
+                Arc::new(ListingJsonArrayStub),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c".into(),
+                query_string: "format=xml".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/xml; charset=utf-8"),
+            "official test_GET_HEAD_content_type GET xml on Hyper"
+        );
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("<object>") && body.contains("<name>o</name>"),
+            "GET ?format=xml must convert the JSON listing, got {body}"
+        );
+    }
+
+    /// Official TestFile.test_POST: object POST must keep listing
+    /// `bytes` / `hash` and update `content_type`. App path only — listing
+    /// rows are applied when the object write carries `X-Container-Host`
+    /// (proxy CU stamp), not by an intercepting listing stub.
+    async fn spawn_file_post_listing_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (HeaderKeyDict, Vec<u8>),
+        >::new()));
+        let listings = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (u64, String, String),
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let objects = Arc::clone(&objects);
+                let listings = Arc::clone(&listings);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (raw_logical, query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_post = first.starts_with("POST ");
+                    let is_get = first.starts_with("GET ");
+                    let is_delete = first.starts_with("DELETE ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    if logical == "/AUTH_test/c" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        if is_head {
+                            let (count_s, bytes_s) = {
+                                let g = listings.lock().unwrap_or_else(|p| p.into_inner());
+                                let bytes: u64 = g.values().map(|(b, _, _)| *b).sum();
+                                (g.len().to_string(), bytes.to_string())
+                            };
+                            write_backend_http_status(
+                                &mut stream,
+                                204,
+                                &[
+                                    ("X-Container-Object-Count", count_s.as_str()),
+                                    ("X-Container-Bytes-Used", bytes_s.as_str()),
+                                ],
+                                &[],
+                            )
+                            .await;
+                            return;
+                        }
+                        if is_get {
+                            let prefix = query
+                                .split('&')
+                                .find_map(|part| part.strip_prefix("prefix="))
+                                .map(swift_http::unquote)
+                                .unwrap_or_default();
+                            let rows: Vec<serde_json::Value> = listings
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .filter(|(name, _)| prefix.is_empty() || name.starts_with(&prefix))
+                                .map(|(name, (bytes, hash, ct))| {
+                                    serde_json::json!({
+                                        "name": name,
+                                        "bytes": bytes,
+                                        "hash": hash,
+                                        "content_type": ct,
+                                        "last_modified": "2010-01-01T00:00:00.000000",
+                                    })
+                                })
+                                .collect();
+                            let payload = serde_json::to_vec(&rows).unwrap();
+                            write_backend_http(
+                                &mut stream,
+                                &[("Content-Type", "application/json")],
+                                &payload,
+                            )
+                            .await;
+                            return;
+                        }
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/c/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let name = logical.trim_start_matches("/AUTH_test/c/").to_string();
+                    let header = |want: &str| -> Option<String> {
+                        text.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case(want).then(|| v.trim().to_string())
+                            })
+                        })
+                    };
+                    let has_cu = header("X-Container-Host").is_some();
+                    if is_put {
+                        let ct = header("Content-Type")
+                            .unwrap_or_else(|| "application/octet-stream".into());
+                        use md5::{Digest, Md5};
+                        let etag = format!("{:x}", Md5::digest(&body));
+                        if let Some(client_etag) = header("ETag") {
+                            let norm = client_etag.trim_matches('"');
+                            if !norm.is_empty() && !norm.eq_ignore_ascii_case(&etag) {
+                                write_backend_http_status(&mut stream, 422, &[], &[]).await;
+                                return;
+                            }
+                        }
+                        // IsolatedIdentity object-server Last-Modified is
+                        // http_date(X-Timestamp.ceil()). Official
+                        // testLastModified compares that PUT header to HEAD.
+                        let last_modified = header("X-Timestamp")
+                            .and_then(|raw| raw.parse::<Timestamp>().ok())
+                            .map(|ts| swift_http::http_date(ts.ceil()))
+                            .unwrap_or_else(|| "Wed, 09 Sep 2026 12:00:00 GMT".to_string());
+                        let mut stored = HeaderKeyDict::new();
+                        stored.set("Content-Type", &ct);
+                        stored.set("ETag", &etag);
+                        stored.set("Content-Length", body.len().to_string());
+                        stored.set("Last-Modified", &last_modified);
+                        stored.set("Accept-Ranges", "bytes");
+                        for line in text.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.to_ascii_lowercase().starts_with("x-object-meta-") {
+                                    stored.set(k.trim(), v.trim());
+                                }
+                            }
+                        }
+                        objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical.clone(), (stored, body.clone()));
+                        if has_cu {
+                            listings
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(name, (body.len() as u64, etag.clone(), ct));
+                        }
+                        write_backend_http_status(
+                            &mut stream,
+                            201,
+                            &[
+                                ("ETag", etag.as_str()),
+                                ("Last-Modified", last_modified.as_str()),
+                            ],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    if is_post {
+                        let found = {
+                            let mut guard = objects.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some((headers, _)) = guard.get_mut(&logical) {
+                                if let Some(ct) = header("Content-Type") {
+                                    headers.set("Content-Type", &ct);
+                                    if has_cu {
+                                        if let Some(row) = listings
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .get_mut(&name)
+                                        {
+                                            row.2 = ct;
+                                        }
+                                    }
+                                }
+                                // IsolatedIdentity object-server POST replaces
+                                // the whole .meta user set (official
+                                // testMetadataOnPost). Merge left stale keys.
+                                let stale: Vec<String> = headers
+                                    .iter()
+                                    .filter(|(k, _)| {
+                                        k.to_ascii_lowercase().starts_with("x-object-meta-")
+                                    })
+                                    .map(|(k, _)| k.to_string())
+                                    .collect();
+                                for k in stale {
+                                    headers.remove(&k);
+                                }
+                                for line in text.lines() {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        if k.to_ascii_lowercase().starts_with("x-object-meta-")
+                                            && k.len() > "x-object-meta-".len()
+                                        {
+                                            headers.set(k.trim(), v.trim());
+                                        }
+                                    }
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if !found {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        write_backend_http_status(&mut stream, 202, &[], &[]).await;
+                        return;
+                    }
+                    if is_delete {
+                        if let Some(raw) = header("X-If-Delete-At") {
+                            if super::parse_int_like(&raw).is_none() {
+                                write_backend_http_status(
+                                    &mut stream,
+                                    400,
+                                    &[],
+                                    b"Bad X-If-Delete-At header value",
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        let found = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&logical)
+                            .is_some();
+                        listings
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&name);
+                        if found {
+                            write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        } else {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        }
+                        return;
+                    }
+                    let stored = objects
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some((headers, obj)) = stored {
+                        let etag = headers
+                            .get("ETag")
+                            .or_else(|| headers.get("Etag"))
+                            .unwrap_or("7265f4d211b56873a381d321f586e4a9")
+                            .to_string();
+                        if let Some(im) = header("If-Match") {
+                            if !object_etag_listed(&im, &etag) {
+                                write_backend_http_status(
+                                    &mut stream,
+                                    412,
+                                    &[("ETag", &etag), ("Accept-Ranges", "bytes")],
+                                    &[],
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        if let Some(inm) = header("If-None-Match") {
+                            if object_etag_listed(&inm, &etag) {
+                                write_backend_http_status(
+                                    &mut stream,
+                                    304,
+                                    &[("ETag", &etag), ("Accept-Ranges", "bytes")],
+                                    &[],
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        let last_modified = headers
+                            .get("Last-Modified")
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        if let Some(lm) = swift_http::parse_http_date(&last_modified) {
+                            if let Some(ims) = header("If-Modified-Since")
+                                .as_deref()
+                                .and_then(swift_http::parse_http_date)
+                            {
+                                if lm <= ims {
+                                    write_backend_http_status(
+                                        &mut stream,
+                                        304,
+                                        &[
+                                            ("ETag", etag.as_str()),
+                                            ("Accept-Ranges", "bytes"),
+                                            ("Last-Modified", last_modified.as_str()),
+                                        ],
+                                        &[],
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            if let Some(ius) = header("If-Unmodified-Since")
+                                .as_deref()
+                                .and_then(swift_http::parse_http_date)
+                            {
+                                if lm > ius {
+                                    write_backend_http_status(
+                                        &mut stream,
+                                        412,
+                                        &[
+                                            ("ETag", etag.as_str()),
+                                            ("Last-Modified", last_modified.as_str()),
+                                        ],
+                                        &[],
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
+                        if !is_head {
+                            if let Some(range_h) = header("Range") {
+                                if let Ok(parsed) = swift_http::Range::parse(&range_h) {
+                                    match parsed.ranges_for_length(Some(obj.len() as u64)) {
+                                        Some(ranges) if ranges.is_empty() => {
+                                            let cr = format!("bytes */{}", obj.len());
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                416,
+                                                &[
+                                                    ("ETag", etag.as_str()),
+                                                    ("Accept-Ranges", "bytes"),
+                                                    ("Content-Range", cr.as_str()),
+                                                ],
+                                                &[],
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        Some(ranges) if ranges.len() == 1 => {
+                                            let (start, end) = ranges[0];
+                                            let slice = obj[start as usize..end as usize].to_vec();
+                                            let cr = format!(
+                                                "bytes {start}-{}/{}",
+                                                end.saturating_sub(1),
+                                                obj.len()
+                                            );
+                                            let ct = headers
+                                                .get("Content-Type")
+                                                .unwrap_or("application/octet-stream")
+                                                .to_string();
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                206,
+                                                &[
+                                                    ("ETag", etag.as_str()),
+                                                    ("Accept-Ranges", "bytes"),
+                                                    ("Content-Range", cr.as_str()),
+                                                    ("Content-Type", ct.as_str()),
+                                                ],
+                                                &slice,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        Some(ranges) => {
+                                            let ct = headers
+                                                .get("Content-Type")
+                                                .unwrap_or("application/octet-stream")
+                                                .to_string();
+                                            let boundary = "filefunc";
+                                            let payload = swift_http::multipart_byteranges(
+                                                boundary,
+                                                &ranges,
+                                                &obj,
+                                                &ct,
+                                                obj.len() as u64,
+                                            );
+                                            let mp_ct =
+                                                swift_http::multipart_byteranges_content_type(
+                                                    boundary,
+                                                );
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                206,
+                                                &[
+                                                    ("ETag", etag.as_str()),
+                                                    ("Accept-Ranges", "bytes"),
+                                                    ("Content-Type", mp_ct.as_str()),
+                                                ],
+                                                &payload,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                        }
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        let extra: Vec<(&str, String)> =
+                            headers.iter().map(|(k, v)| (k, v.to_string())).collect();
+                        let extra_ref: Vec<(&str, &str)> =
+                            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                        write_backend_http(&mut stream, &extra_ref, send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    fn listing_with_delimiter(
+        names: &[String],
+        prefix: &str,
+        delimiter: &str,
+        reverse: bool,
+        marker: &str,
+        end_marker: &str,
+        limit: Option<usize>,
+        path: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let (prefix_owned, delimiter_owned, path_eq, path_mode) = match path {
+            Some(p) if p.is_empty() => (String::new(), "/".to_string(), String::new(), true),
+            Some(p) => {
+                let stripped = format!("{}/", p.trim_end_matches('/'));
+                (stripped.clone(), "/".to_string(), stripped, true)
+            }
+            None => (
+                prefix.to_string(),
+                delimiter.to_string(),
+                String::new(),
+                false,
+            ),
+        };
+        let prefix = prefix_owned.as_str();
+        let delimiter = delimiter_owned.as_str();
+        let mut filtered: Vec<&String> = names.iter().filter(|n| n.starts_with(prefix)).collect();
+        filtered.sort();
+        if !marker.is_empty() {
+            filtered.retain(|n| {
+                if reverse {
+                    n.as_str() < marker
+                } else {
+                    n.as_str() > marker
+                }
+            });
+        }
+        if !end_marker.is_empty() {
+            filtered.retain(|n| {
+                if reverse {
+                    n.as_str() > end_marker
+                } else {
+                    n.as_str() < end_marker
+                }
+            });
+        }
+        if reverse {
+            filtered.reverse();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut rows = Vec::new();
+        for name in filtered {
+            if path_mode {
+                if name.as_str() == path_eq {
+                    continue;
+                }
+                if !delimiter.is_empty() {
+                    let rest = &name[prefix.len()..];
+                    if let Some(idx) = rest.find(delimiter) {
+                        if name.len() > prefix.len() + idx + delimiter.len() {
+                            continue;
+                        }
+                    }
+                }
+                let content_type = if name.ends_with('/') {
+                    "application/directory"
+                } else {
+                    "text/plain"
+                };
+                rows.push(serde_json::json!({
+                    "name": name,
+                    "bytes": 0,
+                    "count": 0,
+                    "hash": "x",
+                    "content_type": content_type,
+                    "last_modified": "2010-01-01T00:00:00.000000",
+                }));
+                continue;
+            }
+            if !delimiter.is_empty() {
+                let rest = &name[prefix.len()..];
+                if let Some(idx) = rest.find(delimiter) {
+                    let subdir = format!("{}{}{}", prefix, &rest[..idx], delimiter);
+                    if seen.insert(subdir.clone()) {
+                        rows.push(serde_json::json!({"subdir": subdir}));
+                    }
+                    continue;
+                }
+            }
+            let content_type = if name.ends_with('/') {
+                "application/directory"
+            } else {
+                "text/plain"
+            };
+            rows.push(serde_json::json!({
+                "name": name,
+                "bytes": 0,
+                "count": 0,
+                "hash": "x",
+                "content_type": content_type,
+                "last_modified": "2010-01-01T00:00:00.000000",
+            }));
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        rows
+    }
+
+    async fn spawn_container_func_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let containers = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Vec<String>,
+        >::new()));
+        let stats = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (u64, u64),
+        >::new()));
+        let container_meta = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            HeaderKeyDict,
+        >::new()));
+        let account_meta = Arc::new(std::sync::Mutex::new(HeaderKeyDict::new()));
+        let object_bodies = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Vec<u8>,
+        >::new()));
+        let object_meta = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            HeaderKeyDict,
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let containers = Arc::clone(&containers);
+                let objects = Arc::clone(&objects);
+                let stats = Arc::clone(&stats);
+                let container_meta = Arc::clone(&container_meta);
+                let account_meta = Arc::clone(&account_meta);
+                let object_bodies = Arc::clone(&object_bodies);
+                let object_meta = Arc::clone(&object_meta);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (raw_logical, query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_post = first.starts_with("POST ");
+                    let is_get = first.starts_with("GET ");
+                    let is_delete = first.starts_with("DELETE ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    let params = swift_http::parse_query(&query);
+                    let qparam = |key: &str| -> String {
+                        params
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_default()
+                    };
+                    let account_counts = || {
+                        let n = containers.lock().unwrap_or_else(|p| p.into_inner()).len();
+                        let (objects_n, bytes_n) = stats
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .values()
+                            .fold((0u64, 0u64), |acc, &(c, b)| (acc.0 + c, acc.1 + b));
+                        (n.to_string(), objects_n.to_string(), bytes_n.to_string())
+                    };
+                    if logical == "/AUTH_test" {
+                        if is_post {
+                            let over = {
+                                let mut stored =
+                                    account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let mut next = stored.clone();
+                                leftover_apply_user_meta("account", &mut next, &text, false);
+                                leftover_apply_account_sysmeta(&mut next, &text);
+                                if leftover_user_meta_over_limit("account", &next) {
+                                    true
+                                } else {
+                                    *stored = next;
+                                    false
+                                }
+                            };
+                            if over {
+                                write_backend_http_status(&mut stream, 400, &[], &[]).await;
+                                return;
+                            }
+                        }
+                        let (n_s, o_s, b_s) = account_counts();
+                        let extra = {
+                            let stored = account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let meta_pairs = leftover_meta_pairs(&stored, "account");
+                            let mut extra = vec![
+                                ("X-Account-Container-Count".to_string(), n_s.clone()),
+                                ("X-Account-Object-Count".to_string(), o_s.clone()),
+                                ("X-Account-Bytes-Used".to_string(), b_s.clone()),
+                            ];
+                            extra.extend(meta_pairs);
+                            extra.extend(leftover_account_sysmeta_pairs(&stored));
+                            extra
+                        };
+                        let mut extra = extra;
+                        if is_get {
+                            let names: Vec<String> = containers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .cloned()
+                                .collect();
+                            let reverse = swift_core::config::config_true_value(&qparam("reverse"));
+                            let path = params
+                                .iter()
+                                .find(|(k, _)| k == "path")
+                                .map(|(_, v)| v.clone());
+                            let mut rows = listing_with_delimiter(
+                                &names,
+                                &qparam("prefix"),
+                                &qparam("delimiter"),
+                                reverse,
+                                &qparam("marker"),
+                                &qparam("end_marker"),
+                                qparam("limit").parse().ok(),
+                                path.as_deref(),
+                            );
+                            {
+                                let stats_g = stats.lock().unwrap_or_else(|p| p.into_inner());
+                                for row in rows.iter_mut() {
+                                    if let Some(name) =
+                                        row.get("name").and_then(|v| v.as_str()).map(str::to_string)
+                                    {
+                                        if let Some(&(count, bytes)) = stats_g.get(&name) {
+                                            row["count"] = serde_json::json!(count);
+                                            row["bytes"] = serde_json::json!(bytes);
+                                        }
+                                    }
+                                }
+                            }
+                            extra
+                                .push(("Content-Type".to_string(), "application/json".to_string()));
+                            let payload = serde_json::to_vec(&rows).unwrap();
+                            let refs = leftover_header_refs(&extra);
+                            write_backend_http(&mut stream, &refs, &payload).await;
+                            return;
+                        }
+                        let refs = leftover_header_refs(&extra);
+                        write_backend_http_status(&mut stream, 204, &refs, &[]).await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    let rest = logical.trim_start_matches("/AUTH_test/");
+                    if let Some((container, object)) = rest.split_once('/') {
+                        if is_put {
+                            let exists = containers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains(container);
+                            if !exists {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            // Official extra-file TestObject.test_if_none_match:
+                            // object-server owns If-None-Match. Hyper already
+                            // forwards it; leftover PUT must 400 unless `*`
+                            // and 412 when the object is already listed.
+                            if let Some(inm) = leftover_header_value(&text, "If-None-Match") {
+                                if inm.trim() != "*" {
+                                    write_backend_http_status(&mut stream, 400, &[], &[]).await;
+                                    return;
+                                }
+                                let listed = objects
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .get(container)
+                                    .is_some_and(|v| v.iter().any(|n| n == object));
+                                if listed {
+                                    write_backend_http_status(&mut stream, 412, &[], &[]).await;
+                                    return;
+                                }
+                            }
+                            let prev = object_bodies
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(logical.clone(), body.clone());
+                            {
+                                let mut objs = objects.lock().unwrap_or_else(|p| p.into_inner());
+                                let list = objs.entry(container.to_string()).or_default();
+                                if !list.iter().any(|n| n == object) {
+                                    list.push(object.to_string());
+                                }
+                            }
+                            {
+                                let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+                                let entry = st.entry(container.to_string()).or_insert((0, 0));
+                                if let Some(old) = prev {
+                                    entry.1 = entry.1.saturating_sub(old.len() as u64);
+                                } else {
+                                    entry.0 += 1;
+                                }
+                                entry.1 += body.len() as u64;
+                            }
+                            {
+                                let mut meta =
+                                    object_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let stored = meta.entry(logical.clone()).or_default();
+                                leftover_apply_object_headers(stored, &text);
+                            }
+                            write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                            return;
+                        }
+                        if is_delete {
+                            let exists = containers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains(container);
+                            if !exists {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            let removed = {
+                                let mut objs = objects.lock().unwrap_or_else(|p| p.into_inner());
+                                let list = objs.entry(container.to_string()).or_default();
+                                if let Some(idx) = list.iter().position(|n| n == object) {
+                                    list.remove(idx);
+                                    if let Some(st) = stats
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .get_mut(container)
+                                    {
+                                        st.0 = st.0.saturating_sub(1);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if removed {
+                                object_bodies
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&logical);
+                                object_meta
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&logical);
+                                write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                            } else {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            }
+                            return;
+                        }
+                        // Official TestObject.test_container_write_only: object
+                        // POST is 202. Extra-file test_metadata then GETs the
+                        // replaced user-meta set; IsolatedIdentity
+                        // object-server POST replaces, it does not merge.
+                        if is_post {
+                            {
+                                let mut meta =
+                                    object_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let stored = meta.entry(logical.clone()).or_default();
+                                leftover_apply_object_headers(stored, &text);
+                            }
+                            write_backend_http_status(&mut stream, 202, &[], &[]).await;
+                            return;
+                        }
+                        let listed = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(container)
+                            .is_some_and(|v| v.iter().any(|n| n == object));
+                        if !listed {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        let payload = object_bodies
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&logical)
+                            .cloned()
+                            .unwrap_or_else(|| b"x".to_vec());
+                        let mut extra = {
+                            let stored = object_meta
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&logical)
+                                .cloned()
+                                .unwrap_or_default();
+                            leftover_object_header_pairs(&stored)
+                        };
+                        // Official extra-file TestObject.test_copy_object COPY
+                        // Range: leftover object GET must 206 the slice.
+                        // Hyper already forwards client Range onto the source
+                        // GET; a leftover 200+full body is treated as
+                        // "backend ignored Range" and dest becomes `test`.
+                        if !is_head {
+                            if let Some(range_h) = leftover_header_value(&text, "Range") {
+                                if let Ok(parsed) = swift_http::Range::parse(&range_h) {
+                                    match parsed.ranges_for_length(Some(payload.len() as u64)) {
+                                        Some(ranges) if ranges.is_empty() => {
+                                            let cr = format!("bytes */{}", payload.len());
+                                            extra.push(("Accept-Ranges".into(), "bytes".into()));
+                                            extra.push(("Content-Range".into(), cr));
+                                            let refs = leftover_header_refs(&extra);
+                                            write_backend_http_status(&mut stream, 416, &refs, &[])
+                                                .await;
+                                            return;
+                                        }
+                                        Some(ranges) if ranges.len() == 1 => {
+                                            let (start, end) = ranges[0];
+                                            let slice =
+                                                payload[start as usize..end as usize].to_vec();
+                                            let cr = format!(
+                                                "bytes {start}-{}/{}",
+                                                end.saturating_sub(1),
+                                                payload.len()
+                                            );
+                                            extra.push(("Accept-Ranges".into(), "bytes".into()));
+                                            extra.push(("Content-Range".into(), cr));
+                                            let refs = leftover_header_refs(&extra);
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                206,
+                                                &refs,
+                                                &slice,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        let refs = leftover_header_refs(&extra);
+                        let send = if is_head { &[][..] } else { payload.as_slice() };
+                        write_backend_http_status(&mut stream, 200, &refs, send).await;
+                        return;
+                    }
+                    let container = rest.to_string();
+                    if shard {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_put {
+                        let incoming_idx =
+                            leftover_header_value(&text, "X-Backend-Storage-Policy-Index");
+                        let default_idx =
+                            leftover_header_value(&text, "X-Backend-Storage-Policy-Default")
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| "0".into());
+                        let status = {
+                            let mut containers =
+                                containers.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut meta = container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let inserted = containers.insert(container.clone());
+                            let stored = meta.entry(container.clone()).or_default();
+                            if !inserted {
+                                if let Some(ref new_idx) = incoming_idx {
+                                    if leftover_stored_policy_index(stored)
+                                        .is_some_and(|old| old != *new_idx)
+                                    {
+                                        409
+                                    } else {
+                                        leftover_apply_user_meta("container", stored, &text, true);
+                                        leftover_apply_container_acl(stored, &text);
+                                        leftover_apply_container_sync(stored, &text);
+                                        if leftover_stored_policy_index(stored).is_none() {
+                                            stored.set("X-Backend-Storage-Policy-Index", new_idx);
+                                        }
+                                        202
+                                    }
+                                } else {
+                                    leftover_apply_user_meta("container", stored, &text, true);
+                                    leftover_apply_container_acl(stored, &text);
+                                    leftover_apply_container_sync(stored, &text);
+                                    if leftover_stored_policy_index(stored).is_none() {
+                                        stored.set("X-Backend-Storage-Policy-Index", &default_idx);
+                                    }
+                                    202
+                                }
+                            } else {
+                                leftover_apply_user_meta("container", stored, &text, true);
+                                leftover_apply_container_acl(stored, &text);
+                                leftover_apply_container_sync(stored, &text);
+                                stored.set(
+                                    "X-Backend-Storage-Policy-Index",
+                                    incoming_idx.as_deref().unwrap_or(default_idx.as_str()),
+                                );
+                                201
+                            }
+                        };
+                        write_backend_http_status(&mut stream, status, &[], &[]).await;
+                        return;
+                    }
+                    let exists = containers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .contains(&container);
+                    if !exists {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_delete {
+                        let has_files = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .is_some_and(|v| !v.is_empty());
+                        if has_files {
+                            write_backend_http_status(&mut stream, 409, &[], &[]).await;
+                            return;
+                        }
+                        containers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&container);
+                        container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&container);
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if is_post {
+                        let over = {
+                            let mut guard =
+                                container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let stored = guard.entry(container.clone()).or_default();
+                            let mut next = stored.clone();
+                            leftover_apply_user_meta("container", &mut next, &text, false);
+                            leftover_apply_container_acl(&mut next, &text);
+                            leftover_apply_container_sync(&mut next, &text);
+                            if leftover_user_meta_over_limit("container", &next) {
+                                true
+                            } else {
+                                *stored = next;
+                                false
+                            }
+                        };
+                        if over {
+                            write_backend_http_status(&mut stream, 400, &[], &[]).await;
+                            return;
+                        }
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if is_head {
+                        let (count_s, bytes_s) = {
+                            let count = objects
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&container)
+                                .map(|v| v.len())
+                                .unwrap_or(0);
+                            let bytes = stats
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&container)
+                                .map(|(_, b)| *b)
+                                .unwrap_or(0);
+                            (count.to_string(), bytes.to_string())
+                        };
+                        let stored = container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_default();
+                        let meta_pairs = leftover_meta_pairs(&stored, "container");
+                        let mut extra = vec![
+                            ("X-Container-Object-Count".to_string(), count_s),
+                            ("X-Container-Bytes-Used".to_string(), bytes_s),
+                        ];
+                        extra.extend(meta_pairs);
+                        extra.extend(leftover_acl_pairs(&stored));
+                        extra.extend(leftover_sync_pairs(&stored));
+                        extra.extend(leftover_policy_pairs(&stored));
+                        let refs = leftover_header_refs(&extra);
+                        write_backend_http_status(&mut stream, 204, &refs, &[]).await;
+                        return;
+                    }
+                    if is_get {
+                        let names = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_default();
+                        let reverse = swift_core::config::config_true_value(&qparam("reverse"));
+                        let path = params
+                            .iter()
+                            .find(|(k, _)| k == "path")
+                            .map(|(_, v)| v.clone());
+                        let mut rows = listing_with_delimiter(
+                            &names,
+                            &qparam("prefix"),
+                            &qparam("delimiter"),
+                            reverse,
+                            &qparam("marker"),
+                            &qparam("end_marker"),
+                            qparam("limit").parse().ok(),
+                            path.as_deref(),
+                        );
+                        {
+                            let bodies = object_bodies.lock().unwrap_or_else(|p| p.into_inner());
+                            for row in rows.iter_mut() {
+                                let Some(name) =
+                                    row.get("name").and_then(|v| v.as_str()).map(str::to_string)
+                                else {
+                                    continue;
+                                };
+                                let logical = format!("/AUTH_test/{container}/{name}");
+                                if let Some(body) = bodies.get(&logical) {
+                                    row["bytes"] = serde_json::json!(body.len());
+                                }
+                            }
+                        }
+                        let payload = serde_json::to_vec(&rows).unwrap();
+                        let stored = container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_default();
+                        let meta_pairs = leftover_meta_pairs(&stored, "container");
+                        let mut extra =
+                            vec![("Content-Type".to_string(), "application/json".to_string())];
+                        extra.extend(meta_pairs);
+                        extra.extend(leftover_acl_pairs(&stored));
+                        extra.extend(leftover_sync_pairs(&stored));
+                        extra.extend(leftover_policy_pairs(&stored));
+                        let refs = leftover_header_refs(&extra);
+                        write_backend_http(&mut stream, &refs, &payload).await;
+                        return;
+                    }
+                    write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn file_post_updates_listing_content_type_on_hyper() {
+        let (port, backend) = spawn_file_post_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        let body = vec![b'x'; 1024];
+        let mut put_headers = HeaderKeyDict::new();
+        put_headers.set("Content-Type", "text/foobar");
+        put_headers.set("Content-Length", "1024");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/file".into(),
+                query_string: String::new(),
+                headers: put_headers,
+                body: IncomingBody::from_bytes(body, u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestFile.test_POST PUT on Hyper, got {} {:?}",
+            put.status, put.reason
+        );
+        let head = || {
+            svc.call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c/file".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        let listing = || {
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: "format=json".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        let after_put = head().await;
+        assert!(
+            (200..300).contains(&after_put.status),
+            "official TestFile.test_POST sanity HEAD on Hyper, got {}",
+            after_put.status
+        );
+        assert_eq!(
+            after_put.headers.get("Content-Type"),
+            Some("text/foobar"),
+            "official TestFile.test_POST sanity content-type"
+        );
+        let etag = after_put
+            .headers
+            .get("ETag")
+            .or_else(|| after_put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("official TestFile.test_POST sanity etag");
+        let listed = listing().await;
+        assert_eq!(
+            listed.status, 200,
+            "official TestFile.test_POST listing after PUT, got {}",
+            listed.status
+        );
+        let listed_body = listed
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.test_POST listing body");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&listed_body).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some("file"))
+            .expect("official TestFile.test_POST listing must include file");
+        assert_eq!(row.get("bytes").and_then(|v| v.as_u64()), Some(1024));
+        assert_eq!(
+            row.get("content_type").and_then(|v| v.as_str()),
+            Some("text/foobar")
+        );
+        assert_eq!(
+            row.get("hash").and_then(|v| v.as_str()),
+            Some(etag.as_str())
+        );
+        let mut post_headers = HeaderKeyDict::new();
+        post_headers.set("Content-Type", "image/foobarbaz");
+        post_headers.set("X-Object-Meta-Test", "blah");
+        let post = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c/file".into(),
+                query_string: String::new(),
+                headers: post_headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&post.status),
+            "official TestFile.test_POST on Hyper, got {} {:?}",
+            post.status,
+            post.reason
+        );
+        let after_post = head().await;
+        assert_eq!(
+            after_post.headers.get("Content-Type"),
+            Some("image/foobarbaz"),
+            "official TestFile.test_POST object content-type after POST"
+        );
+        assert_eq!(
+            after_post.headers.get("Content-Length"),
+            Some("1024"),
+            "official TestFile.test_POST size must stay 1024"
+        );
+        let post_etag = after_post
+            .headers
+            .get("ETag")
+            .or_else(|| after_post.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("official TestFile.test_POST etag after POST");
+        assert_eq!(
+            post_etag, etag,
+            "official TestFile.test_POST etag must not change"
+        );
+        assert_eq!(
+            after_post.headers.get("X-Object-Meta-Test"),
+            Some("blah"),
+            "official TestFile.test_POST metadata"
+        );
+        let listed_after = listing().await;
+        let listed_after_body = listed_after
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.test_POST listing after POST");
+        let rows_after: Vec<serde_json::Value> =
+            serde_json::from_slice(&listed_after_body).unwrap();
+        let row_after = rows_after
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some("file"))
+            .expect("official TestFile.test_POST listing after POST must include file");
+        assert_eq!(row_after.get("bytes").and_then(|v| v.as_u64()), Some(1024));
+        assert_eq!(
+            row_after.get("hash").and_then(|v| v.as_str()),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            row_after.get("content_type").and_then(|v| v.as_str()),
+            Some("image/foobarbaz"),
+            "official TestFile.test_POST listing content_type after POST"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testCopy / testCopyAccount: COPY a source whose
+    /// name keeps a literal `%2F` plus a real slash, with and without a
+    /// leading slash on Destination, including Destination-Account.
+    /// IsolatedIdentity Hyper never calls `Copy::handle()`.
+    struct FileCopyEncodedStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+    }
+    impl swift_middleware::Middleware for FileCopyEncodedStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            Box::pin(async move {
+                if req.method == "PUT" {
+                    // Official testCopy404s / testCopyFromHeader404s: a
+                    // missing destination container must 404, not autocreate.
+                    if !req.path.starts_with("/v1/AUTH_test/c/")
+                        && !req.path.starts_with("/v1/AUTH_test/dstc/")
+                    {
+                        return Response::new(404);
+                    }
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    async fn official_file_copy_encoded_case(
+        svc: &ProxyAsyncService,
+        destination: &str,
+        dest_account: Option<&str>,
+        dest_path: &str,
+    ) {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", destination);
+        if let Some(account) = dest_account {
+            headers.set("Destination-Account", account);
+        }
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/AUTH_test/c/dealde%2Fl04 011e%204c8df/flash.png".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official TestFile.testCopy COPY {destination:?} on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: dest_path.into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestFile.testCopy dest GET {dest_path} on Hyper"
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.testCopy dest body");
+        assert_eq!(
+            body, b"png-bytes",
+            "official TestFile.testCopy dest must keep source bytes ({destination})"
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("image/png"),
+            "official TestFile.testCopy dest content-type ({destination})"
+        );
+        assert_eq!(
+            got.headers.get("X-Object-Meta-Color"),
+            Some("blue"),
+            "official TestFile.testCopy dest metadata ({destination})"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_copy_keeps_encoded_slash_and_metadata_on_hyper() {
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "image/png");
+        source.set("X-Object-Meta-Color", "blue");
+        source.set("Content-Length", "9");
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            "/v1/AUTH_test/c/dealde%2Fl04 011e%204c8df/flash.png".into(),
+            (source, b"png-bytes".to_vec()),
+        )])));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(FileCopyEncodedStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        official_file_copy_encoded_case(
+            &svc,
+            "/c/copied-slash",
+            None,
+            "/v1/AUTH_test/c/copied-slash",
+        )
+        .await;
+        official_file_copy_encoded_case(
+            &svc,
+            "c/copied-noslash",
+            None,
+            "/v1/AUTH_test/c/copied-noslash",
+        )
+        .await;
+        official_file_copy_encoded_case(
+            &svc,
+            "/dstc/copied-cross",
+            None,
+            "/v1/AUTH_test/dstc/copied-cross",
+        )
+        .await;
+        official_file_copy_encoded_case(
+            &svc,
+            "/c/copied-account",
+            Some("AUTH_test"),
+            "/v1/AUTH_test/c/copied-account",
+        )
+        .await;
+    }
+
+    async fn official_file_copy_from_header_case(
+        svc: &ProxyAsyncService,
+        dest_path: &str,
+        copy_from: &str,
+        copy_from_account: Option<&str>,
+    ) {
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Copy-From", copy_from);
+        if let Some(account) = copy_from_account {
+            headers.set("X-Copy-From-Account", account);
+        }
+        let resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: dest_path.into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official TestFile.testCopyFromHeader PUT {copy_from:?} on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: dest_path.into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official TestFile.testCopyFromHeader dest GET {dest_path}"
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official TestFile.testCopyFromHeader dest body");
+        assert_eq!(
+            body, b"src-bytes",
+            "official TestFile.testCopyFromHeader dest must keep source bytes ({copy_from})"
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("text/plain"),
+            "official TestFile.testCopyFromHeader dest content-type ({copy_from})"
+        );
+        assert_eq!(
+            got.headers.get("X-Object-Meta-Color"),
+            Some("blue"),
+            "official TestFile.testCopyFromHeader dest metadata ({copy_from})"
+        );
+    }
+
+    /// Official TestFile.testCopyFromHeader / testCopyFromAccountHeader:
+    /// PUT + X-Copy-From (with and without a leading slash) copies body and
+    /// metadata. Hyper never calls `Copy::handle()`.
+    #[tokio::test]
+    async fn file_copy_from_header_keeps_metadata_on_hyper() {
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "text/plain");
+        source.set("X-Object-Meta-Color", "blue");
+        source.set("Content-Length", "9");
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            "/v1/AUTH_test/c/src".into(),
+            (source, b"src-bytes".to_vec()),
+        )])));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(FileCopyEncodedStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        official_file_copy_from_header_case(&svc, "/v1/AUTH_test/c/copied-slash", "/c/src", None)
+            .await;
+        official_file_copy_from_header_case(&svc, "/v1/AUTH_test/c/copied-noslash", "c/src", None)
+            .await;
+        official_file_copy_from_header_case(
+            &svc,
+            "/v1/AUTH_test/dstc/copied-cross",
+            "/c/src",
+            None,
+        )
+        .await;
+        official_file_copy_from_header_case(
+            &svc,
+            "/v1/AUTH_test/c/copied-account",
+            "/c/src",
+            Some("AUTH_test"),
+        )
+        .await;
+    }
+
+    /// Official TestFile.testCopy404s / testCopyFromHeader404s: missing
+    /// source container/object and missing dest container must 404 on Hyper
+    /// COPY and X-Copy-From (handle_request_async, not Copy::handle).
+    #[tokio::test]
+    async fn file_copy_and_copy_from_404s_on_hyper() {
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "text/plain");
+        source.set("Content-Length", "4");
+        let store = Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            "/v1/AUTH_test/c/src".into(),
+            (source, b"src!".to_vec()),
+        )])));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Copy::new()),
+                Arc::new(FileCopyEncodedStub {
+                    store: Arc::clone(&store),
+                }),
+            ],
+        };
+        for dest in ["/c/out", "c/out", "/dstc/out"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("Destination", dest);
+            let missing_cont = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/nosrc/src".into(),
+                    query_string: String::new(),
+                    headers: headers.clone(),
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                missing_cont.status, 404,
+                "official testCopy404s missing source container {dest}, got {}",
+                missing_cont.status
+            );
+            let mut headers = HeaderKeyDict::new();
+            headers.set("Destination", dest);
+            let missing_obj = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/c/missing".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                missing_obj.status, 404,
+                "official testCopy404s missing source object {dest}, got {}",
+                missing_obj.status
+            );
+        }
+        for dest in ["/nope/out", "nope/out"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("Destination", dest);
+            let missing_dest = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/c/src".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                missing_dest.status, 404,
+                "official testCopy404s missing dest container {dest}, got {}",
+                missing_dest.status
+            );
+        }
+        for copy_from in ["/nosrc/src", "nosrc/src", "/c/missing", "c/missing"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Copy-From", copy_from);
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/c/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                resp.status, 404,
+                "official testCopyFromHeader404s missing source {copy_from}, got {}",
+                resp.status
+            );
+        }
+        for copy_from in ["/c/src", "c/src"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Copy-From", copy_from);
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/nope/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                resp.status, 404,
+                "official testCopyFromHeader404s missing dest {copy_from}, got {}",
+                resp.status
+            );
+        }
+    }
+
+    /// Official TestFile.testCopyAccount / testCopyFromAccountHeader
+    /// cross-account leftover: Destination-Account and X-Copy-From-Account
+    /// must hit `authorize_async` (no intercepting stub).
+    async fn spawn_file_copy_account_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (HeaderKeyDict, Vec<u8>),
+        >::new()));
+        let container_meta = Arc::new(std::sync::Mutex::new({
+            let mut map = std::collections::HashMap::<String, HeaderKeyDict>::new();
+            let mut c = HeaderKeyDict::new();
+            c.set("X-Container-Read", "test2:tester2");
+            map.insert("/AUTH_test/c".into(), c);
+            let mut dst = HeaderKeyDict::new();
+            dst.set("X-Container-Write", "test:tester");
+            map.insert("/AUTH_test2/dst".into(), dst);
+            map.insert("/AUTH_test2/dst2".into(), HeaderKeyDict::new());
+            let mut srccont = HeaderKeyDict::new();
+            srccont.set("X-Container-Read", "test:tester");
+            map.insert("/AUTH_test2/srccont".into(), srccont);
+            map
+        }));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let objects = Arc::clone(&objects);
+                let container_meta = Arc::clone(&container_meta);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (raw_logical, _query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_get = first.starts_with("GET ");
+                    let is_post = first.starts_with("POST ");
+                    let is_delete = first.starts_with("DELETE ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    let header = |want: &str| -> Option<String> {
+                        text.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case(want).then(|| v.trim().to_string())
+                            })
+                        })
+                    };
+                    if logical == "/AUTH_test" || logical == "/AUTH_test2" {
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if logical.starts_with("/AUTH_test/") || logical.starts_with("/AUTH_test2/") {
+                        let rest = logical
+                            .trim_start_matches("/AUTH_test2/")
+                            .trim_start_matches("/AUTH_test/");
+                        if !rest.contains('/') {
+                            if shard {
+                                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            if is_put || is_post {
+                                {
+                                    let mut guard =
+                                        container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                    let stored = guard.entry(logical.clone()).or_default();
+                                    leftover_apply_container_acl(stored, &text);
+                                    leftover_apply_container_sync(stored, &text);
+                                }
+                                write_backend_http_status(
+                                    &mut stream,
+                                    if is_put { 201 } else { 204 },
+                                    &[],
+                                    &[],
+                                )
+                                .await;
+                                return;
+                            }
+                            let extra = {
+                                let guard =
+                                    container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let stored = guard.get(&logical).cloned().unwrap_or_default();
+                                let mut extra = leftover_acl_pairs(&stored);
+                                extra.extend(leftover_sync_pairs(&stored));
+                                extra
+                            };
+                            let refs = leftover_header_refs(&extra);
+                            write_backend_http_status(&mut stream, 204, &refs, &[]).await;
+                            return;
+                        }
+                    }
+                    if !logical.starts_with("/AUTH_test/") && !logical.starts_with("/AUTH_test2/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_put {
+                        let parent = logical
+                            .rsplit_once('/')
+                            .map(|(p, _)| p.to_string())
+                            .unwrap_or_default();
+                        let parent_exists = container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains_key(&parent);
+                        if !parent_exists {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        let mut stored = HeaderKeyDict::new();
+                        stored.set(
+                            "Content-Type",
+                            header("Content-Type").unwrap_or_else(|| "text/plain".into()),
+                        );
+                        stored.set("Content-Length", body.len().to_string());
+                        if let Some(color) = header("X-Object-Meta-Color") {
+                            stored.set("X-Object-Meta-Color", color);
+                        }
+                        if let Some(ts) = header("X-Timestamp") {
+                            stored.set("X-Timestamp", ts);
+                        }
+                        objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical, (stored, body));
+                        write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        return;
+                    }
+                    if is_delete {
+                        let removed = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&logical)
+                            .is_some();
+                        write_backend_http_status(
+                            &mut stream,
+                            if removed { 204 } else { 404 },
+                            &[],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let stored = objects
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some((headers, obj)) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        let extra: Vec<(&str, String)> =
+                            headers.iter().map(|(k, v)| (k, v.to_string())).collect();
+                        let extra_ref: Vec<(&str, &str)> =
+                            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                        write_backend_http(&mut stream, &extra_ref, send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    let _ = (is_get, is_head);
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn file_copy_account_and_copy_from_account_acl_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", Some("test2:tester2"), None);
+        seed_container_rw(&app, "AUTH_test2", "dst", None, Some("test:tester"));
+        seed_container_rw(&app, "AUTH_test2", "dst2", None, None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Copy::new())],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let writer2 = auth_token(&svc, "test2:tester2", "testing2").await;
+        let mut put_src = HeaderKeyDict::new();
+        put_src.set("X-Auth-Token", &owner);
+        put_src.set("Content-Type", "image/png");
+        put_src.set("Content-Length", "9");
+        put_src.set("X-Object-Meta-Color", "blue");
+        let put = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/src".into(),
+                query_string: String::new(),
+                headers: put_src,
+                body: IncomingBody::from_bytes(b"png-bytes".to_vec(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            put.status, 201,
+            "source PUT, got {} {:?}",
+            put.status, put.reason
+        );
+
+        for dest in ["/dst/copied-slash", "dst/copied-noslash"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("Destination", dest);
+            headers.set("Destination-Account", "AUTH_test2");
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "COPY".into(),
+                    path: "/v1/AUTH_test/c/src".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert!(
+                (200..300).contains(&resp.status),
+                "official testCopyAccount Destination-Account {dest}, got {} {:?}",
+                resp.status,
+                resp.reason
+            );
+            let name = dest.rsplit('/').next().unwrap();
+            let mut get_h = HeaderKeyDict::new();
+            get_h.set("X-Auth-Token", &writer2);
+            let got = svc
+                .call(AsyncRequest {
+                    method: "GET".into(),
+                    path: format!("/v1/AUTH_test2/dst/{name}"),
+                    query_string: String::new(),
+                    headers: get_h,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(got.status, 200, "dest GET {name}, got {}", got.status);
+            assert_eq!(
+                got.body.collect_async().await.expect("dest body"),
+                b"png-bytes"
+            );
+            assert_eq!(got.headers.get("Content-Type"), Some("image/png"));
+            assert_eq!(got.headers.get("X-Object-Meta-Color"), Some("blue"));
+        }
+
+        for copy_from in ["/c/src", "c/src"] {
+            let dest = format!(
+                "/v1/AUTH_test2/dst2/from-{}",
+                if copy_from.starts_with('/') {
+                    "slash"
+                } else {
+                    "noslash"
+                }
+            );
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &writer2);
+            headers.set("X-Copy-From-Account", "AUTH_test");
+            headers.set("X-Copy-From", copy_from);
+            let resp = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: dest.clone(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert!(
+                (200..300).contains(&resp.status),
+                "official testCopyFromAccountHeader {copy_from}, got {} {:?}",
+                resp.status,
+                resp.reason
+            );
+            let mut get_h = HeaderKeyDict::new();
+            get_h.set("X-Auth-Token", &writer2);
+            let got = svc
+                .call(AsyncRequest {
+                    method: "GET".into(),
+                    path: dest,
+                    query_string: String::new(),
+                    headers: get_h,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(got.status, 200);
+            assert_eq!(
+                got.body.collect_async().await.expect("from-account body"),
+                b"png-bytes"
+            );
+            assert_eq!(got.headers.get("X-Object-Meta-Color"), Some("blue"));
+        }
+        backend.abort();
+    }
+
+    /// Official TestObject.test_copy_between_accounts. Account-2 cannot
+    /// X-Copy-From a private source until read ACL; account-1 cannot COPY
+    /// into AUTH_test2 until dest write ACL. Must hit `authorize_async`
+    /// (no intercepting stub). Leftover GET returns stored source bytes.
+    #[tokio::test]
+    async fn copy_between_accounts_acl_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "cba", None, None);
+        seed_container_rw(&app, "AUTH_test2", "cba", None, None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta)],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/cba",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test2/cba",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/cba/obj",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let denied_from = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "0"),
+                ("X-Copy-From-Account", "AUTH_test"),
+                ("X-Copy-From", "cba/obj"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied_from.status, 403,
+            "official test_copy_between_accounts X-Copy-From before source ACL, got {}",
+            denied_from.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/cba",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test2:tester2"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_auth_test_rw(&svc, "cba", Some("test2:tester2"), None);
+        seed_container_rw(
+            &svc.app.read().unwrap_or_else(|p| p.into_inner()),
+            "AUTH_test2",
+            "cba",
+            None,
+            None,
+        );
+        let ok_from = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[
+                ("X-Auth-Token", other.as_str()),
+                ("Content-Length", "0"),
+                ("X-Copy-From-Account", "AUTH_test"),
+                ("X-Copy-From", "cba/obj"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ok_from.status, 201,
+            "official test_copy_between_accounts X-Copy-From after source ACL, got {}",
+            ok_from.status
+        );
+        let dest_get = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(dest_get.status, 200);
+        assert_eq!(leftover_body_text(dest_get).await, "test");
+        let dest_del = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            dest_del.status == 204 || dest_del.status == 404,
+            "official test_copy_between_accounts DELETE dest, got {}",
+            dest_del.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test2/cba/test_copy",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            404
+        );
+
+        let denied_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/cba/obj",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("Destination-Account", "AUTH_test2"),
+                ("Destination", "cba/test_copy"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            denied_copy.status, 403,
+            "official test_copy_between_accounts COPY before dest write ACL, got {}",
+            denied_copy.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test2/cba",
+                "",
+                &[
+                    ("X-Auth-Token", other.as_str()),
+                    ("X-Container-Write", "test:tester"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        seed_container_rw(
+            &svc.app.read().unwrap_or_else(|p| p.into_inner()),
+            "AUTH_test2",
+            "cba",
+            None,
+            Some("test:tester"),
+        );
+        let ok_copy = file_hyper_call(
+            &svc,
+            "COPY",
+            "/v1/AUTH_test/cba/obj",
+            "",
+            &[
+                ("X-Auth-Token", owner.as_str()),
+                ("Destination-Account", "AUTH_test2"),
+                ("Destination", "cba/test_copy"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ok_copy.status, 201,
+            "official test_copy_between_accounts COPY after dest write ACL, got {}",
+            ok_copy.status
+        );
+        let copied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test2/cba/test_copy",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(copied.status, 200);
+        assert_eq!(leftover_body_text(copied).await, "test");
+        backend.abort();
+    }
+
+    /// Official TestObject.test_too_small_x_timestamp /
+    /// test_too_big_x_timestamp with IsolatedIdentity gatekeeper shunt ON:
+    /// out-of-range client X-Timestamp is shunted, write uses now, HEAD
+    /// X-Timestamp is wall-clock (not 400).
+    #[tokio::test]
+    async fn file_out_of_range_x_timestamp_is_rewritten_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", None, None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::Gatekeeper::default()),
+                Arc::new(ta),
+            ],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        for (name, raw) in [
+            ("too_small_x_timestamp", "-1"),
+            ("too_big_x_timestamp", "99999999999.9999999999"),
+        ] {
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "0"),
+                    ("X-Timestamp", raw),
+                ],
+                Vec::new(),
+            )
+            .await;
+            let after = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            assert_eq!(
+                put.status, 201,
+                "official {name} PUT with shunt ON, got {} body {:?}",
+                put.status, put.reason
+            );
+            let head = file_hyper_call(
+                &svc,
+                "HEAD",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&head.status),
+                "official {name} HEAD, got {}",
+                head.status
+            );
+            let ts: f64 = head
+                .headers
+                .get("X-Timestamp")
+                .expect("official HEAD X-Timestamp")
+                .parse()
+                .expect("X-Timestamp float");
+            assert!(
+                ts > before - 2.0 && ts < after + 2.0,
+                "official {name} HEAD X-Timestamp {ts} not wall-clock in {before}..{after}"
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testCopyAccount404s / testCopyFromAccountHeader404s
+    /// plus Destination 412 leftovers. Missing source is 404; missing dest
+    /// in a foreign account is 403; same-account missing dest is 404.
+    #[tokio::test]
+    async fn file_copy_account_404s_and_destination_412_on_hyper() {
+        let (port, backend) = spawn_file_copy_account_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", Some("test2:tester2"), None);
+        seed_container_rw(&app, "AUTH_test2", "dst", None, Some("test:tester"));
+        seed_container_rw(&app, "AUTH_test2", "srccont", Some("test:tester"), None);
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta), Arc::new(swift_middleware::Copy::new())],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let mut put_src = HeaderKeyDict::new();
+        put_src.set("X-Auth-Token", &owner);
+        put_src.set("Content-Length", "3");
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/src".into(),
+                query_string: String::new(),
+                headers: put_src.clone(),
+                body: IncomingBody::from_bytes(b"abc".to_vec(), u64::MAX),
+            })
+            .await
+            .status,
+            201
+        );
+        put_src.set(
+            "X-Auth-Token",
+            &auth_token(&svc, "test2:tester2", "testing2").await,
+        );
+        assert_eq!(
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test2/srccont/src".into(),
+                query_string: String::new(),
+                headers: put_src,
+                body: IncomingBody::from_bytes(b"abc".to_vec(), u64::MAX),
+            })
+            .await
+            .status,
+            201
+        );
+
+        let copy = |dest: &str, dest_acct: Option<&str>, src: &str| {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            if !dest.is_empty() {
+                headers.set("Destination", dest);
+            }
+            if let Some(acct) = dest_acct {
+                headers.set("Destination-Account", acct);
+            }
+            svc.call(AsyncRequest {
+                method: "COPY".into(),
+                path: src.into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        for dest in ["/dst/out", "dst/out", "/c/out", "c/out"] {
+            let dest_acct = if dest.contains("dst") {
+                Some("AUTH_test2")
+            } else {
+                None
+            };
+            assert_eq!(
+                copy(dest, dest_acct, "/v1/AUTH_test/nosrc/src")
+                    .await
+                    .status,
+                404,
+                "official testCopyAccount404s missing source container {dest}"
+            );
+            assert_eq!(
+                copy(dest, dest_acct, "/v1/AUTH_test/c/missing")
+                    .await
+                    .status,
+                404,
+                "official testCopyAccount404s missing source object {dest}"
+            );
+        }
+        assert_eq!(
+            copy("/nope/out", None, "/v1/AUTH_test/c/src").await.status,
+            404,
+            "official testCopyAccount404s same-account missing dest"
+        );
+        assert_eq!(
+            copy("nope/out", None, "/v1/AUTH_test/c/src").await.status,
+            404,
+            "official testCopyAccount404s same-account missing dest noslash"
+        );
+        assert_eq!(
+            copy("/nope/out", Some("AUTH_test2"), "/v1/AUTH_test/c/src")
+                .await
+                .status,
+            403,
+            "official testCopyAccount404s foreign missing dest must 403"
+        );
+        assert_eq!(
+            copy("nope/out", Some("AUTH_test2"), "/v1/AUTH_test/c/src")
+                .await
+                .status,
+            403,
+            "official testCopyAccount404s foreign missing dest noslash must 403"
+        );
+        assert_eq!(
+            copy("", None, "/v1/AUTH_test/c/src").await.status,
+            412,
+            "official testCopyNoDestinationHeader"
+        );
+        assert_eq!(
+            copy("noslashdest", None, "/v1/AUTH_test/c/src")
+                .await
+                .status,
+            412,
+            "official testCopyDestinationSlashProblems"
+        );
+
+        for copy_from in ["/nosrc/src", "nosrc/src"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("X-Copy-From-Account", "AUTH_test2");
+            headers.set("X-Copy-From", copy_from);
+            let status = svc
+                .call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/c/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await
+                .status;
+            assert!(
+                status == 403 || status == 404,
+                "official testCopyFromAccountHeader404s missing source container {copy_from}, got {status}"
+            );
+        }
+        for copy_from in ["/srccont/missing", "srccont/missing"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("X-Copy-From-Account", "AUTH_test2");
+            headers.set("X-Copy-From", copy_from);
+            assert_eq!(
+                svc.call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/c/from-404-obj".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await
+                .status,
+                404,
+                "official testCopyFromAccountHeader404s missing source object {copy_from}"
+            );
+        }
+        for copy_from in ["/srccont/src", "srccont/src"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            headers.set("X-Copy-From-Account", "AUTH_test2");
+            headers.set("X-Copy-From", copy_from);
+            assert_eq!(
+                svc.call(AsyncRequest {
+                    method: "PUT".into(),
+                    path: "/v1/AUTH_test/nope/from-404".into(),
+                    query_string: String::new(),
+                    headers,
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await
+                .status,
+                404,
+                "official testCopyFromAccountHeader404s missing dest {copy_from}"
+            );
+        }
+        backend.abort();
+    }
+
+    async fn file_listing_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_file_post_listing_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::ListingFormats)],
+        };
+        (svc, backend)
+    }
+
+    async fn file_hyper_call(
+        svc: &ProxyAsyncService,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Response {
+        let mut h = HeaderKeyDict::new();
+        for (k, v) in headers {
+            h.set(*k, *v);
+        }
+        svc.call(AsyncRequest {
+            method: method.into(),
+            path: path.into(),
+            query_string: query.into(),
+            headers: h,
+            body: IncomingBody::from_bytes(body, u64::MAX),
+        })
+        .await
+    }
+
+    async fn file_listing_names(svc: &ProxyAsyncService) -> Vec<String> {
+        let listed = file_hyper_call(
+            svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            listed.status, 200,
+            "container listing, got {}",
+            listed.status
+        );
+        let body = listed
+            .body
+            .collect_async()
+            .await
+            .expect("container listing body");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        rows.iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    /// Official TestFile.testNoContentLengthForPut / testBadHeaders.
+    /// IsolatedIdentity Hyper never calls check_object_creation from
+    /// `handle()` — the leftover is handle_async + HTTP headers as sent
+    /// (`no_content_length` omits both Content-Length and Transfer-Encoding).
+    #[tokio::test]
+    async fn file_put_missing_content_length_and_bad_headers_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let no_ct = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/noct.txt",
+            "",
+            &[("Content-Length", "4")],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            no_ct.status, 201,
+            "official testBadHeaders no content-type PUT on Hyper, got {}",
+            no_ct.status
+        );
+        let cl_x = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/cl-x",
+            "",
+            &[("Content-Type", "text/plain"), ("Content-Length", "X")],
+            b"xxxx".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            cl_x.status, 400,
+            "official testBadHeaders Content-Length X on Hyper, got {}",
+            cl_x.status
+        );
+        let missing_cl = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/no-cl",
+            "",
+            &[("Content-Type", "text/plain")],
+            b"testing".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            missing_cl.status, 411,
+            "official testNoContentLengthForPut on Hyper, got {}",
+            missing_cl.status
+        );
+        let te = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/te-gzip",
+            "",
+            &[
+                ("Content-Type", "text/plain"),
+                ("Transfer-Encoding", "gzip,chunked"),
+            ],
+            b"xxxx".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            te.status, 501,
+            "official testBadHeaders transfer-encoding gzip,chunked on Hyper, got {}",
+            te.status
+        );
+        for method in ["LICK", "GETorHEAD_base"] {
+            let resp = file_hyper_call(&svc, method, "/v1/AUTH_test", "", &[], Vec::new()).await;
+            assert_eq!(
+                resp.status, 405,
+                "official testBadHeaders {method} on Hyper, got {}",
+                resp.status
+            );
+        }
+        let ranged = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/noct.txt",
+            "",
+            &[("Range", "parsecs=8-12")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ranged.status, 200,
+            "official testBadHeaders invalid Range unit on Hyper, got {}",
+            ranged.status
+        );
+        let body = ranged
+            .body
+            .collect_async()
+            .await
+            .expect("invalid Range GET body");
+        assert_eq!(
+            body, b"abcd",
+            "official testBadHeaders invalid Range must return the full object"
+        );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_non_integer_x_delete_after /
+    /// test_non_integer_x_delete_at / test_x_delete_at_in_the_past.
+    #[tokio::test]
+    async fn file_delete_at_validation_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let after = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/non_integer_x_delete_after",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Delete-After", "*"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            after.status, 400,
+            "official test_non_integer_x_delete_after on Hyper, got {}",
+            after.status
+        );
+        assert_eq!(
+            leftover_body_text(after).await,
+            "Non-integer X-Delete-After",
+            "official test_non_integer_x_delete_after body"
+        );
+        let at = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/non_integer_x_delete_at",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Delete-At", "*"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            at.status, 400,
+            "official test_non_integer_x_delete_at on Hyper, got {}",
+            at.status
+        );
+        assert_eq!(
+            leftover_body_text(at).await,
+            "Non-integer X-Delete-At",
+            "official test_non_integer_x_delete_at body"
+        );
+        let past = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/x_delete_at_in_the_past",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Delete-At", "0"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            past.status, 400,
+            "official test_x_delete_at_in_the_past on Hyper, got {}",
+            past.status
+        );
+        assert_eq!(
+            leftover_body_text(past).await,
+            "X-Delete-At in past",
+            "official test_x_delete_at_in_the_past body"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testNameLimit / testQuestionMarkInName.
+    #[tokio::test]
+    async fn file_name_limit_and_question_mark_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let limit = swift_core::constraints::MAX_OBJECT_NAME_LENGTH as usize;
+        for n in [1usize, 10, limit / 2, limit - 1, limit] {
+            let name = "a".repeat(n);
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testNameLimit len={n} on Hyper, got {}",
+                put.status
+            );
+        }
+        let over = "a".repeat(limit + 1);
+        let too_long = file_hyper_call(
+            &svc,
+            "PUT",
+            &format!("/v1/AUTH_test/c/{over}"),
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            too_long.status, 400,
+            "official testNameLimit / testTooLongName over-limit on Hyper, got {}",
+            too_long.status
+        );
+        let too_long_1025 = file_hyper_call(
+            &svc,
+            "PUT",
+            &format!("/v1/AUTH_test/c/{}", "x".repeat(1025)),
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            too_long_1025.status, 400,
+            "official testTooLongName 1025-char object on Hyper, got {}",
+            too_long_1025.status
+        );
+        let q_put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/pre",
+            "suf=1",
+            &[("Content-Length", "3"), ("Content-Type", "text/plain")],
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            q_put.status, 201,
+            "official testQuestionMarkInName no_path_quote PUT on Hyper, got {}",
+            q_put.status
+        );
+        let names = file_listing_names(&svc).await;
+        assert!(
+            names.iter().any(|n| n == "pre"),
+            "official testQuestionMarkInName listing must keep the prefix before '?', got {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| !n.contains('?')),
+            "official testQuestionMarkInName listing must not keep '?' in the name, got {names:?}"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testBlankMetadataName / testMetadataNumberLimit /
+    /// testMetadataLengthLimits.
+    #[tokio::test]
+    async fn file_blank_and_metadata_limits_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let blank = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/blank-meta",
+            "",
+            &[
+                ("Content-Length", "0"),
+                ("Content-Type", "text/plain"),
+                ("X-Object-Meta-", "nope"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            blank.status, 400,
+            "official testBlankMetadataName on Hyper, got {}",
+            blank.status
+        );
+        let key_limit = swift_core::constraints::MAX_META_NAME_LENGTH as usize;
+        let value_limit = swift_core::constraints::MAX_META_VALUE_LENGTH as usize;
+        let ok_len = {
+            let mut h = HeaderKeyDict::new();
+            h.set("Content-Length", "0");
+            h.set("Content-Type", "text/plain");
+            let ok_key = format!("X-Object-Meta-{}", "a".repeat(key_limit));
+            h.set(&ok_key, "b".repeat(value_limit));
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-ok".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            ok_len.status, 201,
+            "official testMetadataLengthLimits at-limit on Hyper, got {}",
+            ok_len.status
+        );
+        let long_key = {
+            let mut h = HeaderKeyDict::new();
+            h.set("Content-Length", "0");
+            h.set("Content-Type", "text/plain");
+            let long_name = format!("X-Object-Meta-{}", "a".repeat(key_limit + 1));
+            h.set(&long_name, "b");
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-long-key".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            long_key.status, 400,
+            "official testMetadataLengthLimits long key on Hyper, got {}",
+            long_key.status
+        );
+        let long_val = {
+            let mut h = HeaderKeyDict::new();
+            h.set("Content-Length", "0");
+            h.set("Content-Type", "text/plain");
+            h.set("X-Object-Meta-k", "b".repeat(value_limit + 1));
+            svc.call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-long-val".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            long_val.status, 400,
+            "official testMetadataLengthLimits long value on Hyper, got {}",
+            long_val.status
+        );
+        let count_limit = swift_core::constraints::MAX_META_COUNT as usize;
+        let mut ok_count = HeaderKeyDict::new();
+        ok_count.set("Content-Length", "0");
+        ok_count.set("Content-Type", "text/plain");
+        for i in 0..count_limit {
+            let key = format!("X-Object-Meta-k{i:02}");
+            ok_count.set(&key, "v");
+        }
+        let at_count = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-count-ok".into(),
+                query_string: String::new(),
+                headers: ok_count,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            at_count.status, 201,
+            "official testMetadataNumberLimit at-limit on Hyper, got {}",
+            at_count.status
+        );
+        let mut over_count = HeaderKeyDict::new();
+        over_count.set("Content-Length", "0");
+        over_count.set("Content-Type", "text/plain");
+        for i in 0..=count_limit {
+            let key = format!("X-Object-Meta-k{i:02}");
+            over_count.set(&key, "v");
+        }
+        let over = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/meta-count-over".into(),
+                query_string: String::new(),
+                headers: over_count.clone(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            over.status, 400,
+            "official testMetadataNumberLimit over-limit PUT on Hyper, got {}",
+            over.status
+        );
+        let seeded = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/meta-count-over",
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(seeded.status, 201, "seed object before over-limit POST");
+        let post_over = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c/meta-count-over".into(),
+                query_string: String::new(),
+                headers: over_count,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            post_over.status, 400,
+            "official testMetadataNumberLimit over-limit POST on Hyper, got {}",
+            post_over.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testMetadataOnPut / testMetadataOnPost: PUT metas
+    /// survive HEAD; IsolatedIdentity object-server POST replaces the set.
+    #[tokio::test]
+    async fn file_metadata_on_put_and_post_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+                ("X-Object-Meta-Color", "blue"),
+                ("X-Object-Meta-Flavor", "mint"),
+            ],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official testMetadataOnPut PUT on Hyper, got {}",
+            put.status
+        );
+        let head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official testMetadataOnPut HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers.get("X-Object-Meta-Color"),
+            Some("blue"),
+            "official testMetadataOnPut Color {:?}",
+            head.headers
+        );
+        assert_eq!(
+            head.headers.get("X-Object-Meta-Flavor"),
+            Some("mint"),
+            "official testMetadataOnPut Flavor {:?}",
+            head.headers
+        );
+        let post = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[("X-Object-Meta-Size", "large")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            post.status == 202 || post.status == 201,
+            "official testMetadataOnPost first POST, got {}",
+            post.status
+        );
+        let after = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            after.headers.get("X-Object-Meta-Size"),
+            Some("large"),
+            "official testMetadataOnPost Size {:?}",
+            after.headers
+        );
+        assert_eq!(
+            after.headers.get("X-Object-Meta-Color"),
+            None,
+            "official testMetadataOnPost must drop Color, headers {:?}",
+            after.headers
+        );
+        assert_eq!(
+            after.headers.get("X-Object-Meta-Flavor"),
+            None,
+            "official testMetadataOnPost must drop Flavor, headers {:?}",
+            after.headers
+        );
+        let post2 = file_hyper_call(
+            &svc,
+            "POST",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[("X-Object-Meta-Color", "red")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            post2.status == 202 || post2.status == 201,
+            "official testMetadataOnPost second POST, got {}",
+            post2.status
+        );
+        let after2 = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test/c/meta-obj",
+            "",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            after2.headers.get("X-Object-Meta-Color"),
+            Some("red"),
+            "official testMetadataOnPost second Color {:?}",
+            after2.headers
+        );
+        assert_eq!(
+            after2.headers.get("X-Object-Meta-Size"),
+            None,
+            "official testMetadataOnPost must drop Size, headers {:?}",
+            after2.headers
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testDeleteThen404s.
+    #[tokio::test]
+    async fn file_delete_then_404s_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/gone",
+            "",
+            &[("Content-Length", "3"), ("Content-Type", "text/plain")],
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official testDeleteThen404s PUT, got {}",
+            put.status
+        );
+        let del =
+            file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/c/gone", "", &[], Vec::new()).await;
+        assert_eq!(
+            del.status, 204,
+            "official testDeleteThen404s DELETE, got {}",
+            del.status
+        );
+        for method in ["HEAD", "GET", "POST", "DELETE"] {
+            let resp = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/gone",
+                "",
+                &[("X-Object-Meta-A", "b")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.status, 404,
+                "official testDeleteThen404s {method} after DELETE on Hyper, got {}",
+                resp.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestObject.test_delete_content_type /
+    /// test_delete_if_delete_at_bad.
+    #[tokio::test]
+    async fn file_delete_content_type_and_if_delete_at_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/hi",
+                "",
+                &[("Content-Length", "5"), ("Content-Type", "text/plain")],
+                b"there".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let del = file_hyper_call(&svc, "DELETE", "/v1/AUTH_test/c/hi", "", &[], Vec::new()).await;
+        assert!(
+            del.status == 204 || del.status == 404,
+            "official test_delete_content_type, got {}",
+            del.status
+        );
+        assert_eq!(
+            del.headers.get("Content-Type"),
+            Some("text/html; charset=UTF-8"),
+            "official test_delete_content_type Content-Type {:?}",
+            del.headers
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/hi-delete-bad",
+                "",
+                &[("Content-Length", "5"), ("Content-Type", "text/plain")],
+                b"there".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let bad = file_hyper_call(
+            &svc,
+            "DELETE",
+            "/v1/AUTH_test/c/hi",
+            "",
+            &[("X-If-Delete-At", "bad")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad.status, 400,
+            "official test_delete_if_delete_at_bad on Hyper, got {}",
+            bad.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testIfMatch / testIfNoneMatch (regular object).
+    #[tokio::test]
+    async fn file_if_match_and_if_none_match_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        let hit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-Match", &etag)],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&hit.status),
+            "official testIfMatch matching etag on Hyper, got {}",
+            hit.status
+        );
+        let multi = {
+            let mut h = HeaderKeyDict::new();
+            h.set("If-Match", format!("\"bogus1\", \"{etag}\", \"bogus2\""));
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/cond".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert!(
+            (200..300).contains(&multi.status),
+            "official testIfMatchMultipleEtags on Hyper, got {}",
+            multi.status
+        );
+        let miss = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-Match", "bogus")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            miss.status, 412,
+            "official testIfMatch mismatch on Hyper, got {}",
+            miss.status
+        );
+        assert_eq!(
+            miss.headers
+                .get("ETag")
+                .or_else(|| miss.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str()),
+            "official testIfMatch 412 must still expose etag"
+        );
+        let none_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-None-Match", "bogus")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&none_ok.status),
+            "official testIfNoneMatch miss on Hyper, got {}",
+            none_ok.status
+        );
+        let none_hit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/cond",
+            "",
+            &[("If-None-Match", &etag)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            none_hit.status, 304,
+            "official testIfNoneMatch hit on Hyper, got {}",
+            none_hit.status
+        );
+        assert_eq!(
+            none_hit
+                .headers
+                .get("ETag")
+                .or_else(|| none_hit.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            none_hit
+                .headers
+                .get("Accept-Ranges")
+                .or_else(|| none_hit.headers.get("accept-ranges")),
+            Some("bytes"),
+            "official testIfNoneMatch Accept-Ranges"
+        );
+        let none_multi_miss = {
+            let mut h = HeaderKeyDict::new();
+            h.set("If-None-Match", "\"bogus1\", \"bogus2\", \"bogus3\"");
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/cond".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert!(
+            (200..300).contains(&none_multi_miss.status),
+            "official testIfNoneMatchMultipleEtags miss on Hyper, got {}",
+            none_multi_miss.status
+        );
+        let none_multi_hit = {
+            let mut h = HeaderKeyDict::new();
+            h.set(
+                "If-None-Match",
+                format!("\"bogus1\", \"bogus2\", \"{etag}\""),
+            );
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/cond".into(),
+                query_string: String::new(),
+                headers: h,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            none_multi_hit.status, 304,
+            "official testIfNoneMatchMultipleEtags hit on Hyper, got {}",
+            none_multi_hit.status
+        );
+        assert_eq!(
+            none_multi_hit
+                .headers
+                .get("ETag")
+                .or_else(|| none_multi_hit.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            none_multi_hit
+                .headers
+                .get("Accept-Ranges")
+                .or_else(|| none_multi_hit.headers.get("accept-ranges")),
+            Some("bytes")
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testEtagWayoff — client ETag must reach the
+    /// object server so a body md5 mismatch is 422, not a silent 201.
+    #[tokio::test]
+    async fn file_etag_wayoff_is_422_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let resp = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/wayoff",
+            "",
+            &[
+                ("Content-Length", "4"),
+                ("Content-Type", "text/plain"),
+                ("ETag", "reallylonganddefinitelynotavalidetagvalue"),
+            ],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 422,
+            "official testEtagWayoff on Hyper, got {}",
+            resp.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testContentTypeGuessing: PUT without Content-Type
+    /// must guess from the path and publish that type on the listing.
+    #[tokio::test]
+    async fn file_content_type_guessing_updates_listing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        for name in ["tone.wav", "note.txt", "blob.zip"] {
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", "0")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testContentTypeGuessing PUT {name} on Hyper, got {}",
+                put.status
+            );
+        }
+        let listed = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        let body = listed
+            .body
+            .collect_async()
+            .await
+            .expect("content-type listing body");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let mut got = std::collections::HashMap::new();
+        for row in rows {
+            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            if !ext.is_empty() {
+                got.insert(
+                    ext.to_string(),
+                    row.get("content_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(got.get("wav").map(String::as_str), Some("audio/x-wav"));
+        assert_eq!(got.get("txt").map(String::as_str), Some("text/plain"));
+        assert_eq!(got.get("zip").map(String::as_str), Some("application/zip"));
+        backend.abort();
+    }
+
+    /// Official TestFile.testRangedGetsWithLWSinHeader plus suffix `-0` 416.
+    #[tokio::test]
+    async fn file_ranged_gets_with_lws_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let data = vec![b'x'; 10000];
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/ranged",
+            "",
+            &[("Content-Length", "10000"), ("Content-Type", "text/plain")],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        for range in [
+            "BYTES=0-999",
+            "bytes = 0-999",
+            "BYTES = 0 - 999",
+            "bytes = 0 - 999",
+            "bytes=0 - 999",
+            "bytes=0-999 ",
+        ] {
+            let got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged",
+                "",
+                &[("Range", range)],
+                Vec::new(),
+            )
+            .await;
+            let body = got.body.collect_async().await.expect("LWS Range body");
+            assert_eq!(
+                body,
+                &data[..1000],
+                "official testRangedGetsWithLWSinHeader {range:?} on Hyper, status {}",
+                got.status
+            );
+        }
+        let suffix0 = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged",
+            "",
+            &[("Range", "bytes=-0")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            suffix0.status, 416,
+            "official testRangedGets bytes=-0 on Hyper, got {}",
+            suffix0.status
+        );
+        let put_etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        assert_eq!(
+            suffix0
+                .headers
+                .get("ETag")
+                .or_else(|| suffix0.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(put_etag.as_str())
+        );
+        backend.abort();
+    }
+
+    fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn multipart_byterange_parts(
+        content_type: &str,
+        body: &[u8],
+    ) -> Vec<(String, String, Vec<u8>)> {
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_default();
+        assert!(
+            !boundary.is_empty(),
+            "official testMultiRangeGets missing boundary in {content_type}"
+        );
+        let sep = format!("--{boundary}");
+        let sep_b = sep.as_bytes();
+        let mut parts = Vec::new();
+        let mut i = 0;
+        while let Some(rel) = find_bytes(&body[i..], sep_b) {
+            let start = i + rel + sep_b.len();
+            if body.get(start..start + 2) == Some(b"--") {
+                break;
+            }
+            let rest = if body.get(start..start + 2) == Some(b"\r\n") {
+                &body[start + 2..]
+            } else {
+                &body[start..]
+            };
+            let Some(hdr_end) = find_bytes(rest, b"\r\n\r\n") else {
+                break;
+            };
+            let headers = String::from_utf8_lossy(&rest[..hdr_end]);
+            let payload_off = hdr_end + 4;
+            let next = find_bytes(&rest[payload_off..], sep_b)
+                .map(|n| payload_off + n)
+                .unwrap_or(rest.len());
+            let mut payload = rest[payload_off..next].to_vec();
+            if payload.ends_with(b"\r\n") {
+                payload.truncate(payload.len() - 2);
+            }
+            let mut ct = String::new();
+            let mut cr = String::new();
+            for line in headers.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("Content-Type") {
+                        ct = v.trim().to_string();
+                    } else if k.eq_ignore_ascii_case("Content-Range") {
+                        cr = v.trim().to_string();
+                    }
+                }
+            }
+            parts.push((ct, cr, payload));
+            i = start + next;
+        }
+        parts
+    }
+
+    fn dow_long(short: &str) -> &'static str {
+        match short {
+            "Mon" => "Monday",
+            "Tue" => "Tuesday",
+            "Wed" => "Wednesday",
+            "Thu" => "Thursday",
+            "Fri" => "Friday",
+            "Sat" => "Saturday",
+            "Sun" => "Sunday",
+            _ => "Tuesday",
+        }
+    }
+
+    fn imf_to_rfc850(imf: &str) -> String {
+        let parts: Vec<&str> = imf.split_whitespace().collect();
+        let dow = parts[0].trim_end_matches(',');
+        let day = parts[1];
+        let mon = parts[2];
+        let year2 = parts[3].get(2..).unwrap_or(parts[3]);
+        let time = parts[4];
+        format!("{}, {}-{}-{} {} GMT", dow_long(dow), day, mon, year2, time)
+    }
+
+    fn imf_to_asctime(imf: &str) -> String {
+        let parts: Vec<&str> = imf.split_whitespace().collect();
+        let dow = parts[0].trim_end_matches(',');
+        let day: u32 = parts[1].parse().unwrap_or(1);
+        let mon = parts[2];
+        let year = parts[3];
+        let time = parts[4];
+        format!("{dow} {mon} {day:>2} {time} {year}")
+    }
+
+    /// Official TestFileComparison.testIfModifiedSince / testIfUnmodifiedSince
+    /// / testIfMatchAndUnmodified (IMF-fixdate, RFC 850, asctime).
+    #[tokio::test]
+    async fn file_if_modified_and_unmodified_since_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[("Content-Length", "4"), ("Content-Type", "text/plain")],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        let lm = put
+            .headers
+            .get("Last-Modified")
+            .or_else(|| put.headers.get("last-modified"))
+            .expect("PUT Last-Modified")
+            .to_string();
+        let lm_ts = swift_http::parse_http_date(&lm).expect("parse PUT Last-Modified");
+        let time_old = swift_http::http_date(lm_ts - 86_400);
+        let time_new = swift_http::http_date(lm_ts + 86_400);
+        let time_old_rfc850 = imf_to_rfc850(&time_old);
+        let time_old_asctime = imf_to_asctime(&time_old);
+        for method in ["GET", "HEAD"] {
+            let old = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Modified-Since", time_old.as_str())],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&old.status),
+                "official testIfModifiedSince {method} older date on Hyper, got {}",
+                old.status
+            );
+            let fresh = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Modified-Since", time_new.as_str())],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                fresh.status, 304,
+                "official testIfModifiedSince {method} newer date on Hyper, got {}",
+                fresh.status
+            );
+            assert_eq!(
+                fresh
+                    .headers
+                    .get("ETag")
+                    .or_else(|| fresh.headers.get("Etag"))
+                    .map(|s| s.trim_matches('"')),
+                Some(etag.as_str())
+            );
+            assert_eq!(
+                fresh
+                    .headers
+                    .get("Accept-Ranges")
+                    .or_else(|| fresh.headers.get("accept-ranges"))
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("bytes")
+            );
+            let ius_ok = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Unmodified-Since", time_new.as_str())],
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&ius_ok.status),
+                "official testIfUnmodifiedSince {method} newer date on Hyper, got {}",
+                ius_ok.status
+            );
+            let ius_old = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/ims",
+                "",
+                &[("If-Unmodified-Since", time_old_rfc850.as_str())],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                ius_old.status, 412,
+                "official testIfUnmodifiedSince {method} RFC 850 on Hyper, got {}",
+                ius_old.status
+            );
+            assert_eq!(
+                ius_old
+                    .headers
+                    .get("ETag")
+                    .or_else(|| ius_old.headers.get("Etag"))
+                    .map(|s| s.trim_matches('"')),
+                Some(etag.as_str())
+            );
+        }
+        let both_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[
+                ("If-Match", &etag),
+                ("If-Unmodified-Since", time_new.as_str()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&both_ok.status),
+            "official testIfMatchAndUnmodified matching on Hyper, got {}",
+            both_ok.status
+        );
+        let bad_match = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[
+                ("If-Match", "bogus"),
+                ("If-Unmodified-Since", time_new.as_str()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            bad_match.status, 412,
+            "official testIfMatchAndUnmodified bad If-Match on Hyper, got {}",
+            bad_match.status
+        );
+        let old_ius = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ims",
+            "",
+            &[
+                ("If-Match", &etag),
+                ("If-Unmodified-Since", time_old_asctime.as_str()),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            old_ius.status, 412,
+            "official testIfMatchAndUnmodified asctime on Hyper, got {}",
+            old_ius.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testMultiRangeGets.
+    #[tokio::test]
+    async fn file_multi_range_gets_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let file_length = 10000usize;
+        let range_size = file_length / 10;
+        let subrange_size = range_size / 10;
+        let data: Vec<u8> = (0..file_length).map(|i| (i % 251) as u8).collect();
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[
+                ("Content-Length", "10000"),
+                ("Content-Type", "lovecraft/rugose; squamous=true"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        for i in (0..file_length).step_by(range_size) {
+            let range = format!(
+                "bytes={}-{},{}-{},{}-{}",
+                i,
+                i + subrange_size - 1,
+                i + 2 * subrange_size,
+                i + 3 * subrange_size - 1,
+                i + 4 * subrange_size,
+                i + 5 * subrange_size - 1
+            );
+            let got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/multi",
+                "",
+                &[("Range", &range)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                got.status, 206,
+                "official testMultiRangeGets {range} on Hyper, got {}",
+                got.status
+            );
+            let ct = got
+                .headers
+                .get("Content-Type")
+                .or_else(|| got.headers.get("content-type"))
+                .unwrap_or("");
+            assert!(
+                ct.starts_with("multipart/byteranges"),
+                "official testMultiRangeGets Content-Type {ct}"
+            );
+            assert!(
+                got.headers.get("Content-Range").is_none()
+                    && got.headers.get("content-range").is_none(),
+                "official testMultiRangeGets outer Content-Range must be absent"
+            );
+            let body = got.body.collect_async().await.expect("multi-range body");
+            let parts = multipart_byterange_parts(ct, &body);
+            assert_eq!(parts.len(), 3, "{range} parts");
+            let expect = [
+                (i, i + subrange_size - 1, &data[i..i + subrange_size]),
+                (
+                    i + 2 * subrange_size,
+                    i + 3 * subrange_size - 1,
+                    &data[i + 2 * subrange_size..i + 3 * subrange_size],
+                ),
+                (
+                    i + 4 * subrange_size,
+                    i + 5 * subrange_size - 1,
+                    &data[i + 4 * subrange_size..i + 5 * subrange_size],
+                ),
+            ];
+            for (part, (start, end, slice)) in parts.iter().zip(expect) {
+                assert_eq!(part.0, "lovecraft/rugose; squamous=true", "{range}");
+                assert_eq!(
+                    part.1,
+                    format!("bytes {start}-{end}/{file_length}"),
+                    "{range}"
+                );
+                assert_eq!(part.2, slice, "{range}");
+            }
+        }
+        let two_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[(
+                "Range",
+                &format!(
+                    "bytes=0-{},{}-{},{}-{}",
+                    subrange_size - 1,
+                    2 * subrange_size,
+                    3 * subrange_size - 1,
+                    file_length,
+                    file_length + subrange_size - 1
+                ),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(two_ok.status, 206);
+        let ct = two_ok
+            .headers
+            .get("Content-Type")
+            .or_else(|| two_ok.headers.get("content-type"))
+            .unwrap_or("");
+        assert!(ct.starts_with("multipart/byteranges"), "{ct}");
+        let body = two_ok.body.collect_async().await.expect("two-ok body");
+        let parts = multipart_byterange_parts(ct, &body);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].2, &data[..subrange_size]);
+        assert_eq!(parts[1].2, &data[2 * subrange_size..3 * subrange_size]);
+        let one_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[(
+                "Range",
+                &format!(
+                    "bytes=0-{},{}-{}",
+                    subrange_size - 1,
+                    file_length,
+                    file_length + subrange_size - 1
+                ),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(one_ok.status, 206);
+        let ct = one_ok
+            .headers
+            .get("Content-Type")
+            .or_else(|| one_ok.headers.get("content-type"))
+            .unwrap_or("");
+        let body = one_ok.body.collect_async().await.expect("one-ok body");
+        if ct.starts_with("multipart/byteranges") {
+            let parts = multipart_byterange_parts(ct, &body);
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].2, &data[..subrange_size]);
+        } else {
+            let expect_cr = format!("bytes 0-{}/{file_length}", subrange_size - 1);
+            assert_eq!(
+                one_ok
+                    .headers
+                    .get("Content-Range")
+                    .or_else(|| one_ok.headers.get("content-range")),
+                Some(expect_cr.as_str())
+            );
+            assert_eq!(ct, "lovecraft/rugose; squamous=true");
+            assert_eq!(body, &data[..subrange_size]);
+        }
+        let none = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/multi",
+            "",
+            &[(
+                "Range",
+                &format!(
+                    "bytes={}-{},{}-{}",
+                    file_length,
+                    file_length + 2,
+                    file_length + 100,
+                    file_length + 102
+                ),
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            none.status, 416,
+            "official testMultiRangeGets unsatisfiable on Hyper, got {}",
+            none.status
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testLastModified: PUT Last-Modified == HEAD;
+    /// IMS on that exact date is 304; IUMS on that date is 200.
+    #[tokio::test]
+    async fn file_last_modified_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/lm",
+            "",
+            &[
+                ("Content-Length", "4"),
+                ("Content-Type", "application/x-last-modified"),
+            ],
+            b"abcd".to_vec(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let put_lm = put
+            .headers
+            .get("Last-Modified")
+            .or_else(|| put.headers.get("last-modified"))
+            .expect("official testLastModified PUT Last-Modified")
+            .to_string();
+        let etag = put
+            .headers
+            .get("ETag")
+            .or_else(|| put.headers.get("Etag"))
+            .map(|s| s.trim_matches('"').to_string())
+            .expect("PUT etag");
+        let head = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/lm", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official testLastModified HEAD on Hyper, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers
+                .get("Last-Modified")
+                .or_else(|| head.headers.get("last-modified")),
+            Some(put_lm.as_str()),
+            "official testLastModified PUT Last-Modified must equal HEAD"
+        );
+        let ims = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/lm",
+            "",
+            &[("If-Modified-Since", put_lm.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ims.status, 304,
+            "official testLastModified IMS==Last-Modified on Hyper, got {}",
+            ims.status
+        );
+        assert_eq!(
+            ims.headers
+                .get("ETag")
+                .or_else(|| ims.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            ims.headers
+                .get("Accept-Ranges")
+                .or_else(|| ims.headers.get("accept-ranges"))
+                .map(|s| s.to_ascii_lowercase()),
+            Some("bytes".to_string())
+        );
+        let iums = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/lm",
+            "",
+            &[("If-Unmodified-Since", put_lm.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&iums.status),
+            "official testLastModified IUMS==Last-Modified on Hyper, got {}",
+            iums.status
+        );
+        let body = iums.body.collect_async().await.expect("IUMS body");
+        assert_eq!(body, b"abcd");
+        backend.abort();
+    }
+
+    /// Official TestFile.testFileSizeLimit over-limit Content-Length is 413
+    /// before any body is sent (IsolatedIdentity Hyper check_object_creation).
+    #[tokio::test]
+    async fn file_size_limit_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let limit = swift_core::constraints::MAX_FILE_SIZE;
+        for extra in [1i64, 10, 100] {
+            let cl = (limit + extra).to_string();
+            let resp = file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/toobig",
+                "",
+                &[
+                    ("Content-Length", cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.status, 413,
+                "official testFileSizeLimit CL={} on Hyper, got {}",
+                cl, resp.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testZeroByteFile / testStackedOverwrite /
+    /// testChunkedPut (Hyper already decoded the body; leftover stub must
+    /// still accept a chunked backend PUT).
+    #[tokio::test]
+    async fn file_zero_byte_overwrite_and_chunked_put_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let zero = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/empty",
+            "",
+            &[("Content-Length", "0"), ("Content-Type", "text/plain")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            zero.status, 201,
+            "official testZeroByteFile PUT on Hyper, got {}",
+            zero.status
+        );
+        assert!(
+            file_listing_names(&svc).await.iter().any(|n| n == "empty"),
+            "official testZeroByteFile must appear in the listing"
+        );
+        let got = file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/empty", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&got.status),
+            "official testZeroByteFile GET on Hyper, got {}",
+            got.status
+        );
+        let empty = got.body.collect_async().await.expect("zero-byte body");
+        assert!(
+            empty.is_empty(),
+            "official testZeroByteFile body must be empty"
+        );
+
+        let mut last = Vec::new();
+        for i in 1..=10u8 {
+            last = vec![i; 512];
+            let cl = last.len().to_string();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/c/stack",
+                "",
+                &[
+                    ("Content-Length", cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
+                last.clone(),
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testStackedOverwrite PUT {i} on Hyper, got {}",
+                put.status
+            );
+        }
+        let stacked =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/stack", "", &[], Vec::new()).await;
+        assert_eq!(
+            stacked.body.collect_async().await.expect("stacked body"),
+            last,
+            "official testStackedOverwrite last write wins"
+        );
+
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        use md5::{Digest, Md5};
+        let expect_etag = format!("{:x}", Md5::digest(&data));
+        let chunked = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/chunked",
+            "",
+            &[
+                ("Transfer-Encoding", "chunked"),
+                ("Content-Type", "text/plain"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(
+            chunked.status, 201,
+            "official testChunkedPut on Hyper, got {}",
+            chunked.status
+        );
+        let read =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
+        assert_eq!(
+            read.body.collect_async().await.expect("chunked GET"),
+            data,
+            "official testChunkedPut body"
+        );
+        let info =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/chunked", "", &[], Vec::new()).await;
+        assert_eq!(
+            info.headers
+                .get("ETag")
+                .or_else(|| info.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str()),
+            "official testChunkedPut etag"
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testSerialization: json/xml listings carry
+    /// content_type, bytes, hash, last_modified and the listing Content-Type.
+    #[tokio::test]
+    async fn file_serialization_listing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let files = [
+            ("s0", 0usize, "application/x-zero"),
+            ("s1", 1, "application/x-one"),
+            ("s10", 10, "application/x-ten"),
+            ("s100", 100, "application/x-hundred"),
+        ];
+        let mut hashes = std::collections::HashMap::new();
+        for (name, bytes, ct) in files {
+            let body = vec![b'z'; bytes];
+            use md5::{Digest, Md5};
+            hashes.insert(name, format!("{:x}", Md5::digest(&body)));
+            let cl = bytes.to_string();
+            let put = file_hyper_call(
+                &svc,
+                "PUT",
+                &format!("/v1/AUTH_test/c/{name}"),
+                "",
+                &[("Content-Length", cl.as_str()), ("Content-Type", ct)],
+                body,
+            )
+            .await;
+            assert_eq!(
+                put.status, 201,
+                "official testSerialization PUT {name} on Hyper, got {}",
+                put.status
+            );
+        }
+        for format_type in ["json", "xml"] {
+            let listed = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c",
+                &format!("format={format_type}"),
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                listed.status, 200,
+                "official testSerialization {format_type} on Hyper, got {}",
+                listed.status
+            );
+            let ct = listed
+                .headers
+                .get("Content-Type")
+                .or_else(|| listed.headers.get("content-type"))
+                .unwrap_or("");
+            assert_eq!(
+                ct,
+                format!("application/{format_type}; charset=utf-8"),
+                "official testSerialization {format_type} Content-Type"
+            );
+            let body = listed
+                .body
+                .collect_async()
+                .await
+                .expect("serialization listing");
+            if format_type == "json" {
+                let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+                for (name, bytes, ct) in files {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(name))
+                        .unwrap_or_else(|| panic!("missing {name} in json listing"));
+                    assert_eq!(
+                        row.get("bytes").and_then(|v| v.as_u64()),
+                        Some(bytes as u64)
+                    );
+                    assert_eq!(row.get("content_type").and_then(|v| v.as_str()), Some(ct));
+                    assert_eq!(
+                        row.get("hash").and_then(|v| v.as_str()),
+                        Some(hashes[name].as_str())
+                    );
+                    assert!(row.get("last_modified").and_then(|v| v.as_str()).is_some());
+                }
+            } else {
+                let text = String::from_utf8_lossy(&body);
+                for (name, _, _) in files {
+                    assert!(
+                        text.contains(name),
+                        "official testSerialization xml missing {name}: {text}"
+                    );
+                }
+            }
+        }
+        backend.abort();
+    }
+
+    /// Official TestFile.testFileCreate / testHead / testEtagResponse /
+    /// testGetContentType / testDeleteOfFileThatDoesNotExist /
+    /// testHeadOnFileThatDoesNotExist / testGetOnFileThatDoesNotExist /
+    /// testPostOnFileThatDoesNotExist.
+    #[tokio::test]
+    async fn file_create_head_etag_and_missing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let data = b"hello-file".to_vec();
+        use md5::{Digest, Md5};
+        let expect_etag = format!("{:x}", Md5::digest(&data));
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/created",
+            "",
+            &[
+                ("Content-Length", "10"),
+                ("Content-Type", "application/x-created"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official testFileCreate PUT on Hyper, got {}",
+            put.status
+        );
+        assert_eq!(
+            put.headers
+                .get("ETag")
+                .or_else(|| put.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str()),
+            "official testEtagResponse"
+        );
+        let got =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/c/created", "", &[], Vec::new()).await;
+        assert_eq!(
+            got.status, 200,
+            "official testFileCreate GET, got {}",
+            got.status
+        );
+        assert_eq!(got.body.collect_async().await.expect("GET body"), data);
+        assert_eq!(
+            got.headers
+                .get("Content-Type")
+                .or_else(|| got.headers.get("content-type")),
+            Some("application/x-created"),
+            "official testGetContentType"
+        );
+        let head =
+            file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c/created", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official testHead on Hyper, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers
+                .get("Content-Length")
+                .or_else(|| head.headers.get("content-length")),
+            Some("10")
+        );
+        assert_eq!(
+            head.headers
+                .get("ETag")
+                .or_else(|| head.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str())
+        );
+        assert_eq!(
+            head.headers
+                .get("Content-Type")
+                .or_else(|| head.headers.get("content-type")),
+            Some("application/x-created")
+        );
+        assert!(
+            head.headers
+                .get("Last-Modified")
+                .or_else(|| head.headers.get("last-modified"))
+                .is_some(),
+            "official testHead last_modified"
+        );
+        let listed = file_hyper_call(&svc, "HEAD", "/v1/AUTH_test/c", "", &[], Vec::new()).await;
+        assert_eq!(listed.status, 204);
+        assert_eq!(
+            listed
+                .headers
+                .get("X-Container-Object-Count")
+                .or_else(|| listed.headers.get("x-container-object-count")),
+            Some("1"),
+            "official testContainerInfo via file listing stub {:?}",
+            listed.headers
+        );
+        for method in ["GET", "HEAD", "DELETE", "POST"] {
+            let resp = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/c/missing-obj",
+                "",
+                &[("X-Object-Meta-Field", "Value")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.status, 404,
+                "official missing-object {method} in existing container, got {}",
+                resp.status
+            );
+            let other = file_hyper_call(
+                &svc,
+                method,
+                "/v1/AUTH_test/nope/obj",
+                "",
+                &[("X-Object-Meta-Field", "Value")],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                other.status, 404,
+                "official missing-object {method} in missing container, got {}",
+                other.status
+            );
+        }
+        backend.abort();
+    }
+
+    /// Official TestFileUTF8 / TestContainerUTF8 object leftovers: Base2
+    /// uses UTF-8 names. IsolatedIdentity backends percent-encode; leftover
+    /// listings must unquote so json/xml `name` is the Unicode object, not
+    /// `%E5%AF%B9%E8%B1%A1`.
+    #[tokio::test]
+    async fn file_utf8_object_crud_and_listing_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let name = "héllo 对象.png";
+        let path = format!("/v1/AUTH_test/c/{name}");
+        let data = b"utf8-body".to_vec();
+        use md5::{Digest, Md5};
+        let expect_etag = format!("{:x}", Md5::digest(&data));
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            &path,
+            "",
+            &[
+                ("Content-Length", "9"),
+                ("Content-Type", "image/png"),
+                ("X-Object-Meta-Lang", "zh"),
+            ],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(
+            put.status, 201,
+            "official TestFileUTF8 PUT on Hyper, got {}",
+            put.status
+        );
+        let got = file_hyper_call(&svc, "GET", &path, "", &[], Vec::new()).await;
+        assert_eq!(
+            got.status, 200,
+            "official TestFileUTF8 GET, got {}",
+            got.status
+        );
+        assert_eq!(got.body.collect_async().await.expect("GET body"), data);
+        let head = file_hyper_call(&svc, "HEAD", &path, "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&head.status),
+            "official TestFileUTF8 HEAD, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.headers
+                .get("ETag")
+                .or_else(|| head.headers.get("Etag"))
+                .map(|s| s.trim_matches('"')),
+            Some(expect_etag.as_str())
+        );
+        assert_eq!(
+            head.headers.get("X-Object-Meta-Lang"),
+            Some("zh"),
+            "official TestFileUTF8 metadata {:?}",
+            head.headers
+        );
+        let listed = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listed.status, 200);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&listed.body.collect_async().await.expect("json")).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some(name))
+            .unwrap_or_else(|| {
+                panic!("official TestFileUTF8 json listing missing {name}: {rows:?}")
+            });
+        assert_eq!(
+            row.get("hash").and_then(|v| v.as_str()),
+            Some(expect_etag.as_str())
+        );
+        let xml = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c",
+            "format=xml",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        let xml_body = xml.body.collect_async().await.expect("xml");
+        let xml_text = String::from_utf8_lossy(&xml_body);
+        assert!(
+            xml_text.contains(&format!("<name>{name}</name>")),
+            "official TestFileUTF8 xml listing missing {name}: {xml_text}"
+        );
+        let post = file_hyper_call(
+            &svc,
+            "POST",
+            &path,
+            "",
+            &[("X-Object-Meta-Lang", "ja")],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            post.status == 202 || post.status == 201,
+            "official TestFileUTF8 POST, got {}",
+            post.status
+        );
+        let after = file_hyper_call(&svc, "HEAD", &path, "", &[], Vec::new()).await;
+        assert_eq!(after.headers.get("X-Object-Meta-Lang"), Some("ja"));
+        assert_eq!(
+            file_hyper_call(&svc, "DELETE", &path, "", &[], Vec::new())
+                .await
+                .status,
+            204,
+            "official TestFileUTF8 DELETE"
+        );
+        assert_eq!(
+            file_hyper_call(&svc, "GET", &path, "", &[], Vec::new())
+                .await
+                .status,
+            404
+        );
+        backend.abort();
+    }
+
+    /// Official TestFile.testRangedGets (replica leftover forwards Range).
+    #[tokio::test]
+    async fn file_ranged_gets_on_hyper() {
+        let (svc, backend) = file_listing_hyper_svc().await;
+        let file_length = 1000usize;
+        let data: Vec<u8> = (0..file_length).map(|i| (i % 251) as u8).collect();
+        use md5::{Digest, Md5};
+        let etag = format!("{:x}", Md5::digest(&data));
+        let put = file_hyper_call(
+            &svc,
+            "PUT",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Content-Length", "1000"), ("Content-Type", "text/plain")],
+            data.clone(),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let range_size = file_length / 10;
+        for i in (0..file_length).step_by(range_size) {
+            let end = (i + range_size - 1).min(file_length - 1);
+            let range = format!("bytes={i}-{end}");
+            let got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged-single",
+                "",
+                &[("Range", range.as_str())],
+                Vec::new(),
+            )
+            .await;
+            let body = got.body.collect_async().await.expect("ranged body");
+            assert_eq!(
+                body,
+                &data[i..=end],
+                "official testRangedGets {range} status {}",
+                got.status
+            );
+            let suffix = format!("bytes=-{i}");
+            let suf = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged-single",
+                "",
+                &[("Range", suffix.as_str())],
+                Vec::new(),
+            )
+            .await;
+            if i == 0 {
+                assert_eq!(
+                    suf.status, 416,
+                    "official testRangedGets bytes=-0 on Hyper, got {}",
+                    suf.status
+                );
+                assert_eq!(
+                    suf.headers
+                        .get("ETag")
+                        .or_else(|| suf.headers.get("Etag"))
+                        .map(|s| s.trim_matches('"')),
+                    Some(etag.as_str())
+                );
+                assert_eq!(
+                    suf.headers
+                        .get("Accept-Ranges")
+                        .or_else(|| suf.headers.get("accept-ranges"))
+                        .map(|s| s.to_ascii_lowercase()),
+                    Some("bytes".to_string())
+                );
+            } else {
+                let body = suf.body.collect_async().await.expect("suffix body");
+                assert_eq!(
+                    body,
+                    &data[file_length - i..],
+                    "official testRangedGets {suffix}"
+                );
+            }
+            let open = format!("bytes={i}-");
+            let open_got = file_hyper_call(
+                &svc,
+                "GET",
+                "/v1/AUTH_test/c/ranged-single",
+                "",
+                &[("Range", open.as_str())],
+                Vec::new(),
+            )
+            .await;
+            let body = open_got.body.collect_async().await.expect("open range");
+            assert_eq!(body, &data[i..], "official testRangedGets {open}");
+        }
+        let past = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "bytes=2000-3000")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            past.status, 416,
+            "official testRangedGets past-end on Hyper, got {}",
+            past.status
+        );
+        let overlap = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "bytes=900-3000")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            overlap.body.collect_async().await.expect("overlap"),
+            &data[900..]
+        );
+        let no_unit = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "0-4")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            no_unit.body.collect_async().await.expect("no unit"),
+            data,
+            "official testRangedGets Range 0-4 must return the full object"
+        );
+        let huge_suffix = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/c/ranged-single",
+            "",
+            &[("Range", "bytes=-1010")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            huge_suffix.body.collect_async().await.expect("huge suffix"),
+            data,
+            "official testRangedGets suffix longer than object"
+        );
+        backend.abort();
+    }
+
+    /// Official test_versioning_check_acl: versions container is public
+    /// read, but a foreign token must not DELETE/pop the source object.
+    struct VersioningCheckAclStub {
+        current: Arc<std::sync::Mutex<Vec<u8>>>,
+        archive_deletes: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningCheckAclStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let current = Arc::clone(&self.current);
+            let archive_deletes = Arc::clone(&self.archive_deletes);
+            Box::pin(async move {
+                if req
+                    .headers
+                    .get(swift_middleware::VERSIONED_WRITES_AUTHORIZE_ONLY_HEADER)
+                    == Some("true")
+                {
+                    if req.headers.get("X-Auth-Token") == Some("token2") {
+                        return Response::error(403, "Forbidden");
+                    }
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Location", "versions");
+                    resp.headers
+                        .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                    return resp;
+                }
+                if req.path == "/v1/AUTH_test/c/obj" {
+                    if req.method == "GET" || req.method == "HEAD" {
+                        let body = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let mut resp = if req.method == "HEAD" {
+                            Response::new(200)
+                        } else {
+                            Response::with_body(200, body.clone())
+                        };
+                        resp.headers.set("Content-Length", body.len().to_string());
+                        resp.headers.set("X-Timestamp", "1751500001.00000");
+                        return resp;
+                    }
+                    if req.method == "PUT" {
+                        let body = match req.body {
+                            swift_http::Body::Buffered(b) => b,
+                            _ => Vec::new(),
+                        };
+                        *current.lock().unwrap_or_else(|p| p.into_inner()) = body;
+                        return Response::new(201);
+                    }
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/versions" {
+                    let listing = serde_json::json!([
+                        {"name": "003obj/1751500000.00000", "bytes": 5,
+                         "hash": "x", "content_type": "text/plain",
+                         "last_modified": "2010-01-01T00:00:00.000000"}
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.method == "DELETE" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    *archive_deletes.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    return Response::new(204);
+                }
+                if req.method == "GET" && req.path.starts_with("/v1/AUTH_test/versions/") {
+                    return Response::with_body(200, b"aaaaa".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn versioning_check_acl_foreign_token_delete_is_denied_on_hyper() {
+        let current = Arc::new(std::sync::Mutex::new(b"bbbbb".to_vec()));
+        let archive_deletes = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningCheckAclStub {
+                    current: Arc::clone(&current),
+                    archive_deletes: Arc::clone(&archive_deletes),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", "token2");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 403,
+            "official test_versioning_check_acl foreign DELETE on Hyper, got {}",
+            resp.status
+        );
+        let body = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            body, b"bbbbb",
+            "foreign DELETE must not pop/restore the versioned object"
+        );
+        let deleted = *archive_deletes.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            deleted, 0,
+            "foreign DELETE must not consume the versions archive"
+        );
+    }
+
+    /// Official TestObjectVersioning.test_overwriting: owner DELETE must
+    /// restore the previous archive (`bbbbb` → `aaaaa`) on Hyper.
+    #[tokio::test]
+    async fn versioning_overwrite_delete_restores_previous_on_hyper() {
+        let current = Arc::new(std::sync::Mutex::new(b"bbbbb".to_vec()));
+        let archive_deletes = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningCheckAclStub {
+                    current: Arc::clone(&current),
+                    archive_deletes: Arc::clone(&archive_deletes),
+                }),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "DELETE".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official test_overwriting DELETE restore on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let body = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            body, b"aaaaa",
+            "official test_overwriting DELETE must restore the previous archive"
+        );
+        let deleted = *archive_deletes.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            deleted, 1,
+            "official test_overwriting DELETE must consume the restored archive"
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(got.status, 200, "restored object GET on Hyper");
+        let got_body = got
+            .body
+            .collect_async()
+            .await
+            .expect("restored object body");
+        assert_eq!(got_body, b"aaaaa");
+    }
+
+    /// Container-only TempURL keys (IsolatedIdentity TestContainerTempurl).
+    struct ContainerOnlyTempUrlKeys(Vec<String>);
+    impl swift_middleware::KeyProvider for ContainerOnlyTempUrlKeys {
+        fn keys_for(&self, _account: &str, _container: &str) -> Vec<String> {
+            self.0.clone()
+        }
+        fn scoped_keys_for(
+            &self,
+            _account: &str,
+            _container: &str,
+        ) -> swift_middleware::ScopedTempUrlKeys {
+            swift_middleware::ScopedTempUrlKeys {
+                account: Vec::new(),
+                container: self.0.clone(),
+            }
+        }
+    }
+
+    /// Official TestContainerTempurl.test_GET_DLO_outside_container: listing
+    /// a foreign segment container under a container-key TempURL is 401.
+    struct DloOutsideContainerStub {
+        foreign_listings: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for DloOutsideContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let foreign_listings = Arc::clone(&self.foreign_listings);
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/container/object" {
+                    let mut resp = Response::new(200);
+                    resp.headers.set("X-Object-Manifest", "other/segs/");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.path == "/v1/AUTH_account/other" {
+                    *foreign_listings.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    let listing = serde_json::json!([
+                        {"name": "segs/1", "bytes": 3, "hash": "c4ca4238a0b923820dcc509a6f75849b"}
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/AUTH_account/other/segs/1" {
+                    return Response::with_body(200, b"one".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn container_tempurl_dlo_outside_container_is_401_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let foreign_listings = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloOutsideContainerStub {
+                    foreign_listings: Arc::clone(&foreign_listings),
+                }),
+            ],
+        };
+        for method in ["GET", "HEAD"] {
+            let mut resp = svc
+                .call(AsyncRequest {
+                    method: method.into(),
+                    path: "/v1/AUTH_account/container/object".into(),
+                    query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                    headers: HeaderKeyDict::new(),
+                    body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                })
+                .await;
+            assert_eq!(
+                resp.status, 401,
+                "official test_GET_DLO_outside_container {method} on Hyper, got {}",
+                resp.status
+            );
+            resp.body.materialize(u64::MAX).unwrap();
+            let body = match &resp.body {
+                swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+                _ => String::new(),
+            };
+            if method == "GET" {
+                assert!(
+                    body.contains("Temp URL invalid"),
+                    "container-scope DLO {method} 401 body, got {body:?}"
+                );
+            }
+        }
+        let listed = *foreign_listings.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            listed, 0,
+            "must not list the foreign segment container, listings={listed}"
+        );
+    }
+
+    /// Official TestTempURL.test_GET_DLO_inside_container: an account-key
+    /// TempURL of a same-container DLO must assemble the segments.
+    struct DloInsideContainerStub;
+    impl swift_middleware::Middleware for DloInsideContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/container/object" {
+                    let mut resp = Response::new(200);
+                    resp.headers
+                        .set("X-Object-Manifest", "container/get-dlo-inside-seg");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_account/container" {
+                    let listing = serde_json::json!([
+                        {
+                            "name": "get-dlo-inside-seg1",
+                            "bytes": 18,
+                            "hash": "daef64a0c87719319ea9c7c95a21e98b"
+                        },
+                        {
+                            "name": "get-dlo-inside-seg2",
+                            "bytes": 18,
+                            "hash": "fdf1d32b54e50bf56b5676e19bdea8ae"
+                        }
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-inside-seg1" {
+                    return Response::with_body(200, b"one fish two fish ".to_vec());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-inside-seg2" {
+                    return Response::with_body(200, b"red fish blue fish".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn account_tempurl_dlo_inside_container_assembles_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloInsideContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_GET_DLO_inside_container on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("account TempURL DLO body");
+        assert_eq!(
+            body, b"one fish two fish red fish blue fish",
+            "official test_GET_DLO_inside_container assembled body"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_tempurl_dlo_inside_container_assembles_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(ContainerOnlyTempUrlKeys(vec![
+            KEY.to_string()
+        ])));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloInsideContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official TestContainerTempurl.test_GET_DLO_inside_container on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("container TempURL DLO body");
+        assert_eq!(
+            body, b"one fish two fish red fish blue fish",
+            "official TestContainerTempurl.test_GET_DLO_inside_container assembled body"
+        );
+    }
+
+    /// Official TestTempURL.test_GET_DLO_outside_container: account-key
+    /// TempURL of a manifest in another container still assembles.
+    struct DloAccountOutsideContainerStub;
+    impl swift_middleware::Middleware for DloAccountOutsideContainerStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_account/")
+        }
+        fn handle_request_async(
+            &self,
+            req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                if req.path == "/v1/AUTH_account/other/object" {
+                    let mut resp = Response::new(200);
+                    resp.headers
+                        .set("X-Object-Manifest", "container/get-dlo-outside-seg");
+                    resp.headers.set("Etag", "physical-manifest");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_account/container" {
+                    let listing = serde_json::json!([
+                        {
+                            "name": "get-dlo-outside-seg1",
+                            "bytes": 18,
+                            "hash": "daef64a0c87719319ea9c7c95a21e98b"
+                        },
+                        {
+                            "name": "get-dlo-outside-seg2",
+                            "bytes": 18,
+                            "hash": "fdf1d32b54e50bf56b5676e19bdea8ae"
+                        }
+                    ]);
+                    return Response::with_body(200, serde_json::to_vec(&listing).unwrap());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-outside-seg1" {
+                    return Response::with_body(200, b"one fish two fish ".to_vec());
+                }
+                if req.path == "/v1/AUTH_account/container/get-dlo-outside-seg2" {
+                    return Response::with_body(200, b"red fish blue fish".to_vec());
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn account_tempurl_dlo_outside_container_assembles_on_hyper() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "6d8d85ae6488fbc2c28a5a86041f173b8b580d9616679847eeb706c95fa7a164";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(tu),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloAccountOutsideContainerStub),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/other/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official TestTempURL.test_GET_DLO_outside_container on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("account TempURL cross-container DLO body");
+        assert_eq!(
+            body, b"one fish two fish red fish blue fish",
+            "official TestTempURL.test_GET_DLO_outside_container assembled body"
+        );
+    }
+
     fn account_quota_policies() -> swift_core::storage_policy::StoragePolicyCollection {
         let conf = "[storage-policy:0]\nname = nulo\ndefault = yes\n\
                     [storage-policy:1]\nname = unu\n";
@@ -9102,6 +26342,1220 @@ mod pipeline_async_tests {
             resp.status, 403,
             "owner versions-location POST must pass the owner gate, got {} {:?}",
             resp.status, resp.reason
+        );
+    }
+
+    /// Official `test_versioning_container_acl` write path on Hyper.
+    /// Account2 has source write ACL; versions is `X-Container-Write: ''`.
+    /// Must hit `authorize_async` (no intercepting stub): ACL writer
+    /// overwrite archives, source DELETE restores, writer cannot
+    /// GET/DELETE versions objects, user3 cannot write/delete source.
+    async fn spawn_versioning_container_acl_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            (HeaderKeyDict, Vec<u8>),
+        >::new()));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let location = Arc::clone(&location);
+                let objects = Arc::clone(&objects);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (raw_logical, query) = backend_logical_target(first);
+                    let logical = swift_http::unquote(&raw_logical);
+                    let is_head = first.starts_with("HEAD ");
+                    let is_put = first.starts_with("PUT ");
+                    let is_post = first.starts_with("POST ");
+                    let is_get = first.starts_with("GET ");
+                    let is_delete = first.starts_with("DELETE ");
+                    let shard = text
+                        .to_ascii_lowercase()
+                        .contains("x-backend-record-type: shard");
+                    let header = |want: &str| -> Option<String> {
+                        text.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case(want).then(|| v.trim().to_string())
+                            })
+                        })
+                    };
+                    if shard && !logical.contains("/obj") && !logical.contains("/versions/") {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if logical == "/AUTH_test" {
+                        write_backend_http_status(&mut stream, 204, &[], &[]).await;
+                        return;
+                    }
+                    if logical == "/AUTH_test/c" {
+                        if is_post || is_put {
+                            if let Some(v) = header("X-Container-Sysmeta-Versions-Location") {
+                                *location.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    if v.is_empty() { None } else { Some(v) };
+                            }
+                        }
+                        let loc = location.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let mut extra: Vec<(String, String)> =
+                            vec![("X-Container-Write".into(), "test2:tester2".into())];
+                        if let Some(loc) = loc {
+                            extra.push(("X-Container-Sysmeta-Versions-Location".into(), loc));
+                            extra
+                                .push(("X-Container-Sysmeta-Versions-Mode".into(), "stack".into()));
+                        }
+                        let extra_ref: Vec<(&str, &str)> = extra
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        write_backend_http_status(&mut stream, 204, &extra_ref, &[]).await;
+                        return;
+                    }
+                    if logical == "/AUTH_test/versions" {
+                        if shard {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        if is_get {
+                            let prefix = query
+                                .split('&')
+                                .find_map(|part| part.strip_prefix("prefix="))
+                                .unwrap_or("");
+                            let prefix = swift_http::unquote(prefix);
+                            let mut names: Vec<(String, usize)> = objects
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .iter()
+                                .filter_map(|(path, (_, body))| {
+                                    path.strip_prefix("/AUTH_test/versions/")
+                                        .filter(|name| {
+                                            prefix.is_empty() || name.starts_with(&prefix)
+                                        })
+                                        .map(|name| (name.to_string(), body.len()))
+                                })
+                                .collect();
+                            names.sort_by(|a, b| a.0.cmp(&b.0));
+                            if query.contains("reverse=on") {
+                                names.reverse();
+                            }
+                            let rows: Vec<serde_json::Value> = names
+                                .into_iter()
+                                .map(|(name, bytes)| {
+                                    serde_json::json!({
+                                        "name": name,
+                                        "bytes": bytes,
+                                        "hash": "x",
+                                        "content_type": "text/plain",
+                                        "last_modified": "2010-01-01T00:00:00.000000",
+                                    })
+                                })
+                                .collect();
+                            let payload = serde_json::to_vec(&rows).unwrap();
+                            write_backend_http(
+                                &mut stream,
+                                &[("Content-Type", "application/json")],
+                                &payload,
+                            )
+                            .await;
+                            return;
+                        }
+                        write_backend_http_status(
+                            &mut stream,
+                            204,
+                            &[("X-Container-Write", "")],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    if !logical.starts_with("/AUTH_test/c/")
+                        && !logical.starts_with("/AUTH_test/versions/")
+                    {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if is_put {
+                        let mut stored = HeaderKeyDict::new();
+                        stored.set(
+                            "Content-Type",
+                            header("Content-Type").unwrap_or_else(|| "text/plain".into()),
+                        );
+                        stored.set("Content-Length", body.len().to_string());
+                        stored.set(
+                            "X-Timestamp",
+                            header("X-Timestamp").unwrap_or_else(|| "1000.00000".into()),
+                        );
+                        objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(logical, (stored, body));
+                        write_backend_http_status(&mut stream, 201, &[], &[]).await;
+                        return;
+                    }
+                    if is_delete {
+                        let removed = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&logical)
+                            .is_some();
+                        write_backend_http_status(
+                            &mut stream,
+                            if removed { 204 } else { 404 },
+                            &[],
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                    let stored = objects
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&logical)
+                        .cloned();
+                    if let Some((headers, obj)) = stored {
+                        let send = if is_head { &[][..] } else { obj.as_slice() };
+                        let extra: Vec<(&str, String)> =
+                            headers.iter().map(|(k, v)| (k, v.to_string())).collect();
+                        let extra_ref: Vec<(&str, &str)> =
+                            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                        write_backend_http(&mut stream, &extra_ref, send).await;
+                        return;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn versioning_container_acl_writer_overwrite_and_restore_on_hyper() {
+        let (port, backend) = spawn_versioning_container_acl_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_rw(&app, "AUTH_test", "c", None, Some("test2:tester2"));
+        seed_container_rw(&app, "AUTH_test", "versions", None, Some(""));
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        ta.add_user("other", "tester3", "otherpass", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::VersionedWrites::new()),
+            ],
+        };
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let writer = auth_token(&svc, "test2:tester2", "testing2").await;
+        let user3 = auth_token(&svc, "other:tester3", "otherpass").await;
+        let call = |method: &'static str,
+                    path: &'static str,
+                    token: String,
+                    extra: Vec<(&'static str, &'static str)>,
+                    body: Vec<u8>,
+                    query: &'static str| {
+            let svc = &svc;
+            async move {
+                let mut headers = HeaderKeyDict::new();
+                headers.set("X-Auth-Token", &token);
+                if !body.is_empty() {
+                    headers.set("Content-Length", body.len().to_string());
+                    headers.set("Content-Type", "text/plain");
+                }
+                for (k, v) in extra {
+                    headers.set(k, v);
+                }
+                svc.call(AsyncRequest {
+                    method: method.into(),
+                    path: path.into(),
+                    query_string: query.into(),
+                    headers,
+                    body: IncomingBody::from_bytes(body, u64::MAX),
+                })
+                .await
+            }
+        };
+
+        let denied_versions = call(
+            "PUT",
+            "/v1/AUTH_test/versions/should-fail",
+            writer.clone(),
+            vec![],
+            b"should fail".to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            denied_versions.status, 403,
+            "official test_versioning_container_acl versions write denied, got {}",
+            denied_versions.status
+        );
+
+        let denied_loc = call(
+            "POST",
+            "/v1/AUTH_test/c",
+            writer.clone(),
+            vec![("X-Versions-Location", "versions")],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            denied_loc.status, 403,
+            "official test_versioning_container_acl account2 cannot set location, got {}",
+            denied_loc.status
+        );
+
+        let both = call(
+            "POST",
+            "/v1/AUTH_test/c",
+            owner.clone(),
+            vec![
+                ("X-Remove-Versions-Location", "versions"),
+                ("X-Versions-Location", "versions"),
+            ],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&both.status),
+            "official test_versioning_container_acl location wins over remove, got {} {:?}",
+            both.status,
+            both.reason
+        );
+        let after = call(
+            "HEAD",
+            "/v1/AUTH_test/c",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            after.headers.get("X-Versions-Location"),
+            Some("versions"),
+            "official test_versioning_container_acl owner POST must persist location"
+        );
+
+        const FIRST: &[u8] = b"never argue with the data";
+        const SECOND: &[u8] = b"we don't have no beer, just tequila";
+        let first_put = call(
+            "PUT",
+            "/v1/AUTH_test/c/obj",
+            writer.clone(),
+            vec![],
+            FIRST.to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            first_put.status, 201,
+            "official test_versioning_container_acl first ACL-writer PUT, got {} {:?}",
+            first_put.status, first_put.reason
+        );
+        let first_get = call(
+            "GET",
+            "/v1/AUTH_test/c/obj",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            first_get
+                .body
+                .collect_async()
+                .await
+                .expect("first GET body"),
+            FIRST
+        );
+
+        let second_put = call(
+            "PUT",
+            "/v1/AUTH_test/c/obj",
+            writer.clone(),
+            vec![],
+            SECOND.to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            second_put.status, 201,
+            "official test_versioning_container_acl ACL-writer overwrite, got {} {:?}",
+            second_put.status, second_put.reason
+        );
+        let second_get = call(
+            "GET",
+            "/v1/AUTH_test/c/obj",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            second_get
+                .body
+                .collect_async()
+                .await
+                .expect("second GET body"),
+            SECOND,
+            "ACL writer overwrite must replace the source object"
+        );
+
+        let listing = call(
+            "GET",
+            "/v1/AUTH_test/versions",
+            owner.clone(),
+            vec![],
+            Vec::new(),
+            "format=json",
+        )
+        .await;
+        assert_eq!(
+            listing.status, 200,
+            "official test_versioning_container_acl versions listing, got {}",
+            listing.status
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &listing
+                .body
+                .collect_async()
+                .await
+                .expect("versions listing"),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "official test_versioning_container_acl object_count must be 1, got {rows:?}"
+        );
+        let archive_name = swift_http::unquote(
+            rows[0]
+                .get("name")
+                .and_then(|v| v.as_str())
+                .expect("archive name"),
+        );
+        let archive_path = format!("/v1/AUTH_test/versions/{archive_name}");
+        let owner_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &owner);
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: archive_path.clone(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            owner_archive
+                .body
+                .collect_async()
+                .await
+                .expect("archive body"),
+            FIRST,
+            "archived object must be the first ACL-writer PUT"
+        );
+
+        let user3_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &user3);
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: archive_path.clone(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            user3_archive.status, 403,
+            "official test_versioning_container_acl user3 cannot read versions, got {}",
+            user3_archive.status
+        );
+        let user3_write = call(
+            "PUT",
+            "/v1/AUTH_test/c/obj",
+            user3.clone(),
+            vec![],
+            b"some random user trying to write data".to_vec(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            user3_write.status, 403,
+            "official test_versioning_container_acl user3 cannot write source, got {}",
+            user3_write.status
+        );
+        let user3_delete = call(
+            "DELETE",
+            "/v1/AUTH_test/c/obj",
+            user3,
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert_eq!(
+            user3_delete.status, 403,
+            "official test_versioning_container_acl user3 cannot delete source, got {}",
+            user3_delete.status
+        );
+
+        let writer_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &writer);
+            svc.call(AsyncRequest {
+                method: "GET".into(),
+                path: archive_path.clone(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            writer_archive.status, 403,
+            "official test_versioning_container_acl account2 cannot read versions, got {}",
+            writer_archive.status
+        );
+        let writer_del_archive = {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Auth-Token", &writer);
+            svc.call(AsyncRequest {
+                method: "DELETE".into(),
+                path: archive_path,
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        assert_eq!(
+            writer_del_archive.status, 403,
+            "official test_versioning_container_acl account2 cannot delete versions, got {}",
+            writer_del_archive.status
+        );
+
+        let writer_del_source = call(
+            "DELETE",
+            "/v1/AUTH_test/c/obj",
+            writer.clone(),
+            vec![],
+            Vec::new(),
+            "",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&writer_del_source.status),
+            "official test_versioning_container_acl account2 can DELETE source, got {} {:?}",
+            writer_del_source.status,
+            writer_del_source.reason
+        );
+        let restored = call("GET", "/v1/AUTH_test/c/obj", owner, vec![], Vec::new(), "").await;
+        assert_eq!(
+            restored.body.collect_async().await.expect("restored body"),
+            FIRST,
+            "ACL writer DELETE must restore the archived first PUT"
+        );
+        backend.abort();
+    }
+
+    /// Official TestObjectVersioning.test_clear_version_option: owner POST
+    /// `X-Versions-Location: ''` must clear the exposed location; a later
+    /// POST restores it. Must hit VersionedWrites.prepare + finish on Hyper
+    /// (no stub that skips expose_versions_on_response).
+    async fn spawn_versioning_clear_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location = Arc::new(std::sync::Mutex::new(Some("versions".to_string())));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let location = Arc::clone(&location);
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let (text, _body) = read_backend_http_request(&mut stream).await;
+                    if text.is_empty() {
+                        return;
+                    }
+                    let first = text.lines().next().unwrap_or("");
+                    let (logical, _query) = backend_logical_target(first);
+                    if logical != "/AUTH_test/c"
+                        || text
+                            .to_ascii_lowercase()
+                            .contains("x-backend-record-type: shard")
+                    {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
+                    if first.starts_with("POST ") || first.starts_with("PUT ") {
+                        let mut stored = None;
+                        for line in text.lines() {
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name
+                                    .eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Location")
+                                {
+                                    let v = value.trim();
+                                    stored = if v.is_empty() {
+                                        None
+                                    } else {
+                                        Some(v.to_string())
+                                    };
+                                }
+                            }
+                        }
+                        *location.lock().unwrap_or_else(|p| p.into_inner()) = stored;
+                    }
+                    let extra = match location
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_deref()
+                    {
+                        Some(loc) => vec![
+                            ("X-Container-Sysmeta-Versions-Location", loc.to_string()),
+                            ("X-Container-Sysmeta-Versions-Mode", "stack".to_string()),
+                        ],
+                        None => Vec::new(),
+                    };
+                    let extra_ref: Vec<(&str, &str)> =
+                        extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    write_backend_http_status(&mut stream, 204, &extra_ref, &[]).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn versioning_clear_version_option_on_hyper() {
+        let (port, backend) = spawn_versioning_clear_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::VersionedWrites::new())],
+        };
+        let head = || async {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Backend-Swift-Owner", "true");
+            svc.call(AsyncRequest {
+                method: "HEAD".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await
+        };
+        let post_location = |value: &str| {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Backend-Swift-Owner", "true");
+            headers.set("X-Versions-Location", value);
+            svc.call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+        };
+        let sanity = head().await;
+        assert!(
+            (200..300).contains(&sanity.status),
+            "official test_clear_version_option sanity HEAD on Hyper, got {}",
+            sanity.status
+        );
+        assert_eq!(
+            sanity.headers.get("X-Versions-Location"),
+            Some("versions"),
+            "official test_clear_version_option sanity location"
+        );
+        let cleared = post_location("").await;
+        assert!(
+            (200..300).contains(&cleared.status),
+            "official test_clear_version_option clear POST on Hyper, got {} {:?}",
+            cleared.status,
+            cleared.reason
+        );
+        let after_clear = head().await;
+        assert!(
+            after_clear.headers.get("X-Versions-Location").is_none(),
+            "official test_clear_version_option must hide location after empty POST, got {:?}",
+            after_clear.headers.get("X-Versions-Location")
+        );
+        let restored = post_location("versions").await;
+        assert!(
+            (200..300).contains(&restored.status),
+            "official test_clear_version_option restore POST on Hyper, got {} {:?}",
+            restored.status,
+            restored.reason
+        );
+        let after_restore = head().await;
+        assert_eq!(
+            after_restore.headers.get("X-Versions-Location"),
+            Some("versions"),
+            "official test_clear_version_option restore location"
+        );
+        backend.abort();
+    }
+
+    /// Official TestObjectVersioning.test_overwriting: POST metadata must
+    /// not archive a new version on the Hyper stream path.
+    #[tokio::test]
+    async fn versioning_post_does_not_archive_on_hyper() {
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::VersionedWrites::new()),
+                Arc::new(VersioningOverwriteStub {
+                    archive_puts: Arc::clone(&archive_puts),
+                }),
+            ],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Object-Meta-Fu", "baz");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official test_overwriting POST on Hyper, got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 0,
+            "official test_overwriting POST must not archive"
+        );
+    }
+
+    /// Official TestObjectVersioning.test_overwriting COPY from another
+    /// container: dest current (`ccccc`) is archived, dest then reads
+    /// `ddddd` / `text/jibberish04`. IsolatedIdentity Hyper leftover is
+    /// VW-outer (copy never sends dest PUT back through VW).
+    struct VersioningCopyOverwriteStub {
+        store: Arc<std::sync::Mutex<std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)>>>,
+        archive_puts: Arc<std::sync::Mutex<u32>>,
+    }
+    impl swift_middleware::Middleware for VersioningCopyOverwriteStub {
+        fn handle(&self, req: Request, next: &swift_middleware::NextFn) -> Response {
+            next(req)
+        }
+        fn intercepts_request(&self, req: &Request) -> bool {
+            req.path.starts_with("/v1/AUTH_test/")
+        }
+        fn handle_request_async(
+            &self,
+            mut req: Request,
+            _next: swift_middleware::AsyncNextFn,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            let store = Arc::clone(&self.store);
+            let archive_puts = Arc::clone(&self.archive_puts);
+            Box::pin(async move {
+                let parts = match swift_http::split_path(&req.path, 2, 4, true) {
+                    Ok(parts) => parts,
+                    Err(_) => return Response::new(404),
+                };
+                let object = parts[3].clone().unwrap_or_default();
+                if object.is_empty() {
+                    if req.path == "/v1/AUTH_test/c" {
+                        let mut resp = Response::new(204);
+                        resp.headers
+                            .set("X-Container-Sysmeta-Versions-Location", "versions");
+                        resp.headers
+                            .set("X-Container-Sysmeta-Versions-Mode", "stack");
+                        return resp;
+                    }
+                    return Response::new(204);
+                }
+                if req.method == "PUT" {
+                    let headers = req.headers.clone();
+                    let body = match req.body.materialize(u64::MAX) {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => Vec::new(),
+                    };
+                    if req.path.starts_with("/v1/AUTH_test/versions/") {
+                        *archive_puts.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    }
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(req.path, (headers, body));
+                    return Response::new(201);
+                }
+                if matches!(req.method.as_str(), "GET" | "HEAD") {
+                    let Some((headers, body)) = store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&req.path)
+                        .cloned()
+                    else {
+                        return Response::new(404);
+                    };
+                    let mut resp = if req.method == "HEAD" {
+                        Response::new(200)
+                    } else {
+                        Response::with_body(200, body.clone())
+                    };
+                    resp.headers = headers;
+                    resp.headers.set("Content-Length", body.len().to_string());
+                    if resp.headers.get("X-Timestamp").is_none() {
+                        resp.headers.set("X-Timestamp", "1751500001.00000");
+                    }
+                    return resp;
+                }
+                Response::new(404)
+            })
+        }
+    }
+
+    fn seed_versioning_copy_overwrite_store(
+    ) -> std::collections::HashMap<String, (HeaderKeyDict, Vec<u8>)> {
+        let mut current = HeaderKeyDict::new();
+        current.set("Content-Type", "text/jibberish03");
+        current.set("X-Timestamp", "1751500001.00000");
+        current.set("Content-Length", "5");
+        let mut source = HeaderKeyDict::new();
+        source.set("Content-Type", "text/jibberish04");
+        source.set("X-Timestamp", "1751500002.00000");
+        source.set("Content-Length", "5");
+        std::collections::HashMap::from([
+            ("/v1/AUTH_test/c/obj".into(), (current, b"ccccc".to_vec())),
+            (
+                "/v1/AUTH_test/src/srcobj".into(),
+                (source, b"ddddd".to_vec()),
+            ),
+        ])
+    }
+
+    async fn official_overwrite_copy_on_hyper(vw_outer: bool) {
+        let store = Arc::new(std::sync::Mutex::new(seed_versioning_copy_overwrite_store()));
+        let archive_puts = Arc::new(std::sync::Mutex::new(0u32));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let vw: Arc<dyn swift_middleware::Middleware> =
+            Arc::new(swift_middleware::VersionedWrites::new());
+        let copy: Arc<dyn swift_middleware::Middleware> = Arc::new(swift_middleware::Copy::new());
+        let stub: Arc<dyn swift_middleware::Middleware> = Arc::new(VersioningCopyOverwriteStub {
+            store: Arc::clone(&store),
+            archive_puts: Arc::clone(&archive_puts),
+        });
+        let filters = if vw_outer {
+            vec![vw, copy, stub]
+        } else {
+            vec![copy, vw, stub]
+        };
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters,
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Destination", "/c/obj");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "COPY".into(),
+                path: "/v1/AUTH_test/src/srcobj".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert!(
+            (200..300).contains(&resp.status),
+            "official test_overwriting COPY on Hyper (vw_outer={vw_outer}), got {} {:?}",
+            resp.status,
+            resp.reason
+        );
+        let archived = *archive_puts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            archived, 1,
+            "official test_overwriting COPY must archive dest current (vw_outer={vw_outer})"
+        );
+        let got = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c/obj".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            got.status, 200,
+            "official test_overwriting COPY dest GET on Hyper (vw_outer={vw_outer})"
+        );
+        let body = got
+            .body
+            .collect_async()
+            .await
+            .expect("official test_overwriting COPY dest body");
+        assert_eq!(
+            body, b"ddddd",
+            "official test_overwriting COPY dest must be source bytes (vw_outer={vw_outer})"
+        );
+        assert_eq!(
+            got.headers.get("Content-Type"),
+            Some("text/jibberish04"),
+            "official test_overwriting COPY dest content-type (vw_outer={vw_outer})"
+        );
+    }
+
+    #[tokio::test]
+    async fn versioning_overwrite_copy_archives_when_vw_outer_on_hyper() {
+        official_overwrite_copy_on_hyper(true).await;
+    }
+
+    #[tokio::test]
+    async fn versioning_overwrite_copy_archives_when_copy_outer_on_hyper() {
+        official_overwrite_copy_on_hyper(false).await;
+    }
+
+    /// Official IsolatedIdentity `update_metadata` + Python `clean_acl`:
+    /// empty `.r:` and write-ACL referrers are 400 on Hyper container POST.
+    #[tokio::test]
+    async fn container_acl_clean_empty_referer_is_400_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Container-Read", ".r:");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "owner POST X-Container-Read: .r: must 400, got {} {:?}",
+            resp.status, resp.reason
+        );
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("No host/domain value"),
+            "clean_acl empty referer body, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_acl_clean_write_referer_is_400_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Container-Write", ".r:*");
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 400,
+            "owner POST X-Container-Write: .r:* must 400, got {} {:?}",
+            resp.status, resp.reason
+        );
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("Referrers not allowed in write ACL"),
+            "clean_acl write referer body, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_acl_clean_star_domain_is_not_400_on_hyper() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        seed_container_acl(&app, "AUTH_test", "c", None);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![],
+        };
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Swift-Owner", "true");
+        headers.set("X-Container-Read", ".r:*.example.com,.rlistings");
+        let resp = svc
+            .call(AsyncRequest {
+                method: "POST".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 400,
+            "official .r:*.example.com,.rlistings is not a clean_acl 400, got {} {:?}",
+            resp.status, resp.reason
+        );
+    }
+
+    /// Official TestDlo.test_get_manifest_document_itself: GET
+    /// `?multipart-manifest=get` returns the stored manifest bytes and keeps
+    /// `X-Object-Manifest` (DLO must not assemble).
+    #[tokio::test]
+    async fn dlo_get_manifest_document_itself_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: "multipart-manifest=get".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_manifest_document_itself on Hyper, got {}",
+            resp.status
+        );
+        assert_eq!(
+            resp.headers.get("X-Object-Manifest"),
+            Some("c/segs/"),
+            "official test_get_manifest_document_itself keeps X-Object-Manifest"
+        );
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert_eq!(
+            body, "man1-contents",
+            "official test_get_manifest_document_itself returns stored bytes"
+        );
+    }
+
+    /// Official TestDlo.test_get_manifest: unconditional GET assembles
+    /// the concatenated segments (Hyper reassemble, no If-* / Range).
+    #[tokio::test]
+    async fn dlo_get_manifest_assembles_on_hyper() {
+        let dest = Arc::new(std::sync::Mutex::new(None));
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+                Arc::new(DloCopyAssembleStub {
+                    dest: Arc::clone(&dest),
+                }),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/a/c/man".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(
+            resp.status, 200,
+            "official test_get_manifest on Hyper, got {}",
+            resp.status
+        );
+        let body = resp
+            .body
+            .collect_async()
+            .await
+            .expect("official test_get_manifest body");
+        assert_eq!(
+            body, b"onetwo",
+            "official test_get_manifest assembled segments"
+        );
+    }
+
+    /// IsolatedIdentity Hyper never calls `NameCheck::handle()`. Forbidden
+    /// characters must 400 from `prepare()`.
+    #[tokio::test]
+    async fn name_check_hyper_path_rejects_forbidden_character() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::NameCheck::default())],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "PUT".into(),
+                path: "/v1/AUTH_test/c/foo\"bar".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("forbidden chars"),
+            "name_check Hyper 400 body must match handle(), got {body:?}"
+        );
+    }
+
+    /// IsolatedIdentity Hyper never calls `Crossdomain::handle()`.
+    #[tokio::test]
+    async fn crossdomain_hyper_path_serves_policy_xml() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: false,
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(swift_middleware::Crossdomain::default())],
+        };
+        let mut resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/crossdomain.xml".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+        assert!(
+            body.contains("<cross-domain-policy>"),
+            "crossdomain Hyper body must be the policy document, got {body:?}"
         );
     }
 
@@ -11615,6 +30069,116 @@ mod p1a_wiring_tests {
         assert!(req.headers.get("X-Container-Read").is_none());
         assert!(req.headers.get("X-Container-Write").is_none());
         assert!(req.headers.get("X-Container-Sync-Key").is_none());
+    }
+
+    /// IsolatedIdentity leftover: account-RW POST `X-Remove-Container-Read`
+    /// used to reach the container server and clear the ACL after the
+    /// matching `X-Container-Read` was already popped.
+    #[test]
+    fn non_owner_container_put_post_cannot_remove_privileged_headers() {
+        for method in ["PUT", "POST"] {
+            let mut headers = HeaderKeyDict::new();
+            headers.set("X-Remove-Container-Read", "x");
+            headers.set("X-Remove-Container-Write", "x");
+            headers.set("X-Remove-Container-Sync-Key", "x");
+            headers.set("X-Remove-Container-Sync-To", "x");
+            headers.set("X-Remove-Container-Meta-Temp-Url-Key", "x");
+            headers.set("X-Remove-Container-Meta-Color", "x");
+            let mut req = Request {
+                method: method.into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: String::new(),
+                headers,
+                body: swift_http::Body::empty(),
+            };
+            scrub_container_write_owner_headers(&mut req);
+            for name in [
+                "X-Remove-Container-Read",
+                "X-Remove-Container-Write",
+                "X-Remove-Container-Sync-Key",
+                "X-Remove-Container-Sync-To",
+                "X-Remove-Container-Meta-Temp-Url-Key",
+            ] {
+                assert!(
+                    req.headers.get(name).is_none(),
+                    "{method} !swift_owner left {name}"
+                );
+            }
+            assert_eq!(
+                req.headers.get("X-Remove-Container-Meta-Color"),
+                Some("x"),
+                "{method} must keep unprivileged X-Remove-Container-Meta-*"
+            );
+        }
+    }
+
+    /// IsolatedIdentity leftover: Python `clean_acl` on container PUT/POST
+    /// rewrites `.r:*.example.com` and 400s empty / write referrers.
+    #[test]
+    fn owner_container_acl_is_cleaned_like_python() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Backend-Swift-Owner", "true");
+        req.headers
+            .set("X-Container-Read", ".r:*.example.com,.rlistings");
+        req.headers.set("X-Container-Write", "bob");
+        scrub_container_write_owner_headers(&mut req);
+        assert!(
+            clean_container_acl_headers(&mut req).is_none(),
+            "valid owner ACL must not 400"
+        );
+        assert_eq!(
+            req.headers.get("X-Container-Read"),
+            Some(".r:.example.com,.rlistings")
+        );
+        assert_eq!(req.headers.get("X-Container-Write"), Some("bob"));
+    }
+
+    #[test]
+    fn owner_container_write_referrer_acl_is_400() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Backend-Swift-Owner", "true");
+        req.headers.set("X-Container-Write", ".r:*");
+        scrub_container_write_owner_headers(&mut req);
+        let denied = clean_container_acl_headers(&mut req).expect("write referrer");
+        assert_eq!(denied.status, 400);
+        let body = match &denied.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Referrers not allowed in write ACL"),
+            "got {body:?}"
+        );
+    }
+
+    #[test]
+    fn non_owner_invalid_acl_is_scrubbed_not_400() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/AUTH_test/c".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: swift_http::Body::empty(),
+        };
+        req.headers.set("X-Container-Read", ".r:");
+        scrub_container_write_owner_headers(&mut req);
+        assert!(req.headers.get("X-Container-Read").is_none());
+        assert!(
+            clean_container_acl_headers(&mut req).is_none(),
+            "Python pops owner ACL headers before clean_acl"
+        );
     }
 
     /// Official test_versioning_container_acl: account2 / account-RW

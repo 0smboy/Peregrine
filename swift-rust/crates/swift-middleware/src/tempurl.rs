@@ -49,11 +49,12 @@
 //! `ip={range}\n{method}\n{expires}\n{path}` (Python `get_hmac`).
 //!
 //! Deferrals: `logger.increment('tempurl.digests.*')` metrics.
-//! Field leftovers after the Hyper `prepare` fix (not HMAC/auth):
-//! `GET_DLO_outside_container` (DLO manifest segments outside the signed
-//! container — a DLO+TempURL ACL, not this filter's HMAC) and remaining
-//! UTF-8 TempURL cases beyond decoded PATH_INFO (see
-//! `test_prepare_accepts_decoded_object_path`).
+//! Container-scoped TempURL stamps
+//! [`TEMPURL_ALLOWED_PREFIX_HEADER`] so DLO/SLO segment listings outside
+//! the signed container return 401 (`test_GET_DLO_outside_container`).
+//! Account-scoped keys omit the prefix (cross-container DLO is allowed).
+//! Remaining UTF-8 TempURL cases beyond decoded PATH_INFO are still
+//! deferred (see `test_prepare_accepts_decoded_object_path`).
 //!
 //! Wiring: the proxy supplies a [`KeyProvider`] that HEADs account/container
 //! metadata for `Temp-URL-Key[-2]`. `/info` advertising is done by the proxy
@@ -86,6 +87,19 @@ const DEFAULT_METHODS: [&str; 5] = ["GET", "HEAD", "PUT", "POST", "DELETE"];
 /// `swift/common/digest.py`).
 const DEFAULT_ALLOWED_DIGESTS: [&str; 3] = ["sha1", "sha256", "sha512"];
 
+/// Header stamped when HMAC matched a container key only. DLO/SLO must
+/// refuse segment listings whose path is not under this prefix.
+pub const TEMPURL_ALLOWED_PREFIX_HEADER: &str = "X-Backend-Tempurl-Allowed-Prefix";
+
+/// Account vs container Temp-URL keys. Python `_get_keys` keeps the
+/// scopes separate so a container key cannot authorize DLO segments
+/// in another container (OSSA 2015-016 / `GET_DLO_outside_container`).
+#[derive(Debug, Clone, Default)]
+pub struct ScopedTempUrlKeys {
+    pub account: Vec<String>,
+    pub container: Vec<String>,
+}
+
 /// Supplies the Temp-URL keys for a request's account and container.
 ///
 /// This replaces the Python `_get_keys` helper, which reads the
@@ -96,6 +110,41 @@ const DEFAULT_ALLOWED_DIGESTS: [&str; 3] = ["sha1", "sha256", "sha512"];
 pub trait KeyProvider: Send + Sync {
     /// All Temp-URL keys configured for `account`/`container`, in any order.
     fn keys_for(&self, account: &str, container: &str) -> Vec<String>;
+
+    /// Split account vs container keys. Default treats [`keys_for`] as
+    /// account-scoped (existing unit fixtures). Proxy overrides this.
+    fn scoped_keys_for(&self, account: &str, container: &str) -> ScopedTempUrlKeys {
+        ScopedTempUrlKeys {
+            account: self.keys_for(account, container),
+            container: Vec::new(),
+        }
+    }
+}
+
+/// `401 Unauthorized: Temp URL invalid` (Python `_invalid` / scoped
+/// `swift.authorize` denial). HEAD is empty-bodied.
+pub fn tempurl_out_of_scope(method: &str) -> Response {
+    let mut resp = if method == "HEAD" {
+        Response::new(401)
+    } else {
+        Response::with_body(401, "401 Unauthorized: Temp URL invalid\n")
+    };
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    resp
+}
+
+/// True when `path` is inside a container-scoped TempURL prefix, or when
+/// no prefix was stamped (account-scoped / not a TempURL).
+pub fn tempurl_path_in_scope(req: &Request, path: &str) -> bool {
+    let Some(prefix) = req
+        .headers
+        .get(TEMPURL_ALLOWED_PREFIX_HEADER)
+        .filter(|p| !p.is_empty())
+    else {
+        return true;
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 /// [`KeyProvider`] backed by an injectable closure (proxy wires account /
@@ -260,13 +309,7 @@ impl TempUrl {
     /// everything else the plain-text `"401 Unauthorized: Temp URL
     /// invalid\n"`. swob renders both with a `text/html` content type.
     fn invalid(&self, method: &str) -> Response {
-        let mut resp = if method == "HEAD" {
-            Response::new(401)
-        } else {
-            Response::with_body(401, "401 Unauthorized: Temp URL invalid\n")
-        };
-        resp.headers.set("Content-Type", "text/html; charset=UTF-8");
-        resp
+        tempurl_out_of_scope(method)
     }
 
     /// Port of `_get_path_parts`. Returns `(account, container, object)` when
@@ -435,8 +478,8 @@ impl Middleware for TempUrl {
         }
 
         // --- fetch keys and build the signed message path ---
-        let keys = self.key_provider.keys_for(&account, &container);
-        if keys.is_empty() {
+        let scoped = self.key_provider.scoped_keys_for(&account, &container);
+        if scoped.account.is_empty() && scoped.container.is_empty() {
             return MwPrep::ShortCircuit(self.invalid(&req.method));
         }
         let path = match &prefix {
@@ -455,22 +498,32 @@ impl Middleware for TempUrl {
         } else {
             vec![req.method.as_str()]
         };
-        let mut is_valid = false;
-        'search: for m in &candidate_methods {
+        let mut matched_account = false;
+        let mut matched_container = false;
+        for m in &candidate_methods {
             let message = match &ip_range {
                 Some(r) => format!("ip={r}\n{m}\n{expires}\n{path}"),
                 None => format!("{m}\n{expires}\n{path}"),
             };
-            for key in &keys {
+            for key in &scoped.account {
                 if let Some(candidate) = hmac_hex(&algo, key.as_bytes(), message.as_bytes()) {
                     if streq_const_time(&sig_hex, &candidate) {
-                        is_valid = true;
-                        break 'search;
+                        matched_account = true;
                     }
                 }
             }
+            for key in &scoped.container {
+                if let Some(candidate) = hmac_hex(&algo, key.as_bytes(), message.as_bytes()) {
+                    if streq_const_time(&sig_hex, &candidate) {
+                        matched_container = true;
+                    }
+                }
+            }
+            if matched_account || matched_container {
+                break;
+            }
         }
-        if !is_valid {
+        if !matched_account && !matched_container {
             return MwPrep::ShortCircuit(self.invalid(&req.method));
         }
 
@@ -502,6 +555,16 @@ impl Middleware for TempUrl {
         // Bypass TempAuth + proxy ACL checks (Python authorize_override).
         req.headers.set("X-Backend-Authorize-Override", "true");
         req.headers.set("X-Backend-Remote-User", ".wsgi.tempurl");
+        // Container key only: DLO/SLO listings must stay in this container.
+        // Account key wins when the same secret is in both lists.
+        if !matched_account && matched_container {
+            req.headers.set(
+                TEMPURL_ALLOWED_PREFIX_HEADER,
+                format!("/v1/{account}/{container}"),
+            );
+        } else {
+            req.headers.remove(TEMPURL_ALLOWED_PREFIX_HEADER);
+        }
         // Numeric expires for finish() Content-Disposition / Expires so
         // Hyper outbound does not re-parse ISO8601 vs epoch.
         req.headers
@@ -2051,6 +2114,49 @@ mod tests {
         assert_eq!(resp.headers.get("X-Object-Meta-Public-Ok"), Some("kept"));
     }
 
+    struct ContainerOnlyKeys(Vec<String>);
+    impl KeyProvider for ContainerOnlyKeys {
+        fn keys_for(&self, _account: &str, _container: &str) -> Vec<String> {
+            self.0.clone()
+        }
+        fn scoped_keys_for(&self, _account: &str, _container: &str) -> ScopedTempUrlKeys {
+            ScopedTempUrlKeys {
+                account: Vec::new(),
+                container: self.0.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_prepare_stamps_container_scope_prefix() {
+        let tu = TempUrl::new(Arc::new(ContainerOnlyKeys(vec![KEY.to_string()])));
+        let mut req = mk(
+            "GET",
+            "/v1/AUTH_account/container/object",
+            &format!("temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}"),
+            &[],
+        );
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("container-key HMAC must Continue, {}", resp.status)
+            }
+        }
+        assert_eq!(
+            req.headers.get(TEMPURL_ALLOWED_PREFIX_HEADER),
+            Some("/v1/AUTH_account/container")
+        );
+        let tu_acct = tempurl(&[KEY]);
+        let mut acct = mk(
+            "GET",
+            "/v1/AUTH_account/container/object",
+            &format!("temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}"),
+            &[],
+        );
+        assert!(matches!(tu_acct.prepare(&mut acct), MwPrep::Continue));
+        assert!(acct.headers.get(TEMPURL_ALLOWED_PREFIX_HEADER).is_none());
+    }
+
     #[test]
     fn test_prepare_accepts_decoded_object_path() {
         // Hyper unquotes PATH_INFO before prepare; HMAC is over the decoded
@@ -2071,5 +2177,44 @@ mod tests {
             req.headers.get("X-Backend-Remote-User"),
             Some(".wsgi.tempurl")
         );
+    }
+
+    #[test]
+    fn test_prepare_accepts_utf8_object_path() {
+        // Official TestTempurlUTF8: HMAC is over the decoded Unicode path,
+        // not the percent-encoded request-target.
+        let tu = tempurl(&[KEY]);
+        let obj = "dir/caf\u{e9}.txt";
+        let path = format!("/v1/{ACCT}/{CONT}/{obj}");
+        let message = format!("GET\n{EXPIRES}\n{path}");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let mut req = mk("GET", &path, &query(&sig), &[]);
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("UTF-8 object HMAC must Continue, got {}", resp.status)
+            }
+        }
+        assert_eq!(
+            req.headers.get("X-Backend-Remote-User"),
+            Some(".wsgi.tempurl")
+        );
+    }
+
+    #[test]
+    fn test_prepare_accepts_utf8_prefix_tempurl() {
+        let tu = tempurl(&[KEY]);
+        let pfx = "dir/caf\u{e9}";
+        let path = format!("/v1/{ACCT}/{CONT}/{pfx}/obj");
+        let message = format!("GET\n{EXPIRES}\nprefix:/v1/{ACCT}/{CONT}/{pfx}");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let q = format!("temp_url_sig={sig}&temp_url_expires={EXPIRES}&temp_url_prefix={pfx}");
+        let mut req = mk("GET", &path, &q, &[]);
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("UTF-8 prefix HMAC must Continue, got {}", resp.status)
+            }
+        }
     }
 }

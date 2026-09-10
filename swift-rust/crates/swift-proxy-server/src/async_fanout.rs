@@ -2448,6 +2448,9 @@ impl ProxyApp {
             return swob_response(503);
         };
         let path = format!("/{}", percent_encode(account));
+        if let Err(resp) = super::constrain_account_listing_limit(&req) {
+            return resp;
+        }
         let method = req.method.clone();
         let query = req.query_string.clone();
         let headers = self.backend_headers(&req, false, "account");
@@ -2652,6 +2655,9 @@ impl ProxyApp {
             r.headers.set("Content-Type", "text/plain");
             return r;
         }
+        if let Some(denied) = super::clean_container_acl_headers(&mut req) {
+            return denied;
+        }
         let Ok((container_part, _)) = self
             .container_ring
             .get_nodes(account, Some(container), None)
@@ -2748,6 +2754,9 @@ impl ProxyApp {
         account: &str,
         container: &str,
     ) -> Response {
+        if let Some(denied) = super::check_container_name_length(container) {
+            return denied;
+        }
         super::scrub_container_write_owner_headers(&mut req);
         if let Some(denied) = super::deny_non_owner_container_versioning(&req) {
             return denied;
@@ -2756,6 +2765,9 @@ impl ProxyApp {
             let mut r = Response::with_body(400, e.0);
             r.headers.set("Content-Type", "text/plain");
             return r;
+        }
+        if let Some(denied) = super::clean_container_acl_headers(&mut req) {
+            return denied;
         }
         let Ok((container_part, _)) = self
             .container_ring
@@ -3522,16 +3534,23 @@ impl ProxyApp {
             percent_encode(container),
             percent_encode(object)
         );
-        self.make_write_async(
-            object_nodes,
-            node_number,
-            object_part,
-            "DELETE",
-            &path,
-            &req.query_string,
-            per_node,
-        )
-        .await
+        let mut resp = self
+            .make_write_async(
+                object_nodes,
+                node_number,
+                object_part,
+                "DELETE",
+                &path,
+                &req.query_string,
+                per_node,
+            )
+            .await;
+        // Official TestObject.test_delete_content_type: swob HTTPNoContent
+        // stamps text/html even when the leftover body is empty.
+        if (200..300).contains(&resp.status) && resp.headers.get("Content-Type").is_none() {
+            resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+        }
+        resp
     }
 
     pub(crate) async fn container_delete_async(

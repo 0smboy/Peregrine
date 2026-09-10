@@ -435,10 +435,15 @@ impl WebConfig {
     /// first `next()` may already be the index *object* (`index contents`)
     /// with no web-* headers — `from_headers(first)` then makes
     /// `enabled()` false and Hyper `return first` leaks those bytes.
-    /// Prefer HEAD when it enables web mode; fall back to captured meta
-    /// only if HEAD carried none (HEAD 401 / empty).
+    /// Prefer a live container HEAD when it looks like container metadata
+    /// (including listings-off after `X-Remove-Container-Meta-Web-Listings`).
+    /// Fall back to captured meta only if HEAD carried no container identity
+    /// (HEAD 401 / empty) so a leftover index object cannot skip config.
     fn from_captured_or_head(first: &HeaderKeyDict, head: &HeaderKeyDict) -> Self {
         let from_head = Self::from_headers(head);
+        if container_head_is_authoritative(head) {
+            return from_head;
+        }
         if from_head.enabled() {
             from_head
         } else {
@@ -495,6 +500,20 @@ impl Scope {
 
 fn is_get_head(req: &Request) -> bool {
     matches!(req.method.as_str(), "GET" | "HEAD")
+}
+
+/// True when `head` is a real container HEAD (Python `_get_container_info`),
+/// not an empty 401. Official `test_staticweb_off` POSTs
+/// `X-Remove-Container-Meta-Web-Listings` then GETs with a prefix TempURL:
+/// HEAD is 2xx without web-listings and must win over leftover captured meta.
+fn container_head_is_authoritative(head: &HeaderKeyDict) -> bool {
+    head.get("X-Container-Object-Count").is_some()
+        || head.get("X-Container-Bytes-Used").is_some()
+        || head.get("X-Timestamp").is_some()
+        || head.iter().any(|(key, _)| {
+            let lower = key.to_ascii_lowercase();
+            lower.starts_with("x-container-")
+        })
 }
 
 /// Python: skip unless anonymous, TempURL, or `X-Web-Mode`.
@@ -2403,6 +2422,89 @@ mod tests {
         let body = String::from_utf8(resp.body.materialize(u64::MAX).unwrap().to_vec())
             .expect("utf8 listing");
         official_listing_of_asserts(&body, &container_path, &index_for_assert);
+    }
+
+    /// Official TestStaticWebTempurl.test_staticweb_off: after
+    /// `X-Remove-Container-Meta-Web-Listings`, a live container HEAD is
+    /// authoritative even when the captured GET still carries leftover
+    /// listings meta. Must not emit `X-Backend-Content-Generator: staticweb`
+    /// so TempURL finish 401s the container-root carve-out.
+    #[tokio::test]
+    async fn test_reassemble_listings_off_head_beats_leftover_captured_listings() {
+        let env = leftover_index_listing_env();
+        let sw = StaticWeb::new();
+        let container_path = env.container_url();
+        let storage = env.storage_path();
+        let mut captured = index_object_captured(&env, false, true);
+        captured
+            .headers
+            .set("X-Container-Meta-Web-Listings", "true");
+        let rest: crate::AsyncNextFn = Arc::new(move |r: Request| {
+            let storage = storage.clone();
+            Box::pin(async move {
+                if r.method == "HEAD" && r.path == storage {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Object-Count", "4");
+                    resp.headers.set("X-Timestamp", "1000.00000");
+                    return resp;
+                }
+                Response::new(404)
+            })
+        });
+        let mut headers = listing_direct_headers(true);
+        headers.set("X-Backend-Remote-User", ".wsgi.tempurl");
+        let req = Request {
+            method: "GET".into(),
+            path: container_path,
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let mut resp = sw.reassemble_async(req, hyper_next(captured, rest)).await;
+        assert_eq!(
+            resp.status, 200,
+            "passthrough captured GET, got {}",
+            resp.status
+        );
+        assert_ne!(
+            resp.headers.get("X-Backend-Content-Generator"),
+            Some("staticweb"),
+            "listings-off must not stamp staticweb so TempURL finish can 401"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&resp.body.materialize(u64::MAX).unwrap_or_default().to_vec())
+                .as_ref(),
+            INDEX_OBJECT_BYTES
+        );
+    }
+
+    /// Official test_staticweb_off dir GET: listings removed, directory
+    /// marker must stay 404 (not a listing page).
+    #[tokio::test]
+    async fn test_reassemble_listings_off_dir_marker_is_404() {
+        let sw = StaticWeb::new();
+        let mut marker = Response::with_body(200, b"".to_vec());
+        marker.headers.set("Content-Type", "application/directory");
+        marker.headers.set("Content-Length", "0");
+        let rest: crate::AsyncNextFn = Arc::new(|r: Request| {
+            Box::pin(async move {
+                if r.method == "HEAD" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set("X-Container-Object-Count", "1");
+                    return resp;
+                }
+                Response::new(404)
+            })
+        });
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/AUTH_test/c/dir/".into(),
+            query_string: String::new(),
+            headers: listing_direct_headers(true),
+            body: Body::empty(),
+        };
+        let resp = sw.reassemble_async(req, hyper_next(marker, rest)).await;
+        assert_eq!(resp.status, 404, "got {}", resp.status);
     }
 
     /// Index-style (`listings=false`, web-index set) still serves the

@@ -19,7 +19,7 @@
 
 use swift_http::{Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 const DEFAULT_POLICY: &str = "<allow-access-from domain=\"*\" secure=\"false\" />";
 
@@ -36,21 +36,35 @@ impl Default for Crossdomain {
     }
 }
 
+impl Crossdomain {
+    fn policy_response(&self) -> Response {
+        let body = format!(
+            "<?xml version=\"1.0\"?>\n\
+             <!DOCTYPE cross-domain-policy SYSTEM \
+             \"http://www.adobe.com/xml/dtds/cross-domain-policy.dtd\" >\n\
+             <cross-domain-policy>\n{}\n</cross-domain-policy>",
+            self.policy
+        );
+        let mut resp = Response::with_body(200, body.into_bytes());
+        resp.headers.set("Content-Type", "application/xml");
+        resp
+    }
+}
+
 impl Middleware for Crossdomain {
-    fn handle(&self, req: Request, next: &NextFn) -> Response {
+    fn prepare(&self, req: &mut Request) -> MwPrep {
         if req.path == "/crossdomain.xml" {
-            let body = format!(
-                "<?xml version=\"1.0\"?>\n\
-                 <!DOCTYPE cross-domain-policy SYSTEM \
-                 \"http://www.adobe.com/xml/dtds/cross-domain-policy.dtd\" >\n\
-                 <cross-domain-policy>\n{}\n</cross-domain-policy>",
-                self.policy
-            );
-            let mut resp = Response::with_body(200, body.into_bytes());
-            resp.headers.set("Content-Type", "application/xml");
-            return resp;
+            MwPrep::ShortCircuit(self.policy_response())
+        } else {
+            MwPrep::Continue
         }
-        next(req)
+    }
+
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => resp,
+            MwPrep::Continue => next(req),
+        }
     }
 }
 
@@ -84,5 +98,23 @@ mod tests {
         // other paths pass through
         let app: Arc<dyn Fn(Request) -> Response + Send + Sync> = Arc::new(|_r| Response::new(204));
         assert_eq!(cd.handle(req("/v1/a"), &app).status, 204);
+    }
+
+    #[test]
+    fn test_prepare_short_circuits_crossdomain_xml() {
+        let cd = Crossdomain::default();
+        let mut request = req("/crossdomain.xml");
+        match cd.prepare(&mut request) {
+            MwPrep::ShortCircuit(mut resp) => {
+                assert_eq!(resp.status, 200);
+                let body =
+                    String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap()).into_owned();
+                assert!(body.contains("<cross-domain-policy>"), "{body}");
+                assert_eq!(resp.headers.get("Content-Type"), Some("application/xml"));
+            }
+            MwPrep::Continue => panic!("GET /crossdomain.xml must short-circuit on Hyper prepare"),
+        }
+        let mut other = req("/v1/a");
+        assert!(matches!(cd.prepare(&mut other), MwPrep::Continue));
     }
 }

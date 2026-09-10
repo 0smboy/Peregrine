@@ -681,6 +681,17 @@ impl ProxyTempUrlKeys {
 
 impl swift_middleware::KeyProvider for ProxyTempUrlKeys {
     fn keys_for(&self, account: &str, container: &str) -> Vec<String> {
+        let scoped = self.scoped_keys_for(account, container);
+        let mut keys = scoped.account;
+        keys.extend(scoped.container);
+        keys
+    }
+
+    fn scoped_keys_for(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> swift_middleware::ScopedTempUrlKeys {
         let current = {
             let guard = self
                 .app
@@ -688,7 +699,7 @@ impl swift_middleware::KeyProvider for ProxyTempUrlKeys {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Arc::clone(&guard)
         };
-        current.temp_url_keys(account, container)
+        current.temp_url_keys_scoped(account, container)
     }
 }
 
