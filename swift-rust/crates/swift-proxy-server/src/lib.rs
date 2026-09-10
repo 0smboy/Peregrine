@@ -9388,6 +9388,29 @@ mod pipeline_async_tests {
         }
     }
 
+    /// IsolatedIdentity account/container-server validate merged stored
+    /// user-meta (official extra-file test_bad_metadata3 last POST).
+    fn leftover_user_meta_over_limit(target: &str, stored: &HeaderKeyDict) -> bool {
+        let prefix = format!("x-{target}-meta-");
+        let mut count = 0i64;
+        let mut size = 0i64;
+        for (k, v) in stored.iter() {
+            let lk = k.to_ascii_lowercase();
+            if !lk.starts_with(&prefix) || lk.len() <= prefix.len() {
+                continue;
+            }
+            let key = &lk[prefix.len()..];
+            count += 1;
+            size += key.chars().count() as i64 + v.chars().count() as i64;
+            if count > swift_core::constraints::MAX_META_COUNT
+                || size > swift_core::constraints::MAX_META_OVERALL_SIZE
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn leftover_apply_container_acl(stored: &mut HeaderKeyDict, text: &str) {
         for line in text.lines() {
             let Some((k, v)) = line.split_once(':') else {
@@ -14197,6 +14220,222 @@ mod pipeline_async_tests {
             leftover_body_text(got).await,
             "0123456789",
             "official test_container_quota_bytes GET body"
+        );
+        backend.abort();
+    }
+
+    async fn leftover_hyper_headers(
+        svc: &ProxyAsyncService,
+        method: &str,
+        path: &str,
+        headers: HeaderKeyDict,
+    ) -> Response {
+        svc.call(AsyncRequest {
+            method: method.into(),
+            path: path.into(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+        })
+        .await
+    }
+
+    fn leftover_meta_count_headers(prefix: &str, n: usize) -> HeaderKeyDict {
+        let mut headers = HeaderKeyDict::new();
+        for x in 0..n {
+            headers.set(&format!("{prefix}{x}"), "v");
+        }
+        headers
+    }
+
+    fn leftover_meta_overall_fill(prefix: &str) -> (HeaderKeyDict, i64) {
+        let max_val = swift_core::constraints::MAX_META_VALUE_LENGTH as i64;
+        let max_all = swift_core::constraints::MAX_META_OVERALL_SIZE;
+        let header_value = "k".repeat(max_val as usize);
+        let mut size = 0i64;
+        let mut x = 0i64;
+        let mut headers = HeaderKeyDict::new();
+        while size < (max_all - 4 - max_val) {
+            size += 4 + max_val;
+            headers.set(&format!("{prefix}{x:04}"), &header_value);
+            x += 1;
+        }
+        if max_all - size > 1 {
+            headers.set(
+                &format!("{prefix}k"),
+                "v".repeat((max_all - size - 1) as usize),
+            );
+        }
+        (headers, size)
+    }
+
+    /// Official extra-file TestAccount.test_bad_metadata2 / test_bad_metadata3.
+    #[tokio::test]
+    async fn extra_file_account_bad_metadata_count_and_overall_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        let count = swift_core::constraints::MAX_META_COUNT as usize;
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                leftover_meta_count_headers("X-Account-Meta-", count),
+            )
+            .await
+            .status,
+            204,
+            "official test_bad_metadata2 at-limit count"
+        );
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test",
+                leftover_meta_count_headers("X-Account-Meta-", count + 1),
+            )
+            .await
+            .status,
+            400,
+            "official test_bad_metadata2 over-limit count"
+        );
+        backend.abort();
+        let (svc, backend) = container_func_hyper_svc().await;
+        let (fill, size) = leftover_meta_overall_fill("X-Account-Meta-");
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", fill.clone())
+                .await
+                .status,
+            204,
+            "official test_bad_metadata3 at-limit overall"
+        );
+        let mut over_req = fill;
+        over_req.set(
+            "X-Account-Meta-k",
+            "x".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", over_req)
+                .await
+                .status,
+            400,
+            "official test_bad_metadata3 over-limit overall request"
+        );
+        let mut border = HeaderKeyDict::new();
+        border.set(
+            "X-Account-Meta-k",
+            "y".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size - 1) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", border)
+                .await
+                .status,
+            204,
+            "official test_bad_metadata3 aggregate on the border"
+        );
+        let mut over_agg = HeaderKeyDict::new();
+        over_agg.set(
+            "X-Account-Meta-k",
+            "z".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test", over_agg)
+                .await
+                .status,
+            400,
+            "official test_bad_metadata3 aggregate over limit"
+        );
+        backend.abort();
+    }
+
+    /// Official extra-file TestContainer.test_POST_bad_metadata2 /
+    /// test_POST_bad_metadata3.
+    #[tokio::test]
+    async fn extra_file_container_post_bad_metadata_count_and_overall_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-c2", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT meta-c2"
+        );
+        let count = swift_core::constraints::MAX_META_COUNT as usize;
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-c2",
+                leftover_meta_count_headers("X-Container-Meta-", count),
+            )
+            .await
+            .status,
+            204,
+            "official test_POST_bad_metadata2 at-limit count"
+        );
+        assert_eq!(
+            leftover_hyper_headers(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/meta-c2",
+                leftover_meta_count_headers("X-Container-Meta-", count + 1),
+            )
+            .await
+            .status,
+            400,
+            "official test_POST_bad_metadata2 over-limit count"
+        );
+        backend.abort();
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/meta-c2", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT meta-c2 for overall"
+        );
+        let (fill, size) = leftover_meta_overall_fill("X-Container-Meta-");
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", fill.clone())
+                .await
+                .status,
+            204,
+            "official test_POST_bad_metadata3 at-limit overall"
+        );
+        let mut over_req = fill;
+        over_req.set(
+            "X-Container-Meta-k",
+            "x".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", over_req)
+                .await
+                .status,
+            400,
+            "official test_POST_bad_metadata3 over-limit overall request"
+        );
+        let mut border = HeaderKeyDict::new();
+        border.set(
+            "X-Container-Meta-k",
+            "y".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size - 1) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", border)
+                .await
+                .status,
+            204,
+            "official test_POST_bad_metadata3 aggregate on the border"
+        );
+        let mut over_agg = HeaderKeyDict::new();
+        over_agg.set(
+            "X-Container-Meta-k",
+            "z".repeat((swift_core::constraints::MAX_META_OVERALL_SIZE - size) as usize),
+        );
+        assert_eq!(
+            leftover_hyper_headers(&svc, "POST", "/v1/AUTH_test/meta-c2", over_agg)
+                .await
+                .status,
+            400,
+            "official test_POST_bad_metadata3 aggregate over limit"
         );
         backend.abort();
     }
@@ -21365,9 +21604,23 @@ mod pipeline_async_tests {
                     };
                     if logical == "/AUTH_test" {
                         if is_post {
-                            let mut stored = account_meta.lock().unwrap_or_else(|p| p.into_inner());
-                            leftover_apply_user_meta("account", &mut stored, &text, false);
-                            leftover_apply_account_sysmeta(&mut stored, &text);
+                            let over = {
+                                let mut stored =
+                                    account_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let mut next = stored.clone();
+                                leftover_apply_user_meta("account", &mut next, &text, false);
+                                leftover_apply_account_sysmeta(&mut next, &text);
+                                if leftover_user_meta_over_limit("account", &next) {
+                                    true
+                                } else {
+                                    *stored = next;
+                                    false
+                                }
+                            };
+                            if over {
+                                write_backend_http_status(&mut stream, 400, &[], &[]).await;
+                                return;
+                            }
                         }
                         let (n_s, o_s, b_s) = account_counts();
                         let extra = {
@@ -21707,13 +21960,24 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_post {
-                        {
+                        let over = {
                             let mut guard =
                                 container_meta.lock().unwrap_or_else(|p| p.into_inner());
                             let stored = guard.entry(container.clone()).or_default();
-                            leftover_apply_user_meta("container", stored, &text, false);
-                            leftover_apply_container_acl(stored, &text);
-                            leftover_apply_container_sync(stored, &text);
+                            let mut next = stored.clone();
+                            leftover_apply_user_meta("container", &mut next, &text, false);
+                            leftover_apply_container_acl(&mut next, &text);
+                            leftover_apply_container_sync(&mut next, &text);
+                            if leftover_user_meta_over_limit("container", &next) {
+                                true
+                            } else {
+                                *stored = next;
+                                false
+                            }
+                        };
+                        if over {
+                            write_backend_http_status(&mut stream, 400, &[], &[]).await;
+                            return;
                         }
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
