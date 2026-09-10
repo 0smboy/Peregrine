@@ -13757,6 +13757,117 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestObject.test_copy_object. Extra-file identity: source
+    /// body `test`, X-Copy-From then COPY, DELETE dest is 404, and COPY
+    /// `Range: bytes=1-2` dest body is `es`. IsolatedIdentity Hyper never
+    /// calls `Copy::handle()` — leftover hits `object_copy_async` (no stub).
+    #[tokio::test]
+    async fn extra_file_copy_object_on_hyper() {
+        let (svc, backend) = container_func_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(&svc, "PUT", "/v1/AUTH_test/copy-c", "", &[], Vec::new())
+                .await
+                .status,
+            201,
+            "owner PUT copy-c"
+        );
+        assert_eq!(
+            leftover_put_object(&svc, "/v1/AUTH_test/copy-c/src", "", &[], b"test")
+                .await
+                .status,
+            201,
+            "official test_copy_object PUT source"
+        );
+        let src = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/src", "").await;
+        assert_eq!(src.status, 200, "official test_copy_object GET source");
+        assert_eq!(leftover_body_text(src).await, "test");
+
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/copy-c/test_copy",
+                "",
+                &[("X-Copy-From", "copy-c/src")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_copy_object X-Copy-From"
+        );
+        let copied = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "").await;
+        assert_eq!(copied.status, 200);
+        assert_eq!(
+            leftover_body_text(copied).await,
+            "test",
+            "official test_copy_object dest equals source"
+        );
+
+        assert!(
+            matches!(
+                file_hyper_call(
+                    &svc,
+                    "DELETE",
+                    "/v1/AUTH_test/copy-c/test_copy",
+                    "",
+                    &[],
+                    Vec::new(),
+                )
+                .await
+                .status,
+                204 | 404
+            ),
+            "official test_copy_object DELETE dest"
+        );
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "")
+                .await
+                .status,
+            404,
+            "official test_copy_object GET dest after DELETE"
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "COPY",
+                "/v1/AUTH_test/copy-c/src",
+                "",
+                &[("Destination", "copy-c/test_copy")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_copy_object COPY"
+        );
+        let copied = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "").await;
+        assert_eq!(leftover_body_text(copied).await, "test");
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "COPY",
+                "/v1/AUTH_test/copy-c/src",
+                "",
+                &[("Destination", "copy-c/test_copy"), ("Range", "bytes=1-2")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_copy_object COPY Range"
+        );
+        let ranged = leftover_container_get(&svc, "/v1/AUTH_test/copy-c/test_copy", "").await;
+        assert_eq!(ranged.status, 200);
+        assert_eq!(
+            leftover_body_text(ranged).await,
+            "es",
+            "official test_copy_object COPY Range bytes=1-2 of test"
+        );
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
@@ -21076,6 +21187,15 @@ mod pipeline_async_tests {
                         // cannot lock that status.
                         if is_post {
                             write_backend_http_status(&mut stream, 202, &[], &[]).await;
+                            return;
+                        }
+                        let listed = objects
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(container)
+                            .is_some_and(|v| v.iter().any(|n| n == object));
+                        if !listed {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                             return;
                         }
                         let payload = object_bodies
