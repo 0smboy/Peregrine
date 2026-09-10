@@ -29,7 +29,6 @@
 //! `X-History-Location` into sysmeta when `allow_versioned_writes` is true.
 //!
 //! Deferred / wontfix:
-//! * `swift.authorize` write-ACL recheck before archive (no authorize hook).
 //! * In-proxy reverse-listing fallback for pre-2.6.0 container servers
 //!   (listing uses `reverse=on` only).
 
@@ -1073,6 +1072,35 @@ impl VersionedWrites {
         req
     }
 
+    /// Client-auth subrequest to a hidden versions object.
+    ///
+    /// Official `test_container_acls`: X-Container-Read on the public
+    /// container allows GET current, but GET `?version-id=` is a request
+    /// against the reserved versions container and still requires a
+    /// swift_owner. Pre-authing that GET (Authorize-Override) is the IsolatedIdentity
+    /// hole that made `assertRaises(ResponseError)` fail.
+    fn modern_client_version_request(
+        method: &str,
+        path: String,
+        query_string: &str,
+        source_headers: &swift_http::HeaderKeyDict,
+    ) -> Request {
+        let mut req = Request {
+            method: method.to_string(),
+            path,
+            query_string: query_string.to_string(),
+            headers: source_headers.clone(),
+            body: Body::empty(),
+        };
+        req.headers.remove("Content-Length");
+        req.headers.remove("Transfer-Encoding");
+        req.headers.remove("X-Backend-Authorize-Override");
+        if req.path.contains('\0') {
+            req.headers.set("X-Backend-Allow-Reserved-Names", "true");
+        }
+        req
+    }
+
     fn modern_authorization_probe(req: &AsyncRequest) -> Request {
         let mut authorize = Request {
             method: req.method.clone(),
@@ -1463,6 +1491,17 @@ impl VersionedWrites {
             return next(req).await;
         }
 
+        // Python auth middleware 403s before versioned_writes.handle_PUT.
+        // IsolatedIdentity Hyper intercepts streaming VW first, so copy-current
+        // would otherwise archive (pre-authed) and then 403 the client PUT —
+        // official test_versioning_container_acl: user3 write → 1 != 2.
+        // Probe the public object path with the client token before any
+        // versions-container GET/PUT (Python `_copy_current` write_acl check).
+        let authorized = next(empty_async_request(Self::modern_authorization_probe(&req))).await;
+        if !(200..300).contains(&authorized.status) {
+            return authorized;
+        }
+
         let container_path = format!("/{version}/{account}/{container}");
         let mut info = Self::modern_internal_request("HEAD", container_path, "", &req.headers);
         info.headers.set(OWNER_INFO_HEADER, "true");
@@ -1496,13 +1535,7 @@ impl VersionedWrites {
         }
         let hidden = configured.unwrap();
 
-        // The public object path has not reached the terminal controller yet.
-        // Authorize it before moving the unread client body into an internal
-        // reserved-name request.
-        let authorized = next(empty_async_request(Self::modern_authorization_probe(&req))).await;
-        if !(200..300).contains(&authorized.status) {
-            return authorized;
-        }
+        // Client PUT already passed the authorize-only probe above.
 
         // Fail before reading client data if the hidden container has gone
         // missing. This leaves the current/null version untouched.
@@ -2008,7 +2041,7 @@ impl VersionedWrites {
                     // public request; archive subrequest must not drop
                     // symlink=get or the archive user-symlink is followed).
                     let rest = query_without_param(&req.query_string, "version-id");
-                    let archive = Self::modern_internal_request(
+                    let archive = Self::modern_client_version_request(
                         &req.method,
                         archive_path,
                         &rest,
@@ -3752,6 +3785,138 @@ mod tests {
             "archive PUT must be pre-authed: {calls:?}"
         );
         assert_eq!(archive.2.get("X-Backend-Source"), Some("VW"));
+    }
+
+    #[tokio::test]
+    async fn test_unrelated_user_put_does_not_archive() {
+        // Official test_versioning_container_acl line 568: user3 has no
+        // source ACL. Hyper must 403 before copy-current; a pre-authed
+        // archive PUT would bump versions_container object_count 1 → 2.
+        type Call = (String, String, HeaderKeyDict);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.headers.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(403);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers.set(SYSMETA_VERSIONS_LOC, "versions");
+                    resp.headers.set(SYSMETA_VERSIONS_MODE, "stack");
+                    return resp;
+                }
+                if req.method == "GET" && req.path == "/v1/AUTH_test/c/obj" {
+                    let mut resp = Response::with_body(200, b"aaaaa".to_vec());
+                    resp.headers.set("X-Timestamp", "1751500000.00000");
+                    resp.headers.set("Content-Type", "text/plain");
+                    resp.headers.set("Content-Length", "5");
+                    return resp;
+                }
+                Response::new(201)
+            })
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("Content-Length", "32");
+        headers.set("X-Auth-Token", "user3");
+        let req = AsyncRequest {
+            method: "PUT".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: IncomingBody::from_bytes(b"some random user trying to write".to_vec(), 1024),
+        };
+        let vw = VersionedWrites::new();
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 403);
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, _, h)| m == "PUT" && h.contains_key(AUTHORIZE_ONLY_HEADER)),
+            "must probe client PUT: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "PUT" && p.starts_with("/v1/AUTH_test/versions/"))),
+            "403 PUT must not archive: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(m, p, _)| !(m == "GET" && p == "/v1/AUTH_test/c/obj")),
+            "403 PUT must not GET current: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_id_get_does_not_preauth_archive() {
+        // Official test_container_acls: container read ACL allows GET current
+        // but GET ?version-id= is against the reserved versions container and
+        // must keep the client token (no Authorize-Override).
+        type Call = (String, String, HeaderKeyDict);
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let next: StreamingAsyncNextFn = Arc::new(move |mut req: AsyncRequest| {
+            let calls = Arc::clone(&calls2);
+            Box::pin(async move {
+                let _ = req.body.materialize(u64::MAX).await.unwrap();
+                calls.lock().unwrap().push((
+                    req.method.clone(),
+                    req.path.clone(),
+                    req.headers.clone(),
+                ));
+                if req.headers.contains_key(AUTHORIZE_ONLY_HEADER) {
+                    return Response::new(204);
+                }
+                if req.method == "HEAD" && req.path == "/v1/AUTH_test/c" {
+                    let mut resp = Response::new(204);
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_ENABLED, "true");
+                    resp.headers
+                        .set(SYSMETA_OBJECT_VERSIONS_CONTAINER, "%00versions%00c");
+                    return resp;
+                }
+                if req
+                    .headers
+                    .get("X-Backend-Authorize-Override")
+                    .is_some_and(config_true_value)
+                {
+                    return Response::new(200);
+                }
+                Response::new(403)
+            })
+        });
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", "user3");
+        let req = AsyncRequest {
+            method: "GET".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: "version-id=1751500000.00000".to_string(),
+            headers,
+            body: IncomingBody::from_bytes(Vec::new(), 1024),
+        };
+        let vw = VersionedWrites::new().with_object_versioning(true);
+        let resp = vw.handle_streaming_request(req, next).await;
+        assert_eq!(resp.status, 403);
+        let calls = calls.lock().unwrap();
+        let archive = calls.iter().find(|(m, p, _)| {
+            m == "GET" && p.contains("versions") && !p.ends_with("/c/obj")
+        });
+        assert!(archive.is_some(), "must GET archive: {calls:?}");
+        assert_ne!(
+            archive.unwrap().2.get("X-Backend-Authorize-Override"),
+            Some("true"),
+            "version-id GET must not be pre-authed: {calls:?}"
+        );
     }
 
     fn intercept_legacy_backend(

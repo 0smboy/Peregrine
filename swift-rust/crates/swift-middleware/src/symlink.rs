@@ -1158,8 +1158,13 @@ fn build_traversal_req(
     new_req.method = cur.method.clone();
     new_req.path = wsgi_unquote(&quoted_path);
     new_req.query_string = String::new();
-    new_req.headers = cur.headers.clone();
+    // Python `make_subrequest(orig_req.environ, ...)`. Copying `cur.headers`
+    // leaks hop-1 `X-Backend-Authorize-Override` (reserved versions-symlink)
+    // onto hop-2 user symlink (official test_container_acls line 404).
+    new_req.headers = orig_req.headers.clone();
     new_req.headers.set("X-Backend-Source", "SYM");
+    new_req.headers.remove("X-Backend-Authorize-Override");
+    new_req.headers.remove("X-Backend-Allow-Reserved-Names");
     if resp
         .headers
         .get(ALLOW_RESERVED_NAMES)
@@ -2054,5 +2059,81 @@ mod tests {
         };
         assert_eq!(body, b"target body");
         assert_eq!(resp.headers.get("Content-Location"), Some("/v1/a/c/target"));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_user_symlink_follow_does_not_leak_override() {
+        // Official test_container_acls: GET current is hop 1 reserved
+        // versions-symlink (pre-auth) then hop 2 user symlink into another
+        // container. Python make_subrequest uses the client environ for hop 2.
+        // Copying cur.headers leaks X-Backend-Authorize-Override so user3
+        // reads the target (ResponseError not raised at line 404).
+        type Hop = (String, Option<String>);
+        let hops: std::sync::Arc<std::sync::Mutex<Vec<Hop>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hops2 = std::sync::Arc::clone(&hops);
+        let next: AsyncNextFn = std::sync::Arc::new(move |r: Request| {
+            let hops = std::sync::Arc::clone(&hops2);
+            Box::pin(async move {
+                hops.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((
+                        r.path.clone(),
+                        r.headers
+                            .get("X-Backend-Authorize-Override")
+                            .map(str::to_string),
+                    ));
+                if r.path == "/v1/AUTH_test/c/obj" {
+                    let mut link = Response::new(200);
+                    link.headers
+                        .set(TGT_OBJ_SYSMETA_SYMLINK_HDR, "%00versions%00c/archive");
+                    link.headers.set(ALLOW_RESERVED_NAMES, "true");
+                    link.headers.set(SYMLOOP_EXTEND, "true");
+                    return link;
+                }
+                if r.path.contains("versions") {
+                    let mut user = Response::new(200);
+                    user.headers
+                        .set(TGT_OBJ_SYSMETA_SYMLINK_HDR, "other/tgt");
+                    return user;
+                }
+                if r.path == "/v1/AUTH_test/other/tgt" {
+                    if r.headers
+                        .get("X-Backend-Authorize-Override")
+                        .is_some_and(config_true_value)
+                    {
+                        return Response::with_body(200, b"link".to_vec());
+                    }
+                    return Response::new(403);
+                }
+                Response::new(404)
+            })
+        });
+        let mw = Symlink::new(2);
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Auth-Token", "user3");
+        let req = Request {
+            method: "GET".to_string(),
+            path: "/v1/AUTH_test/c/obj".to_string(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        };
+        let resp = mw.handle_object_async(req, next).await;
+        assert_eq!(
+            resp.status, 403,
+            "user symlink hop must 403 without leaked override; hops={:?}",
+            hops.lock().unwrap_or_else(|p| p.into_inner())
+        );
+        let hops = hops.lock().unwrap_or_else(|p| p.into_inner());
+        let target = hops
+            .iter()
+            .find(|(p, _)| p == "/v1/AUTH_test/other/tgt")
+            .expect("must GET user-symlink target");
+        assert_ne!(
+            target.1.as_deref(),
+            Some("true"),
+            "hop 2 must not inherit Authorize-Override: {hops:?}"
+        );
     }
 }
