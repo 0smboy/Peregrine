@@ -9807,6 +9807,124 @@ mod pipeline_async_tests {
                 .is_empty(),
             "official testStructure path=/dir1/subdir2 empty"
         );
+        let mut stored: Vec<String> = files.iter().map(|s| (*s).to_string()).collect();
+        stored.sort();
+        for format_type in ["", "json", "xml"] {
+            let query = if format_type.is_empty() {
+                String::new()
+            } else {
+                format!("format={format_type}")
+            };
+            assert_eq!(
+                listing_plain_names(&svc, "/v1/AUTH_test/paths", &query).await,
+                stored,
+                "official TestContainerPaths.testContainerListing format={format_type:?}"
+            );
+        }
+        let json = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/paths",
+            "format=json",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(json.status, 200);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&json.body.collect_async().await.expect("paths json listing"))
+                .unwrap();
+        for row in &rows {
+            assert!(
+                row.get("last_modified").and_then(|v| v.as_str()).is_some(),
+                "official TestContainerPaths.testContainerListing last_modified {row}"
+            );
+            assert!(
+                row.get("bytes").and_then(|v| v.as_i64()).unwrap_or(-1) >= 0,
+                "official TestContainerPaths.testContainerListing bytes {row}"
+            );
+            if row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.ends_with('/'))
+            {
+                assert_eq!(
+                    row.get("content_type").and_then(|v| v.as_str()),
+                    Some("application/directory"),
+                    "official TestContainerPaths.testContainerListing directory {row}"
+                );
+            }
+        }
+        async fn traverse_from(svc: &ProxyAsyncService, path: &str) -> (Vec<String>, Vec<String>) {
+            let mut found_files = Vec::new();
+            let mut found_dirs = Vec::new();
+            async fn walk(
+                svc: &ProxyAsyncService,
+                path: &str,
+                depth: usize,
+                files: &mut Vec<String>,
+                dirs: &mut Vec<String>,
+            ) {
+                assert!(depth <= 10, "official testTraverseContainer too deep");
+                let q = if path.is_empty() {
+                    "path=".to_string()
+                } else {
+                    format!("path={}", path.replace(' ', "%20"))
+                };
+                for item in listing_plain_names(svc, "/v1/AUTH_test/paths", &q).await {
+                    assert!(
+                        item.starts_with(path),
+                        "official testTraverseContainer {item} vs path={path:?}"
+                    );
+                    if item.ends_with('/') {
+                        Box::pin(walk(svc, &item, depth + 1, files, dirs)).await;
+                        dirs.push(item);
+                    } else {
+                        files.push(item);
+                    }
+                }
+            }
+            walk(svc, path, 0, &mut found_files, &mut found_dirs).await;
+            (found_files, found_dirs)
+        }
+        let (found_files, found_dirs) = traverse_from(&svc, "").await;
+        for name in files {
+            if name.starts_with('/') {
+                assert!(
+                    !found_dirs.iter().any(|n| n == name) && !found_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path='' must omit {name}"
+                );
+            } else if name.ends_with('/') {
+                assert!(
+                    found_dirs.iter().any(|n| n == name),
+                    "official testTraverseContainer path='' missing dir {name}"
+                );
+            } else {
+                assert!(
+                    found_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path='' missing file {name}"
+                );
+            }
+        }
+        let (slash_files, slash_dirs) = traverse_from(&svc, "/").await;
+        for name in files {
+            if !name.starts_with('/') {
+                assert!(
+                    !slash_dirs.iter().any(|n| n == name) && !slash_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path=/ must omit {name}"
+                );
+            } else if name.ends_with('/') {
+                assert!(
+                    slash_dirs.iter().any(|n| n == name),
+                    "official testTraverseContainer path=/ missing dir {name}"
+                );
+            } else {
+                assert!(
+                    slash_files.iter().any(|n| n == name),
+                    "official testTraverseContainer path=/ missing file {name}"
+                );
+            }
+        }
         backend.abort();
     }
 
@@ -10414,6 +10532,94 @@ mod pipeline_async_tests {
             invalid.status
         );
         backend.abort();
+    }
+
+    /// Official TestAccountNoContainers.testInvalidUTF8Path and the
+    /// invalid half of TestContainer.testUtf8Container. IsolatedIdentity
+    /// `no_path_quote` puts raw / percent-decoded non-UTF-8 on the request
+    /// line; Hyper `request_line_precondition` is 412 before `AsyncRequest`
+    /// (a Rust `String` cannot hold those bytes).
+    #[tokio::test]
+    async fn invalid_utf8_path_is_412_on_hyper_wire() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || {
+            let config = swift_http::ServerConfig {
+                worker_threads: 1,
+                shutdown: Some(flag),
+                head_deadline_secs: 5,
+                client_timeout_secs: 5,
+                ..swift_http::ServerConfig::default()
+            };
+            let handler: swift_http::Handler = Arc::new(|_req| Response::new(200));
+            swift_http::serve_forever_with_config(listener, handler, config)
+        });
+        let wire = |request: &[u8]| -> Vec<u8> {
+            let mut last = None;
+            for _ in 0..50 {
+                match std::net::TcpStream::connect(addr) {
+                    Ok(mut client) => {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        client.write_all(request).unwrap();
+                        let _ = client.shutdown(std::net::Shutdown::Write);
+                        let mut response = Vec::new();
+                        client.read_to_end(&mut response).unwrap();
+                        return response;
+                    }
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            panic!("official testInvalidUTF8Path connect {last:?}");
+        };
+        let encoded = wire(
+            b"PUT /v1/AUTH_test/%FF HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let encoded_text = String::from_utf8_lossy(&encoded);
+        assert!(
+            encoded_text.contains("412"),
+            "official testInvalidUTF8Path percent-encoded on Hyper, got {encoded_text}"
+        );
+        assert!(
+            encoded_text.contains("Invalid UTF8 or contains NULL"),
+            "official testInvalidUTF8Path body {encoded_text}"
+        );
+        let mut raw = b"PUT /v1/AUTH_test/".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        raw.extend_from_slice(b" HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let raw_resp = wire(&raw);
+        let raw_text = String::from_utf8_lossy(&raw_resp);
+        assert!(
+            raw_text.contains("412"),
+            "official testUtf8Container invalid name on Hyper, got {raw_text}"
+        );
+        assert!(
+            raw_text.contains("Invalid UTF8 or contains NULL"),
+            "official testUtf8Container invalid body {raw_text}"
+        );
+        let listing = wire(b"GET /v1/AUTH_test/%FF HTTP/1.1\r\nConnection: close\r\n\r\n");
+        let listing_text = String::from_utf8_lossy(&listing);
+        assert!(
+            listing_text.contains("412"),
+            "official testUtf8Container invalid listing on Hyper, got {listing_text}"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        server
+            .join()
+            .unwrap()
+            .expect("official testInvalidUTF8Path Hyper serve");
     }
 
     /// Official TestContainer.testFileThenContainerDelete /
@@ -16410,12 +16616,17 @@ mod pipeline_async_tests {
                         }
                     }
                 }
+                let content_type = if name.ends_with('/') {
+                    "application/directory"
+                } else {
+                    "text/plain"
+                };
                 rows.push(serde_json::json!({
                     "name": name,
                     "bytes": 0,
                     "count": 0,
                     "hash": "x",
-                    "content_type": "text/plain",
+                    "content_type": content_type,
                     "last_modified": "2010-01-01T00:00:00.000000",
                 }));
                 continue;
@@ -16430,12 +16641,17 @@ mod pipeline_async_tests {
                     continue;
                 }
             }
+            let content_type = if name.ends_with('/') {
+                "application/directory"
+            } else {
+                "text/plain"
+            };
             rows.push(serde_json::json!({
                 "name": name,
                 "bytes": 0,
                 "count": 0,
                 "hash": "x",
-                "content_type": "text/plain",
+                "content_type": content_type,
                 "last_modified": "2010-01-01T00:00:00.000000",
             }));
         }
