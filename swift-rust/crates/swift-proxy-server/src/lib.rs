@@ -19531,6 +19531,18 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_put {
+                        let parent = logical
+                            .rsplit_once('/')
+                            .map(|(p, _)| p.to_string())
+                            .unwrap_or_default();
+                        let parent_exists = container_meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains_key(&parent);
+                        if !parent_exists {
+                            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            return;
+                        }
                         let mut stored = HeaderKeyDict::new();
                         stored.set(
                             "Content-Type",
