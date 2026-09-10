@@ -21204,7 +21204,7 @@ mod pipeline_async_tests {
                             .get(&logical)
                             .cloned()
                             .unwrap_or_else(|| b"x".to_vec());
-                        let extra = {
+                        let mut extra = {
                             let stored = object_meta
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -21213,6 +21213,50 @@ mod pipeline_async_tests {
                                 .unwrap_or_default();
                             leftover_object_header_pairs(&stored)
                         };
+                        // Official extra-file TestObject.test_copy_object COPY
+                        // Range: leftover object GET must 206 the slice.
+                        // Hyper already forwards client Range onto the source
+                        // GET; a leftover 200+full body is treated as
+                        // "backend ignored Range" and dest becomes `test`.
+                        if !is_head {
+                            if let Some(range_h) = leftover_header_value(&text, "Range") {
+                                if let Ok(parsed) = swift_http::Range::parse(&range_h) {
+                                    match parsed.ranges_for_length(Some(payload.len() as u64)) {
+                                        Some(ranges) if ranges.is_empty() => {
+                                            let cr = format!("bytes */{}", payload.len());
+                                            extra.push(("Accept-Ranges".into(), "bytes".into()));
+                                            extra.push(("Content-Range".into(), cr));
+                                            let refs = leftover_header_refs(&extra);
+                                            write_backend_http_status(&mut stream, 416, &refs, &[])
+                                                .await;
+                                            return;
+                                        }
+                                        Some(ranges) if ranges.len() == 1 => {
+                                            let (start, end) = ranges[0];
+                                            let slice =
+                                                payload[start as usize..end as usize].to_vec();
+                                            let cr = format!(
+                                                "bytes {start}-{}/{}",
+                                                end.saturating_sub(1),
+                                                payload.len()
+                                            );
+                                            extra.push(("Accept-Ranges".into(), "bytes".into()));
+                                            extra.push(("Content-Range".into(), cr));
+                                            let refs = leftover_header_refs(&extra);
+                                            write_backend_http_status(
+                                                &mut stream,
+                                                206,
+                                                &refs,
+                                                &slice,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                         let refs = leftover_header_refs(&extra);
                         let send = if is_head { &[][..] } else { payload.as_slice() };
                         write_backend_http_status(&mut stream, 200, &refs, send).await;
