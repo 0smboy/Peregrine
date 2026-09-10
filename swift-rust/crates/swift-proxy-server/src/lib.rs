@@ -9748,12 +9748,7 @@ mod pipeline_async_tests {
             names.sort();
             names.into_iter().map(str::to_string).collect()
         };
-        let qpath = |p: &str| {
-            format!(
-                "path={}",
-                p.replace('+', "%2B").replace(' ', "%20")
-            )
-        };
+        let qpath = |p: &str| format!("path={}", p.replace('+', "%2B").replace(' ', "%20"));
         assert_eq!(
             listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/")).await,
             expect(vec!["/dir1/", "/dir2/", "/file1", "/file A"]),
@@ -9814,7 +9809,7 @@ mod pipeline_async_tests {
             )
             .await,
             expect(vec!["dir1/subdir+with{whatever/file D"]),
-            "official testStructure path=dir1/subdir+with{whatever/"
+            "official testStructure path=dir1/subdir+with{{whatever/"
         );
         assert!(
             listing_plain_names(&svc, "/v1/AUTH_test/paths", &qpath("/dir1/subdir2"))
