@@ -13181,6 +13181,155 @@ mod pipeline_async_tests {
         backend.abort();
     }
 
+    /// Official TestAccount.test_account_acls User2 path. `test2:tester2`
+    /// is `.admin` of AUTH_test2, not AUTH_test — before grant GET is 403;
+    /// admin HEAD sees the ACL; RW can PUT+DELETE a container; RO cannot
+    /// PUT. Must hit `authorize_async` (no stub).
+    #[tokio::test]
+    async fn account_acl_v2_user2_container_crud_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        let owner_get = leftover_container_get(&svc, "/v1/AUTH_test", owner.as_str()).await;
+        assert!(
+            (200..300).contains(&owner_get.status),
+            "official test_account_acls owner GET empty ACL, got {}",
+            owner_get.status
+        );
+        assert!(
+            owner_get.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls empty ACL must not echo"
+        );
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test", other.as_str())
+                .await
+                .status,
+            403,
+            "official test_account_acls User2 GET before grant"
+        );
+
+        let admin = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: vec!["test2:tester2".into()],
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &admin).await;
+        let admin_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&admin_head.status),
+            "official test_account_acls User2 admin HEAD, got {}",
+            admin_head.status
+        );
+        assert_eq!(
+            admin_head.headers.get("X-Account-Access-Control"),
+            Some(admin.as_str()),
+            "official test_account_acls User2 admin sees ACL"
+        );
+
+        let rw = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: vec!["test2:tester2".into()],
+            read_only: Vec::new(),
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &rw).await;
+        let rw_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            rw_head.status, 204,
+            "official test_account_acls User2 RW HEAD, got {}",
+            rw_head.status
+        );
+        assert!(
+            rw_head.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls User2 RW must hide ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/mycontainer",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "official test_account_acls User2 RW PUT container"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "DELETE",
+                "/v1/AUTH_test/mycontainer",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_account_acls User2 RW DELETE container"
+        );
+
+        let ro = swift_middleware::format_acl_v2(&swift_middleware::AccountAcls {
+            admin: Vec::new(),
+            read_write: Vec::new(),
+            read_only: vec!["test2:tester2".into()],
+        });
+        leftover_grant_account_acl(&svc, owner.as_str(), &ro).await;
+        let ro_head = file_hyper_call(
+            &svc,
+            "HEAD",
+            "/v1/AUTH_test",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            ro_head.status, 204,
+            "official test_account_acls User2 RO HEAD, got {}",
+            ro_head.status
+        );
+        assert!(
+            ro_head.headers.get("X-Account-Access-Control").is_none(),
+            "official test_account_acls User2 RO must hide ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/mycontainer",
+                "",
+                &[("X-Auth-Token", other.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            403,
+            "official test_account_acls User2 RO cannot PUT container"
+        );
+        leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        backend.abort();
+    }
+
     /// Official TestContainer.test_read_only_acl_listings /
     /// test_read_only_acl_metadata / test_read_write_acl_listings /
     /// test_read_write_acl_metadata / test_admin_acl_listing /
