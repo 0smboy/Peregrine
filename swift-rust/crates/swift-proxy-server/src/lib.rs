@@ -9472,6 +9472,35 @@ mod pipeline_async_tests {
             .collect()
     }
 
+    fn leftover_apply_object_headers(stored: &mut HeaderKeyDict, text: &str) {
+        leftover_apply_user_meta("object", stored, text, true);
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk == "x-object-manifest" || lk == "content-type" {
+                if val.is_empty() {
+                    stored.remove(k.trim());
+                } else {
+                    stored.set(k.trim(), val);
+                }
+            }
+        }
+    }
+
+    fn leftover_object_header_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        let mut pairs = leftover_meta_pairs(stored, "object");
+        for (k, v) in stored.iter() {
+            let lk = k.to_ascii_lowercase();
+            if lk == "x-object-manifest" || lk == "content-type" {
+                pairs.push((k.to_string(), v.to_string()));
+            }
+        }
+        pairs
+    }
+
     fn leftover_meta_pairs(stored: &HeaderKeyDict, target: &str) -> Vec<(String, String)> {
         let prefix = format!("x-{target}-meta-");
         stored
@@ -11689,6 +11718,46 @@ mod pipeline_async_tests {
         (svc, backend)
     }
 
+    /// Official TestObject.test_manifest leftover path: TempAuth + DLO
+    /// on leftover (no intercepting stub). `test:tester3` has no `.admin`.
+    async fn dlo_func_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        ta.add_user("test", "tester3", "testing3", &[]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(ta),
+                Arc::new(swift_middleware::DynamicLargeObject::new()),
+            ],
+        };
+        (svc, backend)
+    }
+
     /// Official TestContainer.test_public_container /
     /// TestObject.test_public_object / TestContainer.test_cross_account_container.
     #[tokio::test]
@@ -13327,6 +13396,292 @@ mod pipeline_async_tests {
             "official test_account_acls User2 RO cannot PUT container"
         );
         leftover_grant_account_acl(&svc, owner.as_str(), "{}").await;
+        backend.abort();
+    }
+
+    /// Official TestObject.test_manifest. Leftover persists
+    /// `X-Object-Manifest` + `Content-Type` and listing `bytes` so Hyper
+    /// DLO can assemble `onetwothreefourfive`, honor ranges, remanifest,
+    /// and deny tester3 until both the manifest and segment containers
+    /// grant read. Must hit DLO `reassemble_async` (no stub).
+    #[tokio::test]
+    async fn extra_file_dlo_manifest_on_hyper() {
+        let (svc, backend) = dlo_func_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let reader = auth_token(&svc, "test:tester3", "testing3").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/dlo-c",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT dlo-c"
+        );
+        let segments1 = ["one", "two", "three", "four", "five"];
+        for (i, seg) in segments1.iter().enumerate() {
+            assert_eq!(
+                leftover_put_object(
+                    &svc,
+                    &format!("/v1/AUTH_test/dlo-c/segments1/{i}"),
+                    owner.as_str(),
+                    &[],
+                    seg.as_bytes(),
+                )
+                .await
+                .status,
+                201,
+                "official test_manifest PUT segments1/{i}"
+            );
+        }
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/dlo-c/manifest",
+                owner.as_str(),
+                &[
+                    ("X-Object-Manifest", "dlo-c/segments1/"),
+                    ("Content-Type", "text/jibberish"),
+                ],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_manifest PUT manifest"
+        );
+        let assembled =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            assembled.status, 200,
+            "official test_manifest GET assembled, got {}",
+            assembled.status
+        );
+        assert_eq!(
+            assembled.headers.get("Content-Type"),
+            Some("text/jibberish"),
+            "official test_manifest content-type"
+        );
+        assert_eq!(
+            leftover_body_text(assembled).await,
+            "onetwothreefourfive",
+            "official test_manifest assembled body"
+        );
+
+        let range_start = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/dlo-c/manifest",
+            "",
+            &[("X-Auth-Token", owner.as_str()), ("Range", "bytes=3-")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            range_start.status, 206,
+            "official test_manifest bytes=3-, got {}",
+            range_start.status
+        );
+        assert_eq!(leftover_body_text(range_start).await, "twothreefourfive");
+
+        let range_mid = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/dlo-c/manifest",
+            "",
+            &[("X-Auth-Token", owner.as_str()), ("Range", "bytes=5-")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            range_mid.status, 206,
+            "official test_manifest bytes=5-, got {}",
+            range_mid.status
+        );
+        assert_eq!(leftover_body_text(range_mid).await, "threefourfive");
+
+        let range_span = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/dlo-c/manifest",
+            "",
+            &[("X-Auth-Token", owner.as_str()), ("Range", "bytes=5-10")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            range_span.status, 206,
+            "official test_manifest bytes=5-10, got {}",
+            range_span.status
+        );
+        assert_eq!(leftover_body_text(range_span).await, "threef");
+
+        let segments2 = ["six", "seven", "eight"];
+        for (i, seg) in segments2.iter().enumerate() {
+            assert_eq!(
+                leftover_put_object(
+                    &svc,
+                    &format!("/v1/AUTH_test/dlo-c/segments2/{i}"),
+                    owner.as_str(),
+                    &[],
+                    seg.as_bytes(),
+                )
+                .await
+                .status,
+                201,
+                "official test_manifest PUT segments2/{i}"
+            );
+        }
+        let still_first =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            leftover_body_text(still_first).await,
+            "onetwothreefourfive",
+            "official test_manifest GET still first segments"
+        );
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/dlo-c/manifest",
+                owner.as_str(),
+                &[("X-Object-Manifest", "dlo-c/segments2/")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_manifest remanifest segments2"
+        );
+        let second =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            leftover_body_text(second).await,
+            "sixseveneight",
+            "official test_manifest GET second segments"
+        );
+
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str())
+                .await
+                .status,
+            403,
+            "official test_manifest tester3 before ACL"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/dlo-c",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_manifest grant tester3 read"
+        );
+        seed_auth_test_rw(&svc, "dlo-c", Some("test:tester3"), None);
+        let reader_second =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str()).await;
+        assert_eq!(
+            reader_second.status, 200,
+            "official test_manifest tester3 after ACL, got {}",
+            reader_second.status
+        );
+        assert_eq!(leftover_body_text(reader_second).await, "sixseveneight");
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/dlo-segs",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201,
+            "owner PUT dlo-segs"
+        );
+        let segments3 = ["nine", "ten", "eleven"];
+        for (i, seg) in segments3.iter().enumerate() {
+            assert_eq!(
+                leftover_put_object(
+                    &svc,
+                    &format!("/v1/AUTH_test/dlo-segs/segments3/{i}"),
+                    owner.as_str(),
+                    &[],
+                    seg.as_bytes(),
+                )
+                .await
+                .status,
+                201,
+                "official test_manifest PUT segments3/{i}"
+            );
+        }
+        assert_eq!(
+            leftover_put_object(
+                &svc,
+                "/v1/AUTH_test/dlo-c/manifest",
+                owner.as_str(),
+                &[("X-Object-Manifest", "dlo-segs/segments3/")],
+                b"",
+            )
+            .await
+            .status,
+            201,
+            "official test_manifest remanifest other container"
+        );
+        let third =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", owner.as_str()).await;
+        assert_eq!(
+            leftover_body_text(third).await,
+            "nineteneleven",
+            "official test_manifest GET third segments"
+        );
+        assert_eq!(
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str())
+                .await
+                .status,
+            403,
+            "official test_manifest tester3 denied foreign segments"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/dlo-segs",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test:tester3"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_manifest grant tester3 segment container"
+        );
+        seed_auth_test_rw(&svc, "dlo-segs", Some("test:tester3"), None);
+        let reader_third =
+            leftover_container_get(&svc, "/v1/AUTH_test/dlo-c/manifest", reader.as_str()).await;
+        assert_eq!(
+            reader_third.status, 200,
+            "official test_manifest tester3 after both ACLs, got {}",
+            reader_third.status
+        );
+        assert_eq!(leftover_body_text(reader_third).await, "nineteneleven");
         backend.abort();
     }
 
@@ -15184,6 +15539,20 @@ mod pipeline_async_tests {
 
     async fn leftover_container_get(svc: &ProxyAsyncService, path: &str, token: &str) -> Response {
         file_hyper_call(svc, "GET", path, "", &[("X-Auth-Token", token)], Vec::new()).await
+    }
+
+    async fn leftover_put_object(
+        svc: &ProxyAsyncService,
+        path: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
+        let cl = body.len().to_string();
+        let mut headers: Vec<(&str, &str)> =
+            vec![("X-Auth-Token", token), ("Content-Length", cl.as_str())];
+        headers.extend_from_slice(extra);
+        file_hyper_call(svc, "PUT", path, "", &headers, body.to_vec()).await
     }
 
     #[tokio::test]
@@ -20428,6 +20797,10 @@ mod pipeline_async_tests {
             String,
             Vec<u8>,
         >::new()));
+        let object_meta = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            HeaderKeyDict,
+        >::new()));
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -20439,6 +20812,7 @@ mod pipeline_async_tests {
                 let container_meta = Arc::clone(&container_meta);
                 let account_meta = Arc::clone(&account_meta);
                 let object_bodies = Arc::clone(&object_bodies);
+                let object_meta = Arc::clone(&object_meta);
                 tokio::spawn(async move {
                     let mut stream = stream;
                     let (text, body) = read_backend_http_request(&mut stream).await;
@@ -20554,21 +20928,32 @@ mod pipeline_async_tests {
                                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                                 return;
                             }
-                            objects
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .entry(container.to_string())
-                                .or_default()
-                                .push(object.to_string());
-                            object_bodies
+                            let prev = object_bodies
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .insert(logical.clone(), body.clone());
                             {
+                                let mut objs = objects.lock().unwrap_or_else(|p| p.into_inner());
+                                let list = objs.entry(container.to_string()).or_default();
+                                if !list.iter().any(|n| n == object) {
+                                    list.push(object.to_string());
+                                }
+                            }
+                            {
                                 let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
                                 let entry = st.entry(container.to_string()).or_insert((0, 0));
-                                entry.0 += 1;
+                                if let Some(old) = prev {
+                                    entry.1 = entry.1.saturating_sub(old.len() as u64);
+                                } else {
+                                    entry.0 += 1;
+                                }
                                 entry.1 += body.len() as u64;
+                            }
+                            {
+                                let mut meta =
+                                    object_meta.lock().unwrap_or_else(|p| p.into_inner());
+                                let stored = meta.entry(logical.clone()).or_default();
+                                leftover_apply_object_headers(stored, &text);
                             }
                             write_backend_http_status(&mut stream, 201, &[], &[]).await;
                             return;
@@ -20604,6 +20989,10 @@ mod pipeline_async_tests {
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
                                     .remove(&logical);
+                                object_meta
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(&logical);
                                 write_backend_http_status(&mut stream, 204, &[], &[]).await;
                             } else {
                                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
@@ -20623,8 +21012,18 @@ mod pipeline_async_tests {
                             .get(&logical)
                             .cloned()
                             .unwrap_or_else(|| b"x".to_vec());
+                        let extra = {
+                            let stored = object_meta
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&logical)
+                                .cloned()
+                                .unwrap_or_default();
+                            leftover_object_header_pairs(&stored)
+                        };
+                        let refs = leftover_header_refs(&extra);
                         let send = if is_head { &[][..] } else { payload.as_slice() };
-                        write_backend_http_status(&mut stream, 200, &[], send).await;
+                        write_backend_http_status(&mut stream, 200, &refs, send).await;
                         return;
                     }
                     let container = rest.to_string();
@@ -20771,7 +21170,7 @@ mod pipeline_async_tests {
                             .iter()
                             .find(|(k, _)| k == "path")
                             .map(|(_, v)| v.clone());
-                        let rows = listing_with_delimiter(
+                        let mut rows = listing_with_delimiter(
                             &names,
                             &qparam("prefix"),
                             &qparam("delimiter"),
@@ -20781,6 +21180,20 @@ mod pipeline_async_tests {
                             qparam("limit").parse().ok(),
                             path.as_deref(),
                         );
+                        {
+                            let bodies = object_bodies.lock().unwrap_or_else(|p| p.into_inner());
+                            for row in rows.iter_mut() {
+                                let Some(name) =
+                                    row.get("name").and_then(|v| v.as_str()).map(str::to_string)
+                                else {
+                                    continue;
+                                };
+                                let logical = format!("/AUTH_test/{container}/{name}");
+                                if let Some(body) = bodies.get(&logical) {
+                                    row["bytes"] = serde_json::json!(body.len());
+                                }
+                            }
+                        }
                         let payload = serde_json::to_vec(&rows).unwrap();
                         let stored = container_meta
                             .lock()
