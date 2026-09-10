@@ -9342,6 +9342,38 @@ mod pipeline_async_tests {
         }
     }
 
+    fn leftover_apply_container_acl(stored: &mut HeaderKeyDict, text: &str) {
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let lk = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if lk == "x-remove-container-read" {
+                stored.remove("X-Container-Read");
+            } else if lk == "x-remove-container-write" {
+                stored.remove("X-Container-Write");
+            } else if lk == "x-container-read" || lk == "x-container-write" {
+                if val.is_empty() {
+                    stored.remove(k.trim());
+                } else {
+                    stored.set(k.trim(), val);
+                }
+            }
+        }
+    }
+
+    fn leftover_acl_pairs(stored: &HeaderKeyDict) -> Vec<(String, String)> {
+        stored
+            .iter()
+            .filter(|(k, _)| {
+                let lk = k.to_ascii_lowercase();
+                lk == "x-container-read" || lk == "x-container-write"
+            })
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     fn leftover_meta_pairs(stored: &HeaderKeyDict, target: &str) -> Vec<(String, String)> {
         let prefix = format!("x-{target}-meta-");
         stored
@@ -11174,6 +11206,245 @@ mod pipeline_async_tests {
             denied.status, 401,
             "official test_cors secret origin OPTIONS, got {}",
             denied.status
+        );
+        backend.abort();
+    }
+
+    async fn public_acl_hyper_svc() -> (ProxyAsyncService, tokio::task::JoinHandle<()>) {
+        let (port, backend) = spawn_container_func_backend().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let ring = ring_on_127(port);
+        let app = Arc::new(ProxyApp::with_object_ring(
+            ring.clone(),
+            ring.clone(),
+            ring,
+            ProxyConfig {
+                auth_enabled: true,
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                request_node_count_factor: 1,
+                ..Default::default()
+            },
+        ));
+        app.info_cache.set_account(
+            "AUTH_test".to_string(),
+            AccountInfo {
+                status: 204,
+                ..Default::default()
+            },
+            60.0,
+        );
+        let mut ta = swift_middleware::TempAuth::new("http://127.0.0.1:8080");
+        ta.add_user("test", "tester", "testing", &[".admin"]);
+        ta.add_user("test2", "tester2", "testing2", &[".admin"]);
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(ta)],
+        };
+        (svc, backend)
+    }
+
+    /// Official TestContainer.test_public_container /
+    /// TestObject.test_public_object / TestContainer.test_cross_account_container.
+    #[tokio::test]
+    async fn public_and_cross_account_container_acl_on_hyper() {
+        let (svc, backend) = public_acl_hyper_svc().await;
+        let owner = auth_token(&svc, "test:tester", "testing").await;
+        let other = auth_token(&svc, "test2:tester2", "testing2").await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[("X-Auth-Token", owner.as_str())],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let anon_list =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc", "", &[], Vec::new()).await;
+        assert_eq!(
+            anon_list.status, 401,
+            "official test_public_container before ACL, got {}",
+            anon_list.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ".r:*,.rlistings"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204,
+            "official test_public_container POST .r:*"
+        );
+        let public_list =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc", "", &[], Vec::new()).await;
+        assert!(
+            (200..300).contains(&public_list.status),
+            "official test_public_container after ACL, got {}",
+            public_list.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[("X-Auth-Token", owner.as_str()), ("X-Container-Read", ""),],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let private_again =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc", "", &[], Vec::new()).await;
+        assert_eq!(
+            private_again.status, 401,
+            "official test_public_container after revoke, got {}",
+            private_again.status
+        );
+
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/pubc/obj",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("Content-Length", "4"),
+                    ("Content-Type", "text/plain"),
+                ],
+                b"test".to_vec(),
+            )
+            .await
+            .status,
+            201
+        );
+        let anon_obj =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc/obj", "", &[], Vec::new()).await;
+        assert_eq!(
+            anon_obj.status, 401,
+            "official test_public_object before ACL, got {}",
+            anon_obj.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ".r:*"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let public_obj =
+            file_hyper_call(&svc, "GET", "/v1/AUTH_test/pubc/obj", "", &[], Vec::new()).await;
+        assert_eq!(
+            public_obj.status, 200,
+            "official test_public_object after ACL, got {}",
+            public_obj.status
+        );
+        assert_eq!(
+            leftover_body_text(public_obj).await,
+            "x",
+            "official test_public_object leftover GET body"
+        );
+
+        let foreign_denied = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/pubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        // `.r:*` without `.rlistings` still denies a foreign listing.
+        assert_eq!(
+            foreign_denied.status, 403,
+            "official test_cross_account_container listing without write/read user ACL, got {}",
+            foreign_denied.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", "test2:tester2"),
+                    ("X-Container-Write", "test2:tester2"),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let foreign_ok = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/pubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&foreign_ok.status),
+            "official test_cross_account_container after user ACL, got {}",
+            foreign_ok.status
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "POST",
+                "/v1/AUTH_test/pubc",
+                "",
+                &[
+                    ("X-Auth-Token", owner.as_str()),
+                    ("X-Container-Read", ""),
+                    ("X-Container-Write", ""),
+                ],
+                Vec::new(),
+            )
+            .await
+            .status,
+            204
+        );
+        let foreign_again = file_hyper_call(
+            &svc,
+            "GET",
+            "/v1/AUTH_test/pubc",
+            "",
+            &[("X-Auth-Token", other.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            foreign_again.status, 403,
+            "official test_cross_account_container after revoke, got {}",
+            foreign_again.status
         );
         backend.abort();
     }
@@ -17576,16 +17847,13 @@ mod pipeline_async_tests {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .insert(container.clone());
-                        leftover_apply_user_meta(
-                            "container",
-                            container_meta
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .entry(container.clone())
-                                .or_default(),
-                            &text,
-                            true,
-                        );
+                        {
+                            let mut guard =
+                                container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let stored = guard.entry(container.clone()).or_default();
+                            leftover_apply_user_meta("container", stored, &text, true);
+                            leftover_apply_container_acl(stored, &text);
+                        }
                         write_backend_http_status(
                             &mut stream,
                             if inserted { 201 } else { 202 },
@@ -17625,16 +17893,13 @@ mod pipeline_async_tests {
                         return;
                     }
                     if is_post {
-                        leftover_apply_user_meta(
-                            "container",
-                            container_meta
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .entry(container.clone())
-                                .or_default(),
-                            &text,
-                            false,
-                        );
+                        {
+                            let mut guard =
+                                container_meta.lock().unwrap_or_else(|p| p.into_inner());
+                            let stored = guard.entry(container.clone()).or_default();
+                            leftover_apply_user_meta("container", stored, &text, false);
+                            leftover_apply_container_acl(stored, &text);
+                        }
                         write_backend_http_status(&mut stream, 204, &[], &[]).await;
                         return;
                     }
@@ -17666,6 +17931,7 @@ mod pipeline_async_tests {
                             ("X-Container-Bytes-Used".to_string(), bytes_s),
                         ];
                         extra.extend(meta_pairs);
+                        extra.extend(leftover_acl_pairs(&stored));
                         let refs = leftover_header_refs(&extra);
                         write_backend_http_status(&mut stream, 204, &refs, &[]).await;
                         return;
@@ -17703,6 +17969,7 @@ mod pipeline_async_tests {
                         let mut extra =
                             vec![("Content-Type".to_string(), "application/json".to_string())];
                         extra.extend(meta_pairs);
+                        extra.extend(leftover_acl_pairs(&stored));
                         let refs = leftover_header_refs(&extra);
                         write_backend_http(&mut stream, &refs, &payload).await;
                         return;
