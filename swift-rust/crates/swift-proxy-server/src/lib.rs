@@ -9237,11 +9237,14 @@ mod pipeline_async_tests {
         let mut index_names = std::collections::HashMap::new();
         index_names.insert(0i64, "gold".to_string());
         index_names.insert(1i64, "silver".to_string());
+        let mut object_rings = std::collections::HashMap::new();
+        object_rings.insert(1i64, ring.clone());
         let app = Arc::new(
-            ProxyApp::with_object_ring(
+            ProxyApp::with_policy_object_rings(
                 ring.clone(),
                 ring.clone(),
                 ring,
+                object_rings,
                 ProxyConfig {
                     auth_enabled: false,
                     conn_timeout: Duration::from_millis(200),
@@ -9763,6 +9766,111 @@ mod pipeline_async_tests {
             "official deleted container HEAD has no X-Storage-Policy {:?}",
             gone.headers
         );
+        backend.abort();
+    }
+
+    /// Official TestObject.test_cross_policy_copy. IsolatedIdentity Hyper
+    /// `object_copy_async` (not `Copy::handle`). Dest PUT uses the dest
+    /// container policy ring; leftover object GET returns stored source
+    /// bytes. Policy 1 must have an object ring (no silent fallback to 0).
+    #[tokio::test]
+    async fn cross_policy_copy_on_hyper() {
+        let (svc, backend) = storage_policy_hyper_svc().await;
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/goldc",
+                "",
+                &[("X-Storage-Policy", "gold")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/silverc",
+                "",
+                &[("X-Storage-Policy", "silver")],
+                Vec::new(),
+            )
+            .await
+            .status,
+            201
+        );
+        let gold_body = "goldc/gobj";
+        let silver_body = "silverc/sobj";
+        let gold_cl = gold_body.len().to_string();
+        let silver_cl = silver_body.len().to_string();
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/goldc/gobj",
+                "",
+                &[
+                    ("Content-Length", gold_cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
+                gold_body.as_bytes().to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_cross_policy_copy gold object PUT"
+        );
+        assert_eq!(
+            file_hyper_call(
+                &svc,
+                "PUT",
+                "/v1/AUTH_test/silverc/sobj",
+                "",
+                &[
+                    ("Content-Length", silver_cl.as_str()),
+                    ("Content-Type", "text/plain"),
+                ],
+                silver_body.as_bytes().to_vec(),
+            )
+            .await
+            .status,
+            201,
+            "official test_cross_policy_copy silver object PUT"
+        );
+        let copies = [
+            ("/v1/AUTH_test/goldc/sobj", "silverc/sobj", silver_body),
+            ("/v1/AUTH_test/silverc/gobj", "goldc/gobj", gold_body),
+        ];
+        for (dest, source, expect) in copies {
+            let copied = file_hyper_call(
+                &svc,
+                "PUT",
+                dest,
+                "",
+                &[("Content-Length", "0"), ("X-Copy-From", source)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                copied.status, 201,
+                "official test_cross_policy_copy X-Copy-From {source} -> {dest}, got {}",
+                copied.status
+            );
+            let got = file_hyper_call(&svc, "GET", dest, "", &[], Vec::new()).await;
+            assert_eq!(
+                got.status, 200,
+                "official test_cross_policy_copy GET {dest}, got {}",
+                got.status
+            );
+            assert_eq!(
+                leftover_body_text(got).await,
+                expect,
+                "official test_cross_policy_copy body {dest} from {source}"
+            );
+        }
         backend.abort();
     }
 
