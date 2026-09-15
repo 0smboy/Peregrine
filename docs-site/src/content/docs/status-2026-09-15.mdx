@@ -1,0 +1,50 @@
+---
+title: Status 2026-09-15
+description: Lab tip 9531eb62 G5-B census snapshot — NOT GREEN; prod untouched.
+sidebar:
+  order: 24
+---
+
+<Aside type="danger" title="Not acceptance">
+G5-B is **not green**. This page is a lab tip snapshot, not C_FINAL and not a
+fleet rollout authorization. Production `:8080` remains on `ab5cb95c…`.
+</Aside>
+
+## Live tip
+
+| Field | Value |
+|---|---|
+| Tip SHA-256 | `9531eb621ee86c15dac050d883b68f097f775c67198947506ffc7dab806794e8` |
+| Lab listeners | `:18080` / `:18082` (`g6-rust-bin`) |
+| Prod `:8080` | **UNTOUCHED** (`ab5cb95c…`) |
+| Engine release | [lab-tip-9531eb62-20260915](https://github.com/0smboy/swift-rust/releases/tag/lab-tip-9531eb62-20260915) |
+| Drive packet | [Peregrine-G5B-20260915-9531eb62](https://drive.google.com/drive/folders/1MfW5eiLRwqYsflVIGZIok4hmhAU6fjJZ) |
+
+## G5-B census (Ceph s3compat ~725)
+
+**PASS=484 · FAIL=47 · ERROR=112 · SKIP=83 · F+E=159 · conn=0**
+
+Evidence: `swift2:/root/work/peregrine-g0g7-logs/G5B-live-9531eb62/`.
+
+Owner override still requires a full green ~725 before accepting G0–G6.
+
+## Product tips closed on this tip line (field-proven)
+
+| Tip | Prefix | Change |
+|---|---|---|
+| H71–H73 | `9f3120fd` | anon ListBuckets; CompleteMPU VersionId; MPU Initiator/Owner |
+| H74 | `f77ecf1a` | anon PutObject via AllUsers WRITE |
+| H75 | `c6e650da` | versioned archive GetObjectAcl ACL stamp |
+| H77 | `346256cc` | SigV4 Trimall whitespace-only |
+| H79 | `5fd37900` | anon Put CORS restore |
+| H82 | `dd218530` | Expect:100-continue ACL-before-100 |
+| H89 | `9531eb62` | DeferredTaggingSysmeta (`.meta` re-stamp) |
+
+## Still tip-ask NO / walls
+
+sts / select / encrypt / WORM Bypass / lifecycle timing / header harness /
+Condition STOPPED / AQPE status mismatch / ctime harness / concurrent flake.
+
+## Related historical snapshot
+
+Earlier dated page: [Status 2026-08-31](/status-2026-08-31).
