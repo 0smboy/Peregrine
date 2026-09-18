@@ -89,7 +89,7 @@ lab's container replication was degraded during the census.
 
 | Gate | State | Basis |
 |---|---|---|
-| G0 | GREEN for the G6 claim on `17adf0b` only; lab tip `9531eb62` is not scored against the G0 manifest (lab tree has no `.git`; source published as a tarball release and PR branch `lab/tip-9531eb62-h89`) | [Status 2026-08-31](/status-2026-08-31), Drive `G5B-HANDOFF-9531eb62-20260915.md` §2.1, §4.2 |
+| G0 | GREEN for the G6 claim on `17adf0b` only. The `9531eb62` tip line is **permanently G0-incapable**: its lab source tree is gone (the path named in the handoff no longer exists, and the surviving tree matches only 76 of 270 files against the published commit), so the identity chain can only be re-closed by a bit-reproducible rebuild. Build the next candidate from a real commit before scoring. | [Status 2026-08-31](/status-2026-08-31), `tools/test-results/g5b-oracle-diff-20260918/SWIFT-RUST-PR1-REVIEW.md` |
 | G1 | GREEN for the isolated G6 run | [Status 2026-08-31](/status-2026-08-31) |
 | G2 | GREEN for the G6 artifact | [Status 2026-08-31](/status-2026-08-31) |
 | G3 | Open, but now has first per-route evidence: 12 route groups (S3 PUT/GET/HEAD/Range/COPY/MPU, Swift PUT/GET/HEAD/Range/COPY/SLO, EC PUT+GET) show `native_async > 0` with `legacy_sync`, `block_in_place`, and `blocking_network_wait` all 0. `ssync` remains uncovered and the tip has no G0 identity, so this is evidence, not acceptance. | `tools/test-results/g3-routes-20260918/` (2026-09-18) |
