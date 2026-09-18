@@ -30,6 +30,44 @@ is BLOCKED, and production readiness is NO-GO.
 | G7 | concurrency and fault behavior | idle/slow-client, backpressure, fairness, cancellation, reload, shutdown, durability, failure injection, bounded memory | every scenario meets explicit thresholds |
 | G8 | fair performance and long soak | clean route-labelled A/B, repeated statistics, 24-hour soak, integrity and resource trend | preset thresholds pass with no hidden exclusions |
 
+## G5 known-failure policy (owner decision 2026-09-18)
+
+The G5 row above has always said "capability/known-failure policy, exact-name
+diff, unexpected test names = 0". A separate owner override in force from
+2026-09-15 additionally demanded that the **whole** Ceph s3compat set of ~725
+pass. That override is **withdrawn**: the frozen policy is the bar.
+
+The override was withdrawn because it measured the wrong thing. The Ceph suite
+asserts RGW behavior, and the paired run on 2026-09-18 showed that of 159
+FAIL+ERROR records at lab tip `9531eb62`, **156 also fail on Python Swift**,
+which itself fails 388 of the same 725. Satisfying "all 725 pass" would have
+required the Rust engine to deliberately diverge from Python Swift.
+
+The policy lives in `tools/g5-known-failures/` and is generated, never
+hand-edited. One rule keeps it honest:
+
+> an identity may be frozen expected-fail **only if** the Python Swift oracle
+> fails it too in the paired baseline run, or the harness cannot execute it.
+
+So a failure that is Rust's alone is withheld from the list on purpose and
+scores as unexpected; a frozen entry that starts passing is reported as a stale
+entry and **fails** the gate until re-frozen. The list is not a blanket excuse,
+and that is checked rather than asserted: scoring the Python baseline itself
+against the policy yields 231 unexpected failures.
+
+Score a run with `tools/g5-score.py RUN.xml --policy <policy.tsv>`. For tip
+`9531eb62` the verdict is **FAIL with 3 unexpected**, 0 unexpected skips, 0
+stale entries — one lab configuration mismatch, one transient traced to
+degraded lab replication, and one genuine engine gap behind an owner wall.
+Evidence: `tools/test-results/g5-score-20260918/` and
+`tools/test-results/g5b-oracle-diff-20260918/` (2026-09-18).
+
+Withdrawing the override does not move G5 toward green on its own, and G5 is
+still not green. The policy must be re-frozen against the G0-pinned Python
+oracle commit `541a598…` rather than the swift2 deployment, configuration
+parity (G2) must be established, the degraded lab replication must be fixed,
+and G5-A has never been run on this tip.
+
 ## Evidence rules
 
 - compare test names/identities, not aggregate counts;

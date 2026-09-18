@@ -118,8 +118,10 @@ It does **not** make G5 green:
   which is a G1 problem the directive says to fix before scoring.
 - G5-A (`test/s3api`) was not run on this tip at all.
 
-It does establish that the owner override in force since 2026-09-15 — "full
-~725 all green before G0–G6 is accepted" — cannot be satisfied by engine work:
+It did establish that the owner override that ran from 2026-09-15 — "full
+~725 all green before G0–G6 is accepted", **withdrawn 2026-09-18 in favour of
+the frozen policy in `../../g5-known-failures/`** — could not be satisfied by
+engine work:
 **156 of the 159 failures are shared with the reference implementation**, and
 the reference itself fails 388 of the same 725. Meeting the bar literally would
 require the Rust engine to diverge from Python Swift on 156 identities.

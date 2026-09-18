@@ -28,7 +28,14 @@ Evidence: `swift2:/root/work/peregrine-g0g7-logs/G5B-live-9531eb62/` and
 `g6-g5b-live-9531eb62-RESULT.txt` in the Drive packet (harvest ended
 2026-09-15T00:58:55Z, wall ~42 min, nosetests `EXIT=1`).
 
-Owner override still requires a full green ~725 before accepting G0–G6.
+**Owner override withdrawn 2026-09-18.** It required a full green ~725 before
+accepting G0–G6; G5 is now scored against the frozen known-failure policy that
+the [gate contract](/validation-gates#g5-known-failure-policy-owner-decision-2026-09-18)
+always specified. Under that policy this same census scores **484 passed, 156
+expected failures, 3 unexpected, 0 unexpected skips, 0 stale entries → FAIL**.
+G5-B is still not green; the difference is that the gap is three named
+identities instead of an opaque 159. Evidence:
+`tools/test-results/g5-score-20260918/`.
 
 ### F+E theme bins (159, `conn_closed=0`)
 
@@ -87,7 +94,7 @@ lab's container replication was degraded during the census.
 | G2 | GREEN for the G6 artifact | [Status 2026-08-31](/status-2026-08-31) |
 | G3 | Open, but now has first per-route evidence: 12 route groups (S3 PUT/GET/HEAD/Range/COPY/MPU, Swift PUT/GET/HEAD/Range/COPY/SLO, EC PUT+GET) show `native_async > 0` with `legacy_sync`, `block_in_place`, and `blocking_network_wait` all 0. `ssync` remains uncovered and the tip has no G0 identity, so this is evidence, not acceptance. | `tools/test-results/g3-routes-20260918/` (2026-09-18) |
 | G4 | Historical evidence only; no current-candidate acceptance | [Status 2026-08-31](/status-2026-08-31) |
-| G5 | **NOT GREEN** — G5-B census above; after the 2026-09-18 oracle diff the Rust-attributable gap is 3 identities, but the oracle is not the G0-pinned Python commit and no G5-A (`test/s3api`) record exists for this tip | this page, `tools/test-results/g5b-oracle-diff-20260918/`, Drive packet `KEY_RESULT_INDEX.txt` |
+| G5 | **NOT GREEN** — scored against the frozen policy: 3 unexpected (one lab config mismatch, one transient from degraded replication, one engine gap behind an owner wall). The policy must still be re-frozen against the G0-pinned Python oracle, G2 parity is unproven, and no G5-A (`test/s3api`) record exists for this tip | `tools/test-results/g5-score-20260918/`, `tools/g5-known-failures/`, `tools/test-results/g5b-oracle-diff-20260918/` |
 | G6 | GREEN on `17adf0b` (W068 + W069 + W070, 179/179) | [Status 2026-08-31](/status-2026-08-31) |
 | G7 | NOT ACCEPTED | [Status 2026-08-31](/status-2026-08-31) |
 

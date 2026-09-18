@@ -101,11 +101,24 @@ which is satisfiable; "raw PASS on all ~725" is not, because the walls include
 whole unimplemented capabilities (STS AssumeRole, S3 Select SQL engine,
 SSE-C/KMS).
 
-## 4. Decision required from the owner (pick one, in writing)
+## 4. Owner decision: **C, taken 2026-09-18**
 
-> Updated 2026-09-18 after the oracle diff: option C is the evidence-backed
-> choice, and option B would mean deliberately diverging from Python Swift on
-> identities the reference implementation also fails.
+> **Decided.** The owner chose **option C**: the raw-725 override is withdrawn
+> and G5 is scored against a frozen known-failure policy.
+> Implemented in `tools/g5-known-failures/` (policy + README),
+> `tools/g5-freeze-known-failures.py` (generator), `tools/g5-score.py` (scorer),
+> with the verdict recorded in `tools/test-results/g5-score-20260918/` and the
+> contract change published in
+> `docs-site/src/content/docs/validation-gates.mdx`.
+>
+> Verdict for tip `9531eb62` under the policy: 484 passed, 156 expected
+> failures, **3 unexpected**, 0 unexpected skips, 0 stale entries → **FAIL**.
+> Closing those three needs one lab config alignment
+> (`client_timeout` 600 → 60, still awaiting owner sign-off), one environment
+> fix (the degraded replication in §2 of `LAB-FINDINGS.md`), and one wall lift
+> (`BypassGovernanceRetention`).
+>
+> The options table below is kept as the record of what was decided against.
 
 | # | Decision | Effect on G5-B |
 |---|---|---|

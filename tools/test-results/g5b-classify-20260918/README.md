@@ -86,11 +86,15 @@ name instead of by signature reasoning.
 
 ## Consequence for the acceptance bar
 
-The owner override in force since 2026-09-15 is "full ~725 all green before
-G0–G6 is accepted". 41 of the 159 cannot go green without editing the frozen
-harness, and 38 cannot go green unless the Rust engine deliberately diverges
-from Python Swift. So that bar cannot be met by engine work, and meeting part
-of it would damage parity.
+The owner override that ran from 2026-09-15 was "full ~725 all green before
+G0–G6 is accepted". 41 of the 159 could not go green without editing the frozen
+harness, and 38 could not go green unless the Rust engine deliberately diverged
+from Python Swift. That bar could not be met by engine work, and meeting part of
+it would have damaged parity.
+
+**Withdrawn 2026-09-18 (option C).** G5 is now scored against the frozen policy
+in `tools/g5-known-failures/`; see that README and
+`docs-site/src/content/docs/validation-gates.mdx`.
 
 The canonical G5 contract in `docs-site/src/content/docs/validation-gates.mdx`
 ("capability/known-failure policy, exact-name diff, unexpected test names = 0")
