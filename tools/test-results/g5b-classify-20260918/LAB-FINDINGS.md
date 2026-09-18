@@ -99,6 +99,38 @@ tolerance let the census run without ever setting a region, while Python Swift
 rejects it. Rust being *more* permissive than both Python Swift and AWS here is
 a compatibility gap in the opposite direction from the census failures.
 
+## 6. A small direct reproduction of §2, plus this session's residue
+
+Cleaning up the G3 probe left two EC containers that will not delete:
+
+```
+DELETE /v1/AUTH_test/g3probe-ec-0b5c3a95/o  -> 404   (object is gone)
+HEAD   /v1/AUTH_test/g3probe-ec-0b5c3a95    -> X-Container-Object-Count: 1
+DELETE /v1/AUTH_test/g3probe-ec-0b5c3a95    -> 409   (not empty)
+```
+
+The container DB still carries a row for an object that no longer exists, so
+the container is undeletable — the container layer and the object layer
+disagree. A healthy cluster reconciles this through the container updater; with
+~15 900 `async_pending` entries it is not reconciling. The second container
+(`g3probe-ec-f3838ac4`) was in fact deleted but still appeared in the account
+listing, which is the same lag from the account side.
+
+Both are a few hundred bytes and were left in place: forcing container DBs back
+into agreement is not something to do unilaterally on the cluster whose
+replication semantics G6 scored.
+
+Residue from this session, deliberately left:
+
+| Where | What | Note |
+|---|---|---|
+| swift1 lab tip | 2 × `g3probe-ec-*` containers | undeletable per above; ≈526 B |
+| swift1 | `/root/work/peregrine-probe-20260918/` | probe scripts and results |
+| swift2 Python oracle | `pybase20260918-*` buckets from the baseline run | `/srv/node/d1` is at 10 % used with 46 GiB free, so no pressure; the suite's own teardown could not remove them because Python Swift rejects the empty `version-id-marker` the harness sends |
+| swift1 | `/var/log/messages.1.gz` (32.6 MB) | the compressed replication-error log, kept as evidence |
+
+19 other probe buckets were created and removed during the session.
+
 ## Evidence
 
 - `PREFLIGHT-9531eb62.txt`, `SUMMARY-9531eb62.json`, `fail_error_names-9531eb62.txt`
