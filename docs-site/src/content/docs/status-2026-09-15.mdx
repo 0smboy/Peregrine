@@ -46,11 +46,28 @@ Owner override still requires a full green ~725 before accepting G0–G6.
 | logging / usage | 2 / 2 | — |
 | acl / multipart / tag | 1 / 1 / 1 | — |
 
-Source: theme-bins line of the same RESULT file. The three largest bins
-(sts, select, encrypt = 86 of 159) plus header, lifecycle, and policy walls
-cover roughly 117 of the 159. Under the current tip-ask NO walls the residual
-cannot reach zero; the lab agent parked the tip line as `tipable-exhausted`
-on 2026-09-15 pending an owner decision.
+Source: theme-bins line of the same RESULT file. The lab agent parked the tip
+line as `tipable-exhausted` on 2026-09-15 pending an owner decision, on the
+reading that the walls made the residual unreachable.
+
+<Aside type="note" title="Re-attributed on 2026-09-18 — the theme bins are misleading">
+A dual-oracle re-measurement changed what these 159 mean. The Ceph suite
+asserts RGW behavior, so a raw Rust failure count cannot say whether a failure
+is a Rust regression. Scoring the same 725 identities against Python Swift and
+diffing by exact name gives **156 both-fail, 3 rust-only, 231 python-only**:
+the Rust-attributable G5-B gap is **3 identities**, and Python Swift itself
+fails 388 of the same 725. The `sts` bin (34, the largest) contains no engine
+evidence at all — the suite config has no `[iam]`/`[webidentity]` section, so
+those abort before a request is signed. The `select` bin (29) never reaches
+S3 Select either: every test hardcodes `bucket_name = "test"` and aborts in
+setup because same-owner re-create answers 409 on both Swift implementations.
+
+Evidence: `tools/test-results/g5b-oracle-diff-20260918/` and
+`tools/test-results/g5b-classify-20260918/` (2026-09-18).
+This re-attribution does **not** make G5 green — see the caveats in that
+README, including that the oracle is not the G0-pinned Python commit and that
+the lab's container replication was degraded during the census.
+</Aside>
 
 ## Board for the G0–G7 target (as of this snapshot)
 
@@ -59,13 +76,36 @@ on 2026-09-15 pending an owner decision.
 | G0 | GREEN for the G6 claim on `17adf0b` only; lab tip `9531eb62` is not scored against the G0 manifest (lab tree has no `.git`; source published as a tarball release and PR branch `lab/tip-9531eb62-h89`) | [Status 2026-08-31](/status-2026-08-31), Drive `G5B-HANDOFF-9531eb62-20260915.md` §2.1, §4.2 |
 | G1 | GREEN for the isolated G6 run | [Status 2026-08-31](/status-2026-08-31) |
 | G2 | GREEN for the G6 artifact | [Status 2026-08-31](/status-2026-08-31) |
-| G3 | Open (route matrix / runtime counters not yet accepted) | [Status 2026-08-31](/status-2026-08-31) |
+| G3 | Open, but now has first per-route evidence: 12 route groups (S3 PUT/GET/HEAD/Range/COPY/MPU, Swift PUT/GET/HEAD/Range/COPY/SLO, EC PUT+GET) show `native_async > 0` with `legacy_sync`, `block_in_place`, and `blocking_network_wait` all 0. `ssync` remains uncovered and the tip has no G0 identity, so this is evidence, not acceptance. | `tools/test-results/g3-routes-20260918/` (2026-09-18) |
 | G4 | Historical evidence only; no current-candidate acceptance | [Status 2026-08-31](/status-2026-08-31) |
-| G5 | **NOT GREEN** — G5-B census above; the 2026-09-15 packet carries no G5-A (`test/s3api`) record for this tip | this page, Drive packet `KEY_RESULT_INDEX.txt` |
+| G5 | **NOT GREEN** — G5-B census above; after the 2026-09-18 oracle diff the Rust-attributable gap is 3 identities, but the oracle is not the G0-pinned Python commit and no G5-A (`test/s3api`) record exists for this tip | this page, `tools/test-results/g5b-oracle-diff-20260918/`, Drive packet `KEY_RESULT_INDEX.txt` |
 | G6 | GREEN on `17adf0b` (W068 + W069 + W070, 179/179) | [Status 2026-08-31](/status-2026-08-31) |
 | G7 | NOT ACCEPTED | [Status 2026-08-31](/status-2026-08-31) |
 
 G0–G7 are therefore **not** all green, and G5-B is not the only open gate.
+
+## Lab state recorded 2026-09-18
+
+Read-only reconnaissance plus one bounded disk reclaim; prod `:8080`, the live
+tip binary, `/srv/node/d{1,2,3}`, the overseer, and remint were not touched.
+Full detail in `tools/test-results/g5b-classify-20260918/LAB-FINDINGS.md`.
+
+- **Prod `:8080` runs the Rust proxy**, not Python: pid 3114191 =
+  `/usr/local/bin/swift-proxy-server`, an ELF whose sha256 is the published
+  `ab5cb95c…`, under a unit described `Swift proxy server (rust)`. The sha
+  matches every prior claim, so nothing drifted; the 2026-09-15 Drive handoff
+  simply mislabelled it. Python Swift is the separate pyswift `:8090`.
+- **The lab's container/account replication is broken (G1).** Every replicator
+  push to `10.0.4.2:6201/6202` is refused because the lab rings carry the
+  production storage topology while the lab servers bind `127.0.0.1:16211/16212`.
+  Backlog ≈ 15 900 `async_pending` entries. The directive requires G1 before
+  G4/G5 scoring, so the census should not be read as a pure product measurement.
+- **Disk:** swift1 `/` was at 1.7 GiB free (below the 3 GiB floor) with
+  `/var/log/messages` growing ~300 MiB/day from that replication loop, and no
+  `compress` in logrotate. After adding compression and rotating, **3.2 GiB
+  free**; the 1.19 GB log compressed 36:1.
+- swift1's Python oracle on `:8090` is running from a **deleted** virtualenv, so
+  it must not be restarted. The 2026-09-18 baseline therefore used swift2.
 
 ## Product tips closed on this tip line (field-proven)
 
