@@ -17,11 +17,23 @@ work backlog the lab agent can drain under the current owner policy.**
 |---|---|---|---|
 | G5-B census PASS=484 FAIL=47 ERROR=112 SKIP=83 F+E=159 conn=0 total=726 | `docs-site/src/content/docs/status-2026-09-15.mdx` | `https://peregrine-docs-ochre.vercel.app/status-2026-09-15/` (tokens present, 2026-09-18) | Drive `1MfW5eiLRwqYsflVIGZIok4hmhAU6fjJZ` → `g6-g5b-live-9531eb62-RESULT.txt` (harvest END 2026-09-15T00:58:55Z, `EXIT=1`) |
 | Tip sha256 `9531eb621ee86c15dac050d883b68f097f775c67198947506ffc7dab806794e8` | same | same | same + `G5B-HANDOFF-9531eb62-20260915.md` §2.1 |
-| Prod `:8080` untouched, Python `ab5cb95c…` | same | same | RESULT "prod :8080=200 UNTOUCHED" |
+| Prod `:8080` untouched on `ab5cb95c…` | same | same | RESULT "prod :8080=200 UNTOUCHED"; verified on-node 2026-09-18 (see note below) |
 | Theme bins sts34 select29 encrypt23 header14 other13 object_lock13 lifecycle9 policy8 append3 version3 atomic3 logging2 usage2 acl1 multipart1 tag1 | added to `status-2026-09-15.mdx` in this handoff | pending deploy | RESULT theme-bins line |
 | G6 GREEN on `17adf0b`; G7 NOT ACCEPTED; G3 open; G4/G5 historical only | `status-2026-08-31.mdx`, `PEREGRINE-G6-GREEN-RELEASE-20260901.md` | `/status-2026-08-31/` | Swift1 `/var/log/g6-ec/`, Drive `Peregrine-G6-green-20260831-7883bbb/` |
 
 All numbers agree. No claim was upgraded.
+
+One label in the predecessor's Drive handoff is wrong and must not be copied
+forward: it calls prod `:8080` "生产 Python `ab5cb95c`". On-node on 2026-09-18,
+`:8080` is served by pid 3114191 = `/usr/local/bin/swift-proxy-server`, an ELF
+executable whose sha256 is exactly `ab5cb95c5c3973db8336e4940711fba18ce3cabaae62e13da0865c07ad31622b`,
+and its unit is `Description=Swift proxy server (rust)`. So prod `:8080` runs
+the **Rust** proxy at that sha, which is what the repo's own
+`docs/fairness-lab/HANDOFF-20260822-ENV.md` has said all along ("生产
+`/usr/local/bin/swift-proxy-server`"). The Python deployments are the separate
+pyswift ones on `:8090` (Python Swift 2.38.0 on swift1, loopback-only; 2.33.0
+on swift2/3/4, network-reachable). The sha itself was never in doubt; only the
+implementation label was.
 
 Docs defect found and fixed in this handoff: `releases.mdx` aside had a stray
 `[` ("[dated 2026-09-15; prior 2026-08-31") rendered literally on the live
