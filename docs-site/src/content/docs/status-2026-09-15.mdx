@@ -24,9 +24,48 @@ fleet rollout authorization. Production `:8080` remains on `ab5cb95c…`.
 
 **PASS=484 · FAIL=47 · ERROR=112 · SKIP=83 · F+E=159 · conn=0**
 
-Evidence: `swift2:/root/work/peregrine-g0g7-logs/G5B-live-9531eb62/`.
+Evidence: `swift2:/root/work/peregrine-g0g7-logs/G5B-live-9531eb62/` and
+`g6-g5b-live-9531eb62-RESULT.txt` in the Drive packet (harvest ended
+2026-09-15T00:58:55Z, wall ~42 min, nosetests `EXIT=1`).
 
 Owner override still requires a full green ~725 before accepting G0–G6.
+
+### F+E theme bins (159, `conn_closed=0`)
+
+| Theme | Count | Tip-ask state |
+|---|---|---|
+| sts | 34 | NO (wall) |
+| select | 29 | NO (wall) |
+| encrypt | 23 | NO (wall) |
+| header harness | 14 | NO (wall) |
+| other | 13 | mixed |
+| object_lock | 13 | Bypass/Restrict NO; tagging-after-lock is H90 soft leftover |
+| lifecycle | 9 | timing/count NO (wall) |
+| policy | 8 | IfExists/tenant/IAM NO (wall) |
+| append / version / atomic | 3 / 3 / 3 | `version` includes the `test_versioned_concurrent_object_create_and_remove` flake |
+| logging / usage | 2 / 2 | — |
+| acl / multipart / tag | 1 / 1 / 1 | — |
+
+Source: theme-bins line of the same RESULT file. The three largest bins
+(sts, select, encrypt = 86 of 159) plus header, lifecycle, and policy walls
+cover roughly 117 of the 159. Under the current tip-ask NO walls the residual
+cannot reach zero; the lab agent parked the tip line as `tipable-exhausted`
+on 2026-09-15 pending an owner decision.
+
+## Board for the G0–G7 target (as of this snapshot)
+
+| Gate | State | Basis |
+|---|---|---|
+| G0 | GREEN for the G6 claim on `17adf0b` only; lab tip `9531eb62` is not scored against the G0 manifest (lab tree has no `.git`; source published as a tarball release and PR branch `lab/tip-9531eb62-h89`) | [Status 2026-08-31](/status-2026-08-31), Drive `G5B-HANDOFF-9531eb62-20260915.md` §2.1, §4.2 |
+| G1 | GREEN for the isolated G6 run | [Status 2026-08-31](/status-2026-08-31) |
+| G2 | GREEN for the G6 artifact | [Status 2026-08-31](/status-2026-08-31) |
+| G3 | Open (route matrix / runtime counters not yet accepted) | [Status 2026-08-31](/status-2026-08-31) |
+| G4 | Historical evidence only; no current-candidate acceptance | [Status 2026-08-31](/status-2026-08-31) |
+| G5 | **NOT GREEN** — G5-B census above; the 2026-09-15 packet carries no G5-A (`test/s3api`) record for this tip | this page, Drive packet `KEY_RESULT_INDEX.txt` |
+| G6 | GREEN on `17adf0b` (W068 + W069 + W070, 179/179) | [Status 2026-08-31](/status-2026-08-31) |
+| G7 | NOT ACCEPTED | [Status 2026-08-31](/status-2026-08-31) |
+
+G0–G7 are therefore **not** all green, and G5-B is not the only open gate.
 
 ## Product tips closed on this tip line (field-proven)
 
