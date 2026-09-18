@@ -1,0 +1,24 @@
+{
+  "summary": {
+    "verdict": "FAIL",
+    "identities": 725,
+    "passed": 484,
+    "expected_failure": 156,
+    "unexpected_failure": 3,
+    "unexpected_skip": 0,
+    "stale_entries": 0,
+    "expected_failure_by_class": {
+      "not-applicable-rgw": 38,
+      "swift-family-gap": 78,
+      "harness-blocked": 40
+    },
+    "module_teardown_errors": 1
+  },
+  "unexpected_failure": [
+    "s3tests.functional.test_headers:test_object_create_bad_contentlength_mismatch_above",
+    "s3tests_boto3.functional.test_s3:test_buckets_create_then_list",
+    "s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass"
+  ],
+  "unexpected_skip": [],
+  "stale_entries": []
+}
