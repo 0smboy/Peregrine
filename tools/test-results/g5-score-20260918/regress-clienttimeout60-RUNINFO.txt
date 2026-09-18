@@ -1,0 +1,5 @@
+purpose=regression check after lab client_timeout 600 -> 60 on :18080
+tip=9531eb62 (unchanged; config-only reload via overseer USR1)
+started_utc=2026-09-18T07:18:04Z
+EXIT=1
+ended_utc=2026-09-18T07:23:54Z
