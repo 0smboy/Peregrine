@@ -1,0 +1,33 @@
+{
+  "total": 159,
+  "by_class": {
+    "swift-vs-rgw": 38,
+    "engine": 80,
+    "harness": 41
+  },
+  "by_signature": {
+    "engine/bucket-logging-unimplemented": 2,
+    "engine/header-validation-missing": 14,
+    "engine/lifecycle-count-timing": 9,
+    "engine/list-ctime": 1,
+    "engine/object-lock-delete-denied": 13,
+    "engine/policy-condition-ifexists": 8,
+    "engine/presign-expires-range": 3,
+    "engine/sse-c-not-rejected": 12,
+    "engine/sse-kms-not-rejected": 2,
+    "engine/sse-kms-unimplemented": 9,
+    "engine/unreadable-object-read": 1,
+    "engine/versioned-concurrency": 2,
+    "engine/wrong-error-bucketnotempty": 4,
+    "harness/botocore-client-side-validation": 3,
+    "harness/harness-wrong-endpoint": 1,
+    "harness/sts-config-missing": 34,
+    "harness/test-code-attr-on-exception": 1,
+    "harness/test-code-nameerror": 1,
+    "harness/test-code-py2ism": 1,
+    "swift-vs-rgw/acl-grant-by-email": 1,
+    "swift-vs-rgw/create-bucket-not-idempotent": 31,
+    "swift-vs-rgw/rgw-append-extension": 3,
+    "swift-vs-rgw/rgw-usage-extension": 3
+  }
+}

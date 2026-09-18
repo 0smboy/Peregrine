@@ -1,0 +1,16 @@
+plane=swift1 LIVE 10.0.0.1:18080
+tip_sha=9531eb621ee86c15dac050d883b68f097f775c67198947506ffc7dab806794e8
+tip8=9531eb62
+theme=H89 DeferredTaggingSysmeta (PutObject x-amz-tagging .data overlay); quiet honest full-725 score vs dd218530 485/158
+prod_8080_pid=3114191 UNTOUCHED
+18082=LISTEN 127.0.0.1 KEEP g6-internal pid=3114339 (deleted-ok KEEP)
+overseer bash KEEP pid=757796
+conf=/root/work/s3compat/config/ceph-s3.live-13be1dbc.cfg
+remint_ceph-s3.cfg=INTACT (NOT this conf) md5=b042939ffd3e1ffdd3f6d00e35c0843c
+NOT remint 127.0.0.1:18080
+NOT prod :8080
+no tip mid-run
+bin=/root/work/g6-rust-bin/swift-proxy-server NOT (deleted)
+live_pid=3412970 internal_pid=3114339
+swift1_root_disk=5.0G_free 88%
+started_utc=2026-09-15T00:16:56Z

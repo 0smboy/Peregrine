@@ -1,0 +1,13 @@
+{
+  "tip": "9531eb62",
+  "pass": 484,
+  "fail": 47,
+  "error": 112,
+  "skip": 83,
+  "total": 726,
+  "exit": 1,
+  "fe": 159,
+  "wall_s": 2519.0,
+  "conn_closed": 0,
+  "fe_excl_conn": 159
+}

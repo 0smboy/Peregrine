@@ -1,0 +1,32 @@
+total FAIL+ERROR records: 159
+
+harness: 41
+     34  sts-config-missing
+      3  botocore-client-side-validation
+      1  harness-wrong-endpoint
+      1  test-code-attr-on-exception
+      1  test-code-nameerror
+      1  test-code-py2ism
+
+swift-vs-rgw: 38
+     31  create-bucket-not-idempotent
+      3  rgw-append-extension
+      3  rgw-usage-extension
+      1  acl-grant-by-email
+
+engine: 80
+     14  header-validation-missing
+     13  object-lock-delete-denied
+     12  sse-c-not-rejected
+      9  lifecycle-count-timing
+      9  sse-kms-unimplemented
+      8  policy-condition-ifexists
+      4  wrong-error-bucketnotempty
+      3  presign-expires-range
+      2  bucket-logging-unimplemented
+      2  sse-kms-not-rejected
+      2  versioned-concurrency
+      1  list-ctime
+      1  unreadable-object-read
+
+engine-attributable: 80 of 159  (harness 41, swift-vs-rgw 38)
