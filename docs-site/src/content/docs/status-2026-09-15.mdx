@@ -69,13 +69,29 @@ those abort before a request is signed. The `select` bin (29) never reaches
 S3 Select either: every test hardcodes `bucket_name = "test"` and aborts in
 setup because same-owner re-create answers 409 on both Swift implementations.
 
-Each of the 3 rust-only identities was then characterized. One is a
-**configuration** difference, not an engine defect: on a body shorter than its
-declared `Content-Length`, both implementations answer `400 RequestTimeout`,
-Python at 60.1s (its default) and Rust at 600.4s (the lab's
-`client_timeout = 600`), which is longer than the harness waits. One did not
-reproduce in 10 rounds and matches the degraded replication below. One is a
-genuine gap — object-lock governance bypass — and it sits inside an owner wall.
+Each of the 3 rust-only identities was then characterized and acted on the same
+day:
+
+1. **Configuration, not a defect.** On a body shorter than its declared
+   `Content-Length` both implementations answer `400 RequestTimeout`, Python at
+   60.1s (its default) and Rust at 600.4s (the lab's `client_timeout = 600`),
+   which is longer than the harness waits. The owner approved aligning the lab
+   to 60; after the reload the identity **passes**.
+2. **Transient.** The `NameError` only fires when a just-created bucket is
+   missing from ListBuckets; 10 rounds × 5 buckets showed 0 missing and it
+   **passes** in the re-run. The underlying cause is the degraded replication
+   below, so it can recur.
+3. **Object-lock governance bypass — a deliberate divergence, not an
+   oversight.** The wall was lifted and the code dug: the engine requires the
+   bypass header *and* an explicit IAM Allow, pinned by two unit tests, making
+   it stricter than AWS, RGW, and Python Swift. Awaiting an owner choice between
+   recording the divergence and changing the authorization rule.
+   Analysis: `tools/test-results/g5-score-20260918/WALL-LIFT-OBJECT-LOCK-BYPASS.md`.
+
+A scoped re-run after the timeout change (all 104 `test_headers` identities plus
+the two above) scored 55 passed, 13 expected, 0 unexpected skips, 0 stale, and
+**1 unexpected** — only the object-lock divergence, with no regression from the
+change.
 
 Evidence: `tools/test-results/g5b-oracle-diff-20260918/` and
 `tools/test-results/g5b-classify-20260918/` (2026-09-18).
@@ -94,7 +110,7 @@ lab's container replication was degraded during the census.
 | G2 | GREEN for the G6 artifact | [Status 2026-08-31](/status-2026-08-31) |
 | G3 | Open, but now has first per-route evidence: 12 route groups (S3 PUT/GET/HEAD/Range/COPY/MPU, Swift PUT/GET/HEAD/Range/COPY/SLO, EC PUT+GET) show `native_async > 0` with `legacy_sync`, `block_in_place`, and `blocking_network_wait` all 0. `ssync` remains uncovered and the tip has no G0 identity, so this is evidence, not acceptance. | `tools/test-results/g3-routes-20260918/` (2026-09-18) |
 | G4 | Historical evidence only; no current-candidate acceptance | [Status 2026-08-31](/status-2026-08-31) |
-| G5 | **NOT GREEN** — scored against the frozen policy: 3 unexpected (one lab config mismatch, one transient from degraded replication, one engine gap behind an owner wall). The policy must still be re-frozen against the G0-pinned Python oracle, G2 parity is unproven, and no G5-A (`test/s3api`) record exists for this tip | `tools/test-results/g5-score-20260918/`, `tools/g5-known-failures/`, `tools/test-results/g5b-oracle-diff-20260918/` |
+| G5 | **NOT GREEN** — the 2026-09-15 census scored 3 unexpected against the frozen policy; two are closed (config aligned, transient passing) and one is the object-lock divergence awaiting an owner choice. A full 725 has not been re-run since the config change, the policy must still be re-frozen against the G0-pinned Python oracle, G2 parity is unproven, and no G5-A (`test/s3api`) record exists for this tip | `tools/test-results/g5-score-20260918/`, `tools/g5-known-failures/`, `tools/test-results/g5b-oracle-diff-20260918/` |
 | G6 | GREEN on `17adf0b` (W068 + W069 + W070, 179/179) | [Status 2026-08-31](/status-2026-08-31) |
 | G7 | NOT ACCEPTED | [Status 2026-08-31](/status-2026-08-31) |
 

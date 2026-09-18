@@ -27,6 +27,27 @@ import sys
 import xml.etree.ElementTree as ET
 
 
+def load_divergences(path: str):
+    """Deliberate, signed-off divergences from the suite's expectation.
+
+    Kept in a separate hand-curated file, never in the generated policy, because
+    these are Rust-only failures. The generated policy earns its entries from the
+    oracle; these are a conscious product decision and must stay visible as
+    such. Each line needs a doc reference so the reason is auditable.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    if not path:
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3:
+                out[parts[0]] = (parts[1], parts[2])
+    return out
+
+
 def load_policy(path: str):
     expected_fail: dict[str, tuple[str, str]] = {}
     expected_skip: set[str] = set()
@@ -74,21 +95,30 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("run_xml")
     ap.add_argument("--policy", required=True)
+    ap.add_argument("--divergences",
+                    help="accepted deliberate-divergence file (owner sign-off required)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     exp_fail, exp_skip, _meta = load_policy(args.policy)
+    divergences = load_divergences(args.divergences)
     run, teardown = outcomes(args.run_xml)
 
     unexpected_failure: list[str] = []
     unexpected_skip: list[str] = []
     stale: list[str] = []
     expected_failure: list[str] = []
+    accepted_divergence: list[str] = []
     passed: list[str] = []
 
     for ident, state in sorted(run.items()):
         if state in ("failure", "error"):
-            (expected_failure if ident in exp_fail else unexpected_failure).append(ident)
+            if ident in exp_fail:
+                expected_failure.append(ident)
+            elif ident in divergences:
+                accepted_divergence.append(ident)
+            else:
+                unexpected_failure.append(ident)
         elif state == "skip":
             if ident not in exp_skip:
                 unexpected_skip.append(ident)
@@ -105,6 +135,7 @@ def main() -> int:
         "identities": len(run),
         "passed": len(passed),
         "expected_failure": len(expected_failure),
+        "accepted_divergence": len(accepted_divergence),
         "unexpected_failure": len(unexpected_failure),
         "unexpected_skip": len(unexpected_skip),
         "stale_entries": len(stale),
@@ -129,6 +160,10 @@ def main() -> int:
     print(f"expected failure      : {len(expected_failure)}")
     for label, n in sorted(by_class.items(), key=lambda kv: -kv[1]):
         print(f"    {n:>4}  {label}")
+    print(f"accepted divergence   : {len(accepted_divergence)}")
+    for ident in accepted_divergence:
+        label, doc = divergences[ident]
+        print(f"    {ident}\n        [{label}] {doc}")
     print(f"unexpected failure    : {len(unexpected_failure)}")
     for ident in unexpected_failure:
         print(f"    {ident}")

@@ -1,0 +1,14 @@
+# Deliberate divergences from the Ceph s3compat expectation.
+#
+# NOT loaded by default. `tools/g5-score.py` only counts these when you pass
+# --divergences, because accepting one is an owner decision, not a measurement.
+#
+# Unlike the generated policy, entries here are Rust-only failures: the Python
+# Swift oracle passes them. They are listed because the engine deliberately
+# chose a different behavior, and every entry must name the document that
+# justifies it so the choice stays auditable.
+#
+# columns: identity<TAB>class<TAB>doc-reference
+#
+# --- awaiting owner sign-off (option A in the doc below) -----------------
+s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass	stricter-than-aws	tools/test-results/g5-score-20260918/WALL-LIFT-OBJECT-LOCK-BYPASS.md

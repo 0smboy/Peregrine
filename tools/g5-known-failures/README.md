@@ -60,14 +60,30 @@ G5 verdict under this policy: FAIL
 **G5-B is FAIL with exactly three unexpected identities** — not green, but the
 gap is now three named things instead of an opaque 159:
 
-| Identity | What it is | Action |
+| Identity | What it is | Status |
 |---|---|---|
-| `s3tests.functional.test_headers:test_object_create_bad_contentlength_mismatch_above` | Configuration, not a defect. Both engines answer `400 RequestTimeout`; Python at 60.1s (default), Rust at 600.4s (lab `client_timeout = 600`), longer than the harness waits. | Set `client_timeout = 60` on the lab Rust proxy to match the oracle. Lab-plane config change, needs owner sign-off. Deliberately **not** frozen as a known failure, because hiding a config mismatch is what G2 exists to prevent. |
-| `s3tests_boto3.functional.test_s3:test_buckets_create_then_list` | Transient. Its `NameError` only fires when a just-created bucket is missing from ListBuckets; 10 rounds × 5 buckets showed 0 missing. | Fix the degraded lab replication (G1) recorded in `../test-results/g5b-classify-20260918/LAB-FINDINGS.md`, then re-run. |
-| `s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass` | A genuine Rust gap: `AccessDenied` from `PutObjectRetention` with governance bypass, where Python Swift passes. | Inside the owner's `BypassGovernanceRetention` tip-ask NO wall. Needs the wall lifted before anyone digs. |
+| `s3tests.functional.test_headers:test_object_create_bad_contentlength_mismatch_above` | Configuration, not a defect. Both engines answer `400 RequestTimeout`; Python at 60.1s (default), Rust at 600.4s (lab `client_timeout = 600`), longer than the harness waits. | **Closed 2026-09-18.** Owner approved aligning the lab: `client_timeout` 600 → 60 in `/etc/g6-rust/proxy-server.conf`, reloaded through the overseer's `USR1` contract (tip binary and sha unchanged). The probe now answers at 60.2s and the identity **passes** in a scored run. Deliberately never frozen as a known failure — hiding a config mismatch is what G2 exists to prevent. |
+| `s3tests_boto3.functional.test_s3:test_buckets_create_then_list` | Transient. Its `NameError` only fires when a just-created bucket is missing from ListBuckets; 10 rounds × 5 buckets showed 0 missing. | **Passed** in the 2026-09-18 scored re-run. The underlying cause — degraded lab replication (G1, `../test-results/g5b-classify-20260918/LAB-FINDINGS.md`) — is still unfixed, so it can recur. |
+| `s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass` | Wall lifted 2026-09-18 and dug. **Not an oversight**: the engine deliberately requires the bypass header *and* an explicit IAM Allow, pinned by two unit tests, and is stricter than AWS, RGW, and Python Swift. | Awaiting an owner choice between recording it as a deliberate divergence and changing the authorization rule. Full analysis: `../test-results/g5-score-20260918/WALL-LIFT-OBJECT-LOCK-BYPASS.md`. |
 
-So closing G5-B needs one config alignment, one environment fix, and one wall
-lift — no other engine work on this suite.
+After the config alignment, the scoped re-run of all 104 `test_headers`
+identities plus these two scored **55 passed, 13 expected, 0 unexpected skips,
+0 stale, 1 unexpected** — the unexpected being only the object-lock divergence.
+No regression appeared from the timeout change.
+
+## Deliberate divergences
+
+`g5b-divergences-20260918.tsv` is a separate, hand-curated list for Rust-only
+failures the engine chose on purpose. It is **not loaded unless you pass
+`--divergences`**, because accepting one is an owner decision rather than a
+measurement, and every entry must name the document that justifies it.
+
+Keeping these out of the generated policy is deliberate: the generated file
+earns its entries from the oracle, so mixing in a product decision would
+destroy that property. With the object-lock entry accepted the same scoped run
+reads `accepted divergence: 1, unexpected: 0 → PASS`; without it, `unexpected:
+1 → FAIL`. Both views are committed side by side in
+`../test-results/g5-score-20260918/`.
 
 ## What option C does not do
 

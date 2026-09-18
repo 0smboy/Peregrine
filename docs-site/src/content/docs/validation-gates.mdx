@@ -56,9 +56,17 @@ and that is checked rather than asserted: scoring the Python baseline itself
 against the policy yields 231 unexpected failures.
 
 Score a run with `tools/g5-score.py RUN.xml --policy <policy.tsv>`. For tip
-`9531eb62` the verdict is **FAIL with 3 unexpected**, 0 unexpected skips, 0
-stale entries — one lab configuration mismatch, one transient traced to
-degraded lab replication, and one genuine engine gap behind an owner wall.
+`9531eb62` the 2026-09-15 census scored **FAIL with 3 unexpected**, 0 unexpected
+skips, 0 stale entries. Two are since closed — the lab `client_timeout` was
+aligned to the oracle's 60s and that identity now passes, and the transient
+passed on re-run — leaving the object-lock governance-bypass divergence.
+
+Rust-only failures the engine chose on purpose are **never** written into the
+generated policy, because that file earns its entries from the oracle. They go
+in a separate hand-curated divergence list that the scorer only reads when given
+`--divergences`, and each entry must name the document justifying it. Accepting
+a divergence is an owner decision, not a measurement.
+
 Evidence: `tools/test-results/g5-score-20260918/` and
 `tools/test-results/g5b-oracle-diff-20260918/` (2026-09-18).
 
