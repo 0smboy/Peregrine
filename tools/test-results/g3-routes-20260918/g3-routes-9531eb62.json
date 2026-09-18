@@ -1,0 +1,151 @@
+{
+  "proxy": "127.0.0.1:18080",
+  "results": [
+    {
+      "route": "s3-PUT",
+      "detail": "PUT /g3probe-1b27411a76/obj -> 200",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "s3-GET",
+      "detail": "GET /g3probe-1b27411a76/obj -> 200",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "s3-HEAD",
+      "detail": "HEAD /g3probe-1b27411a76/obj -> 200",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "s3-Range",
+      "detail": "GET range /g3probe-1b27411a76/obj -> 206",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "s3-COPY",
+      "detail": "COPY -> 200",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "s3-MPU",
+      "detail": "initiate 200 / part 200 / complete 200",
+      "delta": {
+        "native_async_requests_total": 3.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "swift-PUT",
+      "detail": "PUT -> 201",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "swift-GET",
+      "detail": "GET -> 200",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "swift-HEAD",
+      "detail": "HEAD -> 200",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "swift-Range",
+      "detail": "GET range -> 206",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "swift-COPY",
+      "detail": "COPY -> 201",
+      "delta": {
+        "native_async_requests_total": 1.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "swift-SLO",
+      "detail": "segment 201 / manifest 201 / GET 200",
+      "delta": {
+        "native_async_requests_total": 4.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    },
+    {
+      "route": "ec-PUT/GET",
+      "detail": "container 201 / PUT 201 / GET 200",
+      "delta": {
+        "native_async_requests_total": 3.0,
+        "legacy_sync_handler_requests_total": 0.0,
+        "block_in_place_total": 0.0,
+        "blocking_network_wait_total": 0.0
+      },
+      "verdict": "PASS"
+    }
+  ],
+  "uncovered": [
+    "ssync"
+  ]
+}
