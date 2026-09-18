@@ -1,0 +1,4 @@
+target 127.0.0.1:18080
+A. Content-Length one byte above the body
+   responded in 600.4s: HTTP/1.1 400 Bad Request  errorcode=RequestTimeout
+   client socket closed (worker not held open by this probe)

@@ -62,11 +62,20 @@ those abort before a request is signed. The `select` bin (29) never reaches
 S3 Select either: every test hardcodes `bucket_name = "test"` and aborts in
 setup because same-owner re-create answers 409 on both Swift implementations.
 
+Each of the 3 rust-only identities was then characterized. One is a
+**configuration** difference, not an engine defect: on a body shorter than its
+declared `Content-Length`, both implementations answer `400 RequestTimeout`,
+Python at 60.1s (its default) and Rust at 600.4s (the lab's
+`client_timeout = 600`), which is longer than the harness waits. One did not
+reproduce in 10 rounds and matches the degraded replication below. One is a
+genuine gap — object-lock governance bypass — and it sits inside an owner wall.
+
 Evidence: `tools/test-results/g5b-oracle-diff-20260918/` and
 `tools/test-results/g5b-classify-20260918/` (2026-09-18).
 This re-attribution does **not** make G5 green — see the caveats in that
-README, including that the oracle is not the G0-pinned Python commit and that
-the lab's container replication was degraded during the census.
+README, including that the oracle is not the G0-pinned Python commit, that
+configuration parity between the two deployments is unproven, and that the
+lab's container replication was degraded during the census.
 </Aside>
 
 ## Board for the G0–G7 target (as of this snapshot)

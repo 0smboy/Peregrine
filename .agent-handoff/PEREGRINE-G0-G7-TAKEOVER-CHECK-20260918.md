@@ -56,7 +56,28 @@ board. Rewritten to keep the two snapshots distinct.
 The lab agent's loop was G5-B-only. Even a green G5-B leaves G3, G4, G5-A and
 G7 open and G0 unscored for the tip line.
 
-## 3. Why G5-B cannot reach 0 F+E under current policy
+## 3. Superseded later the same day: the 159 were re-attributed
+
+Sections 3 and 4 below were written before lab access arrived. They argue from
+the census theme bins, which turned out to be misleading. Once the mandated
+Python baseline was actually run
+(`tools/test-results/g5b-oracle-diff-20260918/`), the exact-name diff came out
+**156 both-fail, 3 rust-only, 231 python-only**, and characterizing the three
+left **one** genuine Rust product gap (object-lock governance bypass, inside a
+wall), one configuration difference (G2: lab `client_timeout = 600` vs the
+oracle's 60s default — both answer `400 RequestTimeout`, just at their own
+timeout), and one transient consistent with the degraded lab replication (G1).
+
+The conclusion in §4 still holds and is in fact stronger: the "raw ~725 all
+green" bar cannot be met by engine work, because 156 of the 159 failures are
+shared with the reference implementation, which itself fails 388 of the same
+725. What changes is the reason — not "the walls hide too much work" but "the
+bar measures the wrong thing". Option C is now the evidence-backed choice.
+
+Read §5 (reach), §6 (constraints) and the two evidence directories as current;
+read §3 and §4 as the pre-access reasoning.
+
+## 3a. Pre-access reasoning: why G5-B cannot reach 0 F+E under current policy
 
 Owner override (2026-09-15): full Ceph s3compat ~725 must be all green before
 G0–G6 are accepted. Owner walls (tip-ask NO, declined to lift twice): `sts`,
@@ -82,6 +103,10 @@ SSE-C/KMS).
 
 ## 4. Decision required from the owner (pick one, in writing)
 
+> Updated 2026-09-18 after the oracle diff: option C is the evidence-backed
+> choice, and option B would mean deliberately diverging from Python Swift on
+> identities the reference implementation also fails.
+
 | # | Decision | Effect on G5-B |
 |---|---|---|
 | A | Keep override + keep walls | G5-B stays parked at 159 F+E forever; G0–G7 all-green is unreachable. |
@@ -94,9 +119,18 @@ Also still open from the predecessor's list: bounce `:18082` (still maps a
 (`lab/tip-9531eb62-h89` → `claude/object-replicator`), restore a real `.git`
 on the lab tip tree (needed for G0 on the tip line).
 
-## 5. Reach of this successor (why nothing was executed on the lab)
+## 5. Reach of this successor
 
-Checked 2026-09-18 from the cloud agent VM:
+> Resolved the same day. The owner ran `tools/lab-agent-access-bootstrap.sh`,
+> which installed a dedicated key on swift1/swift2 and dropped it through the
+> Drive folder, so lab work did happen: see
+> `tools/test-results/g5b-oracle-diff-20260918/`,
+> `tools/test-results/g3-routes-20260918/`, and
+> `tools/test-results/g5b-classify-20260918/LAB-FINDINGS.md`.
+> Still missing: read access to the private `0smboy/swift-rust` for PR #1 and
+> the tip line's git identity.
+
+Originally checked 2026-09-18 from the cloud agent VM, before access:
 
 - `swift1` public `169.58.108.85:18080` and `:8080` — connection timeout /
   refused (firewalld public DROP except SSH, per `tools/CONTABO-CLUSTER.md`).

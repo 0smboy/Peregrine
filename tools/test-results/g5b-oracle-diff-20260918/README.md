@@ -61,21 +61,26 @@ The test declares `Content-Length` one byte above the body and expects
 `400 RequestTimeout` (`test_headers.py:202-216`). Measured 2026-09-18 with a raw
 socket that sends the short body and waits:
 
-| Server | Outcome |
-|---|---|
-| Python Swift `10.0.0.2:8090` | `400 Bad Request` / `RequestTimeout` at **60.1s** |
-| Rust tip `127.0.0.1:18080` | no response within **120s** |
+| Server | Outcome | Configured `client_timeout` |
+|---|---|---|
+| Python Swift `10.0.0.2:8090` | `400 Bad Request` / `RequestTimeout` at **60.1s** | unset → 60s default |
+| Rust tip `127.0.0.1:18080` | `400 Bad Request` / `RequestTimeout` at **600.4s** | **600** (`/etc/g6-rust/proxy-server.conf:17`) |
 
-**This is most likely configuration, not an engine defect.** The engine does
-implement the knob — `crates/swift-proxy-server/src/main.rs:541` documents
-`client_timeout` as the idle-client socket timeout and defaults it to 60 — and
-the lab sets `client_timeout = 600` in `/etc/g6-rust/proxy-server.conf:17`,
-while the Python oracle leaves it at the 60s default. A 660s confirmation run
-was started to check that Rust answers at ~600s
-(`swift1:/root/work/peregrine-probe-20260918/cl600-confirm.txt`); until that
-lands, treat this as **G2 configuration parity**, which is exactly what G2
-exists to catch. An earlier 20s measurement in this session was too short to
-distinguish the two and should be ignored.
+**Not an engine defect — this is G2 configuration parity.** Both
+implementations produce the same status and the same `RequestTimeout` error
+code; each does it at its own configured idle-client timeout. The engine
+implements the knob (`crates/swift-proxy-server/src/main.rs:541` documents
+`client_timeout` as the idle-client socket timeout, default 60) and the lab
+raised it 10×, which is longer than the harness is willing to wait, so the test
+records `timed out` against Rust and passes against Python.
+
+Setting `client_timeout = 60` on the lab Rust proxy to match the oracle should
+close this identity without touching engine code. That is a lab-plane config
+change and needs owner sign-off, so it was not made here.
+
+Evidence: `cl600-confirm.txt` in this directory (Rust, 600.4s) and the 60.1s
+Python measurement above. An earlier 20s measurement in this session was too
+short to distinguish the two and is superseded.
 
 ### 2. `s3tests_boto3.functional.test_s3:test_buckets_create_then_list`
 
@@ -118,6 +123,14 @@ It does establish that the owner override in force since 2026-09-15 — "full
 **156 of the 159 failures are shared with the reference implementation**, and
 the reference itself fails 388 of the same 725. Meeting the bar literally would
 require the Rust engine to diverge from Python Swift on 156 identities.
+
+After characterizing the three, the residue attributable to Rust *product
+behavior* on the whole pinned Ceph suite is **one identity**, the object-lock
+governance-bypass case, and it sits inside an owner wall. The other two are a
+configuration difference (G2) and a transient consistent with the degraded lab
+(G1). The remaining distance to G0–G7 is therefore not a pile of product
+defects; it is one walled behavior plus the unrun gates (G4, G5-A, G7), the
+broken lab replication, and the missing G0 identity for the tip line.
 
 The canonical G5 contract ("capability/known-failure policy, exact-name diff,
 unexpected test names = 0") is satisfiable and hides nothing: `names-both-fail.txt`
