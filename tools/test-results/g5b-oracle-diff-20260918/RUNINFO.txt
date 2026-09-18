@@ -1,0 +1,7 @@
+identities=725
+oracle=python-swift 2.33.0 s3api @ 10.0.0.2:8090 location=us-east-1
+conf=/root/work/s3compat/config/ceph-s3.pybaseline-20260918.cfg (tenant account absent on this oracle: test2:tester2)
+rust_census=G5B-live-9531eb62 (tip 9531eb62, PASS=484 F+E=159)
+started_utc=2026-09-18T05:40:03Z
+EXIT=1
+ended_utc=2026-09-18T06:04:05Z

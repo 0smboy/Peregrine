@@ -1,0 +1,13 @@
+rust identities   : 725  (/tmp/g5b-evi/rust-census.xml)
+python identities : 725  (/tmp/g5b-evi/pybaseline.xml)
+compared          : 725
+
+both-pass         253
+both-fail         156
+rust-only           3
+python-only       231
+skipped-either     82
+
+module-level teardown errors (not identities): rust 1, python 1
+
+Rust-attributable G5-B gap after the oracle diff: 3 (down from the raw 159 FAIL+ERROR)
