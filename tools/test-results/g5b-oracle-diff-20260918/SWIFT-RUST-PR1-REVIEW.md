@@ -31,17 +31,43 @@ files the lab makes before each attempt:
 | `sigv4.rs`, `select.rs`, `response.rs`, `object_lock_worm.rs`, `bucket_config.rs` | 1 each |
 | … 70 files total, e.g. `iam.rs.bak-h17-pre`, `middleware.rs.bak-h6c-pre` | **17 415 added lines** |
 
-It also adds seven empty placeholder logs under
-`rust/tools/test-results/*.log` (0 lines each).
+Per-file statuses over all 401 files: 214 added, 179 modified, 8 removed. The
+seven `rust/tools/test-results/*.log` entries are among the **removals** — the
+PR deletes stale logs, which is an improvement, not a problem. An earlier draft
+of this note had that backwards.
 
 Merging as-is would import 70 dead source copies into the engine repository,
 where they would be indexed, greppable, and confusing forever — and they defeat
 the purpose of G0's "one immutable source identity", since the tree would carry
 eight historical variants of `iam.rs` alongside the real one.
 
-**Recommendation:** strip `*.bak-*` and the empty placeholder logs, then
-re-push the branch, before anyone considers merging. That is a rewrite of the
-snapshot commit, so it needs the owner's call; this agent did not touch it.
+### The strip is prepared and verified, but not pushed
+
+The owner approved stripping them on 2026-09-18. The rewrite was prepared and
+checked, then blocked on token scope:
+
+- amended snapshot commit `e5752da` (was `94e401b6`), authorship preserved
+- `rust/` blob count 465 → **395**
+- diff against the published tree: **70 removed, all matching `.bak-`, 0 added,
+  0 content changes among the kept files**
+
+The supplied fine-grained PAT is read-only for Contents (`POST /git/blobs` →
+`403 Resource not accessible by personal access token`), so neither `git push`
+nor the API can publish it. Either add **Contents: Write** to the token and this
+becomes one command, or run it locally:
+
+```bash
+git clone --branch lab/tip-9531eb62-h89 git@github.com:0smboy/swift-rust.git
+cd swift-rust
+git rm --cached $(find rust -name '*.bak-*')
+find rust -name '*.bak-*' -delete
+git commit --amend --no-edit
+git push --force-with-lease origin lab/tip-9531eb62-h89
+```
+
+`--force-with-lease` is deliberate: it refuses if anyone else has moved the
+branch since. Adding **Checks: Read** to the token would also let CI state be
+confirmed before merge.
 
 ## CI status could not be read
 
