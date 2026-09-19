@@ -1,5 +1,11 @@
 # Peregrine G0–G7 takeover check (cloud agent)
 
+> **Superseded by [`PEREGRINE-G0-G7-HANDOFF-20260919.md`](PEREGRINE-G0-G7-HANDOFF-20260919.md).**
+> Read that for the current board, decisions, lab facts, and next actions. This
+> file is kept as the record of the takeover check itself: what was verified
+> three-way on 2026-09-18, and the pre-access reasoning (§3a, §4) that the later
+> measurements corrected.
+
 Date: 2026-09-18 (UTC)  
 Predecessor: lab agent `swift-master` (grok bot), last nudge 2026-09-15 ~20:08
 ("G5-B still parked tipable-exhausted @ 9531eb62 — 484 / F+E 159 unchanged;
