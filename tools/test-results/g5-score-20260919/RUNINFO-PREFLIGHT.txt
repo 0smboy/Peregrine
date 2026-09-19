@@ -1,0 +1,7 @@
+started_utc=2026-09-19T03:37:21Z
+EXIT=1
+ended_utc=2026-09-19T04:06:04Z
+tip_sha=9531eb621ee86c15dac050d883b68f097f775c67198947506ffc7dab806794e8
+live_pid=621728 exe=/root/work/g6-rust-bin/swift-proxy-server
+client_timeout=client_timeout=60
+swift1_root_free=9.1G
