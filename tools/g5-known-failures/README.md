@@ -78,6 +78,26 @@ failures the engine chose on purpose. It is **not loaded unless you pass
 `--divergences`**, because accepting one is an owner decision rather than a
 measurement, and every entry must name the document that justifies it.
 
+One entry, accepted by the owner on 2026-09-19: the object-lock
+governance-bypass identity, class `stricter-than-aws`. Accepting it changed no
+engine behavior — bypass still requires the header *and* an explicit IAM Allow,
+and both pinned unit tests stand. It records that the engine is deliberately
+stricter than AWS, RGW and Python Swift on this one behavior, and leaves the
+parity fix (option B in the linked analysis) open as engine work for a candidate
+that has a G0 identity from the start.
+
+So the canonical G5-B invocation is now:
+
+```bash
+tools/g5-score.py RUN.xml \
+  --policy       tools/g5-known-failures/g5b-ceph-s3compat-20260918.tsv \
+  --divergences  tools/g5-known-failures/g5b-divergences-20260918.tsv
+```
+
+Dropping `--divergences` is still a valid and useful run: it answers "what would
+fail if we held ourselves to the suite's expectation exactly", and that number
+should be reported alongside, never replaced.
+
 Keeping these out of the generated policy is deliberate: the generated file
 earns its entries from the oracle, so mixing in a product decision would
 destroy that property. With the object-lock entry accepted the same scoped run

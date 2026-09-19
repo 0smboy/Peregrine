@@ -119,6 +119,25 @@ unblocks the gate arithmetic; B is the real fix and should be done on a
 candidate that has a G0 identity from the start, since the `9531eb62` tip line
 can no longer get one (see `../g5b-oracle-diff-20260918/SWIFT-RUST-PR1-REVIEW.md`).
 
+## Decision: A, taken 2026-09-19
+
+The owner chose **A**. The identity is recorded in
+`tools/g5-known-failures/g5b-divergences-20260918.tsv` as class
+`stricter-than-aws`, pointing at this document.
+
+What that does and does not mean:
+
+- It does **not** change engine behavior. Governance bypass still requires the
+  header *and* an explicit IAM Allow, and the two pinned unit tests stand.
+- It does **not** hide the difference. The class name states that Rust is
+  stricter than AWS, the divergence file is separate from the earned policy, and
+  the scorer only counts it when explicitly given `--divergences`, printing the
+  identity and this document reference every time.
+- **Option B stays open.** Accepting the divergence records today's reality; it
+  is not a verdict that owner-implicit bypass is wrong. If parity with AWS, RGW
+  and Python Swift on this behavior is wanted later, B is the change, and the
+  entry here should be removed in the same commit that lands it.
+
 Whichever is chosen, `test_object_lock_changing_mode_from_governance_without_bypass`
 (the companion negative test at `test_s3.py:13565`) must keep passing — it
 already does.
