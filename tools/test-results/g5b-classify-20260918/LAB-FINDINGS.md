@@ -40,7 +40,8 @@ Consequences:
 
 - **Consistency.** `async_pending` backlog on the lab devices: `/srv/1` 5442,
   `/srv/2` 5638, `/srv/3` 4809 files — roughly 15 900 deferred container
-  updates. Listing-dependent and atomicity-dependent identities can fail or
+  updates, and **growing**: the same count was ≈20 994 on 2026-09-19 after one
+  more full suite run, so every scored run makes the window wider. Listing-dependent and atomicity-dependent identities can fail or
   flake for environment reasons, which is the most likely explanation for the
   4 `BucketNotEmpty`-on-PutObject records and plausibly for the
   `test_versioned_concurrent_object_create_and_remove` flake.
@@ -131,7 +132,8 @@ DELETE /v1/AUTH_test/g3probe-ec-0b5c3a95    -> 409   (not empty)
 The container DB still carries a row for an object that no longer exists, so
 the container is undeletable — the container layer and the object layer
 disagree. A healthy cluster reconciles this through the container updater; with
-~15 900 `async_pending` entries it is not reconciling. The second container
+a backlog of this size (≈15 900 on 2026-09-18, ≈20 994 on 2026-09-19) it is
+not reconciling. The second container
 (`g3probe-ec-f3838ac4`) was in fact deleted but still appeared in the account
 listing, which is the same lag from the account side.
 

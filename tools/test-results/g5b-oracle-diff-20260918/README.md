@@ -92,9 +92,15 @@ reachable when **a just-created bucket is absent from ListBuckets**.
 Re-run directly against the tip on 2026-09-18: **10 rounds × 5 buckets, 0
 missing**. It does not reproduce, so the census hit a transient. That is
 consistent with the degraded lab account/container replication recorded in
-`../g5b-classify-20260918/LAB-FINDINGS.md` (§2: ~15 900 `async_pending`
-entries, every replicator push to `10.0.4.2` refused). Ten clean rounds is not
-proof of absence; it does rule out a deterministic defect.
+`../g5b-classify-20260918/LAB-FINDINGS.md` (§2: `async_pending` backlog ≈15 900
+on this date and ≈20 994 by 2026-09-19, every replicator push to `10.0.4.2`
+refused). Ten clean rounds is not proof of absence; it does rule out a
+deterministic defect.
+
+It did recur: the full re-run on 2026-09-19 failed this identity again under
+full-suite load while isolated rounds kept passing, which is what made the
+environment attribution solid rather than suspected
+(`../g5-score-20260919/README.md`).
 
 ### 3. `s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass`
 

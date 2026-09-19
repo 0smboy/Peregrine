@@ -49,8 +49,9 @@ just-created bucket is missing from ListBuckets. Its history is now informative:
 
 It fails under full-suite load and passes in isolation. That is consistent with
 the account/container replication defect in
-`../g5b-classify-20260918/LAB-FINDINGS.md` §2: with ~15 900 `async_pending`
-entries and every replicator push refused, a container creation can be visible
+`../g5b-classify-20260918/LAB-FINDINGS.md` §2: with the `async_pending` backlog
+at ≈20 994 entries after this run (≈15 900 before it) and every replicator push
+refused, a container creation can be visible
 on the container layer before the account listing catches up, so ListBuckets
 misses it. Under load the window widens.
 
