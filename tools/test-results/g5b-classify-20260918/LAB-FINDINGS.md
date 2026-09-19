@@ -53,6 +53,25 @@ Not fixed here: correcting the ring or the replicator's peer set changes lab
 replication semantics, which is exactly what G6 scored. That needs an owner
 decision, not a unilateral edit.
 
+**Update 2026-09-19 — this is now the single blocker on G5-B.** The full 725
+re-run (`../g5-score-20260919/`) scored 0 unexpected skips, 0 stale entries, and
+exactly **one** unexpected identity: `test_buckets_create_then_list`, which fails
+only under full-suite load and passes in isolation, exactly as this defect
+predicts. Every other identity is either passing, earned into the frozen policy,
+or the one accepted divergence. No engine change can close it.
+
+Remediation options, in increasing invasiveness:
+
+| # | Change | Effect on G6's scored semantics |
+|---|---|---|
+| 1 | Point the lab rings' container/account replicas at the addresses the lab servers actually bind (`127.0.0.1:16211/16212`) instead of `10.0.4.2:6201/6202`, then let the replicator drain the backlog. | Changes the lab ring, which W068 scored. A G6 re-run would be needed to keep that claim honest. |
+| 2 | Leave the ring and stop the replicator from retrying an unreachable peer (handoff-only operation), accepting single-replica lab durability. | Lab stops matching the topology G6 scored; the 179 ledger would need re-reading. |
+| 3 | Drain `async_pending` with the container updater and accept that it refills. | Buys a quieter window for one scored run without fixing the cause; would have to be repeated before every run and documented as such. |
+
+Option 1 is the real fix. None of the three should be done without deciding what
+happens to the G6 GREEN claim, because all three touch the topology that claim
+was measured on.
+
 ## 3. Disk: reclaimed 1.7 GiB and closed a latent disk-full
 
 swift1 `/` was at **1.7 GiB free (96 %)**, below the 3 GiB tip/deploy floor,
