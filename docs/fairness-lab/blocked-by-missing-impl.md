@@ -3,7 +3,7 @@
 These items explain why Contabo/deploy cannot mirror full Python ansible.  
 **This cycle does not implement them** — it only prevents false parity claims.
 
-**Strict full matrix (partial = 未实现):** [RUST-VS-PYTHON-PARITY.md](RUST-VS-PYTHON-PARITY.md) · public docs [/parity](https://peregrine-docs-ochre.vercel.app/parity).
+**Strict full matrix (partial = 未实现):** [RUST-VS-PYTHON-PARITY.md](RUST-VS-PYTHON-PARITY.md) · public docs [/parity](https://docs.myswift.rs/parity).
 
 | Item | Impact on fairness | Priority backlog |
 |------|--------------------|------------------|

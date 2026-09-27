@@ -10,9 +10,9 @@ a feature-complete Swift twin or a production drop-in replacement. The strict
 [parity matrix](docs/fairness-lab/RUST-VS-PYTHON-PARITY.md) is the authority
 for what is currently claimable.
 
-**Documentation: <https://peregrine-docs-ochre.vercel.app>** — built with
+**Documentation: <https://docs.myswift.rs>** — built with
 [Nimbus](https://nimbus-docs.com/) (agent-native: every page has a markdown
-alternate, plus [`/llms.txt`](https://peregrine-docs-ochre.vercel.app/llms.txt)).
+alternate, plus [`/llms.txt`](https://docs.myswift.rs/llms.txt)).
 Source in [`docs-site/`](docs-site/).
 
 ---
@@ -116,7 +116,7 @@ Peregrine/
 ├── autocos/            benchmark automation over cosbench-rs
 ├── swift-console/      web console (files / deploy / monitor / lab)
 ├── docs/               architecture, testing, lab-cluster ops
-├── docs-site/          Nimbus docs → https://peregrine-docs-ochre.vercel.app
+├── docs-site/          Nimbus docs → https://docs.myswift.rs
 │                       (`cd docs-site && npm run deploy:prod`)
 └── tools/              cutover scripts + migration evidence summaries
 ```

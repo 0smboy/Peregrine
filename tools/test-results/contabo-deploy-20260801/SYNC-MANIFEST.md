@@ -41,7 +41,7 @@
 | Item | Value |
 |------|-------|
 | Live URL | https://peregrine-docs-ochre.vercel.app |
-| Performance page | https://peregrine-docs-ochre.vercel.app/performance/ |
+| Performance page | https://docs.myswift.rs/performance/ |
 | Source | `docs-site/` (+ write-concurrency docs in Git) |
 | Last prod deploy | 2026-08-02 — `dpl_2bP7kdu9VZroKcXaMasmz847kzBr` (deep-verify Performance notes) |
 | Manual / agent publish | `cd docs-site && npm run deploy:prod` |

@@ -30,7 +30,7 @@
 ## Docs site (Vercel production)
 
 - **Live alias:** https://peregrine-docs-ochre.vercel.app  
-- **Parity page:** https://peregrine-docs-ochre.vercel.app/parity  
+- **Parity page:** https://docs.myswift.rs/parity  
 - Deploy: `vercel --prod` as `0smboy` (proxy cleared) → Aliased production
 
 ## P1 wave (running after publish)
