@@ -45,7 +45,7 @@ retired). SAIO on swift1: Python `:8090`, Rust `:8081`.
 
 ## Publish (Vercel — keep live in sync)
 
-Production site: <https://peregrine-docs-ochre.vercel.app>
+Production site: <https://docs.myswift.rs>
 Project: `peregrine-docs` (Vercel team `0smboys-projects`).
 
 **After any change under `docs-site/` that should be public, deploy before

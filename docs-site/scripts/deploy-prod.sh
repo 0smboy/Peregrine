@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish docs-site to Vercel production (peregrine-docs-ochre.vercel.app).
+# Publish docs-site to Vercel production (docs.myswift.rs).
 # Requires: logged-in `vercel` CLI (`vercel whoami`).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,4 +18,4 @@ fi
 
 echo "Deploying docs-site as ${who} → production…"
 vercel --prod --yes
-echo "Live: https://peregrine-docs-ochre.vercel.app"
+echo "Live: https://docs.myswift.rs"
