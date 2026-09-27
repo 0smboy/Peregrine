@@ -5,7 +5,7 @@ import nimbus, { defineConfig as defineNimbusConfig } from "@cloudflare/nimbus-d
 import { tableScroll } from "@cloudflare/nimbus-docs/markdown";
 
 const nimbusConfig = defineNimbusConfig({
-  site: "https://peregrine-docs-ochre.vercel.app",
+  site: "https://docs.myswift.rs",
   title: "Peregrine",
   description:
     "A Rust-first object-storage engineering platform: scoped Swift compatibility, bounded deployment tooling, load generation, benchmark automation, and a web console. Current production readiness is documented explicitly.",
