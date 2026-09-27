@@ -9,7 +9,7 @@
 **Repo:** https://github.com/0smboy/Peregrine  
 **Engine repo:** https://github.com/0smboy/swift-rust (`claude/object-replicator`)
 
-Docs site: https://peregrine-docs-ochre.vercel.app
+Docs site: https://docs.myswift.rs
 
 ---
 

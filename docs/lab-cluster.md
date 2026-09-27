@@ -93,5 +93,5 @@ Console / autocos follow the same pattern from their crates; see
 - [`testing.md`](testing.md) — verification levels and harnesses
 - [`architecture.md`](architecture.md) — component map
 - [`tools/CONTABO-CLUSTER.md`](../tools/CONTABO-CLUSTER.md) — Contabo endpoints
-- Docs site: [Operations](https://peregrine-docs-ochre.vercel.app/operations),
-  [Testing](https://peregrine-docs-ochre.vercel.app/testing)
+- Docs site: [Operations](https://docs.myswift.rs/operations),
+  [Testing](https://docs.myswift.rs/testing)
