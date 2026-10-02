@@ -311,6 +311,7 @@ impl Inner {
 pub struct BlockingJob<T> {
     state: Arc<AtomicU8>,
     rx: mpsc::Receiver<Result<T, BlockingJoinError>>,
+    detach: bool,
 }
 
 impl<T> BlockingJob<T> {
@@ -353,10 +354,22 @@ impl<T> BlockingJob<T> {
     pub fn is_started(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_STARTED
     }
+
+    /// Drop this handle without cancelling a still-queued job.
+    ///
+    /// Cleanup and other must-run finite work use this so request
+    /// cancellation cannot skip a queued unlink. The receiver is dropped;
+    /// the closure still runs to completion (or until domain shutdown).
+    pub fn detach(mut self) {
+        self.detach = true;
+    }
 }
 
 impl<T> Drop for BlockingJob<T> {
     fn drop(&mut self) {
+        if self.detach {
+            return;
+        }
         let _ = self.state.compare_exchange(
             STATE_QUEUED,
             STATE_CANCELLED,
@@ -472,7 +485,11 @@ impl BlockingDomain {
             queue.push_back(job);
         }
         self.inner.notify.notify_one();
-        Ok(BlockingJob { state, rx })
+        Ok(BlockingJob {
+            state,
+            rx,
+            detach: false,
+        })
     }
 
     /// Submit and join. Fail-closed on a full queue (does not wait for a slot).
@@ -781,6 +798,40 @@ mod tests {
         assert!(
             !ran_queued.load(Ordering::SeqCst),
             "aborted queued job must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_does_not_cancel_queued_job() {
+        let domain = BlockingDomain::with_bounds(1, 4).unwrap();
+        let (entered_tx, entered_rx) = std_mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std_mpsc::sync_channel::<()>(1);
+        let ran_queued = Arc::new(AtomicBool::new(false));
+
+        let in_flight = domain
+            .submit(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                21u32
+            })
+            .unwrap();
+        wait_until(|| entered_rx.try_recv().is_ok()).await;
+
+        let ran = Arc::clone(&ran_queued);
+        let queued = domain
+            .submit(move || {
+                ran.store(true, Ordering::SeqCst);
+                22u32
+            })
+            .unwrap();
+        queued.detach();
+
+        release_tx.send(()).unwrap();
+        assert_eq!(in_flight.join().await.unwrap(), 21);
+        wait_until(|| ran_queued.load(Ordering::SeqCst)).await;
+        assert!(
+            ran_queued.load(Ordering::SeqCst),
+            "detached queued cleanup must still run"
         );
     }
 }

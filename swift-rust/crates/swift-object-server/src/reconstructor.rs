@@ -23,15 +23,18 @@
 //!    purge the local copies on success. These move existing fragment
 //!    archives as opaque bytes and are feature-independent.
 //!
-//! 2. The fragment REBUILD path ([`EcDriver::reconstruct_object`]): given
-//!    `ndata` peer fragment archives it rebuilds the archive for a specific
-//!    fragment index, byte-identical to what the original PUT stored. This
-//!    links liberasurecode, so it is behind the `ec` feature (Linux-only).
+//! 2. The fragment REBUILD path spools peer archives on disk and invokes
+//!    [`EcDriver::reconstruct`] one codec segment at a time. The rebuilt
+//!    archive remains byte-identical to the original PUT without retaining
+//!    full-object payloads in memory. This links liberasurecode, so it is
+//!    behind the `ec` feature (Linux-only).
 
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::reconstruction_spool::{ArchiveBody, SpoolBudget};
 use swift_core::hashing::HashPathConfig;
 #[cfg(feature = "ec")]
 use swift_core::timestamp::Timestamp;
@@ -55,12 +58,35 @@ impl EcScheme {
     }
 }
 
+#[cfg(feature = "ec")]
+pub fn fragment_archive_size_bound(scheme: EcScheme, original_size: usize) -> Option<usize> {
+    if scheme.ndata == 0
+        || scheme.segment_size == 0
+        || scheme.segment_size > i32::MAX as usize
+        || scheme
+            .ndata
+            .checked_add(scheme.nparity)
+            .is_none_or(|total| total > i32::MAX as usize)
+    {
+        return None;
+    }
+    let driver = EcDriver::new(scheme.ndata, scheme.nparity).ok()?;
+    let full = original_size / scheme.segment_size;
+    let tail = original_size % scheme.segment_size;
+    let total = full.checked_mul(driver.fragment_size(scheme.segment_size))?;
+    total.checked_add(if tail == 0 {
+        0
+    } else {
+        driver.fragment_size(tail)
+    })
+}
+
 /// A fragment archive fetched from a peer node, with the EC sysmeta needed to
 /// rebuild and persist the local fragment.
 #[derive(Debug, Clone)]
 pub struct FetchedFragment {
     pub frag_index: i32,
-    pub archive: Vec<u8>,
+    pub archive: ArchiveBody,
     pub ec_etag: String,
     pub ec_content_length: usize,
     /// The object's data timestamp (internal form), so the rebuilt fragment
@@ -72,6 +98,12 @@ pub struct FetchedFragment {
 /// Fetches a peer's fragment archive for an object. Pluggable so the rebuild
 /// logic is unit-tested without a live cluster.
 pub trait FragmentFetcher {
+    /// The same reservation domain covers peer input and rebuilt output.
+    /// Production HTTP fetchers require an explicit disk spool configuration.
+    fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+        None
+    }
+
     fn fetch(
         &self,
         node: &RingDevice,
@@ -94,6 +126,95 @@ pub trait FragmentFetcher {
         _preferred_timestamp: Option<&str>,
     ) -> Option<FetchedFragment> {
         self.fetch(node, partition, account, container, object)
+    }
+
+    /// Distinguish a local retryable resource denial from one unavailable
+    /// peer, so a full spool cannot be misreported as an EC quorum defect.
+    fn fetch_at_checked(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Result<Option<FetchedFragment>, String> {
+        Ok(self.fetch_at(
+            node,
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        ))
+    }
+}
+
+/// Remap peer `RingDevice` ports before a fragment GET so isolated listen
+/// ports (`16210`) are used instead of the ring port (`6010`).
+pub struct OverlayFragmentFetcher<'a> {
+    pub inner: &'a dyn FragmentFetcher,
+    pub overlay: &'a crate::localdev::ObjectListenOverlay,
+}
+
+impl FragmentFetcher for OverlayFragmentFetcher<'_> {
+    fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+        self.inner.reconstruction_spool()
+    }
+
+    fn fetch(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+    ) -> Option<FetchedFragment> {
+        self.inner.fetch(
+            &self.overlay.remap_device(node),
+            partition,
+            account,
+            container,
+            object,
+        )
+    }
+
+    fn fetch_at(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Option<FetchedFragment> {
+        self.inner.fetch_at(
+            &self.overlay.remap_device(node),
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        )
+    }
+
+    fn fetch_at_checked(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Result<Option<FetchedFragment>, String> {
+        self.inner.fetch_at_checked(
+            &self.overlay.remap_device(node),
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+        )
     }
 }
 
@@ -118,13 +239,72 @@ pub enum ReconstructError {
     BadTimestamp(String),
 }
 
+/// Python `[object-reconstructor] quarantine_threshold` / `quarantine_age`.
+/// Threshold 0 (default) never quarantines. Official
+/// `test_rebuild_quarantines_lonely_frag` sets threshold=1 and age=0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuarantinePolicy {
+    pub threshold: u64,
+    pub age_secs: f64,
+}
+
+impl Default for QuarantinePolicy {
+    fn default() -> Self {
+        Self {
+            threshold: 0,
+            age_secs: 604800.0,
+        }
+    }
+}
+
+impl QuarantinePolicy {
+    pub fn from_conf(threshold: &str, age: &str) -> Self {
+        Self {
+            threshold: threshold.parse().unwrap_or(0),
+            age_secs: age.parse().unwrap_or(604800.0),
+        }
+    }
+}
+
+/// Python `_is_quarantine_candidate` (obj.py). A solitary local fragment
+/// whose peers only 404, and that is older than `quarantine_age`, is
+/// moved off the primary path so a later direct GET is 404 not 503.
+pub fn is_solitary_quarantine_candidate(
+    policy: QuarantinePolicy,
+    ndata: usize,
+    useful_at_local: usize,
+    local_index_present: bool,
+    only_404_errors: bool,
+    only_local_timestamp: bool,
+    local_timestamp_secs: f64,
+    now_secs: f64,
+) -> bool {
+    if policy.threshold == 0 || !only_404_errors || !only_local_timestamp || !local_index_present {
+        return false;
+    }
+    if now_secs - local_timestamp_secs <= policy.age_secs {
+        return false;
+    }
+    useful_at_local > 0 && useful_at_local <= policy.threshold as usize && useful_at_local < ndata
+}
+
+/// Prefix `ssync_sender` recognizes to move the local hash dir.
+pub const QUARANTINE_REBUILD_PREFIX: &str = "QUARANTINE ";
+
+#[cfg(feature = "ec")]
+#[derive(Debug, Default, Clone)]
+struct GatherTally {
+    useful_indexes: std::collections::BTreeSet<i32>,
+    timestamps: std::collections::BTreeSet<String>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconstructorStats {
     pub rebuilt: u64,
     pub failed: u64,
 }
 
-#[cfg(feature = "ec")]
+#[cfg(all(feature = "ec", test))]
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
     format!("{:x}", Md5::digest(data))
@@ -146,9 +326,31 @@ pub fn local_frag_index(
         .position(|pn| pn.dev.ip == my_ip && pn.dev.port == my_port && pn.dev.device == my_device)
 }
 
+fn same_data_timestamp(left: &str, right: &str) -> bool {
+    match (
+        left.parse::<swift_core::timestamp::Timestamp>(),
+        right.parse::<swift_core::timestamp::Timestamp>(),
+    ) {
+        (Ok(a), Ok(b)) => a.internal() == b.internal(),
+        _ => left == right,
+    }
+}
+
+/// Bucket key so a datafile `X-Timestamp` (`1751500123.45678`) and an HTTP
+/// `X-Backend-Data-Timestamp` (same instant, possibly `.internal()` form)
+/// join one reconstruct_fa quorum. Field `test_rebuild_missing_frags` POSTs
+/// after PUT; ca2081b compared the raw strings and dropped every peer.
+#[cfg(feature = "ec")]
+fn version_timestamp_key(ts: &str) -> String {
+    ts.parse::<swift_core::timestamp::Timestamp>()
+        .map(|t| t.internal())
+        .unwrap_or_else(|_| ts.to_string())
+}
+
 /// Gather `ndata` fragment archives for one object from its peers. Keeps
-/// only fragments that agree with the first-fetched one on the object's EC
-/// etag + timestamp (one coherent version).
+/// only unique fragment indexes that agree on the object's EC etag, original
+/// length, and data timestamp. A stale first peer must not anchor the entire
+/// attempt when a later coherent quorum exists.
 #[cfg(feature = "ec")]
 fn gather_coherent_archives(
     peers: &[RingDevice],
@@ -159,39 +361,175 @@ fn gather_coherent_archives(
     ndata: usize,
     fetcher: &dyn FragmentFetcher,
     preferred_timestamp: Option<&str>,
-) -> Result<(FetchedFragment, Vec<Vec<u8>>), ReconstructError> {
-    let mut archives: Vec<Vec<u8>> = Vec::new();
-    let mut chosen: Option<FetchedFragment> = None;
-    for node in peers {
-        if archives.len() >= ndata {
-            break;
+    seed: Option<FetchedFragment>,
+    mut tally: Option<&mut GatherTally>,
+) -> Result<(FetchedFragment, Vec<ArchiveBody>), ReconstructError> {
+    type VersionKey = (String, String, usize);
+    let mut versions: BTreeMap<VersionKey, BTreeMap<i32, FetchedFragment>> = BTreeMap::new();
+    let accept = |frag: &FetchedFragment| {
+        frag.frag_index >= 0
+            && preferred_timestamp
+                .is_none_or(|expected| same_data_timestamp(&frag.timestamp, expected))
+    };
+    if let Some(frag) = seed.filter(|frag| accept(frag)) {
+        if let Some(tally) = tally.as_mut() {
+            tally.useful_indexes.insert(frag.frag_index);
+            tally
+                .timestamps
+                .insert(version_timestamp_key(&frag.timestamp));
         }
-        let Some(frag) = fetcher.fetch_at(
-            node,
-            partition,
-            account,
-            container,
-            object,
-            preferred_timestamp,
-        ) else {
+        let key = (
+            version_timestamp_key(&frag.timestamp),
+            frag.ec_etag.clone(),
+            frag.ec_content_length,
+        );
+        versions
+            .entry(key)
+            .or_default()
+            .entry(frag.frag_index)
+            .or_insert(frag);
+    }
+    for node in peers {
+        let Some(frag) = fetcher
+            .fetch_at_checked(
+                node,
+                partition,
+                account,
+                container,
+                object,
+                preferred_timestamp,
+            )
+            .map_err(ReconstructError::DiskFile)?
+        else {
             continue;
         };
-        match &chosen {
-            None => {
-                chosen = Some(frag.clone());
-                archives.push(frag.archive);
-            }
-            Some(c) => {
-                if c.ec_etag == frag.ec_etag && c.timestamp == frag.timestamp {
-                    archives.push(frag.archive);
-                }
-            }
+        if !accept(&frag) {
+            continue;
         }
+        if let Some(tally) = tally.as_mut() {
+            tally.useful_indexes.insert(frag.frag_index);
+            tally
+                .timestamps
+                .insert(version_timestamp_key(&frag.timestamp));
+        }
+        let key = (
+            version_timestamp_key(&frag.timestamp),
+            frag.ec_etag.clone(),
+            frag.ec_content_length,
+        );
+        versions
+            .entry(key)
+            .or_default()
+            .entry(frag.frag_index)
+            .or_insert(frag);
     }
-    if archives.len() < ndata {
+    let Some((_key, coherent)) = versions
+        .into_iter()
+        .rev()
+        .find(|(_key, fragments)| fragments.len() >= ndata)
+    else {
         return Err(ReconstructError::NotEnoughFragments);
+    };
+    let mut fragments = coherent.into_values().take(ndata);
+    let first = fragments
+        .next()
+        .ok_or(ReconstructError::NotEnoughFragments)?;
+    let chosen = FetchedFragment {
+        frag_index: first.frag_index,
+        archive: Vec::new().into(),
+        ec_etag: first.ec_etag.clone(),
+        ec_content_length: first.ec_content_length,
+        timestamp: first.timestamp.clone(),
+        content_type: first.content_type.clone(),
+    };
+    let mut archives = Vec::with_capacity(ndata);
+    archives.push(first.archive);
+    archives.extend(fragments.map(|fragment| fragment.archive));
+    Ok((chosen, archives))
+}
+
+/// Reconstruct one codec segment at a time into an anonymous output archive.
+/// Rust-owned resident payload is k fragment segments plus one output
+/// fragment segment (in addition to the codec's bounded per-segment FFI
+/// workspace); full-object archives are never materialized in RAM.
+#[cfg(feature = "ec")]
+fn reconstruct_archives_to_spool(
+    scheme: EcScheme,
+    archives: &[ArchiveBody],
+    original_size: usize,
+    destination_index: usize,
+    budget: &SpoolBudget,
+) -> Result<ArchiveBody, String> {
+    if scheme.ndata == 0
+        || scheme.segment_size == 0
+        || scheme.segment_size > i32::MAX as usize
+        || scheme
+            .ndata
+            .checked_add(scheme.nparity)
+            .is_none_or(|total| total > i32::MAX as usize)
+        || destination_index >= scheme.n_unique()
+        || archives.len() < scheme.ndata
+    {
+        return Err("invalid reconstruction scheme, target, or source count".into());
     }
-    Ok((chosen.unwrap(), archives))
+    let expected = fragment_archive_size_bound(scheme, original_size)
+        .ok_or("fragment archive length overflow")?;
+    if archives
+        .iter()
+        .any(|archive| archive.len() != expected as u64)
+    {
+        return Err("source archive length does not match EC object metadata".into());
+    }
+    let driver = EcDriver::new(scheme.ndata, scheme.nparity).map_err(|error| error.to_string())?;
+    let mut output = budget
+        .reserve(expected as u64)
+        .map_err(|error| error.to_string())?;
+    let mut readers: Vec<_> = archives
+        .iter()
+        .take(scheme.ndata)
+        .map(ArchiveBody::reader)
+        .collect();
+    let mut fragments = vec![Vec::new(); scheme.ndata];
+    let mut indexes = vec![None; scheme.ndata];
+    let mut remaining = original_size;
+    while remaining > 0 {
+        let segment = remaining.min(scheme.segment_size);
+        let fragment_len = driver.fragment_size(segment);
+        let mut seen = BTreeSet::new();
+        for (index, (reader, fragment)) in readers.iter_mut().zip(fragments.iter_mut()).enumerate()
+        {
+            if fragment.len() < fragment_len {
+                fragment
+                    .try_reserve_exact(fragment_len - fragment.len())
+                    .map_err(|_| "could not reserve EC segment buffer (retryable)".to_string())?;
+            }
+            fragment.resize(fragment_len, 0);
+            reader
+                .read_exact(fragment)
+                .map_err(|error| format!("incomplete EC segment: {error}"))?;
+            let actual =
+                EcDriver::fragment_index(fragment).ok_or("invalid fragment segment header")?;
+            if actual < 0
+                || actual as usize >= scheme.n_unique()
+                || !seen.insert(actual)
+                || indexes[index].is_some_and(|expected| expected != actual)
+            {
+                return Err("inconsistent or duplicate fragment segment index".into());
+            }
+            indexes[index] = Some(actual);
+        }
+        let rebuilt = driver
+            .reconstruct(&fragments, destination_index)
+            .map_err(|error| error.to_string())?;
+        if rebuilt.len() != fragment_len {
+            return Err("rebuilt segment length mismatch".into());
+        }
+        output
+            .write_all(&rebuilt)
+            .map_err(|error| format!("reconstruction spool write (retryable): {error}"))?;
+        remaining -= segment;
+    }
+    output.finish().map_err(|error| error.to_string())
 }
 
 /// `reconstruct_fa` for the ssync SYNC path (`sync_diskfile_builder`): the
@@ -204,23 +542,41 @@ fn gather_coherent_archives(
 pub struct EcSyncRebuilder<'a> {
     pub scheme: EcScheme,
     pub partition: u64,
-    /// Fragment sources: the partition's primaries excluding the node being
-    /// rebuilt to (Python `_make_fragment_requests`' source set).
-    pub peers: Vec<RingDevice>,
+    /// Fragment sources: `(backend_index, device)` for the partition's
+    /// primaries. `reconstruct_fa` skips the node being rebuilt to (Python
+    /// `_make_fragment_requests`).
+    pub peers: Vec<(i64, RingDevice)>,
     pub fetcher: &'a dyn FragmentFetcher,
+    /// Official lonely-frag probe: `quarantine_threshold=1` `quarantine_age=0`.
+    pub quarantine: QuarantinePolicy,
 }
 
 #[cfg(feature = "ec")]
 impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
     fn rebuild(
         &self,
+        object_hash: &str,
+        datafile_metadata: &Metadata,
+        target_frag_index: i64,
+    ) -> Result<(Metadata, ArchiveBody), String> {
+        self.rebuild_with_local(object_hash, datafile_metadata, target_frag_index, None)
+    }
+
+    fn rebuild_with_local(
+        &self,
         _object_hash: &str,
         datafile_metadata: &Metadata,
         target_frag_index: i64,
-    ) -> Result<(Metadata, Vec<u8>), String> {
+        local: Option<FetchedFragment>,
+    ) -> Result<(Metadata, ArchiveBody), String> {
+        let spool = self
+            .fetcher
+            .reconstruction_spool()
+            .ok_or("reconstruction spool is not configured (retryable)")?;
         let get = |name: &str| {
             datafile_metadata.iter().find_map(|(k, v)| match (k, v) {
                 (MetaValue::Str(k), MetaValue::Str(v)) if k == name => Some(v.clone()),
+                (MetaValue::Str(k), MetaValue::Int(i)) if k == name => Some(i.to_string()),
                 _ => None,
             })
         };
@@ -233,8 +589,26 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             parts.next().ok_or("bad name")?,
         );
         let local_ts = get("X-Timestamp").ok_or("datafile has no X-Timestamp")?;
-        let (chosen, archives) = gather_coherent_archives(
-            &self.peers,
+        let local_ts = local_ts
+            .parse::<swift_core::timestamp::Timestamp>()
+            .map(|ts| ts.internal())
+            .unwrap_or(local_ts);
+        let sources: Vec<RingDevice> = self
+            .peers
+            .iter()
+            .filter(|(index, _)| *index != target_frag_index)
+            .map(|(_, device)| device.clone())
+            .collect();
+        let local_frag_index: Option<i32> = get("X-Object-Sysmeta-Ec-Frag-Index")
+            .and_then(|s| s.parse().ok())
+            .or_else(|| local.as_ref().map(|f| f.frag_index));
+        let local_ts_secs = local_ts
+            .parse::<swift_core::timestamp::Timestamp>()
+            .map(|t| t.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut tally = GatherTally::default();
+        let (chosen, archives) = match gather_coherent_archives(
+            &sources,
             self.partition,
             account,
             container,
@@ -242,27 +616,53 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
             self.scheme.ndata,
             self.fetcher,
             Some(&local_ts),
-        )
-        .map_err(|e| format!("{e:?}"))?;
+            local,
+            Some(&mut tally),
+        ) {
+            Ok(got) => got,
+            Err(ReconstructError::NotEnoughFragments) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let useful = tally.useful_indexes.len();
+                let local_present =
+                    local_frag_index.is_some_and(|idx| tally.useful_indexes.contains(&idx));
+                if is_solitary_quarantine_candidate(
+                    self.quarantine,
+                    self.scheme.ndata,
+                    useful,
+                    local_present,
+                    true,
+                    tally.timestamps.len() <= 1,
+                    local_ts_secs,
+                    now,
+                ) {
+                    return Err(format!(
+                        "{QUARANTINE_REBUILD_PREFIX}solitary fragment #{}",
+                        local_frag_index.unwrap_or(-1)
+                    ));
+                }
+                return Err("NotEnoughFragments".into());
+            }
+            Err(e) => return Err(format!("{e:?}")),
+        };
         // The rebuilt bytes must belong to the SAME version the sender is
         // offering: peers serving a different timestamp would be labelled
         // with this datafile's metadata and corrupt the receiver's view.
-        if chosen.timestamp != local_ts {
+        if !same_data_timestamp(&chosen.timestamp, &local_ts) {
             return Err(format!(
                 "peers serve timestamp {} but the local fragment is {local_ts}",
                 chosen.timestamp
             ));
         }
-        let driver =
-            EcDriver::new(self.scheme.ndata, self.scheme.nparity).map_err(|e| format!("{e:?}"))?;
-        let rebuilt = driver
-            .reconstruct_object(
-                &archives,
-                chosen.ec_content_length,
-                self.scheme.segment_size,
-                target_frag_index as usize,
-            )
-            .map_err(|e| format!("{e:?}"))?;
+        let rebuilt = reconstruct_archives_to_spool(
+            self.scheme,
+            &archives,
+            chosen.ec_content_length,
+            target_frag_index as usize,
+            &spool,
+        )?;
         let mut metadata: Metadata = Vec::with_capacity(datafile_metadata.len());
         for (k, v) in datafile_metadata {
             if let MetaValue::Str(key) = k {
@@ -272,7 +672,9 @@ impl crate::ssync_sender::SyncDiskfileBuilder for EcSyncRebuilder<'_> {
                     continue;
                 }
                 if key == "X-Object-Sysmeta-Ec-Frag-Index" {
-                    metadata.push((k.clone(), MetaValue::Int(target_frag_index)));
+                    // String so object-server GET echoes the header for
+                    // proxy EC GET (Int sysmeta used to be dropped).
+                    metadata.push((k.clone(), MetaValue::Str(target_frag_index.to_string())));
                     continue;
                 }
             }
@@ -296,8 +698,9 @@ pub fn rebuild_job(
     job: &ReconstructJob,
     fetcher: &dyn FragmentFetcher,
 ) -> Result<(), ReconstructError> {
-    let driver = EcDriver::new(scheme.ndata, scheme.nparity)
-        .map_err(|e| ReconstructError::Ec(format!("{e:?}")))?;
+    let spool = fetcher.reconstruction_spool().ok_or_else(|| {
+        ReconstructError::DiskFile("reconstruction spool is not configured (retryable)".into())
+    })?;
 
     let (chosen, archives) = gather_coherent_archives(
         &job.peers,
@@ -308,16 +711,19 @@ pub fn rebuild_job(
         scheme.ndata,
         fetcher,
         None,
+        None,
+        None,
     )?;
 
-    let rebuilt = driver
-        .reconstruct_object(
-            &archives,
-            chosen.ec_content_length,
-            scheme.segment_size,
-            job.destination_index,
-        )
-        .map_err(|e| ReconstructError::Ec(format!("{e:?}")))?;
+    let rebuilt = reconstruct_archives_to_spool(
+        scheme,
+        &archives,
+        chosen.ec_content_length,
+        job.destination_index,
+        &spool,
+    )
+    .map_err(ReconstructError::Ec)?;
+    drop(archives);
 
     let ts: Timestamp = chosen
         .timestamp
@@ -358,7 +764,7 @@ pub fn rebuild_job(
         ),
         (
             MetaValue::Str("ETag".into()),
-            MetaValue::Str(md5_hex(&rebuilt)),
+            MetaValue::Str(rebuilt.md5_hex().to_string()),
         ),
         (
             MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
@@ -374,12 +780,29 @@ pub fn rebuild_job(
         ),
     ];
 
+    // Rebuild publication is a maintenance mutation of the same hash directory
+    // used by foreground PUT/DELETE and EC revert purge. Serialize the entire
+    // create/write/metadata/commit transition on the shared object stripe so a
+    // purge or newer foreground generation cannot interleave with durability.
+    let _mutation_guard = df
+        .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        .map_err(|error| ReconstructError::DiskFile(error.to_string()))?;
     let mut writer = df
         .create(".data")
         .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
-    writer
-        .write(&rebuilt)
-        .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
+    let mut reader = rebuilt.reader();
+    let mut buffer = [0u8; swift_http::STREAM_CHUNK];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| ReconstructError::DiskFile(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write(&buffer[..read])
+            .map_err(|error| ReconstructError::DiskFile(error.to_string()))?;
+    }
     writer
         .put(metadata)
         .map_err(|e| ReconstructError::DiskFile(e.to_string()))?;
@@ -456,15 +879,18 @@ pub fn discover_jobs(
         if df.open(None).is_err() {
             continue;
         }
-        // The local fragment is present iff dest_index is in the newest durable
-        // fragment set.
-        let have_local = df
+        // Rebuild only when this hash dir still has a durable fragment set
+        // that does not include our primary index. Tombstone-only dirs have
+        // no data file (`open` fails). Empty fragment sets are not rebuild
+        // candidates — there is nothing to name or reconstruct from.
+        let Some((_, idxs)) = df
             .fragments()
             .ok()
             .and_then(|sets| sets.into_iter().max_by_key(|(ts, _)| *ts))
-            .map(|(_, idxs)| idxs.contains(&(dest_index as i64)))
-            .unwrap_or(false);
-        if have_local {
+        else {
+            continue;
+        };
+        if idxs.is_empty() || idxs.contains(&(dest_index as i64)) {
             continue;
         }
         let Some((account, container, object)) = df.get_metadata().ok().and_then(object_name)
@@ -564,10 +990,350 @@ fn partition_of(hash_dir: &Path, _policy_index: u32) -> Option<u64> {
 
 /// A real HTTP fragment fetcher: a backend GET to the peer object server,
 /// reading the fragment archive body plus its EC sysmeta headers.
+const INTERNAL_HTTP_HEAD_LIMIT: usize = 64 * 1024;
+const INTERNAL_HTTP_LINE_LIMIT: usize = 16 * 1024;
+const INTERNAL_HTTP_TRAILER_LIMIT: usize = 64 * 1024;
+const INTERNAL_HTTP_TRAILER_LINE_LIMIT: usize = 8 * 1024;
+const DEFAULT_FRAGMENT_RESPONSE_LIMIT: usize = 512 * 1024 * 1024;
+const DEFAULT_SUFFIX_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+fn socket_addr(ip: &str, port: u32) -> Result<std::net::SocketAddr, String> {
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| format!("invalid replication IP {ip:?}"))?;
+    let port = u16::try_from(port).map_err(|_| format!("invalid replication port {port}"))?;
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+fn remaining_socket_timeout(deadline: Instant, idle: Duration) -> std::io::Result<Duration> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline"))?;
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request deadline",
+        ));
+    }
+    Ok(remaining.min(idle).max(Duration::from_millis(1)))
+}
+
+fn write_all_before(
+    stream: &mut std::net::TcpStream,
+    mut bytes: &[u8],
+    idle: Duration,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining_socket_timeout(deadline, idle)?))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "peer stopped accepting request bytes",
+                ))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+struct DeadlineSocketReader<'a> {
+    stream: &'a mut std::net::TcpStream,
+    idle: Duration,
+    deadline: Instant,
+    buffer: [u8; 8192],
+    start: usize,
+    end: usize,
+}
+
+impl<'a> DeadlineSocketReader<'a> {
+    fn new(stream: &'a mut std::net::TcpStream, idle: Duration, deadline: Instant) -> Self {
+        Self {
+            stream,
+            idle,
+            deadline,
+            buffer: [0; 8192],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    fn read_byte(&mut self) -> std::io::Result<u8> {
+        if self.start == self.end {
+            self.stream
+                .set_read_timeout(Some(remaining_socket_timeout(self.deadline, self.idle)?))?;
+            loop {
+                match self.stream.read(&mut self.buffer) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "peer closed response",
+                        ))
+                    }
+                    Ok(read) => {
+                        self.start = 0;
+                        self.end = read;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let byte = self.buffer[self.start];
+        self.start += 1;
+        Ok(byte)
+    }
+
+    fn read_exact_vec(&mut self, len: usize) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        self.append_exact(&mut out, len)?;
+        Ok(out)
+    }
+
+    fn append_exact(&mut self, out: &mut Vec<u8>, mut len: usize) -> Result<(), String> {
+        out.try_reserve_exact(len)
+            .map_err(|_| format!("could not reserve {len} response bytes"))?;
+        while len > 0 {
+            if self.start == self.end {
+                out.push(self.read_byte().map_err(|error| error.to_string())?);
+                len -= 1;
+            }
+            let count = len.min(self.end - self.start);
+            out.extend_from_slice(&self.buffer[self.start..self.start + count]);
+            self.start += count;
+            len -= count;
+        }
+        Ok(())
+    }
+
+    fn read_crlf_line(&mut self, limit: usize) -> Result<Vec<u8>, String> {
+        let mut line = Vec::new();
+        loop {
+            let byte = self.read_byte().map_err(|error| error.to_string())?;
+            if byte == b'\n' {
+                if line.pop() != Some(b'\r') {
+                    return Err("HTTP line ended without CRLF".to_string());
+                }
+                return Ok(line);
+            }
+            line.push(byte);
+            if line.len() > limit.saturating_add(1) {
+                return Err(format!("HTTP line exceeds {limit} bytes"));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InternalHttpHead {
+    status: u16,
+    headers: BTreeMap<String, String>,
+}
+
+/// Token names, plus UTF-8 `X-Object-Meta-*` / sysmeta (official
+/// `TestReconstructorRebuildUTF8` POST). A token-only check rejected the
+/// whole partner GET, so `reconstruct_fa` gathered 0 archives and UTF8
+/// `test_rebuild_missing_frags` 404'd after once
+/// (`/workspace/g6-rebuild-e650f12-utf8/`, 2026-09-06).
+fn is_internal_http_field_name(name: &str) -> bool {
+    if name.is_empty() || name.contains(['\r', '\n', ':', ' ', '\t']) {
+        return false;
+    }
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    ["x-object-meta-", "x-object-sysmeta-", "x-object-transient-sysmeta-"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && lower.len() > prefix.len())
+}
+
+fn read_internal_http_head(
+    reader: &mut DeadlineSocketReader<'_>,
+) -> Result<InternalHttpHead, String> {
+    let status_line = reader.read_crlf_line(INTERNAL_HTTP_LINE_LIMIT)?;
+    let status_line =
+        std::str::from_utf8(&status_line).map_err(|_| "non-UTF8 HTTP status line".to_string())?;
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts
+        .next()
+        .ok_or_else(|| "missing HTTP version".to_string())?;
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(format!("unsupported HTTP version {version:?}"));
+    }
+    let status = status_parts
+        .next()
+        .ok_or_else(|| "missing HTTP status".to_string())?
+        .parse::<u16>()
+        .map_err(|_| "invalid HTTP status".to_string())?;
+    let mut total = status_line.len() + 2;
+    let mut headers = BTreeMap::new();
+    loop {
+        let raw = reader.read_crlf_line(INTERNAL_HTTP_LINE_LIMIT)?;
+        total = total
+            .checked_add(raw.len() + 2)
+            .ok_or_else(|| "HTTP response head length overflow".to_string())?;
+        if total > INTERNAL_HTTP_HEAD_LIMIT {
+            return Err(format!(
+                "HTTP response head exceeds {INTERNAL_HTTP_HEAD_LIMIT} bytes"
+            ));
+        }
+        if raw.is_empty() {
+            break;
+        }
+        if raw.first().is_some_and(u8::is_ascii_whitespace) {
+            return Err("folded HTTP response headers are not supported".to_string());
+        }
+        let line =
+            std::str::from_utf8(&raw).map_err(|_| "non-UTF8 HTTP response header".to_string())?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "malformed HTTP response header".to_string())?;
+        if !is_internal_http_field_name(name) {
+            return Err(format!("invalid HTTP response header name {name:?}"));
+        }
+        let name = name.to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if headers.insert(name.clone(), value).is_some() {
+            return Err(format!("duplicate HTTP response header {name}"));
+        }
+    }
+    Ok(InternalHttpHead { status, headers })
+}
+
+fn read_internal_http_body(
+    reader: &mut DeadlineSocketReader<'_>,
+    headers: &BTreeMap<String, String>,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let content_length = headers.get("content-length");
+    let transfer_encoding = headers.get("transfer-encoding");
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err("response contains both Content-Length and Transfer-Encoding".to_string());
+    }
+    if let Some(value) = content_length {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid response Content-Length".to_string());
+        }
+        let len = value
+            .parse::<usize>()
+            .map_err(|_| "response Content-Length overflow".to_string())?;
+        if len > limit {
+            return Err(format!("response body exceeds {limit} bytes"));
+        }
+        return reader.read_exact_vec(len);
+    }
+    if let Some(value) = transfer_encoding {
+        if !value.eq_ignore_ascii_case("chunked") {
+            return Err(format!("unsupported response Transfer-Encoding {value:?}"));
+        }
+        let mut body = Vec::new();
+        loop {
+            let line = reader.read_crlf_line(128)?;
+            let text =
+                std::str::from_utf8(&line).map_err(|_| "non-ASCII HTTP chunk size".to_string())?;
+            let size_text = text.split(';').next().unwrap_or_default().trim();
+            if size_text.is_empty() || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("invalid HTTP chunk size".to_string());
+            }
+            let size = usize::from_str_radix(size_text, 16)
+                .map_err(|_| "HTTP chunk size overflow".to_string())?;
+            if size == 0 {
+                let mut trailer_bytes = 0usize;
+                loop {
+                    let trailer = reader.read_crlf_line(INTERNAL_HTTP_TRAILER_LINE_LIMIT)?;
+                    trailer_bytes = trailer_bytes
+                        .checked_add(trailer.len() + 2)
+                        .ok_or_else(|| "HTTP trailers length overflow".to_string())?;
+                    if trailer_bytes > INTERNAL_HTTP_TRAILER_LIMIT {
+                        return Err("HTTP trailers exceed aggregate limit".to_string());
+                    }
+                    if trailer.is_empty() {
+                        return Ok(body);
+                    }
+                    if !trailer.contains(&b':') {
+                        return Err("malformed HTTP trailer".to_string());
+                    }
+                }
+            }
+            let next_len = body
+                .len()
+                .checked_add(size)
+                .ok_or_else(|| "decoded HTTP body length overflow".to_string())?;
+            if next_len > limit {
+                return Err(format!("decoded response body exceeds {limit} bytes"));
+            }
+            reader.append_exact(&mut body, size)?;
+            if reader.read_exact_vec(2)? != b"\r\n" {
+                return Err("HTTP chunk payload missing CRLF".to_string());
+            }
+        }
+    }
+    Err("response has no explicit body framing".to_string())
+}
+
+/// Shared REPLICATE transport for both maintenance daemons. Errors are
+/// classified from the head before any body read; successful bodies require
+/// exact framing, an allocation bound and an absolute request deadline.
+#[allow(clippy::too_many_arguments)]
+pub fn bounded_replicate_rpc(
+    address: std::net::SocketAddr,
+    path: &str,
+    policy_index: u32,
+    conn_timeout: Duration,
+    idle_timeout: Duration,
+    request_timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<(u16, Vec<u8>), String> {
+    if conn_timeout.is_zero()
+        || idle_timeout.is_zero()
+        || request_timeout.is_zero()
+        || !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err("invalid REPLICATE request bounds or target".into());
+    }
+    let mut conn = std::net::TcpStream::connect_timeout(&address, conn_timeout)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now()
+        .checked_add(request_timeout)
+        .ok_or_else(|| "invalid REPLICATE deadline".to_string())?;
+    let request = format!("REPLICATE {path} HTTP/1.1\r\nHost: {address}\r\nX-Backend-Storage-Policy-Index: {policy_index}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    write_all_before(&mut conn, request.as_bytes(), idle_timeout, deadline)
+        .map_err(|error| error.to_string())?;
+    let mut reader = DeadlineSocketReader::new(&mut conn, idle_timeout, deadline);
+    let head = read_internal_http_head(&mut reader)?;
+    if head.status != 200 {
+        return Ok((head.status, Vec::new()));
+    }
+    Ok((
+        head.status,
+        read_internal_http_body(&mut reader, &head.headers, max_body_bytes)?,
+    ))
+}
+
 pub struct HttpFragmentFetcher {
     pub policy_index: u32,
     pub conn_timeout: Duration,
     pub node_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_response_bytes: usize,
+    pub max_original_size: usize,
+    pub scheme: Option<EcScheme>,
+    /// Shared across peer downloads, rebuilt outputs, and daemon processes.
+    /// Explicit configuration prevents a default constructor from creating
+    /// temp files in an unknown data or RAM filesystem.
+    pub spool: Option<SpoolBudget>,
 }
 
 impl Default for HttpFragmentFetcher {
@@ -576,11 +1342,20 @@ impl Default for HttpFragmentFetcher {
             policy_index: 0,
             conn_timeout: Duration::from_millis(500),
             node_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(120),
+            max_response_bytes: DEFAULT_FRAGMENT_RESPONSE_LIMIT,
+            max_original_size: swift_core::constraints::MAX_FILE_SIZE as usize,
+            scheme: None,
+            spool: None,
         }
     }
 }
 
 impl FragmentFetcher for HttpFragmentFetcher {
+    fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+        self.spool.clone()
+    }
+
     fn fetch(
         &self,
         node: &RingDevice,
@@ -589,7 +1364,9 @@ impl FragmentFetcher for HttpFragmentFetcher {
         container: &str,
         object: &str,
     ) -> Option<FetchedFragment> {
-        self.fetch_with_preference(node, partition, account, container, object, None)
+        self.fetch_at_checked(node, partition, account, container, object, None)
+            .ok()
+            .flatten()
     }
 
     fn fetch_at(
@@ -601,7 +1378,7 @@ impl FragmentFetcher for HttpFragmentFetcher {
         object: &str,
         preferred_timestamp: Option<&str>,
     ) -> Option<FetchedFragment> {
-        self.fetch_with_preference(
+        self.fetch_at_checked(
             node,
             partition,
             account,
@@ -609,6 +1386,33 @@ impl FragmentFetcher for HttpFragmentFetcher {
             object,
             preferred_timestamp,
         )
+        .ok()
+        .flatten()
+    }
+
+    fn fetch_at_checked(
+        &self,
+        node: &RingDevice,
+        partition: u64,
+        account: &str,
+        container: &str,
+        object: &str,
+        preferred_timestamp: Option<&str>,
+    ) -> Result<Option<FetchedFragment>, String> {
+        let mut resource_error = None;
+        let result = self.fetch_with_preference(
+            node,
+            partition,
+            account,
+            container,
+            object,
+            preferred_timestamp,
+            &mut resource_error,
+        );
+        match resource_error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
     }
 }
 
@@ -640,16 +1444,21 @@ impl HttpFragmentFetcher {
         container: &str,
         object: &str,
         preferred_timestamp: Option<&str>,
+        resource_error: &mut Option<String>,
     ) -> Option<FetchedFragment> {
-        let addr = format!("{}:{}", node.ip, node.port);
-        let sock: std::net::SocketAddr = addr.parse().ok()?;
-        let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
-        conn.set_read_timeout(Some(self.node_timeout)).ok()?;
-        conn.set_write_timeout(Some(self.node_timeout)).ok()?;
-        let mut conn = conn;
+        let spool = self.spool.as_ref()?;
+        let replication_ip = node.replication_ip.as_deref().unwrap_or(&node.ip);
+        let replication_port = node.replication_port.unwrap_or(node.port);
+        let sock = socket_addr(replication_ip, replication_port).ok()?;
+        let mut conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout).ok()?;
+        let deadline = Instant::now().checked_add(self.request_timeout)?;
         let target = Self::request_target(node, partition, account, container, object);
         let preference_header = preferred_timestamp
             .map(|timestamp| {
+                let timestamp = timestamp
+                    .parse::<swift_core::timestamp::Timestamp>()
+                    .map(|ts| ts.internal())
+                    .unwrap_or_else(|_| timestamp.to_string());
                 format!(
                     "X-Backend-Fragment-Preferences: {}\r\n",
                     serde_json::json!([{"timestamp": timestamp, "exclude": []}])
@@ -661,56 +1470,109 @@ impl HttpFragmentFetcher {
              X-Backend-Storage-Policy-Index: {}\r\n\
              X-Backend-Replication: True\r\n\
              {preference_header}\
-             Content-Length: 0\r\nConnection: close\r\n\r\n",
-            self.policy_index
+            Content-Length: 0\r\nConnection: close\r\n\r\n",
+            self.policy_index,
+            addr = sock
         );
-        conn.write_all(req.as_bytes()).ok()?;
-        let mut raw = Vec::new();
-        conn.read_to_end(&mut raw).ok()?;
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-        let body = raw[split + 4..].to_vec();
-        let mut lines = head.lines();
-        let status: u16 = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
-        if status != 200 {
+        write_all_before(&mut conn, req.as_bytes(), self.node_timeout, deadline).ok()?;
+        let mut reader = DeadlineSocketReader::new(&mut conn, self.node_timeout, deadline);
+        let head = read_internal_http_head(&mut reader).ok()?;
+        if head.status != 200 {
             return None;
         }
-        let mut ec_etag = String::new();
-        let mut ec_content_length = 0usize;
+        let ec_etag = head.headers.get("x-object-sysmeta-ec-etag")?.clone();
+        if ec_etag.len() != 32 || !ec_etag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let ec_content_length = head
+            .headers
+            .get("x-object-sysmeta-ec-content-length")?
+            .parse::<usize>()
+            .ok()?;
+        if ec_content_length > self.max_original_size {
+            return None;
+        }
+        let frag_index = head
+            .headers
+            .get("x-object-sysmeta-ec-frag-index")?
+            .parse::<i32>()
+            .ok()?;
+        if frag_index < 0 {
+            return None;
+        }
         // Fast-POST objects carry both timestamps.  The data timestamp names
         // the fragment archive/durable set; the backend timestamp may instead
         // be the newer metadata timestamp.  Header order is not a contract, so
         // collect them independently and prefer the data timestamp explicitly.
-        let mut data_timestamp = String::new();
-        let mut backend_timestamp = String::new();
-        let mut content_type = "application/octet-stream".to_string();
-        let mut frag_index = -1i32;
-        for l in lines {
-            let Some((k, v)) = l.split_once(':') else {
-                continue;
-            };
-            let (k, v) = (k.trim(), v.trim());
-            match k.to_ascii_lowercase().as_str() {
-                "x-object-sysmeta-ec-etag" => ec_etag = v.to_string(),
-                "x-object-sysmeta-ec-content-length" => ec_content_length = v.parse().unwrap_or(0),
-                "x-object-sysmeta-ec-frag-index" => frag_index = v.parse().unwrap_or(-1),
-                "x-backend-data-timestamp" => data_timestamp = v.to_string(),
-                "x-backend-timestamp" if backend_timestamp.is_empty() => {
-                    backend_timestamp = v.to_string();
-                }
-                "content-type" => content_type = v.to_string(),
-                _ => {}
+        let timestamp = head
+            .headers
+            .get("x-backend-data-timestamp")
+            .or_else(|| head.headers.get("x-backend-timestamp"))?
+            .clone();
+        timestamp.parse::<swift_core::timestamp::Timestamp>().ok()?;
+        if preferred_timestamp.is_some_and(|expected| !same_data_timestamp(&timestamp, expected)) {
+            return None;
+        }
+        let content_type = head
+            .headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        #[cfg(not(feature = "ec"))]
+        let body_limit = self.max_response_bytes;
+        #[cfg(feature = "ec")]
+        let mut body_limit = self.max_response_bytes;
+        #[cfg(feature = "ec")]
+        if let Some(scheme) = self.scheme {
+            if frag_index as usize >= scheme.n_unique() {
+                return None;
             }
+            let expected = fragment_archive_size_bound(scheme, ec_content_length)?;
+            if expected > self.max_response_bytes {
+                return None;
+            }
+            body_limit = expected;
         }
         #[cfg(feature = "ec")]
-        if frag_index < 0 {
-            frag_index = EcDriver::fragment_index(&body).unwrap_or(-1);
-        }
-        let timestamp = if data_timestamp.is_empty() {
-            backend_timestamp
-        } else {
-            data_timestamp
+        let expected = match self.scheme {
+            Some(scheme) => Some(fragment_archive_size_bound(scheme, ec_content_length)?),
+            None => None,
         };
+        #[cfg(not(feature = "ec"))]
+        let expected: Option<usize> = None;
+        let body = match read_internal_http_body_spooled(
+            &mut reader,
+            &head.headers,
+            body_limit,
+            expected,
+            spool,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                if error.contains("(retryable)") {
+                    *resource_error = Some(error);
+                }
+                return None;
+            }
+        };
+        #[cfg(feature = "ec")]
+        if let Some(scheme) = self.scheme {
+            let expected = fragment_archive_size_bound(scheme, ec_content_length)?;
+            if body.len() != expected as u64 {
+                return None;
+            }
+            if !body.is_empty() {
+                let driver = EcDriver::new(scheme.ndata, scheme.nparity).ok()?;
+                let first_len = driver.fragment_size(ec_content_length.min(scheme.segment_size));
+                let mut first = Vec::new();
+                first.try_reserve_exact(first_len).ok()?;
+                first.resize(first_len, 0);
+                body.reader().read_exact(&mut first).ok()?;
+                if EcDriver::fragment_index(&first) != Some(frag_index) {
+                    return None;
+                }
+            }
+        }
         Some(FetchedFragment {
             frag_index,
             archive: body,
@@ -719,6 +1581,113 @@ impl HttpFragmentFetcher {
             timestamp,
             content_type,
         })
+    }
+}
+
+/// Same strict framing as the bounded RPC reader, with a disk sink rather
+/// than a full-response Vec. No chunk or Content-Length controls allocation.
+fn read_internal_http_body_spooled(
+    reader: &mut DeadlineSocketReader<'_>,
+    headers: &BTreeMap<String, String>,
+    limit: usize,
+    expected: Option<usize>,
+    budget: &SpoolBudget,
+) -> Result<ArchiveBody, String> {
+    fn copy_bytes(
+        reader: &mut DeadlineSocketReader<'_>,
+        output: &mut impl Write,
+        mut count: usize,
+    ) -> Result<(), String> {
+        while count > 0 {
+            if reader.start == reader.end {
+                let byte = reader.read_byte().map_err(|error| error.to_string())?;
+                output
+                    .write_all(&[byte])
+                    .map_err(|error| format!("reconstruction spool write (retryable): {error}"))?;
+                count -= 1;
+            } else {
+                let next = count.min(reader.end - reader.start);
+                output
+                    .write_all(&reader.buffer[reader.start..reader.start + next])
+                    .map_err(|error| format!("reconstruction spool write (retryable): {error}"))?;
+                reader.start += next;
+                count -= next;
+            }
+        }
+        Ok(())
+    }
+    let content_length = headers.get("content-length");
+    let transfer_encoding = headers.get("transfer-encoding");
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err("response contains both Content-Length and Transfer-Encoding".into());
+    }
+    if let Some(value) = content_length {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid response Content-Length".into());
+        }
+        let length = value
+            .parse::<usize>()
+            .map_err(|_| "response Content-Length overflow")?;
+        if length > limit || expected.is_some_and(|expected| length != expected) {
+            return Err("fragment body length exceeds limit or disagrees with EC metadata".into());
+        }
+        let mut output = budget
+            .reserve(length as u64)
+            .map_err(|error| format!("reconstruction spool reservation (retryable): {error}"))?;
+        copy_bytes(reader, &mut output, length)?;
+        return output.finish().map_err(|error| error.to_string());
+    }
+    if !transfer_encoding.is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+        return Err("fragment response requires Content-Length or single chunked framing".into());
+    }
+    let reserved = expected.unwrap_or(limit);
+    if reserved > limit {
+        return Err("fragment expected length exceeds limit".into());
+    }
+    let mut output = budget
+        .reserve(reserved as u64)
+        .map_err(|error| format!("reconstruction spool reservation (retryable): {error}"))?;
+    let mut total = 0usize;
+    loop {
+        let line = reader.read_crlf_line(128)?;
+        let text = std::str::from_utf8(&line).map_err(|_| "non-ASCII HTTP chunk size")?;
+        let size = text.split(';').next().unwrap_or_default().trim();
+        if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid HTTP chunk size".into());
+        }
+        let size = usize::from_str_radix(size, 16).map_err(|_| "HTTP chunk size overflow")?;
+        if size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let trailer = reader.read_crlf_line(INTERNAL_HTTP_TRAILER_LINE_LIMIT)?;
+                trailer_bytes = trailer_bytes
+                    .checked_add(trailer.len() + 2)
+                    .ok_or("HTTP trailers length overflow")?;
+                if trailer_bytes > INTERNAL_HTTP_TRAILER_LIMIT {
+                    return Err("HTTP trailers exceed aggregate limit".into());
+                }
+                if trailer.is_empty() {
+                    break;
+                }
+                if !trailer.contains(&b':') {
+                    return Err("malformed HTTP trailer".into());
+                }
+            }
+            if expected.is_some() {
+                return output.finish().map_err(|error| error.to_string());
+            }
+            return Ok(output.finish_bounded());
+        }
+        total = total
+            .checked_add(size)
+            .filter(|&next| next <= reserved)
+            .ok_or("fragment chunked body exceeds limit")?;
+        copy_bytes(reader, &mut output, size)?;
+        if reader.read_byte().map_err(|error| error.to_string())? != b'\r'
+            || reader.read_byte().map_err(|error| error.to_string())? != b'\n'
+        {
+            return Err("HTTP chunk missing CRLF".into());
+        }
     }
 }
 
@@ -732,12 +1701,15 @@ impl HttpFragmentFetcher {
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use swift_core::pickle::{self, Value};
+#[cfg(test)]
+use swift_core::pickle;
+use swift_core::pickle::Value;
 use swift_diskfile::{get_partition_hashes, CleanupConfig, Hashes};
 use swift_ring::{HandoffNode, PartNode};
 
 use crate::ssync_sender::{
-    ObjectTimestamps, Sender, SenderReport, SsyncJob, SsyncNode, SsyncSenderError, TcpSsyncWire,
+    object_timestamps_from_hash_dir_strict, ObjectTimestamps, Sender, SenderReport, SsyncJob,
+    SsyncNode, SsyncSenderError, TcpSsyncWire,
 };
 
 /// `reconstructor.SYNC` / `reconstructor.REVERT`.
@@ -803,6 +1775,14 @@ fn ssync_node(dev: &RingDevice, backend_index: i64) -> SsyncNode {
         replication_port: dev.replication_port.unwrap_or(dev.port),
         device: dev.device.clone(),
         backend_index: Some(backend_index),
+    }
+}
+
+/// Rewrite SYNC/REVERT partner ports after `build_part_jobs` so isolated
+/// remaps (`6010` → `16210`) reach the object server `break_nodes` emptied.
+pub fn apply_listen_overlay(job: &mut EcPartJob, overlay: &crate::localdev::ObjectListenOverlay) {
+    for node in job.sync_to.iter_mut().chain(job.sync_handoffs.iter_mut()) {
+        node.replication_port = overlay.listen_port(&node.device, node.replication_port);
     }
 }
 
@@ -971,18 +1951,14 @@ pub fn build_part_jobs(
                 .map(|s| s.nparity + 1)
                 .unwrap_or(part_nodes.len())
                 .min(part_nodes.len());
-            let sync_to = tombstone_sample_indices(
-                part_nodes.len(),
-                nsample,
-                partition,
-                local_dev_id,
-            )
-                .into_iter()
-                .map(|index| {
-                    let node = &part_nodes[index];
-                    ssync_node(node.dev, node.index as i64)
-                })
-                .collect();
+            let sync_to =
+                tombstone_sample_indices(part_nodes.len(), nsample, partition, local_dev_id)
+                    .into_iter()
+                    .map(|index| {
+                        let node = &part_nodes[index];
+                        ssync_node(node.dev, node.index as i64)
+                    })
+                    .collect();
             jobs.push(EcPartJob {
                 job_type: EcJobType::Revert,
                 frag_index: None,
@@ -999,8 +1975,7 @@ pub fn build_part_jobs(
     jobs
 }
 
-static TOMBSTONE_SAMPLE_NONCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static TOMBSTONE_SAMPLE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1171,6 +2146,8 @@ pub trait SuffixHashFetcher {
 pub struct HttpSuffixHashFetcher {
     pub conn_timeout: Duration,
     pub node_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_response_bytes: usize,
 }
 
 impl Default for HttpSuffixHashFetcher {
@@ -1178,6 +2155,8 @@ impl Default for HttpSuffixHashFetcher {
         HttpSuffixHashFetcher {
             conn_timeout: Duration::from_millis(500),
             node_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(30),
+            max_response_bytes: DEFAULT_SUFFIX_RESPONSE_LIMIT,
         }
     }
 }
@@ -1189,44 +2168,83 @@ impl HttpSuffixHashFetcher {
         partition: u64,
         policy_index: u32,
     ) -> Result<Value, SuffixSyncError> {
-        let addr = format!("{}:{}", node.replication_ip, node.replication_port);
-        let sock: std::net::SocketAddr = addr.parse().map_err(|_| SuffixSyncError::Failed)?;
-        let conn = std::net::TcpStream::connect_timeout(&sock, self.conn_timeout)
+        let sock = socket_addr(&node.replication_ip, node.replication_port)
             .map_err(|_| SuffixSyncError::Failed)?;
-        conn.set_read_timeout(Some(self.node_timeout))
-            .map_err(|_| SuffixSyncError::Failed)?;
-        conn.set_write_timeout(Some(self.node_timeout))
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let mut conn = conn;
-        let req = format!(
-            "REPLICATE /{}/{partition} HTTP/1.1\r\nHost: {addr}\r\n\
-             X-Backend-Storage-Policy-Index: {policy_index}\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n",
-            node.device
-        );
-        conn.write_all(req.as_bytes())
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let mut raw = Vec::new();
-        conn.read_to_end(&mut raw)
-            .map_err(|_| SuffixSyncError::Failed)?;
-        let split = raw
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .ok_or(SuffixSyncError::Failed)?;
-        let status: u16 = String::from_utf8_lossy(&raw[..split])
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse().ok())
-            .ok_or(SuffixSyncError::Failed)?;
+        let (status, body) = bounded_replicate_rpc(
+            sock,
+            &format!("/{}/{partition}", node.device),
+            policy_index,
+            self.conn_timeout,
+            self.node_timeout,
+            self.request_timeout,
+            self.max_response_bytes,
+        )
+        .map_err(|_| SuffixSyncError::Failed)?;
         if status == 507 {
             return Err(SuffixSyncError::InsufficientStorage);
         }
         if status != 200 {
             return Err(SuffixSyncError::Failed);
         }
-        pickle::loads(&raw[split + 4..]).map_err(|_| SuffixSyncError::Failed)
+        let decoded =
+            crate::replicator::decode_suffix_hashes(&body).ok_or(SuffixSyncError::Failed)?;
+        validate_ec_suffix_hashes(decoded, 256)
     }
+}
+
+/// Normalize Python 2 byte strings at this wire boundary, then reject any
+/// malformed suffix table before it can be interpreted as an empty peer.
+fn validate_ec_suffix_hashes(value: Value, n_unique: u32) -> Result<Value, SuffixSyncError> {
+    let Value::Dict(pairs) = value else {
+        return Err(SuffixSyncError::Failed);
+    };
+    if pairs.len() > 4096 {
+        return Err(SuffixSyncError::Failed);
+    }
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(pairs.len());
+    for (suffix, subdict) in pairs {
+        let suffix =
+            crate::replicator::suffix_ascii_string(suffix).ok_or(SuffixSyncError::Failed)?;
+        if !lower_hex(&suffix, 3) || !seen.insert(suffix.clone()) {
+            return Err(SuffixSyncError::Failed);
+        }
+        let subdict = match subdict {
+            Value::None => Value::None,
+            Value::Dict(entries) => {
+                if entries.len() > n_unique as usize + 1 {
+                    return Err(SuffixSyncError::Failed);
+                }
+                let mut indexes = BTreeSet::new();
+                let mut valid = Vec::with_capacity(entries.len());
+                for (key, digest) in entries {
+                    let index = match key {
+                        Value::None => None,
+                        Value::Int(index) if index >= 0 && index < i64::from(n_unique) => {
+                            Some(index)
+                        }
+                        _ => return Err(SuffixSyncError::Failed),
+                    };
+                    if !indexes.insert(index) {
+                        return Err(SuffixSyncError::Failed);
+                    }
+                    let digest = crate::replicator::suffix_ascii_string(digest)
+                        .ok_or(SuffixSyncError::Failed)?;
+                    if !lower_hex(&digest, 32) {
+                        return Err(SuffixSyncError::Failed);
+                    }
+                    valid.push((
+                        index.map(Value::Int).unwrap_or(Value::None),
+                        Value::Str(digest),
+                    ));
+                }
+                Value::Dict(valid)
+            }
+            _ => return Err(SuffixSyncError::Failed),
+        };
+        normalized.push((Value::Str(suffix), subdict));
+    }
+    Ok(Value::Dict(normalized))
 }
 
 impl SuffixHashFetcher for HttpSuffixHashFetcher {
@@ -1265,6 +2283,11 @@ pub fn get_suffixes_to_sync(
     fetcher: &dyn SuffixHashFetcher,
 ) -> Result<Vec<String>, SuffixSyncError> {
     let remote = fetcher.fetch_hashes_with_status(node, partition, policy_index)?;
+    let n_unique = match policy {
+        PolicyKind::Ec { n_unique_fragments } => n_unique_fragments.unwrap_or(256),
+        PolicyKind::Replication => return Err(SuffixSyncError::Failed),
+    };
+    let remote = validate_ec_suffix_hashes(remote, n_unique)?;
     let (_hashed, local) = get_partition_hashes(part_path, policy, &[], false, cleanup)
         .map_err(|_| SuffixSyncError::Failed)?;
     let suffixes = get_suffix_delta(
@@ -1291,6 +2314,256 @@ pub fn get_suffixes_to_sync(
 /// means the partition is being handled, so give up fast.
 const REVERT_LOCK_TIMEOUT: f64 = 0.2;
 
+/// Foreground object mutations and maintenance purges share the same
+/// cross-process stripe. A revert already owns `.lock-replication`, so this
+/// is always acquired second; `DiskFile::purge` acquires the partition hash
+/// lock only after it, preserving replication -> object -> hash ordering.
+/// Reverts are maintenance work, so a busy object is left for the next pass
+/// instead of stalling the partition for the foreground 15-second budget.
+const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 0.2;
+
+/// Keep every EC SSYNC exchange finite. A job may make bounded progress over
+/// several pages, but it never materializes an entire dense partition in one
+/// request or lets a peer's receiver limits decide our memory ceiling.
+const EC_SSYNC_PAGE_OBJECTS: usize = 10_000;
+const EC_SSYNC_PASS_OBJECTS: usize = 100_000;
+/// Field `1682fdb` once×4: partner reconstruct_fa counted `rebuilt>0` while
+/// SSYNC connect to the emptied victim returned 503 (lock / admission).
+/// Manager.once exits after one pass; retry the same target so the heal PUT
+/// can land before the process returns. Not a 507 retry.
+const SSYNC_UNAVAILABLE_RETRIES: u32 = 8;
+const EC_REVERT_SNAPSHOT_FILES: usize = 1024;
+const EC_REVERT_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevertFileIdentity {
+    name: String,
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevertHashDirIdentity {
+    device: u64,
+    inode: u64,
+    files: Vec<RevertFileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevertObjectSnapshot {
+    suffix: String,
+    timestamps: ObjectTimestamps,
+    identity: RevertHashDirIdentity,
+}
+
+#[derive(Debug, Default)]
+struct RevertPageSnapshot {
+    objects: BTreeMap<String, RevertObjectSnapshot>,
+    last_offered: Option<(String, String)>,
+    limited_by_max_objects: bool,
+}
+
+fn lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn snapshot_revert_hash_dir(hash_dir: &Path) -> Option<RevertHashDirIdentity> {
+    snapshot_revert_hash_dir_with_limit(hash_dir, EC_REVERT_SNAPSHOT_FILES)
+}
+
+fn snapshot_revert_hash_dir_with_limit(
+    hash_dir: &Path,
+    max_files: usize,
+) -> Option<RevertHashDirIdentity> {
+    let dir_metadata = hash_dir.symlink_metadata().ok()?;
+    if !dir_metadata.file_type().is_dir() {
+        return None;
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(hash_dir).ok()? {
+        if files.len() >= max_files {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let metadata = entry.path().symlink_metadata().ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        files.push(RevertFileIdentity {
+            name: entry.file_name().to_str()?.to_string(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        });
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(RevertHashDirIdentity {
+        device: dir_metadata.dev(),
+        inode: dir_metadata.ino(),
+        files,
+    })
+}
+
+/// Freeze the exact logical and physical source generations that the next
+/// bounded sender page is expected to offer. The remote reports are useful
+/// only if their cursor/count shape still matches this snapshot.
+fn snapshot_revert_page(
+    job: &EcPartJob,
+    sender: &Sender<'_>,
+) -> Result<RevertPageSnapshot, String> {
+    snapshot_revert_page_with_budget(job, sender, EC_REVERT_SNAPSHOT_BYTES)
+}
+
+fn snapshot_revert_page_with_budget(
+    job: &EcPartJob,
+    sender: &Sender<'_>,
+    max_snapshot_bytes: usize,
+) -> Result<RevertPageSnapshot, String> {
+    if sender.max_objects == 0 {
+        return Err("EC revert sender page must have a finite object bound".to_string());
+    }
+    let available = sender
+        .yield_local_hashes(true)
+        .map_err(|error| error.to_string())?;
+    let limited_by_max_objects = available.len() > sender.max_objects;
+    let mut page = RevertPageSnapshot {
+        limited_by_max_objects,
+        ..RevertPageSnapshot::default()
+    };
+    let mut snapshot_bytes = 0usize;
+    for (suffix, object_hash, timestamps) in available.into_iter().take(sender.max_objects) {
+        if !lower_hex(&suffix, 3) || !lower_hex(&object_hash, 32) || !object_hash.ends_with(&suffix)
+        {
+            return Err(format!(
+                "revert part {} encountered malformed object path {suffix}/{object_hash}",
+                job.partition
+            ));
+        }
+        let hash_dir = job.path.join(&suffix).join(&object_hash);
+        let device_path = sender.devices.join(&job.device);
+        let df = DiskFile::from_hash_dir(
+            &device_path,
+            &hash_dir,
+            sender.job.policy,
+            sender.job.policy_index,
+            sender.hash_config,
+            sender.diskfile_config.clone(),
+        );
+        let _mutation_guard = df
+            .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "revert part {} could not snapshot locked object {object_hash}: {error}",
+                    job.partition
+                )
+            })?;
+        let locked_timestamps = object_timestamps_from_hash_dir_strict(
+            &hash_dir,
+            sender.job.policy,
+            sender.job.frag_index,
+            Some(&[]),
+        )
+        .map_err(|error| {
+            format!(
+                "revert part {} could not inspect locked object {object_hash}: {error}",
+                job.partition
+            )
+        })?;
+        if locked_timestamps.as_ref() != Some(&timestamps) {
+            return Err(format!(
+                "revert part {} object {object_hash} changed while its transfer snapshot was being frozen",
+                job.partition
+            ));
+        }
+        let identity = snapshot_revert_hash_dir(&hash_dir).ok_or_else(|| {
+            format!(
+                "revert part {} could not snapshot object {object_hash}",
+                job.partition
+            )
+        })?;
+        // Bound the physical census as well as the number of logical objects.
+        // Charge spare Vec capacity, filenames and tree-node overhead before
+        // retaining another snapshot. On exhaustion leave all sources intact.
+        let file_bytes = identity
+            .files
+            .iter()
+            .try_fold(0usize, |total, file| {
+                total
+                    .checked_add(std::mem::size_of::<RevertFileIdentity>())?
+                    .checked_add(file.name.capacity())
+            })
+            .and_then(|total| total.checked_mul(2));
+        snapshot_bytes = file_bytes
+            .and_then(|bytes| bytes.checked_add(512))
+            .and_then(|bytes| snapshot_bytes.checked_add(bytes))
+            .filter(|bytes| *bytes <= max_snapshot_bytes)
+            .ok_or_else(|| {
+                format!(
+                "revert part {} exceeded its {max_snapshot_bytes}-byte physical snapshot budget",
+                job.partition
+            )
+            })?;
+        page.last_offered = Some((suffix.clone(), object_hash.clone()));
+        if page
+            .objects
+            .insert(
+                object_hash.clone(),
+                RevertObjectSnapshot {
+                    suffix,
+                    timestamps,
+                    identity,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "revert part {} offered duplicate object hash {object_hash}",
+                job.partition
+            ));
+        }
+    }
+    Ok(page)
+}
+
+fn valid_revert_report(report: &SenderReport, page: &RevertPageSnapshot) -> bool {
+    report.offered_count == page.objects.len()
+        && report.last_offered == page.last_offered
+        && report.limited_by_max_objects == page.limited_by_max_objects
+        && report
+            .can_delete_objs
+            .iter()
+            .all(|(object_hash, timestamps)| {
+                page.objects
+                    .get(object_hash)
+                    .is_some_and(|snapshot| &snapshot.timestamps == timestamps)
+            })
+}
+
+fn intersect_revert_confirmations(
+    reports: &[BTreeMap<String, ObjectTimestamps>],
+) -> BTreeMap<String, ObjectTimestamps> {
+    let Some((first, rest)) = reports.split_first() else {
+        return BTreeMap::new();
+    };
+    let mut confirmed = first.clone();
+    for report in rest {
+        confirmed.retain(|object_hash, timestamps| report.get(object_hash) == Some(timestamps));
+    }
+    confirmed
+}
+
 /// Per-pass ssync-job stats.
 ///
 /// `last_error` exists because a bare `failures` counter is undiagnosable: a
@@ -1303,21 +2576,124 @@ const REVERT_LOCK_TIMEOUT: f64 = 0.2;
 pub struct EcSsyncStats {
     pub suffix_syncs: u64,
     pub reverts: u64,
+    pub rebuilt: u64,
+    /// Wanted data PUTs that entered reconstruct_fa (success, skip, or
+    /// error). Connect-fail SSYNC does not increment this — that stays in
+    /// `failures` / `log_lines`. Field `1682fdb` could not tell those apart.
+    pub reconstruct_fa_attempts: u64,
     pub failures: u64,
     pub last_error: Option<String>,
+    /// Every SSYNC / reconstruct_fa skip or failure this pass, in order.
+    /// Field `57b7456` only ERROR-logged `last_error` once; INFO of these
+    /// lines is what operators grep.
+    pub log_lines: Vec<String>,
+}
+
+impl EcSsyncStats {
+    /// Record a reconstruct_fa skip or similar without incrementing
+    /// `failures` (SSYNC itself completed).
+    pub fn note(&mut self, msg: String) {
+        self.log_lines.push(msg.clone());
+        self.last_error = Some(msg);
+    }
+
+    /// Record a hard SSYNC / revert failure.
+    pub fn fail(&mut self, msg: String) {
+        self.failures += 1;
+        self.note(msg);
+    }
+}
+
+/// Greppable `Manager.once` start line. Stale `/usr/local/bin` (Aug 9)
+/// pass lines lack `rebuilt=` and never emit this token.
+pub fn format_reconstructor_once_start(
+    pid: u32,
+    conf: &str,
+    argv: &str,
+    swift_dir: &str,
+    swift_dir_source: &str,
+    devices: &str,
+    bind_port: u32,
+    overlay_entries: usize,
+    policies: &str,
+    once: bool,
+) -> String {
+    format!(
+        "object-reconstructor once start: pid={pid} conf={conf} argv={argv} \
+         swift_dir={swift_dir} swift_dir_source={swift_dir_source} \
+         devices={devices} bind_port={bind_port} overlay_entries={overlay_entries} \
+         policies={policies} once={once}"
+    )
+}
+
+/// Greppable `Manager.once` end line after the single sweep.
+pub fn format_reconstructor_once_done(stats: &EcSsyncStats) -> String {
+    format!(
+        "object-reconstructor once done: suffix_syncs={} reverts={} rebuilt={} \
+         reconstruct_fa_attempts={} failures={}",
+        stats.suffix_syncs,
+        stats.reverts,
+        stats.rebuilt,
+        stats.reconstruct_fa_attempts,
+        stats.failures
+    )
+}
+
+/// Always emitted, including `overlay_entries=0`. Field `1682fdb` treated
+/// a missing "listen overlay from" line as `listen_overlay=0`.
+pub fn format_listen_overlay_status(
+    overlay_entries: usize,
+    swift_dir: &str,
+    swift_dir_source: &str,
+) -> String {
+    format!(
+        "object-reconstructor: listen_overlay_entries={overlay_entries} \
+         swift_dir={swift_dir} swift_dir_source={swift_dir_source}"
+    )
+}
+
+/// Connect-level 503 (lock / admission / storage busy). 507 and in-band
+/// `:ERROR:` are not this token.
+pub fn is_retryable_ssync_unavailable(err: &str) -> bool {
+    err.contains("got 503")
+        || err.contains("Service Unavailable")
+        || err.contains("replication lock timeout")
+        || err.contains("object mutation lock timeout")
+}
+
+fn ssync_unavailable_backoff(retry: u32) -> std::time::Duration {
+    let shift = retry.saturating_sub(1).min(3);
+    let factor = 1u64.checked_shl(shift).unwrap_or(8);
+    std::time::Duration::from_millis(200u64.saturating_mul(factor))
+}
+
+/// Per-device sweep after `break_nodes`. Victim `jobs=0` is expected
+/// (rmtree); partners must show `jobs>0` for reconstruct_fa to run.
+pub fn format_reconstructor_sweep(
+    policy_index: u32,
+    policy_name: &str,
+    device: &str,
+    local_id: u64,
+    parts: u64,
+    jobs: u64,
+) -> String {
+    format!(
+        "object-reconstructor: sweep policy={policy_index} policy_name={policy_name} \
+         device={device} local_id={local_id} parts={parts} jobs={jobs}"
+    )
 }
 
 /// `reconstructor.process_job`: run one partition job.
 ///
 /// SYNC (`reconstructor._sync`): ssync the job's suffixes to each partner.
-/// v1 scope notes — Python first narrows suffixes per partner with a
-/// REPLICATE hash comparison (`_get_suffixes_to_sync`); this version ssyncs
-/// the whole suffix list each pass (the missing-check keeps it cheap for
-/// in-sync objects). Python also rebuilds wanted data fragments on the fly at
-/// the partner's frag index (`sync_diskfile_builder`/`reconstruct_fa`); this
-/// version has no rebuilder, so the sender skips data PUTs whose local
-/// fragment does not match the partner's index (exactly what Python does when
-/// the rebuild fails) — tombstones and meta still propagate.
+/// Suffixes are first narrowed per partner with a REPLICATE hash comparison
+/// (`get_suffixes_to_sync`). When the `ec` feature is on, the daemon supplies
+/// [`EcSyncRebuilder`] so a local fragment at a different index is rebuilt
+/// at the partner's backend index (`reconstruct_fa`). Without a rebuilder —
+/// or when rebuild fails — the sender skips those data PUTs (tombstones and
+/// meta still propagate). The daemon also runs [`run_once`] after ssync so a
+/// node that still has the object hash dir but lost its own fragment can
+/// rebuild locally from peers.
 ///
 /// REVERT (`reconstructor._revert`): ssync everything (including non-durable
 /// fragments) to every proper primary; when all of them succeed, purge the
@@ -1374,30 +2750,151 @@ pub fn process_part_job(
                     if suffixes.is_empty() {
                         break;
                     }
-                    let sender = Sender {
-                        devices,
-                        hash_config,
-                        diskfile_config: cfg,
-                        job: &ssync_job,
-                        suffixes: Some(&suffixes),
-                        include_non_durable: false,
-                        max_objects: 0,
-                        sync_frag_target: node.backend_index,
-                        diskfile_builder,
-                    };
-                    match pusher.push(&sender, node) {
-                        Ok(_) => stats.suffix_syncs += suffixes.len() as u64,
-                        Err(e) => {
-                            stats.failures += 1;
-                            stats.last_error = Some(format!(
-                                "sync part {} frag {:?} -> {}:{}/{}: {e}",
+                    let mut start_after: Option<(String, String)> = None;
+                    let mut processed_objects = 0usize;
+                    let mut complete = false;
+                    loop {
+                        let remaining = EC_SSYNC_PASS_OBJECTS.saturating_sub(processed_objects);
+                        if remaining == 0 {
+                            stats.fail(format!(
+                                "sync part {} frag {:?} reached the bounded {}-object pass limit",
+                                job.partition, job.frag_index, EC_SSYNC_PASS_OBJECTS
+                            ));
+                            break;
+                        }
+                        let page_limit = EC_SSYNC_PAGE_OBJECTS.min(remaining);
+                        let sender = Sender {
+                            devices,
+                            hash_config,
+                            diskfile_config: cfg,
+                            job: &ssync_job,
+                            suffixes: Some(&suffixes),
+                            include_non_durable: false,
+                            max_objects: page_limit,
+                            start_after: start_after.clone(),
+                            sync_frag_target: node.backend_index,
+                            diskfile_builder,
+                        };
+                        let report = {
+                            let mut retries = 0u32;
+                            loop {
+                                match pusher.push(&sender, node) {
+                                    Ok(report) => break Ok(report),
+                                    Err(e) => {
+                                        let msg = format!(
+                                            "sync part {} frag {:?} -> {}:{}/{}: {e}",
+                                            job.partition,
+                                            job.frag_index,
+                                            node.replication_ip,
+                                            node.replication_port,
+                                            node.device
+                                        );
+                                        if is_retryable_ssync_unavailable(&msg)
+                                            && retries < SSYNC_UNAVAILABLE_RETRIES
+                                        {
+                                            retries += 1;
+                                            stats.note(format!(
+                                                "{msg} (retry {retries}/{SSYNC_UNAVAILABLE_RETRIES})"
+                                            ));
+                                            std::thread::sleep(ssync_unavailable_backoff(retries));
+                                            continue;
+                                        }
+                                        // Retryable reconstruct_fa aborts the
+                                        // wire without a SenderReport.
+                                        if msg.contains("rebuild resource refusal") {
+                                            stats.reconstruct_fa_attempts += 1;
+                                        }
+                                        stats.fail(msg);
+                                        break Err(());
+                                    }
+                                }
+                            }
+                        };
+                        let Ok(report) = report else {
+                            break;
+                        };
+                        stats.rebuilt += report.rebuilt;
+                        stats.reconstruct_fa_attempts += report.reconstruct_fa_attempts;
+                        if report.rebuilt > 0 {
+                            stats.log_lines.push(format!(
+                                "reconstruct_fa PUT -> {}:{}/{} backend_index={} durable={} rebuilt={}",
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device,
+                                report
+                                    .last_rebuild_target
+                                    .or(node.backend_index)
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                                report
+                                    .last_rebuild_durable
+                                    .map(|d| if d { "true" } else { "false" })
+                                    .unwrap_or("?"),
+                                report.rebuilt
+                            ));
+                        }
+                        if let Some(error) = report.last_rebuild_error {
+                            if error.starts_with("Quarantined object") {
+                                stats.log_lines.push(error);
+                            } else {
+                                stats.note(format!(
+                                    "reconstruct_fa part {} -> {}:{}/{}: {error}",
+                                    job.partition,
+                                    node.replication_ip,
+                                    node.replication_port,
+                                    node.device
+                                ));
+                            }
+                        }
+                        if report.offered_count > page_limit
+                            || (report.offered_count > 0 && report.last_offered.is_none())
+                        {
+                            stats.fail(format!(
+                                "sync part {} frag {:?} -> {}:{}/{} returned an invalid bounded page",
                                 job.partition,
                                 job.frag_index,
                                 node.replication_ip,
                                 node.replication_port,
                                 node.device
                             ));
+                            break;
                         }
+                        processed_objects =
+                            match processed_objects.checked_add(report.offered_count) {
+                                Some(total) => total,
+                                None => {
+                                    stats.fail(format!(
+                                        "sync part {} object count overflow",
+                                        job.partition
+                                    ));
+                                    break;
+                                }
+                            };
+                        if !report.limited_by_max_objects {
+                            complete = true;
+                            break;
+                        }
+                        let Some(next_cursor) = report.last_offered else {
+                            stats.fail(format!(
+                                "sync part {} returned a truncated page without a cursor",
+                                job.partition
+                            ));
+                            break;
+                        };
+                        if start_after
+                            .as_ref()
+                            .is_some_and(|cursor| &next_cursor <= cursor)
+                        {
+                            stats.fail(format!(
+                                "sync part {} returned a non-progressing page cursor",
+                                job.partition
+                            ));
+                            break;
+                        }
+                        start_after = Some(next_cursor);
+                    }
+                    if complete {
+                        stats.suffix_syncs += suffixes.len() as u64;
                     }
                     break;
                 }
@@ -1415,45 +2912,128 @@ pub fn process_part_job(
             ) else {
                 return;
             };
-            let mut synced_with = 0usize;
-            let mut reverted: BTreeMap<String, ObjectTimestamps> = BTreeMap::new();
-            for node in &job.sync_to {
-                let sender = Sender {
+            if job.sync_to.is_empty() {
+                return;
+            }
+
+            let mut start_after: Option<(String, String)> = None;
+            let mut processed_objects = 0usize;
+            let mut processed_any = false;
+            loop {
+                let remaining = EC_SSYNC_PASS_OBJECTS.saturating_sub(processed_objects);
+                if remaining == 0 {
+                    stats.fail(format!(
+                        "revert part {} reached the bounded {}-object pass limit",
+                        job.partition, EC_SSYNC_PASS_OBJECTS
+                    ));
+                    return;
+                }
+                let page_limit = EC_SSYNC_PAGE_OBJECTS.min(remaining);
+                let page_sender = Sender {
                     devices,
                     hash_config,
                     diskfile_config: cfg,
                     job: &ssync_job,
                     suffixes: Some(&job.suffixes),
                     include_non_durable: true,
-                    max_objects: 0,
+                    max_objects: page_limit,
+                    start_after: start_after.clone(),
                     sync_frag_target: None,
                     diskfile_builder: None,
                 };
-                match pusher.push(&sender, node) {
-                    Ok(report) => {
-                        synced_with += 1;
-                        reverted.extend(report.can_delete_objs);
+                let page = match snapshot_revert_page(job, &page_sender) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        stats.fail(error);
+                        return;
                     }
-                    Err(e) => {
-                        stats.failures += 1;
-                        stats.last_error = Some(format!(
-                            "revert part {} -> {}:{}/{}: {e}",
-                            job.partition, node.replication_ip, node.replication_port, node.device
-                        ));
+                };
+                if page.objects.is_empty() {
+                    if processed_any {
+                        stats.reverts += 1;
+                    }
+                    return;
+                }
+
+                let mut confirmations = Vec::with_capacity(job.sync_to.len());
+                for node in &job.sync_to {
+                    let sender = Sender {
+                        devices,
+                        hash_config,
+                        diskfile_config: cfg,
+                        job: &ssync_job,
+                        suffixes: Some(&job.suffixes),
+                        include_non_durable: true,
+                        max_objects: page_limit,
+                        start_after: start_after.clone(),
+                        sync_frag_target: None,
+                        diskfile_builder: None,
+                    };
+                    match pusher.push(&sender, node) {
+                        Ok(report) if valid_revert_report(&report, &page) => {
+                            confirmations.push(report.can_delete_objs);
+                        }
+                        Ok(_) => {
+                            stats.fail(format!(
+                                "revert part {} -> {}:{}/{} returned a stale, malformed, or truncated confirmation page",
+                                job.partition,
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device
+                            ));
+                            return;
+                        }
+                        Err(e) => {
+                            stats.fail(format!(
+                                "revert part {} -> {}:{}/{}: {e}",
+                                job.partition,
+                                node.replication_ip,
+                                node.replication_port,
+                                node.device
+                            ));
+                            return;
+                        }
                     }
                 }
-            }
-            if !job.sync_to.is_empty() && synced_with >= job.sync_to.len() {
-                delete_reverted_objs(
+
+                let confirmed = intersect_revert_confirmations(&confirmations);
+                let confirmed_snapshots: BTreeMap<String, RevertObjectSnapshot> = confirmed
+                    .iter()
+                    .filter_map(|(object_hash, timestamps)| {
+                        page.objects.get(object_hash).and_then(|snapshot| {
+                            (snapshot.timestamps == *timestamps)
+                                .then(|| (object_hash.clone(), snapshot.clone()))
+                        })
+                    })
+                    .collect();
+                if let Err(error) = delete_reverted_objs(
                     devices,
                     hash_config,
                     cfg,
                     policy_index,
                     policy,
                     job,
-                    &reverted,
-                );
-                stats.reverts += 1;
+                    &confirmed_snapshots,
+                ) {
+                    stats.fail(error);
+                    return;
+                }
+                if confirmed_snapshots.len() != page.objects.len() {
+                    stats.fail(format!(
+                        "revert part {} did not receive identical confirmation from every target for all {} offered objects",
+                        job.partition,
+                        page.objects.len()
+                    ));
+                    return;
+                }
+
+                processed_any = true;
+                processed_objects += page.objects.len();
+                if !page.limited_by_max_objects {
+                    stats.reverts += 1;
+                    return;
+                }
+                start_after = page.last_offered;
             }
         }
     }
@@ -1470,46 +3050,19 @@ fn delete_reverted_objs(
     policy_index: u32,
     policy: PolicyKind,
     job: &EcPartJob,
-    objects: &BTreeMap<String, ObjectTimestamps>,
-) {
+    objects: &BTreeMap<String, RevertObjectSnapshot>,
+) -> Result<(), String> {
     let device_path = devices.join(&job.device);
     let mut suffixes_to_delete: BTreeSet<String> = BTreeSet::new();
-    for (object_hash, timestamps) in objects {
-        if object_hash.len() < 3 {
-            continue;
+    for (object_hash, snapshot) in objects {
+        if !lower_hex(object_hash, 32) || !object_hash.ends_with(&snapshot.suffix) {
+            return Err(format!(
+                "revert part {} refused malformed object hash {object_hash}",
+                job.partition
+            ));
         }
-        let suffix = object_hash[object_hash.len() - 3..].to_string();
+        let suffix = snapshot.suffix.clone();
         let hash_dir = job.path.join(&suffix).join(object_hash);
-        let filenames: Vec<String> = std::fs::read_dir(&hash_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
-        // legacy durable data files look like modern nondurable data files;
-        // override nondurable_purge_delay when we know the file is durable
-        let nondurable_purge_delay = if timestamps.durable == Some(true) {
-            0.0
-        } else {
-            cfg.cleanup.commit_window
-        };
-        let data_files: Vec<&String> = filenames.iter().filter(|f| f.ends_with(".data")).collect();
-        let purgable: Vec<&&String> = data_files
-            .iter()
-            .filter(|f| f.starts_with(&timestamps.ts_data.internal()))
-            .collect();
-        let meta_timestamp = if job.primary_frag_index.is_none()
-            && purgable.len() == data_files.len()
-            && data_files.len() <= 1
-        {
-            // pure handoff node purging its last .data file: any reverted
-            // meta file can go too
-            timestamps.ts_meta
-        } else {
-            None
-        };
         let df = DiskFile::from_hash_dir(
             &device_path,
             &hash_dir,
@@ -1518,18 +3071,85 @@ fn delete_reverted_objs(
             hash_config,
             cfg.clone(),
         );
-        let _ = df.purge(
-            &timestamps.ts_data,
+        let _mutation_guard = df
+            .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "revert part {} could not lock object {object_hash}: {error}",
+                    job.partition
+                )
+            })?;
+        // Re-read only after acquiring the object stripe. The pre-transfer
+        // logical state, the exact all-target report, and the physical inode
+        // snapshot must all still describe the same source generation.
+        let current_timestamps =
+            object_timestamps_from_hash_dir_strict(&hash_dir, policy, job.frag_index, Some(&[]))
+                .map_err(|error| {
+                    format!(
+                        "revert part {} could not inspect object {object_hash}: {error}",
+                        job.partition
+                    )
+                })?;
+        if current_timestamps.as_ref() != Some(&snapshot.timestamps) {
+            return Err(format!(
+                "revert part {} source generation changed for object {object_hash}",
+                job.partition
+            ));
+        }
+        if snapshot_revert_hash_dir(&hash_dir).as_ref() != Some(&snapshot.identity) {
+            return Err(format!(
+                "revert part {} source files changed for object {object_hash}",
+                job.partition
+            ));
+        }
+        // The strict snapshot above just validated these names under the
+        // mutation stripe. Do not rescan with lossy names or silently turn
+        // an I/O error into an empty directory during a destructive decision.
+        let filenames: Vec<&String> = snapshot.identity.files.iter().map(|f| &f.name).collect();
+        // legacy durable data files look like modern nondurable data files;
+        // override nondurable_purge_delay when we know the file is durable
+        let nondurable_purge_delay = if snapshot.timestamps.durable == Some(true) {
+            0.0
+        } else {
+            cfg.cleanup.commit_window
+        };
+        let data_files: Vec<&String> = filenames
+            .into_iter()
+            .filter(|f| f.ends_with(".data"))
+            .collect();
+        let purgable: Vec<&&String> = data_files
+            .iter()
+            .filter(|f| f.starts_with(&snapshot.timestamps.ts_data.internal()))
+            .collect();
+        let meta_timestamp = if job.primary_frag_index.is_none()
+            && purgable.len() == data_files.len()
+            && data_files.len() <= 1
+        {
+            // pure handoff node purging its last .data file: any reverted
+            // meta file can go too
+            snapshot.timestamps.ts_meta
+        } else {
+            None
+        };
+        df.purge(
+            &snapshot.timestamps.ts_data,
             job.frag_index,
             nondurable_purge_delay,
             meta_timestamp.as_ref(),
-        );
+        )
+        .map_err(|error| {
+            format!(
+                "revert part {} could not purge object {object_hash}: {error}",
+                job.partition
+            )
+        })?;
         suffixes_to_delete.insert(suffix);
     }
     for suffix in suffixes_to_delete {
         // Python remove_directory: rmdir, ignoring ENOENT/ENOTEMPTY
         let _ = std::fs::remove_dir(job.path.join(suffix));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1549,6 +3169,266 @@ mod suffix_sync_tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         root
+    }
+
+    fn read_test_http_response(
+        response: Vec<u8>,
+        body_limit: usize,
+        idle_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<(InternalHttpHead, Vec<u8>), String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(&response);
+        });
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let deadline = Instant::now().checked_add(request_timeout).unwrap();
+        let mut reader = DeadlineSocketReader::new(&mut stream, idle_timeout, deadline);
+        let head = read_internal_http_head(&mut reader)?;
+        let body = read_internal_http_body(&mut reader, &head.headers, body_limit)?;
+        server.join().unwrap();
+        Ok((head, body))
+    }
+
+    #[test]
+    fn bounded_http_reader_enforces_framing_and_body_caps() {
+        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec();
+        let (head, body) =
+            read_test_http_response(valid, 3, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(body, b"abc");
+
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Proof: yes\r\n\r\n".to_vec();
+        let (_, body) =
+            read_test_http_response(chunked, 3, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(body, b"abc");
+
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\n\r\nabc".to_vec(),
+        ] {
+            assert!(
+                read_test_http_response(
+                    response,
+                    3,
+                    Duration::from_millis(100),
+                    Duration::from_millis(250),
+                )
+                .is_err(),
+                "malformed or truncated framing must fail"
+            );
+        }
+
+        let oversized = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd".to_vec();
+        assert!(read_test_http_response(
+            oversized,
+            3,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn internal_http_head_keeps_utf8_object_meta_so_reconstruct_fa_can_gather() {
+        // Official UTF8 class POSTs `x-object-meta-è-…`. Object-server
+        // echoes UTF-8 field names. Token-only names made partner GET
+        // drop the archive (`g6-rebuild-e650f12-utf8` missing_frags 404).
+        assert!(is_internal_http_field_name("X-Object-Sysmeta-Ec-Etag"));
+        assert!(is_internal_http_field_name("X-Object-Meta-\u{e8}-color"));
+        assert!(!is_internal_http_field_name("X-Evil:Name"));
+
+        let response = b"HTTP/1.1 200 OK\r\n\
+Content-Length: 0\r\n\
+X-Object-Sysmeta-Ec-Etag: 0123456789abcdef0123456789abcdef\r\n\
+X-Object-Meta-\xc3\xa8-color: blue\r\n\
+\r\n"
+        .to_vec();
+        let (head, body) =
+            read_test_http_response(response, 0, Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(body, b"");
+        assert_eq!(
+            head.headers.get("x-object-sysmeta-ec-etag").map(String::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            head.headers
+                .get("x-object-meta-\u{e8}-color")
+                .map(String::as_str),
+            Some("blue")
+        );
+    }
+
+    #[test]
+    fn bounded_http_reader_absolute_deadline_stops_slow_drip() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n");
+            for byte in b"12345678" {
+                std::thread::sleep(Duration::from_millis(35));
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(120);
+        let mut reader = DeadlineSocketReader::new(&mut stream, Duration::from_secs(1), deadline);
+        let head = read_internal_http_head(&mut reader).unwrap();
+        assert!(read_internal_http_body(&mut reader, &head.headers, 8).is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn suffix_hash_fetcher_is_bounded_and_does_not_drain_507() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = u32::from(listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 99999999\r\n\r\n",
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let fetcher = HttpSuffixHashFetcher {
+            conn_timeout: Duration::from_secs(1),
+            node_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            max_response_bytes: 32,
+        };
+        let started = Instant::now();
+        assert_eq!(
+            fetcher.fetch_result(&node(port, 0), 1, 0),
+            Err(SuffixSyncError::InsufficientStorage)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "507 must be classified from its bounded head without draining a hostile body"
+        );
+        server.join().unwrap();
+
+        let value = hashes_value(&[("abc", &[(None, "hash")])]);
+        let body = pickle::dumps(&value).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = u32::from(listener.local_addr().unwrap().port());
+        let oversized = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                oversized.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&oversized);
+        });
+        let fetcher = HttpSuffixHashFetcher {
+            max_response_bytes: body.len().saturating_sub(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            fetcher.fetch_result(&node(port, 0), 1, 0),
+            Err(SuffixSyncError::Failed)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ec_suffix_schema_rejects_invalid_shapes_and_fragment_indexes() {
+        let digest = Value::Str("a".repeat(32));
+        let valid_subdict = Value::Dict(vec![(Value::Int(0), digest.clone())]);
+        for invalid in [
+            Value::None,
+            Value::Dict(vec![(Value::Str("ABC".into()), valid_subdict.clone())]),
+            Value::Dict(vec![(Value::Str("abc".into()), digest.clone())]),
+            Value::Dict(vec![
+                (Value::Str("abc".into()), Value::None),
+                (Value::Bytes(b"abc".to_vec()), valid_subdict.clone()),
+            ]),
+        ] {
+            assert_eq!(
+                validate_ec_suffix_hashes(invalid, 4),
+                Err(SuffixSyncError::Failed)
+            );
+        }
+        for invalid_entries in [
+            vec![(Value::Int(-1), digest.clone())],
+            vec![(Value::Int(4), digest.clone())],
+            vec![(Value::Str("0".into()), digest.clone())],
+            vec![(Value::Int(0), Value::Str("hash".into()))],
+            vec![(Value::Int(0), Value::None)],
+            vec![
+                (Value::Int(0), digest.clone()),
+                (Value::Int(0), digest.clone()),
+            ],
+            vec![(Value::None, digest.clone()), (Value::None, digest.clone())],
+        ] {
+            let invalid = Value::Dict(vec![(
+                Value::Str("abc".into()),
+                Value::Dict(invalid_entries),
+            )]);
+            assert_eq!(
+                validate_ec_suffix_hashes(invalid, 4),
+                Err(SuffixSyncError::Failed)
+            );
+        }
+    }
+
+    #[test]
+    fn ec_suffix_schema_accepts_full_table_and_python2_strings() {
+        let value = Value::Dict(
+            (0..4096)
+                .map(|suffix| {
+                    (
+                        Value::Bytes(format!("{suffix:03x}").into_bytes()),
+                        if suffix == 0 {
+                            Value::None
+                        } else {
+                            Value::Dict(
+                                [
+                                    Value::None,
+                                    Value::Int(0),
+                                    Value::Int(1),
+                                    Value::Int(2),
+                                    Value::Int(3),
+                                ]
+                                .into_iter()
+                                .map(|index| (index, Value::Bytes(vec![b'a'; 32])))
+                                .collect(),
+                            )
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let wire = pickle::dumps(&value).unwrap();
+        let bounded = crate::replicator::decode_suffix_hashes(&wire).unwrap();
+        let normalized = validate_ec_suffix_hashes(bounded, 4).unwrap();
+        let Value::Dict(entries) = normalized else {
+            panic!("expected dict")
+        };
+        assert_eq!(entries.len(), 4096);
+        assert_eq!(entries[0], (Value::Str("000".into()), Value::None));
+        assert_eq!(entries[4095].0, Value::Str("fff".into()));
+        let Value::Dict(last) = &entries[4095].1 else {
+            panic!("expected fragment hashes")
+        };
+        assert_eq!(last.len(), 5);
+        assert!(last
+            .iter()
+            .all(|(_, digest)| *digest == Value::Str("a".repeat(32))));
     }
 
     /// One suffix's `{None | Int(fi): hash}` entries.
@@ -1584,10 +3464,18 @@ mod suffix_sync_tests {
     #[test]
     fn tombstone_sample_changes_subset_without_duplicates() {
         let first = sample_indices(6, 3, 7);
-        assert_eq!(first, sample_indices(6, 3, 7), "seeded sample must be reproducible");
+        assert_eq!(
+            first,
+            sample_indices(6, 3, 7),
+            "seeded sample must be reproducible"
+        );
         assert_eq!(first.len(), 3);
         assert_eq!(
-            first.iter().copied().collect::<std::collections::BTreeSet<_>>().len(),
+            first
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             3,
             "sample is without replacement"
         );
@@ -1603,9 +3491,15 @@ mod suffix_sync_tests {
             subsets.len() > 1,
             "reconstructor retries must not keep choosing the same primaries"
         );
-        let seen: std::collections::BTreeSet<usize> =
-            subsets.iter().flat_map(|subset| subset.iter().copied()).collect();
-        assert_eq!(seen, (0..6).collect(), "retry samples must reach every primary");
+        let seen: std::collections::BTreeSet<usize> = subsets
+            .iter()
+            .flat_map(|subset| subset.iter().copied())
+            .collect();
+        assert_eq!(
+            seen,
+            (0..6).collect(),
+            "retry samples must reach every primary"
+        );
 
         let mut all = sample_indices(4, 4, 11);
         all.sort_unstable();
@@ -1679,6 +3573,265 @@ mod suffix_sync_tests {
         assert_eq!(get_suffix_delta(&local, Some(0), &remote, Some(0)), ["123"]);
     }
 
+    #[test]
+    fn test_revert_requires_exact_all_target_intersection() {
+        let devices = tmp_root("revert-intersection");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let timestamp = "1751500123.00000";
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        put_frag_hash(&part_path, suffix, &object_hash, timestamp, 2);
+        let job = revert_job(&part_path, suffix, Some(2), 2);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let pusher = ScriptedPusher::new(vec![ReportBehavior::Complete, ReportBehavior::OmitFirst]);
+        let fetcher = FakeFetcher {
+            by_port: HashMap::new(),
+        };
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.reverts, 0, "{stats:?}");
+        assert_eq!(stats.failures, 1, "{stats:?}");
+        assert!(
+            part_path.join(suffix).join(object_hash).exists(),
+            "one target's omission must retain the source generation"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_revert_rejects_timestamp_or_page_shape_mismatch() {
+        for (tag, behavior) in [
+            ("timestamp", ReportBehavior::WrongMetaTimestamp),
+            ("shape", ReportBehavior::WrongPageShape),
+        ] {
+            let devices = tmp_root(&format!("revert-bad-report-{tag}"));
+            let part_path = devices
+                .join("sda1")
+                .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+                .join("3");
+            let timestamp = "1751500123.00000";
+            let suffix = "abc";
+            let object_hash = format!("{:0>29}{suffix}", 2);
+            put_frag_hash(&part_path, suffix, &object_hash, timestamp, 2);
+            let job = revert_job(&part_path, suffix, Some(2), 2);
+            let hc = HashPathConfig::new("", "changeme").unwrap();
+            let cfg = DiskFileConfig::default();
+            let pusher = ScriptedPusher::new(vec![ReportBehavior::Complete, behavior]);
+            let fetcher = FakeFetcher {
+                by_port: HashMap::new(),
+            };
+            let mut stats = EcSsyncStats::default();
+            process_part_job(
+                &devices,
+                &hc,
+                &cfg,
+                POLICY_INDEX,
+                ec_kind(),
+                &job,
+                &pusher,
+                &fetcher,
+                None,
+                &mut stats,
+            );
+            assert_eq!(stats.reverts, 0, "{tag}: {stats:?}");
+            assert_eq!(stats.failures, 1, "{tag}: {stats:?}");
+            assert!(
+                part_path.join(suffix).join(object_hash).exists(),
+                "{tag}: malformed confirmation must retain source"
+            );
+            let _ = std::fs::remove_dir_all(&devices);
+        }
+    }
+
+    #[test]
+    fn test_revert_retains_generation_mutated_after_reports() {
+        let devices = tmp_root("revert-report-mutation");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        let hash_dir = part_path.join(suffix).join(&object_hash);
+        put_frag_hash(&part_path, suffix, &object_hash, "1751500123.00000", 2);
+        let job = revert_job(&part_path, suffix, Some(2), 2);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let pusher = ScriptedPusher::new(vec![
+            ReportBehavior::Complete,
+            ReportBehavior::MutateAfter {
+                hash_dir: hash_dir.clone(),
+                timestamp: "1751500124.00000".to_string(),
+                frag_index: 2,
+            },
+        ]);
+        let fetcher = FakeFetcher {
+            by_port: HashMap::new(),
+        };
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.reverts, 0, "{stats:?}");
+        assert_eq!(stats.failures, 1, "{stats:?}");
+        assert!(
+            hash_dir.join("1751500124.00000#2#d.data").exists(),
+            "the post-report foreground generation must survive"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_tombstone_revert_requires_every_target() {
+        for (tag, behaviors, should_delete) in [
+            (
+                "complete",
+                vec![ReportBehavior::Complete, ReportBehavior::Complete],
+                true,
+            ),
+            (
+                "omitted",
+                vec![ReportBehavior::Complete, ReportBehavior::OmitFirst],
+                false,
+            ),
+        ] {
+            let devices = tmp_root(&format!("revert-tombstone-{tag}"));
+            let part_path = devices
+                .join("sda1")
+                .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+                .join("3");
+            let suffix = "abc";
+            let object_hash = format!("{:0>29}{suffix}", 9);
+            let hash_dir = part_path.join(suffix).join(&object_hash);
+            let tombstone = hash_dir.join("1751500123.00000.ts");
+            std::fs::create_dir_all(&hash_dir).unwrap();
+            std::fs::write(&tombstone, b"tombstone").unwrap();
+            let job = revert_job(&part_path, suffix, None, 2);
+            let hc = HashPathConfig::new("", "changeme").unwrap();
+            let cfg = DiskFileConfig::default();
+            let pusher = ScriptedPusher::new(behaviors);
+            let fetcher = FakeFetcher {
+                by_port: HashMap::new(),
+            };
+            let mut stats = EcSsyncStats::default();
+            process_part_job(
+                &devices,
+                &hc,
+                &cfg,
+                POLICY_INDEX,
+                ec_kind(),
+                &job,
+                &pusher,
+                &fetcher,
+                None,
+                &mut stats,
+            );
+            assert_eq!(!tombstone.exists(), should_delete, "{tag}: {stats:?}");
+            assert_eq!(stats.reverts, u64::from(should_delete), "{tag}: {stats:?}");
+            let _ = std::fs::remove_dir_all(&devices);
+        }
+    }
+
+    #[test]
+    fn test_revert_page_is_bounded_and_skips_other_fragment_indexes() {
+        let devices = tmp_root("revert-page");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let suffix = "abc";
+        let first_hash = format!("{:0>29}{suffix}", 4);
+        let second_hash = format!("{:0>29}{suffix}", 5);
+        let other_frag_hash = format!("{:0>29}{suffix}", 1);
+        let another_frag_hash = format!("{:0>29}{suffix}", 2);
+        put_frag_hash(&part_path, suffix, &first_hash, "1751500123.00000", 2);
+        put_frag_hash(&part_path, suffix, &second_hash, "1751500123.00000", 2);
+        put_frag_hash(&part_path, suffix, &other_frag_hash, "1751500123.00000", 3);
+        put_frag_hash(
+            &part_path,
+            suffix,
+            &another_frag_hash,
+            "1751500123.00000",
+            3,
+        );
+        let job = revert_job(&part_path, suffix, Some(2), 1);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let ssync_job = SsyncJob {
+            device: job.device.clone(),
+            partition: job.partition,
+            policy_index: POLICY_INDEX,
+            policy: ec_kind(),
+            frag_index: job.frag_index,
+        };
+        let first_sender = Sender {
+            devices: &devices,
+            hash_config: &hc,
+            diskfile_config: &cfg,
+            job: &ssync_job,
+            suffixes: Some(&job.suffixes),
+            include_non_durable: true,
+            max_objects: 1,
+            start_after: None,
+            sync_frag_target: None,
+            diskfile_builder: None,
+        };
+        let first_page = snapshot_revert_page(&job, &first_sender).unwrap();
+        let too_small = snapshot_revert_page_with_budget(&job, &first_sender, 1);
+        assert!(too_small.unwrap_err().contains("physical snapshot budget"));
+        assert!(part_path.join(suffix).join(&first_hash).is_dir());
+        assert_eq!(first_page.objects.keys().collect::<Vec<_>>(), [&first_hash]);
+        assert!(first_page.limited_by_max_objects);
+        let second_sender = Sender {
+            start_after: first_page.last_offered.clone(),
+            ..first_sender
+        };
+        let second_page = snapshot_revert_page(&job, &second_sender).unwrap();
+        assert_eq!(
+            second_page.objects.keys().collect::<Vec<_>>(),
+            [&second_hash]
+        );
+        assert!(!second_page.limited_by_max_objects);
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn ec_revert_physical_snapshot_has_a_file_limit() {
+        let root = tmp_root("revert-physical-limit");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("1751500123.00000#1#d.data"), b"archive").unwrap();
+        assert!(snapshot_revert_hash_dir_with_limit(&root, 1).is_some());
+        std::fs::write(root.join("1751500123.00001.meta"), b"metadata").unwrap();
+        assert!(snapshot_revert_hash_dir_with_limit(&root, 1).is_none());
+        assert!(snapshot_revert_hash_dir_with_limit(&root, 2).is_some());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- process_part_job SYNC with a fake REPLICATE responder -----------
 
     struct FakeFetcher {
@@ -1730,6 +3883,25 @@ mod suffix_sync_tests {
         pushes: RefCell<Vec<(u32, Vec<String>)>>,
     }
 
+    fn complete_sender_report(sender: &Sender<'_>) -> Result<SenderReport, SsyncSenderError> {
+        let available = sender.yield_local_hashes(sender.include_non_durable)?;
+        let limit = if sender.max_objects == 0 {
+            available.len()
+        } else {
+            sender.max_objects.min(available.len())
+        };
+        let mut report = SenderReport {
+            limited_by_max_objects: sender.max_objects > 0 && available.len() > sender.max_objects,
+            ..SenderReport::default()
+        };
+        for (suffix, object_hash, timestamps) in available.into_iter().take(limit) {
+            report.offered_count += 1;
+            report.last_offered = Some((suffix, object_hash.clone()));
+            report.can_delete_objs.insert(object_hash, timestamps);
+        }
+        Ok(report)
+    }
+
     impl SsyncPusher for RecordingPusher {
         fn push(
             &self,
@@ -1740,7 +3912,71 @@ mod suffix_sync_tests {
                 node.replication_port,
                 sender.suffixes.map(<[String]>::to_vec).unwrap_or_default(),
             ));
-            Ok(SenderReport::default())
+            complete_sender_report(sender)
+        }
+    }
+
+    #[derive(Clone)]
+    enum ReportBehavior {
+        Complete,
+        OmitFirst,
+        WrongMetaTimestamp,
+        WrongPageShape,
+        MutateAfter {
+            hash_dir: PathBuf,
+            timestamp: String,
+            frag_index: i64,
+        },
+    }
+
+    struct ScriptedPusher {
+        behaviors: RefCell<Vec<ReportBehavior>>,
+    }
+
+    impl ScriptedPusher {
+        fn new(behaviors: Vec<ReportBehavior>) -> Self {
+            Self {
+                behaviors: RefCell::new(behaviors),
+            }
+        }
+    }
+
+    impl SsyncPusher for ScriptedPusher {
+        fn push(
+            &self,
+            sender: &Sender<'_>,
+            _node: &SsyncNode,
+        ) -> Result<SenderReport, SsyncSenderError> {
+            let behavior = self.behaviors.borrow_mut().remove(0);
+            let mut report = complete_sender_report(sender)?;
+            match behavior {
+                ReportBehavior::Complete => {}
+                ReportBehavior::OmitFirst => {
+                    if let Some(first) = report.can_delete_objs.keys().next().cloned() {
+                        report.can_delete_objs.remove(&first);
+                    }
+                }
+                ReportBehavior::WrongMetaTimestamp => {
+                    if let Some(timestamps) = report.can_delete_objs.values_mut().next() {
+                        timestamps.ts_meta = Some("9999999999.00000".parse().unwrap());
+                    }
+                }
+                ReportBehavior::WrongPageShape => {
+                    report.offered_count = report.offered_count.saturating_add(1);
+                }
+                ReportBehavior::MutateAfter {
+                    hash_dir,
+                    timestamp,
+                    frag_index,
+                } => {
+                    std::fs::write(
+                        hash_dir.join(format!("{timestamp}#{frag_index}#d.data")),
+                        b"new-generation",
+                    )
+                    .unwrap();
+                }
+            }
+            Ok(report)
         }
     }
 
@@ -1762,9 +3998,12 @@ mod suffix_sync_tests {
 
     /// Lay a durable EC fragment file down under `part_path/<suffix>`.
     fn put_frag(part_path: &Path, suffix: &str, ts: &str, frag_index: i64) {
-        let hash_dir = part_path
-            .join(suffix)
-            .join(format!("{:0>29}{suffix}", frag_index));
+        let object_hash = format!("{:0>29}{suffix}", frag_index);
+        put_frag_hash(part_path, suffix, &object_hash, ts, frag_index);
+    }
+
+    fn put_frag_hash(part_path: &Path, suffix: &str, object_hash: &str, ts: &str, frag_index: i64) {
+        let hash_dir = part_path.join(suffix).join(object_hash);
         std::fs::create_dir_all(&hash_dir).unwrap();
         std::fs::write(hash_dir.join(format!("{ts}#{frag_index}#d.data")), b"").unwrap();
     }
@@ -1775,6 +4014,27 @@ mod suffix_sync_tests {
             replication_port: port,
             device: "sda1".to_string(),
             backend_index: Some(backend_index),
+        }
+    }
+
+    fn revert_job(
+        part_path: &Path,
+        suffix: &str,
+        frag_index: Option<i64>,
+        target_count: usize,
+    ) -> EcPartJob {
+        EcPartJob {
+            job_type: EcJobType::Revert,
+            frag_index,
+            suffixes: vec![suffix.to_string()],
+            sync_to: (0..target_count)
+                .map(|index| node(11_000 + index as u32, index as i64))
+                .collect(),
+            sync_handoffs: Vec::new(),
+            partition: 3,
+            path: part_path.to_path_buf(),
+            device: "sda1".to_string(),
+            primary_frag_index: None,
         }
     }
 
@@ -2075,6 +4335,151 @@ mod suffix_sync_tests {
         );
     }
 
+    fn named_ec_ring(ip: &str, port: u32, device: &str) -> Ring {
+        let dev = |id: u64, ip: &str, port: u32, device: &str| RingDevice {
+            id,
+            region: 1,
+            zone: id + 1,
+            ip: ip.to_string(),
+            port,
+            replication_ip: None,
+            replication_port: None,
+            device: device.to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        Ring::new(
+            swift_ring::RingData::from_parts(
+                vec![
+                    Some(dev(0, ip, port, device)),
+                    Some(dev(1, "10.0.0.2", port, "sdb")),
+                    Some(dev(2, "10.0.0.3", port, "sdc")),
+                ],
+                32,
+                vec![vec![0], vec![1], vec![2]],
+            ),
+            HashPathConfig::new("", "changeme").unwrap(),
+        )
+    }
+
+    fn write_named_ec_frag(
+        device: &Path,
+        account: &str,
+        container: &str,
+        object: &str,
+        frag_index: i64,
+    ) {
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::new(
+            device,
+            0,
+            account,
+            container,
+            object,
+            PolicyKind::Ec {
+                n_unique_fragments: Some(3),
+            },
+            POLICY_INDEX,
+            &hc,
+            cfg,
+        )
+        .unwrap()
+        .with_frag_index(Some(frag_index));
+        let ts: swift_core::timestamp::Timestamp = "1751500001.00000".parse().unwrap();
+        let mut writer = df.create(".data").unwrap();
+        writer.write(b"frag").unwrap();
+        writer
+            .put(vec![
+                (
+                    MetaValue::Str("name".into()),
+                    MetaValue::Str(format!("/{account}/{container}/{object}")),
+                ),
+                (
+                    MetaValue::Str("X-Timestamp".into()),
+                    MetaValue::Str(ts.internal()),
+                ),
+                (
+                    MetaValue::Str("Content-Type".into()),
+                    MetaValue::Str("application/octet-stream".into()),
+                ),
+                (
+                    MetaValue::Str("Content-Length".into()),
+                    MetaValue::Str("4".into()),
+                ),
+                (MetaValue::Str("ETag".into()), MetaValue::Str("x".into())),
+                (
+                    MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                    MetaValue::Int(frag_index),
+                ),
+            ])
+            .unwrap();
+        writer.commit(&ts).unwrap();
+        writer.close();
+    }
+
+    #[test]
+    fn test_discover_jobs_finds_missing_local_primary_fragment() {
+        let root = tmp_root("discover-missing");
+        let device = root.join("sda1");
+        std::fs::create_dir_all(&device).unwrap();
+        write_named_ec_frag(&device, "AUTH_test", "c", "o", 1);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let ring = named_ec_ring("127.0.0.1", 6200, "sda1");
+        let jobs = discover_jobs(
+            &device,
+            POLICY_INDEX,
+            EcScheme {
+                ndata: 2,
+                nparity: 1,
+                segment_size: 1024,
+            },
+            &ring,
+            "127.0.0.1",
+            6200,
+            "sda1",
+            &hc,
+            &cfg,
+        );
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].account, "AUTH_test");
+        assert_eq!(jobs[0].container, "c");
+        assert_eq!(jobs[0].object, "o");
+        assert_eq!(jobs[0].destination_index, 0);
+        assert_eq!(jobs[0].peers.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_discover_jobs_skips_when_local_fragment_is_present() {
+        let root = tmp_root("discover-present");
+        let device = root.join("sda1");
+        std::fs::create_dir_all(&device).unwrap();
+        write_named_ec_frag(&device, "AUTH_test", "c", "o", 0);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let ring = named_ec_ring("127.0.0.1", 6200, "sda1");
+        let jobs = discover_jobs(
+            &device,
+            POLICY_INDEX,
+            EcScheme {
+                ndata: 2,
+                nparity: 1,
+                segment_size: 1024,
+            },
+            &ring,
+            "127.0.0.1",
+            6200,
+            "sda1",
+            &hc,
+            &cfg,
+        );
+        assert!(jobs.is_empty(), "{jobs:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn test_sync_job_pushes_to_a_partner_that_lost_its_fragment() {
         let devices = tmp_root("push-victim");
@@ -2115,6 +4520,452 @@ mod suffix_sync_tests {
         assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
         assert_eq!(stats.failures, 0, "{stats:?}");
         let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Official `break_nodes` `rmtree`s the victim partition. Isolated rings
+    /// still advertise `6010` while the object server listens on `16210`.
+    /// Without the SWIFT_DIR overlay, REPLICATE to the ring port is skipped
+    /// (`SuffixSyncError::Failed`) and the partner never SSYNCs.
+    #[test]
+    fn test_break_nodes_partner_sync_uses_listen_overlay_not_ring_port() {
+        let devices = tmp_root("break-nodes-overlay");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+
+        // Victim partition is gone (break_nodes). Listen port is 16210;
+        // ring still says 6010.
+        let listen_port = 16210u32;
+        let ring_port = 6010u32;
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(listen_port, hashes_value(&[("abc", &[])]))]),
+        };
+        let pusher = RecordingPusher::default();
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+
+        let mut job = sync_job(&part_path, &["abc"], vec![node(ring_port, 2)]);
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert!(
+            pusher.pushes.borrow().is_empty(),
+            "ring port 6010 must not reach the isolated listen port: {stats:?}"
+        );
+        assert_eq!(stats.suffix_syncs, 0, "{stats:?}");
+
+        let mut overlay = crate::localdev::ObjectListenOverlay::empty();
+        overlay.insert("sda1", listen_port);
+        apply_listen_overlay(&mut job, &overlay);
+        assert_eq!(job.sync_to[0].replication_port, listen_port);
+
+        stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &pusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(
+            *pusher.pushes.borrow(),
+            vec![(listen_port, vec!["abc".to_string()])],
+            "overlay must SSYNC the emptied victim at the listen port"
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(stats.failures, 0, "{stats:?}");
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Field G6 on `ca2081b`: overlay made partner SSYNC (`suffix_syncs>0`)
+    /// but `rebuilt` stayed 0 because only local `reconstruct_missing`
+    /// incremented it. Official `break_nodes` heals via `reconstruct_fa`.
+    #[test]
+    fn test_process_part_job_counts_reconstruct_fa_puts_as_rebuilt() {
+        struct RebuildReportPusher;
+        impl SsyncPusher for RebuildReportPusher {
+            fn push(
+                &self,
+                sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                let mut report = complete_sender_report(sender)?;
+                report.rebuilt = 1;
+                report.reconstruct_fa_attempts = 1;
+                Ok(report)
+            }
+        }
+        let devices = tmp_root("recon-fa-count");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16210, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16210, 2)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &RebuildReportPusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(
+            stats.rebuilt, 1,
+            "reconstruct_fa PUT must increment rebuilt: {stats:?}"
+        );
+        assert_eq!(
+            stats.reconstruct_fa_attempts, 1,
+            "successful reconstruct_fa is still an attempt: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Field G6 on `ca2081b`: overlay made SSYNC complete (`suffix_syncs>0`)
+    /// while reconstruct_fa skipped the data PUT. `rebuilt` stayed 0 and
+    /// `test_rebuild_missing_frags` proxy_get 404'd
+    /// (`failed=['127.0.0.2:16220/sdb6#2']`). Surface the skip reason.
+    #[test]
+    fn test_process_part_job_surfaces_reconstruct_fa_skip_when_rebuilt_stays_zero() {
+        struct SkipRebuildPusher;
+        impl SsyncPusher for SkipRebuildPusher {
+            fn push(
+                &self,
+                sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                let mut report = complete_sender_report(sender)?;
+                report.rebuilt = 0;
+                report.reconstruct_fa_attempts = 1;
+                report.last_rebuild_error = Some("NotEnoughFragments".into());
+                Ok(report)
+            }
+        }
+        let devices = tmp_root("recon-fa-skip");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16220, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16220, 2)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &SkipRebuildPusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.suffix_syncs, 1, "{stats:?}");
+        assert_eq!(stats.rebuilt, 0, "field ca2081b: {stats:?}");
+        assert_eq!(
+            stats.reconstruct_fa_attempts, 1,
+            "skip after updates() is an attempt, not silence: {stats:?}"
+        );
+        assert!(
+            stats
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("reconstruct_fa") && e.contains("NotEnoughFragments")),
+            "skip reason must reach the pass log: {stats:?}"
+        );
+        assert!(
+            stats
+                .log_lines
+                .iter()
+                .any(|line| line.contains("reconstruct_fa") && line.contains("NotEnoughFragments")),
+            "INFO log_lines must carry reconstruct_fa skip: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_process_part_job_logs_ssync_connect_507() {
+        struct FailPusher;
+        impl SsyncPusher for FailPusher {
+            fn push(
+                &self,
+                _sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                Err(SsyncSenderError::from(std::io::Error::other(
+                    "Expected status 200; got 507 body='Drive: sdb6'",
+                )))
+            }
+        }
+        let devices = tmp_root("recon-ssync-507");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16220, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16220, 2)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &FailPusher,
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(stats.rebuilt, 0, "{stats:?}");
+        assert_eq!(
+            stats.reconstruct_fa_attempts, 0,
+            "connect-fail never entered reconstruct_fa: {stats:?}"
+        );
+        assert!(
+            stats
+                .log_lines
+                .iter()
+                .any(|line| line.contains("got 507") && line.contains("Drive: sdb6")),
+            "SSYNC 507 must be INFO-logged: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    /// Field `1682fdb` single-test: `rebuilt=1` on one partner while
+    /// `sync … -> 127.0.0.3:16230/sdb7: Expected status 200; got 503`
+    /// left the victim empty. Old process_part_job broke on the first 503.
+    #[test]
+    fn test_process_part_job_retries_ssync_503_then_counts_reconstruct_fa() {
+        struct FailThenHealPusher {
+            remaining_503: std::cell::Cell<u32>,
+        }
+        impl SsyncPusher for FailThenHealPusher {
+            fn push(
+                &self,
+                sender: &Sender<'_>,
+                _node: &SsyncNode,
+            ) -> Result<SenderReport, SsyncSenderError> {
+                if self.remaining_503.get() > 0 {
+                    self.remaining_503.set(self.remaining_503.get() - 1);
+                    return Err(SsyncSenderError::from(std::io::Error::other(
+                        "Expected status 200; got 503 body='Drive: sdb7 Reason: replication lock timeout partition=3 timeout=15'",
+                    )));
+                }
+                let mut report = complete_sender_report(sender)?;
+                report.rebuilt = 1;
+                report.reconstruct_fa_attempts = 1;
+                Ok(report)
+            }
+        }
+        let devices = tmp_root("recon-ssync-503-retry");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        put_frag(&part_path, "abc", &ts, 1);
+        let cleanup = CleanupConfig::default();
+        get_partition_hashes(&part_path, ec_kind(), &[], true, &cleanup).unwrap();
+        let fetcher = FakeFetcher {
+            by_port: HashMap::from([(16230, hashes_value(&[("abc", &[])]))]),
+        };
+        let job = sync_job(&part_path, &["abc"], vec![node(16230, 0)]);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let mut stats = EcSsyncStats::default();
+        process_part_job(
+            &devices,
+            &hc,
+            &cfg,
+            POLICY_INDEX,
+            ec_kind(),
+            &job,
+            &FailThenHealPusher {
+                remaining_503: std::cell::Cell::new(1),
+            },
+            &fetcher,
+            None,
+            &mut stats,
+        );
+        assert_eq!(
+            stats.rebuilt, 1,
+            "heal PUT must land after 503 retry: {stats:?}"
+        );
+        assert_eq!(
+            stats.failures, 0,
+            "retried 503 is not a terminal fail: {stats:?}"
+        );
+        assert!(
+            stats
+                .log_lines
+                .iter()
+                .any(|line| line.contains("got 503") && line.contains("retry 1/")),
+            "INFO must show the 503 retry: {stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_ssync_503_is_retryable_and_507_is_not() {
+        assert!(is_retryable_ssync_unavailable(
+            "sync part 3 frag Some(1) -> 127.0.0.3:16230/sdb7: Expected status 200; got 503"
+        ));
+        assert!(is_retryable_ssync_unavailable(
+            "Expected status 200; got 503 body='Service Unavailable (admission)'"
+        ));
+        assert!(
+            !is_retryable_ssync_unavailable(
+                "sync part 3 -> 127.0.0.2:16220/sdb6: Expected status 200; got 507 body='Drive: sdb6'"
+            ),
+            "507 is not the 1682fdb once×4 hole"
+        );
+    }
+
+    #[test]
+    fn test_once_start_and_done_lines_name_devices_policy_and_attempts() {
+        let start = format_reconstructor_once_start(
+            4242,
+            "/etc/g6-rust/object-server/3.conf",
+            "swift-object-reconstructor /etc/g6-rust/object-server/3.conf once",
+            "/etc/g6-rust",
+            "conf_path",
+            "/srv/3/node",
+            16230,
+            0,
+            "1:ec",
+            true,
+        );
+        assert!(
+            start.contains("object-reconstructor once start:"),
+            "{start}"
+        );
+        assert!(start.contains("devices=/srv/3/node"), "{start}");
+        assert!(start.contains("bind_port=16230"), "{start}");
+        assert!(start.contains("overlay_entries=0"), "{start}");
+        assert!(start.contains("swift_dir=/etc/g6-rust"), "{start}");
+        assert!(start.contains("swift_dir_source=conf_path"), "{start}");
+        assert!(start.contains("policies=1:ec"), "{start}");
+        assert!(start.contains("once=true"), "{start}");
+        let overlay = format_listen_overlay_status(0, "/etc/swift", "default");
+        assert!(
+            overlay.contains("listen_overlay_entries=0"),
+            "empty overlay must still be a logged token: {overlay}"
+        );
+        assert!(overlay.contains("swift_dir_source=default"), "{overlay}");
+        let sweep = format_reconstructor_sweep(1, "ec", "sdb3", 2, 3, 0);
+        assert!(sweep.contains("sweep policy=1"), "{sweep}");
+        assert!(sweep.contains("device=sdb3"), "{sweep}");
+        assert!(sweep.contains("jobs=0"), "{sweep}");
+        let mut stats = EcSsyncStats::default();
+        stats.suffix_syncs = 2;
+        stats.reconstruct_fa_attempts = 0;
+        stats.rebuilt = 0;
+        let done = format_reconstructor_once_done(&stats);
+        assert!(done.contains("object-reconstructor once done:"), "{done}");
+        assert!(done.contains("reconstruct_fa_attempts=0"), "{done}");
+        assert!(done.contains("rebuilt=0"), "{done}");
+    }
+
+    #[test]
+    fn test_overlay_fragment_fetcher_rewrites_peer_ring_port() {
+        struct PortRecordingFetcher {
+            seen: std::cell::RefCell<Vec<u32>>,
+        }
+        impl FragmentFetcher for PortRecordingFetcher {
+            fn fetch(
+                &self,
+                node: &RingDevice,
+                _partition: u64,
+                _account: &str,
+                _container: &str,
+                _object: &str,
+            ) -> Option<FetchedFragment> {
+                self.seen
+                    .borrow_mut()
+                    .push(node.replication_port.unwrap_or(node.port));
+                None
+            }
+        }
+        let inner = PortRecordingFetcher {
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut overlay = crate::localdev::ObjectListenOverlay::empty();
+        overlay.insert("d1", 16210);
+        let wrapped = OverlayFragmentFetcher {
+            inner: &inner,
+            overlay: &overlay,
+        };
+        let peer = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "10.0.0.2".into(),
+            port: 6010,
+            replication_ip: None,
+            replication_port: None,
+            device: "d1".into(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let _ = wrapped.fetch(&peer, 0, "a", "c", "o");
+        assert_eq!(
+            *inner.seen.borrow(),
+            vec![16210],
+            "reconstruct_fa peer GET must not dial the ring port"
+        );
     }
 
     // ---- REVERT: partition lock ------------------------------------------
@@ -2188,14 +5039,355 @@ mod suffix_sync_tests {
         assert_eq!(stats.failures, 0, "{stats:?}");
         let _ = std::fs::remove_dir_all(&devices);
     }
+
+    #[test]
+    fn test_delete_reverted_waits_for_object_mutation_stripe() {
+        let devices = tmp_root("revert-object-lock");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        put_frag(&part_path, suffix, &ts, 2);
+        let hash_dir = part_path.join(suffix).join(&object_hash);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::from_hash_dir(
+            &devices.join("sda1"),
+            &hash_dir,
+            ec_kind(),
+            POLICY_INDEX,
+            &hc,
+            cfg.clone(),
+        );
+        let held = df
+            .acquire_mutation_lock(1.0)
+            .expect("test holds the object mutation stripe");
+        let job = EcPartJob {
+            job_type: EcJobType::Revert,
+            frag_index: Some(2),
+            suffixes: vec![suffix.to_string()],
+            sync_to: Vec::new(),
+            sync_handoffs: Vec::new(),
+            partition: 3,
+            path: part_path,
+            device: "sda1".to_string(),
+            primary_frag_index: None,
+        };
+        let timestamp = ts.parse().unwrap();
+        let objects = BTreeMap::from([(
+            object_hash,
+            RevertObjectSnapshot {
+                suffix: suffix.to_string(),
+                timestamps: ObjectTimestamps {
+                    ts_data: timestamp,
+                    ts_meta: None,
+                    ts_ctype: None,
+                    durable: Some(true),
+                },
+                identity: snapshot_revert_hash_dir(&hash_dir).unwrap(),
+            },
+        )]);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        delete_reverted_objs(&devices, &hc, &cfg, POLICY_INDEX, ec_kind(), &job, &objects)
+            .expect("revert succeeds after the foreground lock is released");
+        releaser.join().unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(10),
+            "the purge must wait for the foreground mutation stripe"
+        );
+        assert!(
+            !hash_dir.exists(),
+            "the revert purges the exact generation after the stripe is released"
+        );
+        let _ = std::fs::remove_dir_all(&devices);
+    }
+
+    #[test]
+    fn test_delete_reverted_busy_object_is_retryable_not_success() {
+        let devices = tmp_root("revert-object-busy");
+        let part_path = devices
+            .join("sda1")
+            .join(swift_diskfile::get_data_dir(POLICY_INDEX))
+            .join("3");
+        let ts = now_ts();
+        let suffix = "abc";
+        let object_hash = format!("{:0>29}{suffix}", 2);
+        put_frag(&part_path, suffix, &ts, 2);
+        let hash_dir = part_path.join(suffix).join(&object_hash);
+        let hc = HashPathConfig::new("", "changeme").unwrap();
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::from_hash_dir(
+            &devices.join("sda1"),
+            &hash_dir,
+            ec_kind(),
+            POLICY_INDEX,
+            &hc,
+            cfg.clone(),
+        );
+        let _held = df
+            .acquire_mutation_lock(1.0)
+            .expect("test holds the object mutation stripe");
+        let job = EcPartJob {
+            job_type: EcJobType::Revert,
+            frag_index: Some(2),
+            suffixes: vec![suffix.to_string()],
+            sync_to: Vec::new(),
+            sync_handoffs: Vec::new(),
+            partition: 3,
+            path: part_path,
+            device: "sda1".to_string(),
+            primary_frag_index: None,
+        };
+        let objects = BTreeMap::from([(
+            object_hash,
+            RevertObjectSnapshot {
+                suffix: suffix.to_string(),
+                timestamps: ObjectTimestamps {
+                    ts_data: ts.parse().unwrap(),
+                    ts_meta: None,
+                    ts_ctype: None,
+                    durable: Some(true),
+                },
+                identity: snapshot_revert_hash_dir(&hash_dir).unwrap(),
+            },
+        )]);
+        let error =
+            delete_reverted_objs(&devices, &hc, &cfg, POLICY_INDEX, ec_kind(), &job, &objects)
+                .expect_err("a busy object must leave the revert for a later pass");
+        assert!(error.contains("could not lock object"), "{error}");
+        assert!(hash_dir.exists(), "a busy generation must remain intact");
+        let _ = std::fs::remove_dir_all(&devices);
+    }
 }
 
 #[cfg(all(test, feature = "ec"))]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    struct TestSpool {
+        path: PathBuf,
+        budget: SpoolBudget,
+    }
+    impl TestSpool {
+        fn new(bytes: u64) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = PathBuf::from(format!(
+                "/var/tmp/peregrine-reconstructor-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let budget = SpoolBudget::open(&path, bytes, 0).unwrap();
+            Self { path, budget }
+        }
+    }
+    impl Drop for TestSpool {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    fn body_bytes(body: &ArchiveBody) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        body.reader().read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn disk_body(budget: &SpoolBudget, bytes: &[u8]) -> ArchiveBody {
+        let mut writer = budget.reserve(bytes.len() as u64).unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[test]
+    fn segment_spool_reconstruction_matches_every_fragment_and_tail() {
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 4096,
+        };
+        let driver = EcDriver::new(2, 1).unwrap();
+        let spool = TestSpool::new(1024 * 1024);
+        for size in [0usize, 1, 4095, 4096, 4113, 4 * 4096 + 9] {
+            let data: Vec<u8> = (0..size)
+                .map(|index| (index.wrapping_mul(7) % 251) as u8)
+                .collect();
+            let expected = driver.encode_object(&data, scheme.segment_size).unwrap();
+            for destination in 0..scheme.n_unique() {
+                let sources: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != destination)
+                    .map(|(_, bytes)| disk_body(&spool.budget, bytes))
+                    .collect();
+                let rebuilt = reconstruct_archives_to_spool(
+                    scheme,
+                    &sources,
+                    size,
+                    destination,
+                    &spool.budget,
+                )
+                .unwrap();
+                assert!(rebuilt.is_disk_backed());
+                assert_eq!(
+                    body_bytes(&rebuilt),
+                    expected[destination],
+                    "size={size} destination={destination}"
+                );
+            }
+            assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn spool_exhaustion_preserves_inputs_and_retry_succeeds() {
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 4096,
+        };
+        let data = vec![7u8; 8193];
+        let driver = EcDriver::new(2, 1).unwrap();
+        let expected = driver.encode_object(&data, scheme.segment_size).unwrap();
+        let length = expected[0].len() as u64;
+        let spool = TestSpool::new(3 * length);
+        let inputs = vec![
+            disk_body(&spool.budget, &expected[0]),
+            disk_body(&spool.budget, &expected[1]),
+        ];
+        let held = disk_body(&spool.budget, &expected[2]);
+        let error = reconstruct_archives_to_spool(scheme, &inputs, data.len(), 2, &spool.budget)
+            .unwrap_err();
+        assert!(error.contains("retryable"), "{error}");
+        assert_eq!(body_bytes(&inputs[0]), expected[0]);
+        assert_eq!(body_bytes(&inputs[1]), expected[1]);
+        drop(held);
+        let rebuilt =
+            reconstruct_archives_to_spool(scheme, &inputs, data.len(), 2, &spool.budget).unwrap();
+        assert_eq!(body_bytes(&rebuilt), expected[2]);
+        drop(rebuilt);
+        drop(inputs);
+        assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn reconstruction_keeps_large_archives_on_disk_end_to_end() {
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 1024 * 1024,
+        };
+        let original = 32 * 1024 * 1024 + 9;
+        let length = fragment_archive_size_bound(scheme, original).unwrap() as u64;
+        let spool = TestSpool::new(4 * length);
+        let driver = EcDriver::new(2, 1).unwrap();
+        let mut writers: Vec<_> = (0..3)
+            .map(|_| spool.budget.reserve(length).unwrap())
+            .collect();
+        let mut offset = 0usize;
+        while offset < original {
+            let size = (original - offset).min(scheme.segment_size);
+            let segment: Vec<u8> = (offset..offset + size)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let encoded = driver.encode(&segment).unwrap();
+            for (writer, fragment) in writers.iter_mut().zip(encoded.iter()) {
+                writer.write_all(fragment).unwrap();
+            }
+            offset += size;
+        }
+        let archives: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.finish().unwrap())
+            .collect();
+        assert!(archives.iter().all(ArchiveBody::is_disk_backed));
+        let rebuilt =
+            reconstruct_archives_to_spool(scheme, &archives[..2], original, 2, &spool.budget)
+                .unwrap();
+        assert!(rebuilt.is_disk_backed());
+        assert_eq!(rebuilt.md5_hex(), archives[2].md5_hex());
+        let mut expected = archives[2].reader();
+        let mut actual = rebuilt.reader();
+        let mut a = [0u8; 64 * 1024];
+        let mut b = [0u8; 64 * 1024];
+        loop {
+            let count = expected.read(&mut a).unwrap();
+            if count == 0 {
+                assert_eq!(actual.read(&mut b).unwrap(), 0);
+                break;
+            }
+            actual.read_exact(&mut b[..count]).unwrap();
+            assert_eq!(a[..count], b[..count]);
+        }
+        drop(expected);
+        drop(actual);
+        drop(rebuilt);
+        drop(archives);
+        assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+    }
+
+    fn read_spool_response(
+        response: &[u8],
+        expected: Option<usize>,
+        budget: &SpoolBudget,
+    ) -> Result<ArchiveBody, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let bytes = response.to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(&bytes);
+        });
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut reader = DeadlineSocketReader::new(
+            &mut stream,
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+        );
+        let result = read_internal_http_head(&mut reader).and_then(|head| {
+            read_internal_http_body_spooled(
+                &mut reader,
+                &head.headers,
+                1024 * 1024,
+                expected,
+                budget,
+            )
+        });
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn spooled_http_framing_abort_cleans_and_chunked_retry_succeeds() {
+        let spool = TestSpool::new(2 * 1024 * 1024);
+        for bad in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabcd".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 8\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nabcdefghi\r\n0\r\n\r\n"
+                .as_slice(),
+        ] {
+            assert!(read_spool_response(bad, Some(8), &spool.budget).is_err());
+            assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+        }
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
+        let body = read_spool_response(response, Some(8), &spool.budget).unwrap();
+        assert!(body.is_disk_backed());
+        assert_eq!(body_bytes(&body), b"abcdefgh");
+        drop(body);
+        assert_eq!(spool.budget.reserved_bytes().unwrap(), 0);
+    }
 
     #[test]
     fn http_fragment_fetcher_prefers_data_timestamp_over_header_order() {
+        let spool = TestSpool::new(1024 * 1024);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
@@ -2223,7 +5415,7 @@ mod tests {
                  X-Backend-Timestamp: 1751500999.99999\r\n\
                  X-Backend-Data-Timestamp: 1751500123.45678\r\n\
                  X-Object-Sysmeta-Ec-Frag-Index: 2\r\n\
-                 X-Object-Sysmeta-Ec-Etag: deadbeef\r\n\
+                 X-Object-Sysmeta-Ec-Etag: deadbeefdeadbeefdeadbeefdeadbeef\r\n\
                  X-Object-Sysmeta-Ec-Content-Length: {}\r\n\
                  Content-Type: application/octet-stream\r\n\
                  Content-Length: {}\r\n\
@@ -2251,8 +5443,10 @@ mod tests {
         };
         let fetched = HttpFragmentFetcher {
             policy_index: 2,
+            spool: Some(spool.budget.clone()),
             conn_timeout: Duration::from_secs(2),
             node_timeout: Duration::from_secs(2),
+            ..Default::default()
         }
         .fetch_at(
             &node,
@@ -2267,9 +5461,7 @@ mod tests {
         let request = server.join().unwrap();
         let request = String::from_utf8(request).unwrap();
         assert!(
-            request.starts_with(
-                "GET /sda1/17/AUTH_test/c-%C3%A8/o-%C3%A8/child HTTP/1.1\r\n"
-            ),
+            request.starts_with("GET /sda1/17/AUTH_test/c-%C3%A8/o-%C3%A8/child HTTP/1.1\r\n"),
             "UTF-8 Swift path segments must be percent-encoded: {request:?}"
         );
         assert!(
@@ -2280,19 +5472,184 @@ mod tests {
         );
         assert_eq!(fetched.timestamp, "1751500123.45678");
         assert_eq!(fetched.frag_index, 2);
-        assert_eq!(fetched.archive, b"fragment-archive");
+        assert!(fetched.archive.is_disk_backed());
+        assert_eq!(body_bytes(&fetched.archive), b"fragment-archive");
+    }
+
+    #[test]
+    fn http_fragment_fetcher_uses_replication_plane() {
+        let spool = TestSpool::new(1024 * 1024);
+        let service_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        service_listener.set_nonblocking(true).unwrap();
+        let service_port = service_listener.local_addr().unwrap().port();
+        let replication_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let replication_port = replication_listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = replication_listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = b"replication-plane-fragment";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 X-Backend-Data-Timestamp: 1751500123.45678\r\n\
+                 X-Object-Sysmeta-Ec-Frag-Index: 2\r\n\
+                 X-Object-Sysmeta-Ec-Etag: deadbeefdeadbeefdeadbeefdeadbeef\r\n\
+                 X-Object-Sysmeta-Ec-Content-Length: {}\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\n\r\n",
+                body.len(),
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let node = RingDevice {
+            id: 1,
+            region: 1,
+            zone: 1,
+            ip: "127.0.0.1".to_string(),
+            port: u32::from(service_port),
+            replication_ip: Some("127.0.0.1".to_string()),
+            replication_port: Some(u32::from(replication_port)),
+            device: "sda1".to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let fetched = HttpFragmentFetcher {
+            policy_index: 2,
+            spool: Some(spool.budget.clone()),
+            conn_timeout: Duration::from_secs(1),
+            node_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        }
+        .fetch(&node, 17, "a", "c", "o")
+        .expect("replication-plane response");
+        assert!(fetched.archive.is_disk_backed());
+        assert_eq!(body_bytes(&fetched.archive), b"replication-plane-fragment");
+        assert!(
+            matches!(service_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "the client/service plane must not receive reconstruction GETs"
+        );
+        server.join().unwrap();
+    }
+
+    struct VersionFetcher {
+        by_node: HashMap<u64, FetchedFragment>,
+    }
+
+    impl FragmentFetcher for VersionFetcher {
+        fn fetch(
+            &self,
+            node: &RingDevice,
+            _partition: u64,
+            _account: &str,
+            _container: &str,
+            _object: &str,
+        ) -> Option<FetchedFragment> {
+            self.by_node.get(&node.id).cloned()
+        }
+    }
+
+    fn fetched_fragment(index: i32, timestamp: &str, etag: &str, byte: u8) -> FetchedFragment {
+        FetchedFragment {
+            frag_index: index,
+            archive: vec![byte].into(),
+            ec_etag: etag.to_string(),
+            ec_content_length: 1,
+            timestamp: timestamp.to_string(),
+            content_type: "application/octet-stream".to_string(),
+        }
+    }
+
+    #[test]
+    fn coherent_gather_ignores_stale_first_peer_and_deduplicates_indexes() {
+        let stale_etag = "11111111111111111111111111111111";
+        let current_etag = "22222222222222222222222222222222";
+        let fetcher = VersionFetcher {
+            by_node: HashMap::from([
+                (0, fetched_fragment(0, "1751500000.00000", stale_etag, 0)),
+                (1, fetched_fragment(1, "1751500001.00000", current_etag, 1)),
+                (2, fetched_fragment(2, "1751500001.00000", current_etag, 2)),
+            ]),
+        };
+        let peers = vec![dev(0), dev(1), dev(2)];
+        let (chosen, archives) =
+            gather_coherent_archives(&peers, 0, "a", "c", "o", 2, &fetcher, None, None, None)
+                .expect("later coherent quorum");
+        assert_eq!(chosen.timestamp, "1751500001.00000");
+        assert_eq!(
+            archives.iter().map(body_bytes).collect::<Vec<_>>(),
+            [vec![1], vec![2]]
+        );
+
+        let duplicate_fetcher = VersionFetcher {
+            by_node: HashMap::from([
+                (0, fetched_fragment(0, "1751500001.00000", current_etag, 0)),
+                (1, fetched_fragment(0, "1751500001.00000", current_etag, 9)),
+                (2, fetched_fragment(1, "1751500001.00000", current_etag, 1)),
+            ]),
+        };
+        assert!(matches!(
+            gather_coherent_archives(
+                &peers,
+                0,
+                "a",
+                "c",
+                "o",
+                3,
+                &duplicate_fetcher,
+                None,
+                None,
+                None,
+            ),
+            Err(ReconstructError::NotEnoughFragments)
+        ));
+    }
+
+    /// Field `test_rebuild_missing_frags` POSTs after PUT. Local datafile
+    /// `X-Timestamp` is the normal form; peer `X-Backend-Data-Timestamp` may
+    /// be `.internal()`. ca2081b used `!=` and dropped every fragment, so
+    /// reconstruct_fa skipped, `rebuilt` stayed 0, victim `sdb6#2` 404'd.
+    #[test]
+    fn test_gather_merges_normalized_and_internal_timestamps() {
+        let etag = "22222222222222222222222222222222";
+        let fetcher = VersionFetcher {
+            by_node: HashMap::from([(1, fetched_fragment(1, "1751500123.45678", etag, 1))]),
+        };
+        let seed = fetched_fragment(0, "1751500123.45678_0000000000000000", etag, 0);
+        let (chosen, archives) = gather_coherent_archives(
+            &[dev(1), dev(2)],
+            0,
+            "a",
+            "c",
+            "o",
+            2,
+            &fetcher,
+            Some("1751500123.45678"),
+            Some(seed),
+            None,
+        )
+        .expect("same instant must form one quorum");
+        assert!(same_data_timestamp(&chosen.timestamp, "1751500123.45678"));
+        assert_eq!(archives.len(), 2, "seed + one peer is ndata");
     }
 
     /// A fetcher backed by fragment archives held in memory, keyed by node id
     /// (node `i` returns fragment `i`) — the same layout a real cluster holds.
     struct FakeFetcher {
         archives: Vec<Vec<u8>>,
+        spool: SpoolBudget,
         ec_etag: String,
         ec_content_length: usize,
         timestamp: String,
     }
 
     impl FragmentFetcher for FakeFetcher {
+        fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+            Some(self.spool.clone())
+        }
         fn fetch(
             &self,
             node: &RingDevice,
@@ -2304,7 +5661,7 @@ mod tests {
             let i = node.id as usize;
             Some(FetchedFragment {
                 frag_index: i as i32,
-                archive: self.archives.get(i)?.clone(),
+                archive: self.archives.get(i)?.clone().into(),
                 ec_etag: self.ec_etag.clone(),
                 ec_content_length: self.ec_content_length,
                 timestamp: self.timestamp.clone(),
@@ -2331,6 +5688,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_job_persists_identical_durable_fragment() {
+        let spool = TestSpool::new(1024 * 1024);
         let k = 4usize;
         let m = 2usize;
         let seg = 1000usize;
@@ -2355,6 +5713,7 @@ mod tests {
             .collect();
         let fetcher = FakeFetcher {
             archives: archives.clone(),
+            spool: spool.budget.clone(),
             ec_etag: ec_etag.clone(),
             ec_content_length: data.len(),
             timestamp: ts.to_string(),
@@ -2406,6 +5765,7 @@ mod tests {
 
     #[test]
     fn test_rebuild_job_not_enough_fragments() {
+        let spool = TestSpool::new(1024 * 1024);
         let scheme = EcScheme {
             ndata: 4,
             nparity: 2,
@@ -2423,6 +5783,7 @@ mod tests {
         // only 2 peers available -> fewer than ndata=4
         let fetcher = FakeFetcher {
             archives,
+            spool: spool.budget.clone(),
             ec_etag: md5_hex(&data),
             ec_content_length: data.len(),
             timestamp: "1751500000.00000".to_string(),
@@ -2440,5 +5801,271 @@ mod tests {
             Err(ReconstructError::NotEnoughFragments)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `reconstruct_fa` must use the already-open local fragment. HTTP GET
+    /// back to this node is what stayed at 0 after overlay connected.
+    #[test]
+    fn test_reconstruct_fa_local_seed_reaches_ndata_without_self_http() {
+        use crate::ssync_sender::SyncDiskfileBuilder;
+        let spool = TestSpool::new(4 * 1024 * 1024);
+        let scheme = EcScheme {
+            ndata: 2,
+            nparity: 1,
+            segment_size: 1000,
+        };
+        let driver = EcDriver::new(2, 1).unwrap();
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let archives = driver.encode_object(&data, 1000).unwrap();
+        let ts = "1751500123.45678";
+        let etag = md5_hex(&data);
+        struct PeerOnlyFetcher {
+            archives: Vec<Vec<u8>>,
+            spool: SpoolBudget,
+            etag: String,
+            len: usize,
+            ts: String,
+            seen: std::cell::RefCell<Vec<u64>>,
+        }
+        impl FragmentFetcher for PeerOnlyFetcher {
+            fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+                Some(self.spool.clone())
+            }
+            fn fetch(
+                &self,
+                node: &RingDevice,
+                _p: u64,
+                _a: &str,
+                _c: &str,
+                _o: &str,
+            ) -> Option<FetchedFragment> {
+                self.seen.borrow_mut().push(node.id);
+                if node.id != 1 {
+                    return None;
+                }
+                Some(FetchedFragment {
+                    frag_index: 1,
+                    archive: self.archives.get(1)?.clone().into(),
+                    ec_etag: self.etag.clone(),
+                    ec_content_length: self.len,
+                    timestamp: self.ts.clone(),
+                    content_type: "application/octet-stream".into(),
+                })
+            }
+        }
+        let fetcher = PeerOnlyFetcher {
+            archives: archives.clone(),
+            spool: spool.budget.clone(),
+            etag: etag.clone(),
+            len: data.len(),
+            ts: ts.into(),
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let rebuilder = EcSyncRebuilder {
+            scheme,
+            partition: 7,
+            peers: vec![(0, dev(0)), (1, dev(1)), (2, dev(2))],
+            fetcher: &fetcher,
+            quarantine: QuarantinePolicy::default(),
+        };
+        let metadata: Metadata = vec![
+            (
+                MetaValue::Str("name".into()),
+                MetaValue::Str("/AUTH_test/c/o".into()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".into()),
+                MetaValue::Str(ts.into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                MetaValue::Int(0),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
+                MetaValue::Str(etag),
+            ),
+            (
+                MetaValue::Str("ETag".into()),
+                MetaValue::Str("should-be-dropped".into()),
+            ),
+        ];
+        let without = rebuilder.rebuild("hash", &metadata, 2);
+        assert!(
+            without.is_err(),
+            "HTTP-only to peer 1 is one fragment; ndata=2 must fail: {without:?}"
+        );
+        let seed = FetchedFragment {
+            frag_index: 0,
+            archive: archives[0].clone().into(),
+            ec_etag: md5_hex(&data),
+            ec_content_length: data.len(),
+            timestamp: ts.into(),
+            content_type: "application/octet-stream".into(),
+        };
+        // gather_coherent_archives is reconstruct_fa's fragment collection.
+        // Do not call liberasurecode reconstruct() here: Ubuntu 1.6.2
+        // double-frees when multiple rs_vand descriptors exist (CI uses 1.8.0).
+        // Codec identity is covered by test_rebuild_job_persists_identical_durable_fragment.
+        let (chosen, gathered) = gather_coherent_archives(
+            &rebuilder
+                .peers
+                .iter()
+                .filter(|(index, _)| *index != 2)
+                .map(|(_, device)| device.clone())
+                .collect::<Vec<_>>(),
+            rebuilder.partition,
+            "AUTH_test",
+            "c",
+            "o",
+            scheme.ndata,
+            rebuilder.fetcher,
+            Some(ts),
+            Some(seed),
+            None,
+        )
+        .expect("local seed + one peer is ndata");
+        assert_eq!(gathered.len(), 2);
+        assert!(same_data_timestamp(&chosen.timestamp, ts));
+        assert!(
+            !fetcher.seen.borrow().contains(&2),
+            "must not GET the emptied victim: {:?}",
+            fetcher.seen.borrow()
+        );
+        let _ = (rebuilder, metadata, archives);
+    }
+
+    #[test]
+    fn test_reconstruct_fa_quarantines_solitary_frag_when_threshold_is_one() {
+        use crate::ssync_sender::SyncDiskfileBuilder;
+        struct MissFetcher {
+            spool: SpoolBudget,
+        }
+        impl FragmentFetcher for MissFetcher {
+            fn reconstruction_spool(&self) -> Option<SpoolBudget> {
+                Some(self.spool.clone())
+            }
+            fn fetch(
+                &self,
+                _node: &RingDevice,
+                _p: u64,
+                _a: &str,
+                _c: &str,
+                _o: &str,
+            ) -> Option<FetchedFragment> {
+                None
+            }
+        }
+        let spool = TestSpool::new(1024 * 1024);
+        let fetcher = MissFetcher {
+            spool: spool.budget.clone(),
+        };
+        let old_ts = "1000000000.00000";
+        let seed = FetchedFragment {
+            frag_index: 0,
+            archive: vec![1, 2, 3].into(),
+            ec_etag: "e".into(),
+            ec_content_length: 3,
+            timestamp: old_ts.into(),
+            content_type: "application/octet-stream".into(),
+        };
+        let metadata: Metadata = vec![
+            (
+                MetaValue::Str("name".into()),
+                MetaValue::Str("/AUTH_test/c/o".into()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".into()),
+                MetaValue::Str(old_ts.into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                MetaValue::Int(0),
+            ),
+        ];
+        let with_threshold = EcSyncRebuilder {
+            scheme: EcScheme {
+                ndata: 4,
+                nparity: 2,
+                segment_size: 1000,
+            },
+            partition: 3,
+            peers: vec![(1, dev(1)), (2, dev(2))],
+            fetcher: &fetcher,
+            quarantine: QuarantinePolicy {
+                threshold: 1,
+                age_secs: 0.0,
+            },
+        };
+        let err = with_threshold
+            .rebuild_with_local("hash", &metadata, 1, Some(seed.clone()))
+            .expect_err("lonely frag must quarantine");
+        assert!(
+            err.starts_with(QUARANTINE_REBUILD_PREFIX),
+            "expected QUARANTINE prefix, got {err}"
+        );
+
+        let no_threshold = EcSyncRebuilder {
+            quarantine: QuarantinePolicy::default(),
+            ..with_threshold
+        };
+        let skip = no_threshold
+            .rebuild_with_local("hash", &metadata, 1, Some(seed))
+            .expect_err("threshold 0 must not quarantine");
+        assert_eq!(skip, "NotEnoughFragments");
+    }
+}
+
+#[cfg(test)]
+mod quarantine_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn test_solitary_quarantine_candidate_matches_python() {
+        let policy = QuarantinePolicy {
+            threshold: 1,
+            age_secs: 0.0,
+        };
+        assert!(
+            is_solitary_quarantine_candidate(policy, 4, 1, true, true, true, 1.0, 10.0),
+            "lonely frag older than age=0 is a candidate"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(
+                QuarantinePolicy::default(),
+                4,
+                1,
+                true,
+                true,
+                true,
+                1.0,
+                10.0
+            ),
+            "threshold 0 never quarantines"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(policy, 4, 2, true, true, true, 1.0, 10.0),
+            "two useful responses exceed threshold 1"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(policy, 4, 1, true, false, true, 1.0, 10.0),
+            "a non-404 peer response blocks quarantine"
+        );
+        assert!(
+            !is_solitary_quarantine_candidate(
+                QuarantinePolicy {
+                    threshold: 1,
+                    age_secs: 10000.0,
+                },
+                4,
+                1,
+                true,
+                true,
+                true,
+                9.0,
+                10.0
+            ),
+            "younger than quarantine_age stays"
+        );
     }
 }

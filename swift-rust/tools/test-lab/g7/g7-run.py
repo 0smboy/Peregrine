@@ -33,10 +33,25 @@ def sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def require_frozen_candidate(spec):
+    """Scored G7 cannot start while candidate_commit is PENDING_FREEZE."""
+    sha = spec.get("candidate_commit") if isinstance(spec, dict) else None
+    if not isinstance(sha, str) or not GIT_SHA_RE.fullmatch(sha.strip().lower()):
+        raise ValueError(
+            "candidate_commit is not a frozen 40-char git SHA "
+            f"(got {sha!r}; run freeze-candidate.py on Swift2 first)"
+        )
+    return sha.strip().lower()
+
+
 def load_frozen():
     # YAML is the frozen human file; JSON is the byte-identical machine form
     # generated at freeze time so the runner has no PyYAML dependency.
     spec = json.loads(JSON_PATH.read_text())
+    require_frozen_candidate(spec)
     spec["_sha256"] = sha256_file(YAML_PATH)
     spec["_json_sha256"] = sha256_file(JSON_PATH)
     spec["_bytes"] = YAML_PATH.stat().st_size
@@ -566,6 +581,32 @@ def classify(case, raw, spec, *, calibration=False):
             return check
         if raw.get("operation_ms", 0) < case.get("stall_secs", 0) * 1000:
             return _failed(out, f"{kind} operation did not cross the injected stall")
+    elif kind == "ssync_interrupt":
+        if raw.get("fault_armed") is not True or raw.get("fault_hits", 0) <= 0:
+            return _failed(out, "SSYNC interrupt was not injected on the exercised path")
+        if raw.get("success_ack") is True:
+            return _failed(out, "truncated SSYNC session was success-acknowledged")
+        if raw.get("error_ack") is not True:
+            return _failed(out, "truncated SSYNC session did not error-ack")
+        check = _require_equal(out, raw, "tmp_count", bounds["orphan_temp"])
+        if check:
+            return check
+        check = _require_equal(out, raw, "committed_objects", 0)
+        if check:
+            return check
+    elif kind == "ec_fragment_loss":
+        if raw.get("fault_armed") is not True or raw.get("fault_hits", 0) <= 0:
+            return _failed(out, "EC fragment loss was not injected")
+        if raw.get("fragments_removed", 0) <= 0:
+            return _failed(out, "no EC fragments were removed")
+        check = _require_2xx(out, raw, "put_status")
+        if check:
+            return check
+        check = _require_2xx(out, raw, "get_after")
+        if check:
+            return check
+        if raw.get("body_match") is not True:
+            return _failed(out, "GET after fragment loss did not match the PUT body")
     else:
         return _failed(out, f"no evidence contract for kind {kind}")
 
@@ -912,7 +953,7 @@ def run_case(name, case, spec, token):
         s.sendall(
             f"PUT /v1/{spec['auth']['account']}/g7slow/sigterm HTTP/1.1\r\nHost: {host}\r\nX-Auth-Token: {token}\r\nContent-Length: 10485760\r\n\r\n".encode()
         )
-        ssh("pid=$(cat /var/run/g6-rust/proxy.pid); kill -TERM $pid; echo TERM $pid")
+        rc, out, _ = ssh("pid=$(cat /var/run/g6-rust/proxy.pid); kill -TERM $pid; echo TERM $pid")
         time.sleep(2)
         hp_err = None
         try:
@@ -922,38 +963,48 @@ def run_case(name, case, spec, token):
         ssh("bash /root/work/g7/g7-start-rust.sh")
         time.sleep(2)
         hp = health_p99(spec, n=10)
-        raw = {"case": "sigterm_put", "target": 1, "opened": 1, "health_after_restart_p99_ms": hp["p99_ms"], "down_error": hp_err}
-    elif kind == "sigterm_barrier":
-        st, _, _ = put_object(spec, token, "g7slow", "barrier", b"Z" * 4096)
-        ssh("pid=$(cat /var/run/g6-rust/proxy.pid); kill -TERM $pid; echo TERM $pid")
-        time.sleep(1)
-        ssh("bash /root/work/g7/g7-start-rust.sh")
-        time.sleep(2)
-        st2, body, _ = http(
+        st, _, _ = http(
             host,
             port,
             "GET",
-            f"/v1/{spec['auth']['account']}/g7slow/barrier",
+            f"/v1/{spec['auth']['account']}/g7slow/sigterm",
             headers={"X-Auth-Token": token},
-            timeout=10,
+            timeout=5,
         )
-        raw = {"case": "sigterm_barrier", "target": 1, "opened": 1, "put_status": st, "get_after": st2, "len": len(body or b"")}
+        raw = {
+            "case": "sigterm_put",
+            "target": 1,
+            "opened": 1,
+            "term_sent": rc == 0 and "TERM" in (out or ""),
+            "restart_ok": hp["ok"] == hp["n"] and hp["n"] > 0,
+            "partial_absent": st is None or st >= 400,
+            "health_after_restart_p99_ms": hp["p99_ms"],
+            "down_error": hp_err,
+        }
+    elif kind == "sigterm_barrier":
+        raw = {
+            "case": "sigterm_barrier",
+            "target": 1,
+            "opened": 1,
+            "verdict_hint": "NOT RUN",
+            "not_run_reason": "DurabilityBarrier observation probe is not armed on this runner",
+        }
     elif kind == "fd_exhaust":
-        rc, out, err = ssh("pid=$(cat /var/run/g6-rust/proxy.pid); ls -l /proc/$pid/fd | wc -l; cat /proc/$pid/limits | awk '/open files/{print}'")
-        raw = {"case": "fd_exhaust", "target": 1, "opened": 1, "fd_info": (out or "") + (err or "")}
+        raw = {
+            "case": "fd_exhaust",
+            "target": 1,
+            "opened": 1,
+            "verdict_hint": "NOT RUN",
+            "not_run_reason": "ulimit/fd injector was not armed; listing /proc/pid/fd is not injection",
+        }
     elif kind == "enospc":
-        rc, dfout, _ = ssh("df -k /srv/1/node | tail -1")
-        raw = {"case": "enospc", "target": 1, "opened": 1, "df": dfout, "note": "fill attempted only if /srv/1 is a loop/saio device"}
-        # fill at most the saio path; refuse if it looks like production d1
-        rc2, _, _ = ssh(
-            "if mount | grep -q ' /srv/1 '; then "
-            "dd if=/dev/zero of=/srv/1/node/.g7fill bs=1M count=1 conv=fsync; "
-            "echo FILL_OK; else echo SKIP_NOT_SAIO; fi"
-        )
-        st, _, _ = put_object(spec, token, "g7slow", "enospc", b"E" * 1024)
-        ssh("rm -f /srv/1/node/.g7fill")
-        raw["put_status"] = st
-        raw["fill_rc"] = rc2
+        raw = {
+            "case": "enospc",
+            "target": 1,
+            "opened": 1,
+            "verdict_hint": "NOT RUN",
+            "not_run_reason": "ENOSPC injector not armed; a 1MiB fill file is not a proven ENOSPC hit",
+        }
     elif kind == "eio":
         raw = {"case": "eio", "target": 1, "opened": 1, "note": "device-mapper EIO not armed this run unless /dev/mapper/g7eio exists"}
         rc, out, _ = ssh("ls /dev/mapper/g7eio 2>/dev/null || echo NO_MAPPER")
@@ -983,15 +1034,13 @@ def run_case(name, case, spec, token):
         )
         raw = {"case": "partial_write", "target": 1, "opened": 1, "get_status": st, "expect_not_2xx": st is None or st >= 400}
     elif kind == "backend_connect_timeout":
-        raw = {"case": "backend_connect_timeout", "target": 1, "opened": 1, "note": "blackhole unused replica IP"}
-        ssh("iptables -w -I OUTPUT 1 -p tcp -d 127.0.0.9 -j DROP || true")
-        try:
-            hp = health_p99(spec, n=20)
-            raw["health_p99_ms"] = hp["p99_ms"]
-            raw["health_samples"] = hp["n"]
-            raw["health_ok"] = hp["ok"]
-        finally:
-            ssh("iptables -w -D OUTPUT -p tcp -d 127.0.0.9 -j DROP || true")
+        raw = {
+            "case": "backend_connect_timeout",
+            "target": 1,
+            "opened": 1,
+            "verdict_hint": "NOT RUN",
+            "not_run_reason": "no PUT was sent to the blackhole replica; iptables alone is not a timeout proof",
+        }
     elif kind == "fsync_stall":
         ssh(
             "gcc -shared -fPIC -O2 /root/work/g7/fsync_stall.c -o /root/work/g7/fsync_stall.so -ldl; "
@@ -1011,6 +1060,10 @@ def run_case(name, case, spec, token):
             "opened": 1,
             "put_status": st,
             "put_ms": ms,
+            "operation_status": st,
+            "operation_ms": ms,
+            "fault_armed": True,
+            "fault_hits": 1 if ms >= case.get("stall_secs", 0) * 1000 else 0,
             "health_p99_ms": hp["p99_ms"],
             "health_samples": hp["n"],
             "health_ok": hp["ok"],
@@ -1029,17 +1082,160 @@ def run_case(name, case, spec, token):
         )
         time.sleep(1)
         hp = health_p99(spec, n=case.get("health_samples", 40))
+        t0 = time.monotonic()
+        st, _, ms = http(
+            host,
+            port,
+            "PUT",
+            f"/v1/{spec['auth']['account']}/g7sqlite",
+            headers={"X-Auth-Token": token},
+            timeout=30,
+        )
         raw = {
             "case": "sqlite_stall",
             "target": 1,
             "opened": 1,
+            "operation_status": st,
+            "operation_ms": ms,
+            "fault_armed": True,
+            "fault_hits": 1 if ms >= case.get("stall_secs", 0) * 1000 else 0,
             "health_p99_ms": hp["p99_ms"],
             "health_samples": hp["n"],
             "health_ok": hp["ok"],
+            "elapsed_s": time.monotonic() - t0,
         }
         ssh("pid=$(cat /var/run/g6-rust/container-1.pid); kill -TERM $pid || true; sleep 1; "
             "nohup /root/work/g6-rust-bin/swift-container-server /etc/g6-rust/container-server/1.conf "
             ">>/var/log/g6-rust/container-1.log 2>&1 & echo $! >/var/run/g6-rust/container-1.pid")
+    elif kind == "ssync_interrupt":
+        ssync_host = os.environ.get("G7_SSYNC_HOST", "127.0.0.2")
+        ssync_port = int(os.environ.get("G7_SSYNC_PORT", "16210"))
+        device = os.environ.get("G7_SSYNC_DEVICE", "d1")
+        payload = (
+            b":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n"
+            b":UPDATES: START\r\nPUT /AUTH_test/g7slow/ssync-cut\r\n"
+            b"Content-Length: 32\r\nX-Timestamp: 1700000000.00000\r\n\r\npartial"
+        )
+        opened = 0
+        output = b""
+        try:
+            sock = socket.create_connection((ssync_host, ssync_port), timeout=5)
+            opened = 1
+            sock.sendall(
+                (
+                    f"SSYNC /{device}/0 HTTP/1.1\r\n"
+                    f"Host: {ssync_host}\r\n"
+                    f"Transfer-Encoding: chunked\r\n"
+                    f"X-Backend-Storage-Policy-Index: 0\r\n\r\n"
+                    f"{len(payload):x}\r\n"
+                ).encode()
+                + payload
+                + b"\r\n"
+            )
+            sock.shutdown(socket.SHUT_WR)
+            sock.settimeout(5)
+            chunks = []
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            output = b"".join(chunks)
+            sock.close()
+        except OSError as exc:
+            raw = {
+                "case": "ssync_interrupt",
+                "target": 1,
+                "opened": opened,
+                "verdict_hint": "NOT RUN",
+                "not_run_reason": f"SSYNC {ssync_host}:{ssync_port} unreachable: {exc}",
+            }
+        else:
+            text = output.decode("utf-8", "replace")
+            rc, tmp_out, _ = ssh(
+                "find /srv/1/node /srv/2/node /srv/3/node /srv/4/node -name '*.tmp' "
+                "-o -name '*tmp*' 2>/dev/null | wc -l"
+            )
+            raw = {
+                "case": "ssync_interrupt",
+                "target": 1,
+                "opened": 1,
+                "fault_armed": True,
+                "fault_hits": 1,
+                "success_ack": ":UPDATES: START" in text and ":ERROR:" not in text,
+                "error_ack": ":ERROR:" in text,
+                "tmp_count": int((tmp_out or "0").strip() or 0),
+                "committed_objects": 1 if ":UPDATES: START" in text and ":ERROR:" not in text else 0,
+                "ssync_output": text[-500:],
+            }
+    elif kind == "ec_fragment_loss":
+        policy = os.environ.get("G7_EC_POLICY", "Policy-1")
+        body = b"G7-EC-FRAGMENT-LOSS-" + os.urandom(32)
+        http(
+            host,
+            port,
+            "PUT",
+            f"/v1/{spec['auth']['account']}/g7ec",
+            headers={"X-Auth-Token": token, "X-Storage-Policy": policy},
+            timeout=10,
+        )
+        st, _, _ = http(
+            host,
+            port,
+            "PUT",
+            f"/v1/{spec['auth']['account']}/g7ec/frag-loss",
+            headers={
+                "X-Auth-Token": token,
+                "X-Storage-Policy": policy,
+                "Content-Type": "application/octet-stream",
+            },
+            body=body,
+            timeout=30,
+        )
+        if not st or st >= 300:
+            raw = {
+                "case": "ec_fragment_loss",
+                "target": 1,
+                "opened": 1,
+                "verdict_hint": "NOT RUN",
+                "not_run_reason": f"EC PUT via policy {policy!r} returned {st!r}",
+                "put_status": st,
+            }
+        else:
+            rc, listed, _ = ssh(
+                "find /srv/1/node /srv/2/node /srv/3/node /srv/4/node "
+                "-name '*.data' 2>/dev/null | head"
+            )
+            paths = [line for line in (listed or "").splitlines() if line.strip()]
+            removed = 0
+            if paths:
+                ssh(f"rm -f {paths[0]}")
+                removed = 1
+            st2, got, _ = http(
+                host,
+                port,
+                "GET",
+                f"/v1/{spec['auth']['account']}/g7ec/frag-loss",
+                headers={"X-Auth-Token": token},
+                timeout=30,
+            )
+            raw = {
+                "case": "ec_fragment_loss",
+                "target": 1,
+                "opened": 1,
+                "fault_armed": removed > 0,
+                "fault_hits": removed,
+                "fragments_removed": removed,
+                "put_status": st,
+                "get_after": st2,
+                "body_match": got == body,
+            }
+            if removed <= 0:
+                raw["verdict_hint"] = "NOT RUN"
+                raw["not_run_reason"] = "no on-disk EC fragment was found to remove"
     else:
         raw = {"error": f"unknown kind {kind}", "target": case.get("target"), "opened": 0}
 
@@ -1054,9 +1250,9 @@ def run_case(name, case, spec, token):
     case = dict(case)
     case["_name"] = name
     result = classify(case, raw, spec)
-    if kind in ("eio",) and raw.get("verdict_hint") == "NOT RUN":
+    if raw.get("verdict_hint") == "NOT RUN" and result.get("verdict") != "NOT RUN":
         result["verdict"] = "NOT RUN"
-        result["reason"] = "no EIO mapper"
+        result["reason"] = str(raw.get("not_run_reason") or "required fault was not injected")
     return result
 
 

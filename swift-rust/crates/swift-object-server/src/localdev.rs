@@ -39,9 +39,12 @@
 //! "yes, that is me" for the whole ring and hands the identity of the
 //! lowest-numbered device to every node in it.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 
-use swift_ring::Ring;
+use swift_core::config::SwiftConfig;
+use swift_ring::{Ring, RingDevice};
 
 /// The addresses configured on this host (Python `whataremyips()` with no arg).
 pub fn local_addrs() -> Vec<IpAddr> {
@@ -169,9 +172,210 @@ pub fn ring_device_id_local_name(ring: &Ring, dev_name: &str) -> Option<u64> {
     Some(local[0].id)
 }
 
+/// Ring device id for a local `devices/` directory.
+///
+/// Isolated G6 remaps object-server listen ports (`16210` …) while EC rings
+/// often still list `6010` / `6200`. With `servers_per_port=0` a strict
+/// `(bind_port, name)` match returns `None` and the reconstructor skips every
+/// device (`suffix_syncs=0`) — partner SYNC and the post-ssync local rebuild
+/// never run. Fall back to local IP + device name. Still requires a local
+/// interface address so a multi-node `d1` cannot be stolen.
+pub fn resolve_ring_device_id(
+    ring: &Ring,
+    bind_port: u32,
+    servers_per_port: u32,
+    dev_name: &str,
+) -> Option<u64> {
+    if servers_per_port > 0 {
+        return ring_device_id_local_name(ring, dev_name);
+    }
+    ring_device_id(ring, bind_port, dev_name).or_else(|| ring_device_id_local_name(ring, dev_name))
+}
+
+/// Isolated G6 keeps EC ring ports at `6010` / `6200` while object servers
+/// listen on `16210`…. Identity fallback already finds the local device;
+/// partner REPLICATE / SSYNC / fragment GET still dialed the ring port and
+/// got connection refused, so `break_nodes` never healed.
+///
+/// Built from `SWIFT_DIR/object-server/*.conf` (+ `object-server.conf`):
+/// each conf's `devices` children map to that conf's `bind_port`. When every
+/// parsed conf shares one bind port (one object server per host, same remap
+/// on every node), that port is also the default for unmapped remote devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectListenOverlay {
+    by_device: BTreeMap<String, u32>,
+    default_port: Option<u32>,
+}
+
+impl ObjectListenOverlay {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, device: impl Into<String>, port: u32) {
+        self.by_device.insert(device.into(), port);
+        self.refresh_default();
+    }
+
+    pub fn set_default_port(&mut self, port: u32) {
+        self.default_port = Some(port);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_device.is_empty() && self.default_port.is_none()
+    }
+
+    /// Device → listen-port mappings loaded from `object-server/*.conf`.
+    /// Field `listen_overlay=0` during the `1682fdb` heal window was the
+    /// absence of this count, not a logged token.
+    pub fn entry_count(&self) -> usize {
+        self.by_device.len()
+    }
+
+    pub fn listen_port(&self, device: &str, ring_port: u32) -> u32 {
+        self.by_device
+            .get(device)
+            .copied()
+            .or(self.default_port)
+            .unwrap_or(ring_port)
+    }
+
+    /// Rewrite a ring device so fragment GET / REPLICATE hit the listen port.
+    pub fn remap_device(&self, dev: &RingDevice) -> RingDevice {
+        let mut out = dev.clone();
+        let ring_port = out.replication_port.unwrap_or(out.port);
+        let listen = self.listen_port(&out.device, ring_port);
+        out.port = listen;
+        out.replication_port = Some(listen);
+        out
+    }
+
+    pub fn from_swift_dir(swift_dir: &Path) -> Self {
+        let mut overlay = Self::empty();
+        let mut confs: Vec<PathBuf> = Vec::new();
+        let root_conf = swift_dir.join("object-server.conf");
+        if root_conf.is_file() {
+            confs.push(root_conf);
+        }
+        let dir = swift_dir.join("object-server");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("conf") && path.is_file() {
+                    confs.push(path);
+                }
+            }
+        }
+        for path in confs {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(conf) = SwiftConfig::parse_lenient(&text, &[], false) else {
+                continue;
+            };
+            let Some(port) = conf_bind_port(&conf) else {
+                continue;
+            };
+            let devices = conf_devices(&conf);
+            let mut mapped = false;
+            if let Some(root) = devices.as_ref() {
+                if let Ok(entries) = std::fs::read_dir(root) {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if !name.starts_with('.') {
+                                    overlay.insert(name.to_string(), port);
+                                    mapped = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !mapped {
+                    if let Some(name) = root.file_name().and_then(|s| s.to_str()) {
+                        if name != "node" && name != "srv" {
+                            overlay.insert(name.to_string(), port);
+                        }
+                    }
+                }
+            }
+            // Remember every parsed listen port so a single-port isolated
+            // node can remap remote partners (same bind_port on every host).
+            overlay.note_parsed_port(port);
+        }
+        overlay.refresh_default();
+        overlay
+    }
+
+    fn note_parsed_port(&mut self, port: u32) {
+        match self.default_port {
+            None => self.default_port = Some(port),
+            Some(existing) if existing != port => self.default_port = None,
+            Some(_) => {}
+        }
+    }
+
+    fn refresh_default(&mut self) {
+        let mut unique = BTreeMap::new();
+        for port in self.by_device.values().copied() {
+            unique.insert(port, ());
+        }
+        if unique.len() == 1 {
+            self.default_port = unique.keys().next().copied();
+        } else if unique.len() > 1 {
+            // Per-device ports (SAIO 16210/16220/…). Keep by_device only.
+            self.default_port = None;
+        }
+    }
+}
+
+fn conf_get(conf: &SwiftConfig, key: &str) -> Option<String> {
+    crate::object_server_conf::object_server_conf_get(conf, key)
+}
+
+fn conf_bind_port(conf: &SwiftConfig) -> Option<u32> {
+    conf_get(conf, "bind_port")?.parse().ok()
+}
+
+fn conf_devices(conf: &SwiftConfig) -> Option<PathBuf> {
+    conf_get(conf, "devices").map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use swift_core::hashing::HashPathConfig;
+    use swift_ring::{RingData, RingDevice};
+
+    fn test_dev(id: u64, ip: &str, port: u32, device: &str) -> RingDevice {
+        RingDevice {
+            id,
+            region: 1,
+            zone: 1,
+            ip: ip.to_string(),
+            port,
+            replication_ip: None,
+            replication_port: None,
+            device: device.to_string(),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        }
+    }
+
+    fn test_ring(devs: Vec<Option<RingDevice>>) -> Ring {
+        let assigned: Vec<u32> = devs.iter().flatten().map(|d| d.id as u32).collect();
+        let parts = if assigned.is_empty() {
+            vec![0]
+        } else {
+            assigned
+        };
+        Ring::new(
+            RingData::from_parts(devs, 32, vec![parts]),
+            HashPathConfig::new("", "changeme").unwrap(),
+        )
+    }
 
     #[test]
     fn loopback_is_local_and_a_documentation_address_is_not() {
@@ -218,6 +422,116 @@ mod tests {
         assert!(wild.contains(&"127.0.0.1".to_string()) || !wild.is_empty());
     }
 
-    // ring_device_id_local_name needs a real Ring fixture; covered by Contabo
-    // heal re-proof after deploy (spp>0 + conf bind_port ≠ ring port).
+    #[test]
+    fn remapped_bind_port_falls_back_to_local_name() {
+        // Failed first: spp=0 + bind_port 16210 vs ring port 6010 returned
+        // None, so reconstructor skipped the only local device.
+        let ring = test_ring(vec![Some(test_dev(3, "127.0.0.1", 6010, "d1"))]);
+        assert_eq!(
+            resolve_ring_device_id(&ring, 16210, 0, "d1"),
+            Some(3),
+            "isolated remapped listen port must still find the local device"
+        );
+        assert_eq!(resolve_ring_device_id(&ring, 6010, 0, "d1"), Some(3));
+    }
+
+    #[test]
+    fn remapped_bind_port_does_not_steal_a_remote_d1() {
+        let ring = test_ring(vec![Some(test_dev(3, "192.0.2.1", 6010, "d1"))]);
+        assert_eq!(
+            resolve_ring_device_id(&ring, 16210, 0, "d1"),
+            None,
+            "TEST-NET-1 is never a local interface"
+        );
+        assert_eq!(resolve_ring_device_id(&ring, 6010, 0, "d1"), Some(3));
+    }
+
+    #[test]
+    fn servers_per_port_still_matches_local_name() {
+        let ring = test_ring(vec![Some(test_dev(7, "127.0.0.1", 6217, "sda1"))]);
+        assert_eq!(resolve_ring_device_id(&ring, 6210, 1, "sda1"), Some(7));
+        assert_eq!(resolve_ring_device_id(&ring, 6210, 0, "sda1"), Some(7));
+    }
+
+    fn write_object_conf(dir: &Path, name: &str, bind_port: u32, devices: &Path) {
+        std::fs::create_dir_all(dir.join("object-server")).unwrap();
+        std::fs::write(
+            dir.join("object-server").join(name),
+            format!(
+                "[DEFAULT]\nbind_port = {bind_port}\ndevices = {}\n",
+                devices.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn empty_overlay_keeps_the_ring_port() {
+        // Failed first: partner SYNC used ring 6010 after identity fallback.
+        let overlay = ObjectListenOverlay::empty();
+        assert_eq!(overlay.listen_port("d1", 6010), 6010);
+        assert!(overlay.is_empty());
+    }
+
+    #[test]
+    fn overlay_from_swift_dir_maps_device_dirs_to_bind_port() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-listen-overlay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let devices = root.join("srv/node");
+        std::fs::create_dir_all(devices.join("d1")).unwrap();
+        std::fs::create_dir_all(devices.join("d2")).unwrap();
+        write_object_conf(&root, "1.conf", 16210, &devices);
+        write_object_conf(&root, "2.conf", 16220, &root.join("srv/node-missing"));
+
+        let overlay = ObjectListenOverlay::from_swift_dir(&root);
+        assert_eq!(
+            overlay.listen_port("d1", 6010),
+            16210,
+            "isolated listen port must replace the ring port"
+        );
+        assert_eq!(overlay.listen_port("d2", 6020), 16210);
+        // Two bind ports, one mapped: no cluster-wide default.
+        assert_eq!(
+            overlay.listen_port("remote-d3", 6030),
+            6030,
+            "unmapped device keeps the ring port when listen ports are not unique"
+        );
+        let remapped = overlay.remap_device(&test_dev(3, "10.0.0.2", 6010, "d1"));
+        assert_eq!(remapped.port, 16210);
+        assert_eq!(remapped.replication_port, Some(16210));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn single_bind_port_conf_remaps_unmapped_remote_partners() {
+        // Multi-node isolated: each host has one object-server.conf at 16210
+        // while rings still say 6010. Remote partners use the same listen port.
+        let root = std::env::temp_dir().join(format!(
+            "swift-listen-overlay-oneport-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let devices = root.join("srv/node");
+        std::fs::create_dir_all(devices.join("d1")).unwrap();
+        write_object_conf(&root, "1.conf", 16210, &devices);
+        let overlay = ObjectListenOverlay::from_swift_dir(&root);
+        assert_eq!(overlay.listen_port("d1", 6010), 16210);
+        assert_eq!(
+            overlay.listen_port("d2", 6010),
+            16210,
+            "same remapped bind_port on every host"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -348,7 +348,9 @@ impl ConcurrencySnapshot {
             "Commit-shield operations still draining during shutdown.",
             self.shutdown_waiting_commits,
         );
-        out.push_str("# HELP http_requests_total HTTP requests handled by the production engine.\n");
+        out.push_str(
+            "# HELP http_requests_total HTTP requests handled by the production engine.\n",
+        );
         out.push_str("# TYPE http_requests_total counter\n");
         out.push_str("http_requests_total{engine=\"hyper\"} ");
         out.push_str(&self.http_requests_total_hyper.to_string());
@@ -371,7 +373,9 @@ impl ConcurrencySnapshot {
             "tokio::task::block_in_place invocations on a request path (G3 NO-GO if >0 on migrated paths).",
             self.block_in_place_total,
         );
-        out.push_str("# HELP spawn_blocking_total spawn_blocking jobs started by BlockingDomain.\n");
+        out.push_str(
+            "# HELP spawn_blocking_total spawn_blocking jobs started by BlockingDomain.\n",
+        );
         out.push_str("# TYPE spawn_blocking_total counter\n");
         out.push_str("spawn_blocking_total{domain=\"storage\"} ");
         out.push_str(&self.spawn_blocking_total_storage.to_string());
@@ -449,7 +453,8 @@ struct Inner {
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConcurrencyMetricsInner").finish_non_exhaustive()
+        f.debug_struct("ConcurrencyMetricsInner")
+            .finish_non_exhaustive()
     }
 }
 
@@ -549,7 +554,11 @@ impl ConcurrencyMetrics {
     }
 
     pub fn attach_admission(&self, admission: AdmissionController) {
-        *self.inner.admission.lock().unwrap_or_else(|e| e.into_inner()) = Some(admission);
+        *self
+            .inner
+            .admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(admission);
     }
 
     pub fn attach_storage(&self, storage: StorageExecutor) {
@@ -565,9 +574,10 @@ impl ConcurrencyMetrics {
     }
 
     pub fn observe_scheduler_lag(&self, lag: Duration) {
-        self.inner
-            .runtime_scheduler_lag_ns
-            .store(lag.as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
+        self.inner.runtime_scheduler_lag_ns.store(
+            lag.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
     }
 
     pub fn runtime_tasks_inc(&self) {
@@ -575,11 +585,12 @@ impl ConcurrencyMetrics {
     }
 
     pub fn runtime_tasks_dec(&self) {
-        let _ = self.inner.runtime_tasks.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .inner
+            .runtime_tasks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     pub fn add_request_body_buffer(&self, delta: i64) {
@@ -598,7 +609,9 @@ impl ConcurrencyMetrics {
         self.inner
             .backend_requests_inflight
             .fetch_add(1, Ordering::AcqRel);
-        self.inner.backend_queue_depth.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .backend_queue_depth
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn backend_inflight_dec(&self) {
@@ -607,11 +620,12 @@ impl ConcurrencyMetrics {
             Ordering::Acquire,
             |v| Some(v.saturating_sub(1)),
         );
-        let _ = self.inner.backend_queue_depth.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ =
+            self.inner
+                .backend_queue_depth
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    Some(v.saturating_sub(1))
+                });
     }
 
     pub fn record_timeout(&self, kind: DeadlineKind) {
@@ -636,7 +650,9 @@ impl ConcurrencyMetrics {
     }
 
     pub fn commit_shield_inc(&self) {
-        self.inner.commit_shield_active.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .commit_shield_active
+            .fetch_add(1, Ordering::AcqRel);
         let _ = CONN_SHIELDS.try_with(|c| c.fetch_add(1, Ordering::AcqRel));
     }
 
@@ -673,7 +689,9 @@ impl ConcurrencyMetrics {
 
     /// G3: Hyper admitted an application request (not `/recon/concurrency`).
     pub fn record_http_request_hyper(&self) {
-        self.inner.http_requests_hyper.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .http_requests_hyper
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// G3: native `AsyncService` (proxy/object/account/container).
@@ -786,13 +804,8 @@ impl ConcurrencyMetrics {
     /// Join remaining shields. Never abort: BlockingDomain commit must finish
     /// or fail deterministically.
     pub async fn join_remaining_shields(&self) {
-        let handles: Vec<_> = std::mem::take(
-            &mut *self
-                .inner
-                .shields
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
+        let handles: Vec<_> =
+            std::mem::take(&mut *self.inner.shields.lock().unwrap_or_else(|e| e.into_inner()));
         for handle in handles {
             let _ = handle.await;
         }
@@ -813,7 +826,8 @@ impl ConcurrencyMetrics {
         let (connections_open, requests_active, rejected) = if let Some(a) = admission.as_ref() {
             let open = a.connections_open() as u64;
             let req = a.requests_active() as u64;
-            let rej = a.rejected_connections()
+            let rej = a
+                .rejected_connections()
                 .saturating_add(a.rejected_requests())
                 .saturating_add(a.rejected_class(crate::TrafficClass::Foreground))
                 .saturating_add(a.rejected_class(crate::TrafficClass::Replication))
@@ -897,10 +911,8 @@ impl ConcurrencyMetrics {
                 .response_body_buffer_bytes
                 .load(Ordering::Acquire)
                 .max(0) as u64,
-            backend_requests_inflight: self
-                .inner
-                .backend_requests_inflight
-                .load(Ordering::Acquire) as u64,
+            backend_requests_inflight: self.inner.backend_requests_inflight.load(Ordering::Acquire)
+                as u64,
             backend_queue_depth: self.inner.backend_queue_depth.load(Ordering::Acquire) as u64,
             device_ops_active,
             device_queue_depth,
@@ -917,14 +929,10 @@ impl ConcurrencyMetrics {
                 .load(Ordering::Acquire),
             process_threads,
             open_fds,
-            shutdown_waiting_requests: self
-                .inner
-                .shutdown_waiting_requests
-                .load(Ordering::Acquire) as u64,
-            shutdown_waiting_commits: self
-                .inner
-                .shutdown_waiting_commits
-                .load(Ordering::Acquire) as u64,
+            shutdown_waiting_requests: self.inner.shutdown_waiting_requests.load(Ordering::Acquire)
+                as u64,
+            shutdown_waiting_commits: self.inner.shutdown_waiting_commits.load(Ordering::Acquire)
+                as u64,
             http_requests_total_hyper: self.inner.http_requests_hyper.load(Ordering::Relaxed),
             native_async_requests_total: self.inner.native_async_requests.load(Ordering::Relaxed),
             legacy_sync_handler_requests_total: self
@@ -972,7 +980,9 @@ fn sample_process_threads(worker_threads: usize, blocking_active: usize) -> u64 
             }
         }
     }
-    worker_threads.saturating_add(blocking_active).saturating_add(1) as u64
+    worker_threads
+        .saturating_add(blocking_active)
+        .saturating_add(1) as u64
 }
 
 fn sample_open_fds() -> u64 {
@@ -1188,7 +1198,11 @@ mod tests {
         });
         wait_until(|| entered.load(AtomOrd::SeqCst)).await;
         let snap = m.snapshot();
-        assert!(snap.db_ops_active >= 1, "db_ops_active={}", snap.db_ops_active);
+        assert!(
+            snap.db_ops_active >= 1,
+            "db_ops_active={}",
+            snap.db_ops_active
+        );
         release.store(true, AtomOrd::SeqCst);
         job.await.unwrap().unwrap();
         wait_until(|| m.snapshot().db_ops_active == 0).await;

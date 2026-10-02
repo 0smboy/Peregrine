@@ -84,7 +84,8 @@ impl AccountFreeze {
 
     fn forbidden() -> Response {
         let mut resp = Response::with_body(403, FROZEN_BODY);
-        resp.headers.set("Content-Type", "text/plain; charset=UTF-8");
+        resp.headers
+            .set("Content-Type", "text/plain; charset=UTF-8");
         resp
     }
 }

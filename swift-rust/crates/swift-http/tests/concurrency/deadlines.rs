@@ -136,8 +136,7 @@ fn new_connection_idle_outlives_header_deadline() {
         Arc::new(harness::tiny_ok),
     );
     let mut held = TcpStream::connect_timeout(&server.addr, Duration::from_secs(1)).unwrap();
-    held.set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     held.set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     std::thread::sleep(Duration::from_millis(2100));
@@ -164,8 +163,7 @@ fn first_line_drip_still_hits_header_deadline() {
         Arc::new(harness::tiny_ok),
     );
     let mut slow = TcpStream::connect_timeout(&server.addr, Duration::from_secs(1)).unwrap();
-    slow.set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     slow.set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let started = std::time::Instant::now();

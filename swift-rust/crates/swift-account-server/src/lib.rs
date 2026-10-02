@@ -36,9 +36,7 @@ use swift_core::timestamp::Timestamp;
 use swift_db::{
     AccountBroker, BrokerMetadata, ContainerRecord, DbError, DbValue, ListContainersArgs,
 };
-use swift_http::{
-    split_path, AsyncRequest, AsyncService, Body, HeaderKeyDict, Request, Response,
-};
+use swift_http::{split_path, AsyncRequest, AsyncService, Body, HeaderKeyDict, Request, Response};
 use swift_runtime::{ConcurrencyMetrics, DbExecutor, DbExecutorConfig};
 
 pub const ACCOUNT_LISTING_LIMIT: i64 = 10000;
@@ -622,6 +620,9 @@ impl AccountServer {
         if swift_db::is_corruption_error(e) {
             let _ = swift_db::quarantine_db(db_file, "accounts");
             return swob_response(404, None);
+        }
+        if swift_db::is_lock_contention(e) {
+            return error_response(503, &e.to_string());
         }
         error_response(500, &e.to_string())
     }

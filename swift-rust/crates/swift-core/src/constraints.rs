@@ -369,9 +369,73 @@ pub fn ismount(path: &Path) -> bool {
         // path/.. is the same i-node as path
         return true;
     }
+    // Same-FS bind mounts keep st_dev == parent. Official Linux SAIO and
+    // isolated G6 dirs that are actually bind-mounted still appear as a
+    // mount point in /proc/self/mountinfo (field 5).
+    if path_is_listed_mountpoint(path) {
+        return true;
+    }
     // device/inode checks don't work in some containerized environments;
     // allow an operator-placed stub file
     path.join(".ismount").is_file()
+}
+
+/// Unescape `/proc/self/mountinfo` octal sequences (`\040` space, `\011`
+/// tab, `\012` newline, `\134` backslash).
+pub fn unescape_mountinfo_field(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            if let Ok(escaped) = std::str::from_utf8(&bytes[i + 1..i + 4]) {
+                if let Ok(value) = u8::from_str_radix(escaped, 8) {
+                    out.push(value as char);
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Mount-point path from one `/proc/self/mountinfo` line (field 5).
+pub fn mountinfo_mountpoint(line: &str) -> Option<String> {
+    let mut fields = line.split(' ');
+    let _mount_id = fields.next()?;
+    let _parent_id = fields.next()?;
+    let _dev = fields.next()?;
+    let _root = fields.next()?;
+    Some(unescape_mountinfo_field(fields.next()?))
+}
+
+/// Whether `path` is listed as a mount point in a mountinfo dump.
+pub fn mountinfo_contains_mountpoint(mountinfo: &str, path: &Path) -> bool {
+    let want = normalize_mount_path(path);
+    mountinfo.lines().any(|line| {
+        mountinfo_mountpoint(line)
+            .map(|mp| normalize_mount_path(Path::new(&mp)) == want)
+            .unwrap_or(false)
+    })
+}
+
+fn normalize_mount_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw == "/" {
+        return "/".into();
+    }
+    raw.trim_end_matches('/').to_string()
+}
+
+fn path_is_listed_mountpoint(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    mountinfo_contains_mountpoint(&text, &canon)
 }
 
 #[cfg(not(unix))]
@@ -590,6 +654,13 @@ auto_create_account_prefix = !
         );
         // existing dir passes check_dir
         assert_eq!(check_dir(&tmp, "sdb1").unwrap(), tmp.join("sdb1"));
+        // Field G6: isolated devices are plain dirs; mount_check=false
+        // must accept them (REPLICATE/SSYNC check_drive).
+        assert_eq!(
+            check_drive(&tmp, "sdb1", false).unwrap(),
+            tmp.join("sdb1"),
+            "mount_check=false must accept a plain device directory"
+        );
         // missing dir fails
         assert!(check_dir(&tmp, "nope")
             .unwrap_err()
@@ -604,5 +675,33 @@ auto_create_account_prefix = !
         std::fs::write(tmp.join("sdb1").join(".ismount"), b"").unwrap();
         assert_eq!(check_mount(&tmp, "sdb1").unwrap(), tmp.join("sdb1"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_mountinfo_parser_finds_same_fs_bind_mount() {
+        let dump = "\
+36 35 98:0 / / rw,relatime - ext4 /dev/sda4 rw
+123 36 98:0 /data/sdb6 /srv/2/node/sdb6 rw,relatime - ext4 /dev/sda4 rw
+124 36 98:0 /data/sp\\040ace /mnt/sp\\040ace rw - ext4 /dev/sda4 rw
+";
+        assert!(mountinfo_contains_mountpoint(dump, Path::new("/")));
+        assert!(mountinfo_contains_mountpoint(
+            dump,
+            Path::new("/srv/2/node/sdb6")
+        ));
+        assert!(mountinfo_contains_mountpoint(
+            dump,
+            Path::new("/mnt/sp ace")
+        ));
+        assert!(
+            !mountinfo_contains_mountpoint(dump, Path::new("/srv/2/node/sdb5")),
+            "plain sibling dir is not a mount point"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_is_a_mount() {
+        assert!(ismount(Path::new("/")));
     }
 }

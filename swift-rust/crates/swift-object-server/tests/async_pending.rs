@@ -15,11 +15,10 @@
 
 //! When a container update can't be applied synchronously, the object server
 //! must drop an async_pending pickle that the object-updater daemon later
-//! replays. This drives a PUT with no container side-channel and checks the
-//! file lands in the expected format (round-tripped through the updater's
-//! own parser).
+//! replays. A missing side-channel is not a failure (Python `updates = []`);
+//! a named container host that cannot be reached is.
 
-use swift_http::{HeaderKeyDict, Request};
+use swift_http::{AsyncRequest, HeaderKeyDict, Request};
 use swift_object_server::{
     iter_async_pendings, ContainerUpdateMode, ObjectServer, ObjectServerConfig, UpdaterStats,
 };
@@ -32,21 +31,43 @@ fn config(devices: &std::path::Path) -> ObjectServerConfig {
             .unwrap(),
         diskfile: swift_diskfile::DiskFileConfig::default(),
         policies: std::collections::HashMap::from([(0, swift_diskfile::PolicyKind::Replication)]),
-        container_update_timeout: std::time::Duration::from_secs(1),
+        // Closed CU ports refuse immediately; keep the bound tight so a hang
+        // cannot masquerade as a successful sync update.
+        container_update_timeout: std::time::Duration::from_millis(50),
         container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
     }
 }
 
+fn stamp_cu(headers: &mut HeaderKeyDict, host: &str) {
+    headers.set("X-Container-Host", host);
+    headers.set("X-Container-Device", "sda1");
+    headers.set("X-Container-Partition", "0");
+}
+
+fn count_pendings(devices_root: &std::path::Path) -> usize {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(devices_root) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let mut stats = UpdaterStats::default();
+            total += iter_async_pendings(&entry.path(), &mut stats).len();
+        }
+    }
+    total
+}
+
 #[test]
-fn test_put_without_container_hosts_writes_async_pending() {
+fn test_put_without_container_hosts_does_not_write_async_pending() {
     let dir = std::env::temp_dir().join(format!("swift-os-async-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let device = dir.join("sda1");
     std::fs::create_dir_all(&device).unwrap();
 
     let server = ObjectServer::new(config(&dir));
-    // PUT with NO X-Container-Host side channel -> the container update can't
-    // be applied synchronously and must go to async_pending.
+    // Python: no X-Container-Partition → updates=[] → no pickle. EC fragments
+    // not selected by num_container_updates look like this.
     let mut headers = HeaderKeyDict::new();
     headers.set("X-Timestamp", "1751500000.00000");
     headers.set("Content-Length", "5");
@@ -61,7 +82,38 @@ fn test_put_without_container_hosts_writes_async_pending() {
     let resp = server.handle(req);
     assert_eq!(resp.status, 201, "PUT should still succeed");
 
-    // an async_pending must have been written; the updater parses it back
+    let mut stats = UpdaterStats::default();
+    let updates = iter_async_pendings(&device, &mut stats);
+    assert!(
+        updates.is_empty(),
+        "missing CU side-channel must not enqueue async_pending: {updates:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_put_with_unreachable_container_host_writes_async_pending() {
+    let dir = std::env::temp_dir().join(format!("swift-os-async-down-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+
+    let server = ObjectServer::new(config(&dir));
+    let mut headers = HeaderKeyDict::new();
+    headers.set("X-Timestamp", "1751500000.00000");
+    headers.set("Content-Length", "5");
+    headers.set("Content-Type", "text/plain");
+    stamp_cu(&mut headers, "127.0.0.1:1");
+    let req = Request {
+        method: "PUT".into(),
+        path: "/sda1/0/AUTH_test/c/o".into(),
+        query_string: String::new(),
+        headers,
+        body: b"hello".to_vec().into(),
+    };
+    let resp = server.handle(req);
+    assert_eq!(resp.status, 201, "object PUT stays 2xx when CU is down");
+
     let mut stats = UpdaterStats::default();
     let updates = iter_async_pendings(&device, &mut stats);
     assert_eq!(updates.len(), 1, "one async_pending expected");
@@ -70,8 +122,6 @@ fn test_put_without_container_hosts_writes_async_pending() {
     assert_eq!(u.account, "AUTH_test");
     assert_eq!(u.container, "c");
     assert_eq!(u.obj, "o");
-    // the update headers were carried (x-size / x-timestamp), case-insensitively
-    // (HeaderKeyDict title-cases keys, as Python's does)
     assert!(u
         .headers
         .iter()
@@ -80,6 +130,163 @@ fn test_put_without_container_hosts_writes_async_pending() {
         .headers
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("x-timestamp") && v == "1751500000.00000"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_partial_container_outage_pending_count_stays_under_2x() {
+    // Probe UpdaterStatsMixIn._create_lots_of_asyncs: 2 of 4 container
+    // servers down, then assertGreater(count, N) and assertLess(count, 2N).
+    // Each object is three device-local PUTs (object replicas / EC
+    // fragments) plus one extra no-side-channel PUT (fragment the proxy did
+    // not pick for num_container_updates).
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("swift-os-async-card-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for name in ["sda1", "sdb1", "sdc1", "sdd1"] {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+    }
+
+    let live = TcpListener::bind("127.0.0.1:0").unwrap();
+    live.set_nonblocking(true).unwrap();
+    let live_addr = live.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !stop_t.load(Ordering::Relaxed) {
+            match live.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let server = ObjectServer::new(config(&dir));
+    let live_host = live_addr.to_string();
+    let down_host = "127.0.0.1:1";
+    let total_objs = 12;
+    for i in 0..total_objs {
+        let obj = format!("o-{i:03}");
+        let ts = format!("{}", 1_751_500_000 + i);
+        // Replica / fragment 0: assigned a live container replica → no pending.
+        let mut h0 = HeaderKeyDict::new();
+        h0.set("X-Timestamp", &ts);
+        h0.set("Content-Length", "1");
+        h0.set("Content-Type", "text/plain");
+        stamp_cu(&mut h0, &live_host);
+        assert_eq!(
+            server
+                .handle(Request {
+                    method: "PUT".into(),
+                    path: format!("/sda1/0/AUTH_test/c/{obj}"),
+                    query_string: String::new(),
+                    headers: h0,
+                    body: b"x".to_vec().into(),
+                })
+                .status,
+            201
+        );
+        // Replica / fragment 1: assigned a down container replica → pending.
+        let mut h1 = HeaderKeyDict::new();
+        h1.set("X-Timestamp", &ts);
+        h1.set("Content-Length", "1");
+        h1.set("Content-Type", "text/plain");
+        stamp_cu(&mut h1, down_host);
+        assert_eq!(
+            server
+                .handle(Request {
+                    method: "PUT".into(),
+                    path: format!("/sdb1/0/AUTH_test/c/{obj}"),
+                    query_string: String::new(),
+                    headers: h1,
+                    body: b"x".to_vec().into(),
+                })
+                .status,
+            201
+        );
+        // Half the objects also lose a second assigned replica (2 of 3 CS
+        // down on that partition) so the total sits strictly above N.
+        if i % 2 == 0 {
+            let mut h2 = HeaderKeyDict::new();
+            h2.set("X-Timestamp", &ts);
+            h2.set("Content-Length", "1");
+            h2.set("Content-Type", "text/plain");
+            stamp_cu(&mut h2, down_host);
+            assert_eq!(
+                server
+                    .handle(Request {
+                        method: "PUT".into(),
+                        path: format!("/sdc1/0/AUTH_test/c/{obj}"),
+                        query_string: String::new(),
+                        headers: h2,
+                        body: b"x".to_vec().into(),
+                    })
+                    .status,
+                201
+            );
+        } else {
+            let mut h2 = HeaderKeyDict::new();
+            h2.set("X-Timestamp", &ts);
+            h2.set("Content-Length", "1");
+            h2.set("Content-Type", "text/plain");
+            stamp_cu(&mut h2, &live_host);
+            assert_eq!(
+                server
+                    .handle(Request {
+                        method: "PUT".into(),
+                        path: format!("/sdc1/0/AUTH_test/c/{obj}"),
+                        query_string: String::new(),
+                        headers: h2,
+                        body: b"x".to_vec().into(),
+                    })
+                    .status,
+                201
+            );
+        }
+        // Extra fragment with no CU headers (EC num_container_updates leftover).
+        // Must not emit a pending or the probe's 2N ceiling is breached.
+        let mut h3 = HeaderKeyDict::new();
+        h3.set("X-Timestamp", &ts);
+        h3.set("Content-Length", "1");
+        h3.set("Content-Type", "text/plain");
+        assert_eq!(
+            server
+                .handle(Request {
+                    method: "PUT".into(),
+                    path: format!("/sdd1/0/AUTH_test/c/{obj}"),
+                    query_string: String::new(),
+                    headers: h3,
+                    body: b"x".to_vec().into(),
+                })
+                .status,
+            201
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let count = count_pendings(&dir);
+    assert!(
+        count > total_objs,
+        "pending count {count} should exceed object count {total_objs}"
+    );
+    assert!(
+        count < total_objs * 2,
+        "pending count {count} must stay under 2× object count {}",
+        total_objs * 2
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -130,6 +337,7 @@ fn test_async_pending_pickle_includes_root_db_state() {
     headers.set("Content-Length", "5");
     headers.set("Content-Type", "text/plain");
     headers.set("X-Container-Root-Db-State", "unsharded");
+    stamp_cu(&mut headers, "127.0.0.1:1");
     let req = Request {
         method: "PUT".into(),
         path: "/sda1/0/AUTH_test/c/o-state".into(),
@@ -190,5 +398,61 @@ fn test_put_with_x_delete_at_enqueues_expiry_task() {
         .expect("an expiry-queue async_pending was written");
     assert_eq!(expiry.op, "PUT");
     assert_eq!(expiry.obj, "1751600000-AUTH_test/c/o");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_handle_async_put_without_container_hosts_does_not_write_pending() {
+    let dir = std::env::temp_dir().join(format!("swift-os-async-hy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+    let server = ObjectServer::new(config(&dir));
+    let mut headers = HeaderKeyDict::new();
+    headers.set("X-Timestamp", "1751500000.00000");
+    headers.set("Content-Length", "5");
+    headers.set("Content-Type", "text/plain");
+    let resp = server
+        .handle_async(AsyncRequest {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/o-hy".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(b"hello".to_vec(), u64::MAX),
+        })
+        .await;
+    assert_eq!(resp.status, 201, "{}", resp.reason);
+    let mut stats = UpdaterStats::default();
+    assert!(
+        iter_async_pendings(&device, &mut stats).is_empty(),
+        "Hyper PUT without CU headers must not enqueue"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_handle_async_put_unreachable_container_still_201_and_pending() {
+    let dir = std::env::temp_dir().join(format!("swift-os-async-hy-down-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let device = dir.join("sda1");
+    std::fs::create_dir_all(&device).unwrap();
+    let server = ObjectServer::new(config(&dir));
+    let mut headers = HeaderKeyDict::new();
+    headers.set("X-Timestamp", "1751500000.00000");
+    headers.set("Content-Length", "5");
+    headers.set("Content-Type", "text/plain");
+    stamp_cu(&mut headers, "127.0.0.1:1");
+    let resp = server
+        .handle_async(AsyncRequest {
+            method: "PUT".into(),
+            path: "/sda1/0/AUTH_test/c/o-hy-down".into(),
+            query_string: String::new(),
+            headers,
+            body: swift_http::IncomingBody::from_bytes(b"hello".to_vec(), u64::MAX),
+        })
+        .await;
+    assert_eq!(resp.status, 201, "object PUT stays 2xx when CU is down");
+    let mut stats = UpdaterStats::default();
+    assert_eq!(iter_async_pendings(&device, &mut stats).len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -24,6 +24,7 @@ use swift_core::obslog::{LogLevel, Logger};
 use swift_core::statsd::StatsdClient;
 use swift_core::storage_policy::parse_storage_policies;
 use swift_diskfile::{DiskFileConfig, PolicyKind};
+use swift_object_server::object_server_conf::{object_server_conf_flag, object_server_conf_get};
 use swift_object_server::servers_per_port::{
     bind_acceptors_with_reuse, child_bind_port_from_env, default_swift_dir, effective_concurrency,
     listen_ports, maybe_supervise_port_workers, ConcurrencyInputs,
@@ -67,13 +68,8 @@ fn main() {
         eprintln!("could not read {conf_path}: {e}");
         std::process::exit(1);
     });
-    let section = "app:object-server";
     let get = |key: &str, default: &str| -> String {
-        conf.get(section, key)
-            .ok()
-            .flatten()
-            .or_else(|| conf.get("DEFAULT", key).ok().flatten())
-            .unwrap_or_else(|| default.to_string())
+        object_server_conf_get(&conf, key).unwrap_or_else(|| default.to_string())
     };
     swift_http::reject_legacy_server_runtime(Some(&get("server_runtime", ""))).unwrap_or_else(
         |e| {
@@ -119,11 +115,18 @@ fn main() {
         logger.error(&format!("bad swift.conf storage policies: {e}"));
         std::process::exit(1);
     });
-    let fallocate_reserve =
+    let disable_fallocate = object_server_conf_flag(&conf, "disable_fallocate", false);
+    // Python `disable_fallocate` skips fallocate() including the reserve
+    // check. Isolated G6 sets this true; ignoring it left a 507 path that
+    // `mount_check=false` does not cover.
+    let fallocate_reserve = if disable_fallocate {
+        swift_core::config::FallocateReserve::Bytes(0)
+    } else {
         config_fallocate_value(&get("fallocate_reserve", "1%")).unwrap_or_else(|e| {
             logger.error(&e.to_string());
             std::process::exit(1);
-        });
+        })
+    };
     // WORM clock-health knob for the native lock gate. 0 (default) =
     // disabled: clock_ok stays the historical constant `true`. >0 = enabled
     // fail-closed against chrony tracking. Invalid values refuse startup
@@ -137,10 +140,7 @@ fn main() {
     };
     let config = ObjectServerConfig {
         devices: get("devices", "/srv/node").into(),
-        mount_check: matches!(
-            get("mount_check", "true").to_lowercase().as_str(),
-            "true" | "1" | "yes" | "on" | "t" | "y"
-        ),
+        mount_check: object_server_conf_flag(&conf, "mount_check", true),
         hash_config,
         diskfile: DiskFileConfig {
             fsync_on_close: matches!(
@@ -164,6 +164,13 @@ fn main() {
             _ => ContainerUpdateMode::Sync,
         },
     };
+    logger.info(&format!(
+        "swift-object-server: devices={} mount_check={} disable_fallocate={} \
+         fallocate_reserve={fallocate_reserve:?}",
+        config.devices.display(),
+        config.mount_check,
+        disable_fallocate
+    ));
 
     // Topology / concurrency — docs/fairness-lab/WORKERS-SEMANTICS.md
     let workers: usize = get("workers", "0").parse().unwrap_or(0);
@@ -285,6 +292,22 @@ fn main() {
             "swift-object-server listening on {addr} (socket {i}/{})",
             listeners.len()
         ));
+    }
+
+    if config.mount_check {
+        if let Ok(entries) = std::fs::read_dir(&config.devices) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && !swift_core::constraints::ismount(&path) {
+                    logger.warning(&format!(
+                        "mount_check=true but {} is not a mount point; \
+                         REPLICATE/SSYNC/PUT will 507 (unmounted). \
+                         Isolated SAIO dirs need mount_check=false or a .ismount stub.",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
 
     let mut server = ObjectServer::new(config)

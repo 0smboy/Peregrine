@@ -53,8 +53,13 @@ pub const S3_BUCKET_TAGGING_META: &str = "X-Container-Sysmeta-S3-Tagging";
 /// Compact object TagSet encoding (sysmeta — off public `x-amz-meta-*`).
 pub const S3_OBJECT_TAGGING_META: &str = "X-Object-Sysmeta-S3-Tagging";
 
-/// Percent-encoded raw LifecycleConfiguration XML.
-pub const S3_LIFECYCLE_META: &str = "X-Container-Meta-S3-Lifecycle";
+/// Percent-encoded raw LifecycleConfiguration XML in protected sysmeta.
+/// User-meta (`X-Container-Meta-*`) is capped at 256 bytes by Swift; a
+/// real LifecycleConfiguration exceeds that after percent-encoding.
+pub const S3_LIFECYCLE_META: &str = "X-Container-Sysmeta-S3-Lifecycle";
+
+/// Historical public-meta lifecycle key. Read as fallback, never write.
+pub const S3_LIFECYCLE_LEGACY_META: &str = "X-Container-Meta-S3-Lifecycle";
 
 /// Percent-encoded raw ObjectLockConfiguration XML in protected sysmeta.
 pub const S3_OBJECT_LOCK_META: &str = "X-Container-Sysmeta-S3-Object-Lock";
@@ -153,9 +158,7 @@ pub fn apply_versioning_meta(headers: &mut HeaderKeyDict, status: &str) {
 /// Protected sysmeta always wins when present. A malformed sysmeta value is an
 /// error and never falls back to the legacy public-meta value. Legacy metadata
 /// is accepted only when sysmeta is absent, and is validated just as strictly.
-pub fn versioning_status_from_headers(
-    headers: &HeaderKeyDict,
-) -> Result<Option<String>, String> {
+pub fn versioning_status_from_headers(headers: &HeaderKeyDict) -> Result<Option<String>, String> {
     if let Some(status) = headers.get(S3_VERSIONING_META) {
         return validate_stored_versioning_status(status).map(Some);
     }
@@ -298,22 +301,151 @@ pub fn validate_lifecycle_xml(body: &[u8]) -> Result<(), String> {
     if !text.contains("LifecycleConfiguration") {
         return Err("MalformedXML".into());
     }
+    // Python RNG: Rule/Status is exactly Enabled|Disabled (case-sensitive).
+    let mut rest = text;
+    while let Some(start) = rest.find("<Rule") {
+        let after = &rest[start..];
+        let end = after
+            .find("</Rule>")
+            .ok_or_else(|| "MalformedXML".to_string())?;
+        let rule = &after[..end];
+        rest = &after[end + 7..];
+        let Some(s0) = rule.find("<Status>") else {
+            return Err("MalformedXML".into());
+        };
+        let after_status = &rule[s0 + 8..];
+        let Some(s1) = after_status.find("</Status>") else {
+            return Err("MalformedXML".into());
+        };
+        let status = after_status[..s1].trim();
+        if status != "Enabled" && status != "Disabled" {
+            return Err("MalformedXML".into());
+        }
+        // Python schema/lifecycle_configuration.rng: Date is xs:dateTime.
+        // Compact "20200101" / date-only "2023-09-27" must 400.
+        let mut rest_date = rule;
+        while let Some(ds) = rest_date.find("<Date") {
+            let after = &rest_date[ds..];
+            let Some(gt) = after.find('>') else {
+                return Err("MalformedXML".into());
+            };
+            let inner = &after[gt + 1..];
+            let Some(close) = inner.find("</Date>") else {
+                return Err("MalformedXML".into());
+            };
+            let date = inner[..close].trim();
+            // AWS Lifecycle Date is ISO-8601 midnight UTC. Compact
+            // "20200101" is coerced by botocore to unix-seconds
+            // 1970-08-22T19:08:21Z, which is dateTime but not midnight.
+            if !is_lifecycle_date(date) {
+                return Err("MalformedXML".into());
+            }
+            rest_date = &inner[close + 7..];
+        }
+    }
     Ok(())
 }
 
-/// Store raw lifecycle XML (percent-encoded) on container meta.
+/// AWS S3 Lifecycle Date: xs:dateTime at midnight UTC.
+fn is_lifecycle_date(raw: &str) -> bool {
+    if !is_xsd_datetime(raw) {
+        return false;
+    }
+    let s = raw.trim();
+    let Some((_, time)) = s.split_once('T').or_else(|| s.split_once('t')) else {
+        return false;
+    };
+    let clock = time
+        .strip_suffix('Z')
+        .or_else(|| time.strip_suffix('z'))
+        .unwrap_or(time);
+    let clock = match clock.rfind(['+', '-']) {
+        Some(i) if i > 0 => &clock[..i],
+        _ => clock,
+    };
+    let mut tparts = clock.split(':');
+    let (Some(hh), Some(mm), Some(ss), None) =
+        (tparts.next(), tparts.next(), tparts.next(), tparts.next())
+    else {
+        return false;
+    };
+    if hh != "00" || mm != "00" {
+        return false;
+    }
+    let (sec, frac) = match ss.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (ss, None),
+    };
+    sec == "00"
+        && frac
+            .map(|f| !f.is_empty() && f.bytes().all(|b| b == b'0'))
+            .unwrap_or(true)
+}
+
+/// XSD dateTime as used by Python lxml RelaxNG `data type="dateTime"`.
+fn is_xsd_datetime(raw: &str) -> bool {
+    let s = raw.trim();
+    let Some((date, time)) = s.split_once('T').or_else(|| s.split_once('t')) else {
+        return false;
+    };
+    let mut dparts = date.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (dparts.next(), dparts.next(), dparts.next(), dparts.next())
+    else {
+        return false;
+    };
+    if y.len() < 4 || m.len() != 2 || d.len() != 2 {
+        return false;
+    }
+    if !y.bytes().all(|b| b.is_ascii_digit())
+        || !m.bytes().all(|b| b.is_ascii_digit())
+        || !d.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let clock = time
+        .strip_suffix('Z')
+        .or_else(|| time.strip_suffix('z'))
+        .unwrap_or(time);
+    let clock = match clock.rfind(['+', '-']) {
+        Some(i) if i > 0 => &clock[..i],
+        _ => clock,
+    };
+    let mut tparts = clock.split(':');
+    let (Some(hh), Some(mm), Some(ss), None) =
+        (tparts.next(), tparts.next(), tparts.next(), tparts.next())
+    else {
+        return false;
+    };
+    if hh.len() != 2 || mm.len() != 2 {
+        return false;
+    }
+    let sec = ss.split('.').next().unwrap_or(ss);
+    sec.len() >= 2 && sec.as_bytes()[..2].iter().all(|b| b.is_ascii_digit())
+}
+
+/// Store raw lifecycle XML (percent-encoded) on container sysmeta.
 pub fn apply_lifecycle_meta(headers: &mut HeaderKeyDict, body: &[u8]) {
+    headers.remove(S3_LIFECYCLE_LEGACY_META);
     headers.set(S3_LIFECYCLE_META, encode_meta_blob(body));
 }
 
 /// Clear lifecycle meta.
 pub fn clear_lifecycle_meta(headers: &mut HeaderKeyDict) {
+    headers.remove(S3_LIFECYCLE_LEGACY_META);
     headers.set(S3_LIFECYCLE_META, "");
 }
 
 /// Recover stored lifecycle XML bytes from headers.
 pub fn lifecycle_xml_from_headers(headers: &HeaderKeyDict) -> Option<Vec<u8>> {
-    let raw = headers.get(S3_LIFECYCLE_META).filter(|s| !s.is_empty())?;
+    let raw = headers
+        .get(S3_LIFECYCLE_META)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get(S3_LIFECYCLE_LEGACY_META)
+                .filter(|s| !s.is_empty())
+        })?;
     decode_meta_blob(raw).ok()
 }
 
@@ -339,9 +471,7 @@ pub fn apply_object_lock_meta(headers: &mut HeaderKeyDict, body: &[u8]) {
 ///
 /// This is a strict API: corrupt persisted security metadata is returned as an
 /// error rather than being confused with an unconfigured bucket.
-pub fn object_lock_xml_from_headers(
-    headers: &HeaderKeyDict,
-) -> Result<Option<Vec<u8>>, String> {
+pub fn object_lock_xml_from_headers(headers: &HeaderKeyDict) -> Result<Option<Vec<u8>>, String> {
     validated_object_lock_xml_from_headers(headers)
 }
 
@@ -513,7 +643,8 @@ pub const STORED_BUCKET_CONFIGS: &[StoredBucketConfig] = &[
         query: "requestPayment",
         header: "X-Container-Sysmeta-S3-Cfg-RequestPayment",
         missing_code: None,
-        empty_xml: b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
+        empty_xml:
+            b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
     },
     StoredBucketConfig {
         query: "accelerate",
@@ -614,7 +745,11 @@ pub fn stored_bucket_config(params: &[(String, String)]) -> Option<&'static Stor
         .find(|cfg| params.iter().any(|(k, _)| k == cfg.query))
 }
 
-pub fn apply_stored_bucket_config(headers: &mut HeaderKeyDict, cfg: &StoredBucketConfig, body: &[u8]) {
+pub fn apply_stored_bucket_config(
+    headers: &mut HeaderKeyDict,
+    cfg: &StoredBucketConfig,
+    body: &[u8],
+) {
     headers.set(cfg.header, encode_meta_blob(body));
 }
 
@@ -757,6 +892,23 @@ mod tests {
   </Rule>
 </LifecycleConfiguration>"#;
         validate_lifecycle_xml(body).unwrap();
+        let bad = br#"<LifecycleConfiguration><Rule><ID>x</ID><Status>invalid</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(bad).is_err());
+        let lower = br#"<LifecycleConfiguration><Rule><Status>enabled</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(lower).is_err());
+        let compact = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>20200101</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(compact).is_err());
+        let date_only = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2023-09-27</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(date_only).is_err());
+        let ok_dt = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(ok_dt).is_ok());
+        // boto3 Date='20200101' → unix-seconds dateTime, not midnight UTC.
+        let boto_compact = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>rule1</ID><Expiration><Date>1970-08-22T19:08:21Z</Date></Expiration><Prefix>test1/</Prefix><Status>Enabled</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(boto_compact).is_err());
+        let boto_trans = br#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>rule1</ID><Expiration><Date>2023-09-27T00:00:00Z</Date></Expiration><Transition><Date>1970-08-23T00:55:27Z</Date><StorageClass>GLACIER</StorageClass></Transition><Prefix>test1/</Prefix><Status>Enabled</Status></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(boto_trans).is_err());
+        let not_midnight = br#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>2020-01-01T19:08:21Z</Date></Expiration></Rule></LifecycleConfiguration>"#;
+        assert!(validate_lifecycle_xml(not_midnight).is_err());
         let mut h = HeaderKeyDict::new();
         apply_lifecycle_meta(&mut h, body);
         let got = lifecycle_xml_from_headers(&h).unwrap();
@@ -866,10 +1018,7 @@ mod tests {
 </ObjectLockConfiguration>"#;
         let mut source = HeaderKeyDict::new();
         source.set(S3_VERSIONING_LEGACY_META, "Enabled");
-        source.set(
-            S3_OBJECT_LOCK_LEGACY_META,
-            encode_meta_blob(lock_body),
-        );
+        source.set(S3_OBJECT_LOCK_LEGACY_META, encode_meta_blob(lock_body));
         let mut target = HeaderKeyDict::new();
         target.set(S3_VERSIONING_LEGACY_META, "Suspended");
         target.set(S3_OBJECT_LOCK_LEGACY_META, "stale");
@@ -890,10 +1039,7 @@ mod tests {
         let mut untouched_target = HeaderKeyDict::new();
         untouched_target.set(S3_VERSIONING_LEGACY_META, "keep-until-error");
         assert_eq!(
-            apply_legacy_bucket_security_sysmeta_migration(
-                &poisoned_source,
-                &mut untouched_target,
-            ),
+            apply_legacy_bucket_security_sysmeta_migration(&poisoned_source, &mut untouched_target,),
             Err("InvalidVersioningMetadata".to_string())
         );
         assert_eq!(
@@ -905,8 +1051,10 @@ mod tests {
 
     #[test]
     fn empty_list_versions_shape() {
-        let xml = String::from_utf8(empty_list_versions_result_xml("mybucket", "", "", "", 1000, None))
-            .unwrap();
+        let xml = String::from_utf8(empty_list_versions_result_xml(
+            "mybucket", "", "", "", 1000, None,
+        ))
+        .unwrap();
         assert!(xml.contains("ListVersionsResult"));
         assert!(xml.contains("<Name>mybucket</Name>"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));

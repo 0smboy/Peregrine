@@ -45,8 +45,11 @@
 //! **Concurrency:** PUT segment HEAD uses up to `concurrent_gets` threads
 //! (default 10). Heartbeat whitespace respects `yield_frequency` (seconds
 //! between yields; default 10). Container listing SLO-etag refetch is
-//! available via [`refetch_listing_slo_etag`]. bulk Accept negotiation on
-//! delete beyond JSON is residual. When the expirer `UPDATE` enqueue fails,
+//! available via [`refetch_listing_slo_etag`]. JSON listings promote both
+//! `slo_etag` and leftover `s3_etag` (Python SLO + ListingEtag). MPU
+//! complete leftover override params are preserved on PUT. bulk Accept
+//! negotiation on delete beyond JSON is residual. When the expirer
+//! `UPDATE` enqueue fails,
 //! a best-effort background segment-DELETE thread is used instead of
 //! Python's bare 503.
 
@@ -88,6 +91,7 @@ const IGNORE_RANGE_HDR: &str = "X-Backend-Ignore-Range-If-Metadata-Present";
 const SYSMETA_SLO_ETAG: &str = "X-Object-Sysmeta-Slo-Etag";
 const SYSMETA_SLO_SIZE: &str = "X-Object-Sysmeta-Slo-Size";
 const OVERRIDE_ETAG: &str = "X-Object-Sysmeta-Container-Update-Override-Etag";
+const SYS_S3API_ETAG: &str = "X-Object-Sysmeta-S3Api-Etag";
 const ETG_IS_AT: &str = "X-Backend-Etag-Is-At";
 
 /// Default expirer account (Python `EXPIRER_ACCOUNT_NAME`).
@@ -98,6 +102,29 @@ const EXPIRER_CONTAINER_DIVISOR: i64 = 86400;
 const ASYNC_DELETE_TYPE: &str = "application/async-deleted";
 /// md5 of empty string — etag on zero-byte async-delete task records.
 const MD5_OF_EMPTY_STRING: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
+fn version_id_query(req: &Request) -> Option<String> {
+    let value = req.param("version-id")?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn manifest_get_query(req: &Request) -> String {
+    match version_id_query(req) {
+        Some(vid) => format!("multipart-manifest=get&version-id={vid}"),
+        None => "multipart-manifest=get".to_string(),
+    }
+}
+
+fn manifest_object_delete_query(req: &Request) -> String {
+    match version_id_query(req) {
+        Some(vid) => format!("version-id={vid}"),
+        None => String::new(),
+    }
+}
 
 fn slo_override(req: &Request) -> bool {
     config_true_value(req.headers.get("X-Backend-Slo-Override").unwrap_or(""))
@@ -540,6 +567,32 @@ fn first_segment_failure(status: u16) -> Response {
     }
 }
 
+async fn collect_ranged_leaves_async(
+    orig: Request,
+    version: String,
+    account: String,
+    leaves: Vec<LeafSeg>,
+    next: crate::AsyncNextFn,
+) -> Result<Vec<u8>, Response> {
+    let mut out = Vec::new();
+    for leaf in leaves {
+        if let Some(raw) = leaf.raw_data {
+            out.extend_from_slice(&raw);
+            continue;
+        }
+        let path = format!("/{version}/{account}{}", leaf.name);
+        let response = next(slo_subreq(&orig, path, leaf.range.as_deref())).await;
+        if !(200..300).contains(&response.status) {
+            return Err(first_segment_failure(response.status));
+        }
+        match response.body.collect_async().await {
+            Ok(bytes) => out.extend(bytes),
+            Err(_) => return Err(Response::error(500, "Error reading SLO segment")),
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch the first object-backed leaf before the client response is
 /// committed. Python Swift's `SegmentedIterable::validate_first_segment`
 /// does the same: a missing first segment is a visible 409, while a failure
@@ -904,6 +957,7 @@ fn parse_part_number(req: &Request) -> Result<Option<usize>, Response> {
 
 fn part_unsatisfiable(
     orig: &Request,
+    inner: &Response,
     etag: &str,
     json_etag: Option<&str>,
     total: i64,
@@ -923,10 +977,27 @@ fn part_unsatisfiable(
         r.headers.set(MANIFEST_ETAG_HEADER, j);
     }
     r.headers.set("X-Parts-Count", nseg.to_string());
+    // Python `_return_slo_response` builds 416 on top of the inner SLO
+    // headers. Functional `File.info()` requires Content-Type and
+    // Last-Modified even on HEAD 416.
+    let mut from_inner = inner.headers.clone();
+    strip_swift_bytes_content_type(&mut from_inner);
+    if let Some(ct) = from_inner.get("Content-Type") {
+        r.headers.set("Content-Type", ct);
+    } else if orig.method != "HEAD" {
+        r.headers.set("Content-Type", "text/plain; charset=utf-8");
+    }
+    if let Some(lm) = inner.headers.get("Last-Modified") {
+        r.headers.set("Last-Modified", lm);
+    }
+    // Python `_return_slo_response` keeps inner X-Object-Version-Id on
+    // 416, including current-object `?part-number=` without version-id=.
+    if let Some(vid) = inner.headers.get("X-Object-Version-Id") {
+        r.headers.set("X-Object-Version-Id", vid);
+    }
     if orig.method == "HEAD" {
         r.headers.set("Content-Length", "0");
     } else {
-        r.headers.set("Content-Type", "text/plain; charset=utf-8");
         r.headers.set("Content-Length", msg.len());
     }
     r
@@ -972,8 +1043,47 @@ fn apply_slo_put_listing_headers(req: &mut Request, json_etag: &str, slo_etag: &
         ct.push_str(&format!(";swift_bytes={total}"));
     }
     req.headers.set("Content-Type", ct);
-    req.headers
-        .set(OVERRIDE_ETAG, format!("{json_etag}; slo_etag={slo_etag}"));
+    // Python slo.py: leftover override params (s3_etag) survive, then
+    // `; slo_etag=` is appended. A blank base (`; s3_etag=…`) is replaced
+    // with the stored-manifest MD5. Bare rust-s3api composites are seeded
+    // from X-Object-Sysmeta-S3Api-Etag so ListingEtag / this rewrite can
+    // promote a top-level `s3_etag` on Swift JSON listings.
+    req.headers.set(
+        OVERRIDE_ETAG,
+        merge_slo_listing_override_etag(req, json_etag, slo_etag),
+    );
+}
+
+fn merge_slo_listing_override_etag(req: &Request, json_etag: &str, slo_etag: &str) -> String {
+    let existing = req.headers.get(OVERRIDE_ETAG).unwrap_or("");
+    let (val, params) = match existing.split_once(';') {
+        Some((v, rest)) => (v, Some(rest)),
+        None => (existing, None),
+    };
+    let mut base = if val.trim().is_empty() {
+        json_etag.to_string()
+    } else {
+        val.to_string()
+    };
+    if let Some(params) = params {
+        base.push(';');
+        base.push_str(params);
+    }
+    if !listing_hash_has_param(&base, "s3_etag") {
+        if let Some(s3) = req.headers.get(SYS_S3API_ETAG).filter(|s| !s.is_empty()) {
+            base.push_str("; s3_etag=");
+            base.push_str(s3.trim().trim_matches('"'));
+        }
+    }
+    format!("{base}; slo_etag={slo_etag}")
+}
+
+fn listing_hash_has_param(hash: &str, name: &str) -> bool {
+    hash.split(';').skip(1).any(|part| {
+        part.trim()
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim() == name)
+    })
 }
 
 fn rewrite_listing_slo_etag(resp: &mut Response) {
@@ -1004,9 +1114,30 @@ fn rewrite_listing_slo_etag(resp: &mut Response) {
         let Some(hash) = obj.get("hash").and_then(|v| v.as_str()).map(str::to_string) else {
             continue;
         };
-        if let Some((etag, slo)) = split_listing_slo_etag(&hash) {
-            obj.insert("hash".into(), etag.into());
-            obj.insert("slo_etag".into(), format!("\"{slo}\"").into());
+        let (etag, params) = parse_listing_hash_params(&hash);
+        let mut leftover = String::new();
+        let mut slo = None;
+        let mut s3 = None;
+        for (k, v) in params {
+            if k == "slo_etag" && slo.is_none() {
+                slo = Some(v);
+            } else if k == "s3_etag" && s3.is_none() {
+                s3 = Some(v);
+            } else {
+                leftover.push_str("; ");
+                leftover.push_str(&k);
+                leftover.push('=');
+                leftover.push_str(&v);
+            }
+        }
+        if slo.is_some() || s3.is_some() {
+            obj.insert("hash".into(), format!("{etag}{leftover}").into());
+            if let Some(slo) = slo {
+                obj.insert("slo_etag".into(), format!("\"{slo}\"").into());
+            }
+            if let Some(s3) = s3 {
+                obj.insert("s3_etag".into(), format!("\"{s3}\"").into());
+            }
         }
         if let Some(ct) = obj
             .get("content_type")
@@ -1040,29 +1171,25 @@ fn rewrite_listing_slo_etag(resp: &mut Response) {
     resp.body = body.into();
 }
 
-/// Split `{etag}; slo_etag={slo}` (Python parse_header on listing hash).
-fn split_listing_slo_etag(hash: &str) -> Option<(String, String)> {
-    let mut etag = String::new();
-    let mut slo = None;
-    let mut first = true;
-    for part in hash.split(';') {
-        let part = part.trim();
-        if first {
-            etag = part.to_string();
-            first = false;
-            continue;
-        }
-        let Some((k, v)) = part.split_once('=') else {
-            continue;
-        };
-        if k.trim() == "slo_etag" {
-            slo = Some(v.trim().trim_matches('"').to_string());
-        } else {
-            etag.push_str("; ");
-            etag.push_str(part);
-        }
-    }
-    slo.filter(|s| !s.is_empty()).map(|s| (etag, s))
+/// Python `parse_header` on a listing hash: first token is the etag, later
+/// `k=v` tokens are leftover params (`slo_etag`, `s3_etag`, …).
+fn parse_listing_hash_params(hash: &str) -> (String, Vec<(String, String)>) {
+    let mut parts = hash.split(';');
+    let etag = parts.next().unwrap_or("").trim().to_string();
+    let params = parts
+        .filter_map(|part| {
+            let part = part.trim();
+            let (k, v) = part.split_once('=')?;
+            let k = k.trim();
+            let v = v.trim().trim_matches('"');
+            if k.is_empty() || v.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect();
+    (etag, params)
 }
 
 fn if_none_match_put_rejected(req: &Request) -> Option<Response> {
@@ -1082,6 +1209,24 @@ fn heartbeat_error_body(status: u16) -> String {
         422 => "Unprocessable Entity\nUnable to process the contained instructions".to_string(),
         _ => swift_http::reason_phrase(status).to_string(),
     }
+}
+
+/// Pre-completed heartbeat payload with unknown Content-Length.
+///
+/// The UTF-8 compatibility write path (`write_swift_compat_response`)
+/// forbids `Body::Streamed`: it sends the 202 + `Transfer-Encoding:
+/// chunked` headers first, then errors on a blocking reader, so the
+/// client sees `chunked` without a body (`HTTPResponse.body` missing).
+/// ASCII tests take the Hyper `SwiftHttpBody::from_swift` path, which
+/// does convert Streamed → channel. Official `TestSloUTF8` uses the
+/// utf8-compat lane, so the async heartbeat response must already be a
+/// `Body::Channel` (one message, then EOF) with `content_length: None`
+/// to keep `resp.chunked is True`.
+fn complete_chunked_body(bytes: Vec<u8>) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let _ = tx.try_send(Ok(bytes));
+    drop(tx);
+    Body::from_channel(rx, None, swift_runtime::TaskScope::bounded(1))
 }
 
 fn wrap_heartbeat_response(
@@ -1167,7 +1312,7 @@ fn wrap_heartbeat_response(
             "text/plain"
         },
     );
-    out.body = Body::from_reader(Box::new(std::io::Cursor::new(body)), None);
+    out.body = complete_chunked_body(body);
     out
 }
 
@@ -1382,6 +1527,7 @@ impl Slo {
             if part_num.is_some() {
                 return part_unsatisfiable(
                     &orig,
+                    &resp,
                     &etag,
                     json_etag.as_deref(),
                     total_len.max(0),
@@ -1437,12 +1583,11 @@ impl Slo {
             );
             let len = (last_excl - first) as i64;
             let body = if is_get {
-                let first_response = match prefetch_first_leaf(
-                    &orig, &version, &account, &ranged, next,
-                ) {
-                    Ok(response) => response,
-                    Err(error) => return error,
-                };
+                let first_response =
+                    match prefetch_first_leaf(&orig, &version, &account, &ranged, next) {
+                        Ok(response) => response,
+                        Err(error) => return error,
+                    };
                 Self::leaf_stream_body(
                     orig.clone_head(),
                     version.clone(),
@@ -1469,12 +1614,11 @@ impl Slo {
                         Ok(l) => l,
                         Err(err) => return err,
                     };
-                    let first_response = match prefetch_first_leaf(
-                        &orig, &version, &account, &ranged, next,
-                    ) {
-                        Ok(response) => response,
-                        Err(error) => return error,
-                    };
+                    let first_response =
+                        match prefetch_first_leaf(&orig, &version, &account, &ranged, next) {
+                            Ok(response) => response,
+                            Err(error) => return error,
+                        };
                     let mut b = Self::leaf_stream_body(
                         orig.clone_head(),
                         version.clone(),
@@ -1484,11 +1628,10 @@ impl Slo {
                         first_response,
                         last_excl - first,
                     );
-                    pieces.push(
-                        b.materialize(u64::MAX)
-                            .map(|s| s.to_vec())
-                            .unwrap_or_default(),
-                    );
+                    pieces.push(match b.materialize(u64::MAX) {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => return Response::error(500, "Error reading SLO segment"),
+                    });
                 }
             }
             let mp =
@@ -1497,11 +1640,11 @@ impl Slo {
             let len = mp.len() as i64;
             (206u16, mp.into(), len)
         } else if is_get {
-            let first_response =
-                match prefetch_first_leaf(&orig, &version, &account, &leaves, next) {
-                    Ok(response) => response,
-                    Err(error) => return error,
-                };
+            let first_response = match prefetch_first_leaf(&orig, &version, &account, &leaves, next)
+            {
+                Ok(response) => response,
+                Err(error) => return error,
+            };
             let body = Self::leaf_stream_body(
                 orig.clone_head(),
                 version.clone(),
@@ -1528,6 +1671,33 @@ impl Slo {
         let orig = req.clone_head();
         strip_conditionals(&mut req.headers);
         let mut resp = next(req).await;
+        // S3 path rewrite happens after the outer prepare(); the first
+        // backend GET may still be a ranged SLO *manifest* (206 of JSON).
+        // Refetch the whole JSON so Range applies to assembled size.
+        // Ordinary objects must keep 206: a blind retry without Range
+        // turns GET/COPY/CopyPart Range into a 200 full body
+        // (G4 Range cluster, G5-A test_get_object_range / MPU copy-part).
+        let first_is_slo = resp
+            .headers
+            .get(SLO_HEADER)
+            .map(config_true_value)
+            .unwrap_or(false);
+        // Range against the physical JSON is unsatisfiable when the offset
+        // is past the manifest size (object-server 416, historically without
+        // the SLO header). Retry without Range so reassembly can apply the
+        // client Range to the assembled object. Ordinary non-SLO 206/416
+        // must stay as-is.
+        if first_is_slo
+            && orig.headers.get("Range").is_some()
+            && (resp.status == 206 || resp.status == 416)
+        {
+            let mut retry = orig.clone_head();
+            retry.headers.remove("Range");
+            retry.headers.remove("range");
+            ignore_range(&mut retry.headers, SLO_HEADER);
+            strip_conditionals(&mut retry.headers);
+            resp = next(retry).await;
+        }
 
         let is_slo = resp
             .headers
@@ -1670,6 +1840,7 @@ impl Slo {
             if part_num.is_some() {
                 return part_unsatisfiable(
                     &orig,
+                    &resp,
                     &etag,
                     json_etag.as_deref(),
                     total_len.max(0),
@@ -1770,32 +1941,21 @@ impl Slo {
                         Ok(l) => l,
                         Err(err) => return err,
                     };
-                    let first_response = match prefetch_first_leaf_async(
-                        orig.clone_head(),
-                        version.clone(),
-                        account.clone(),
-                        ranged.first().cloned(),
-                        next.clone(),
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => return error,
-                    };
-                    let mut b = leaf_stream_channel(
+                    // Channel bodies cannot use materialize() on a Tokio
+                    // worker (WouldBlock → empty parts). Drain with collect_async.
+                    let piece = match collect_ranged_leaves_async(
                         orig.clone_head(),
                         version.clone(),
                         account.clone(),
                         ranged,
                         next.clone(),
-                        first_response,
-                        last_excl - first,
-                    );
-                    pieces.push(
-                        b.materialize(u64::MAX)
-                            .map(|s| s.to_vec())
-                            .unwrap_or_default(),
-                    );
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => return error,
+                    };
+                    pieces.push(piece);
                 }
             }
             let mp =
@@ -2090,9 +2250,10 @@ impl Slo {
         let manifest_name = format!("/{container}/{object}");
 
         // Fetch stored manifest (raw GET with multipart-manifest=get).
+        // Keep version-id: Python slo.py copies the client QUERY_STRING.
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get);
@@ -2133,7 +2294,7 @@ impl Slo {
                 let mut sub = req.clone_head();
                 sub.method = "GET".to_string();
                 sub.path = path;
-                sub.query_string = "multipart-manifest=get".to_string();
+                sub.query_string = manifest_get_query(&req);
                 sub.headers.remove("Content-Length");
                 ignore_range(&mut sub.headers, SLO_HEADER);
                 let mut sresp = next(sub);
@@ -2185,8 +2346,15 @@ impl Slo {
             let mut del = req.clone_head();
             del.method = "DELETE".to_string();
             del.path = delete_path;
-            del.query_string = String::new();
+            del.query_string = if name == &format!("/{container}/{object}")
+                || name.ends_with(&format!("/{container}/{object}"))
+            {
+                manifest_object_delete_query(&req)
+            } else {
+                String::new()
+            };
             del.headers.remove("Content-Length");
+            del.headers.set("X-Backend-Slo-Override", "true");
             let resp = next(del);
             match resp.status {
                 s if (200..300).contains(&s) => number_deleted += 1,
@@ -2245,7 +2413,7 @@ impl Slo {
         let manifest_name = format!("/{container}/{object}");
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get).await;
@@ -2288,8 +2456,15 @@ impl Slo {
             let mut del = req.clone_head();
             del.method = "DELETE".to_string();
             del.path = delete_path;
-            del.query_string = String::new();
+            del.query_string = if name == &format!("/{container}/{object}")
+                || name.ends_with(&format!("/{container}/{object}"))
+            {
+                manifest_object_delete_query(&req)
+            } else {
+                String::new()
+            };
             del.headers.remove("Content-Length");
+            del.headers.set("X-Backend-Slo-Override", "true");
             let resp = next(del).await;
             match resp.status {
                 s if (200..300).contains(&s) => number_deleted += 1,
@@ -2328,7 +2503,7 @@ impl Slo {
 
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get).await;
@@ -2468,9 +2643,7 @@ impl Slo {
         enqueue
             .headers
             .set("X-Backend-Allow-Reserved-Names", "true");
-        enqueue
-            .headers
-            .set("X-Backend-Authorize-Override", "true");
+        enqueue.headers.set("X-Backend-Authorize-Override", "true");
         enqueue.body = jobs_body.into();
         let enq_path = enqueue.path.clone();
         let enq_resp = next(enqueue).await;
@@ -2509,7 +2682,7 @@ impl Slo {
         // Load SLO segments (top-level only; nested expansion is rejected).
         let mut get = req.clone_head();
         get.method = "GET".to_string();
-        get.query_string = "multipart-manifest=get".to_string();
+        get.query_string = manifest_get_query(&req);
         get.headers.remove("Content-Length");
         ignore_range(&mut get.headers, SLO_HEADER);
         let mut mresp = next(get);
@@ -2655,9 +2828,7 @@ impl Slo {
         enqueue
             .headers
             .set("X-Backend-Allow-Reserved-Names", "true");
-        enqueue
-            .headers
-            .set("X-Backend-Authorize-Override", "true");
+        enqueue.headers.set("X-Backend-Authorize-Override", "true");
         enqueue.body = jobs_body.into();
         let enq_resp = next(enqueue);
         if !(200..300).contains(&enq_resp.status) {
@@ -3497,27 +3668,11 @@ async fn probe_async_delete_write_acl_async(
             None
         }
     }
-    if let Some(r) = probe_one(
-        next,
-        req.clone_head(),
-        version,
-        account,
-        manifest_container,
-    )
-    .await
-    {
+    if let Some(r) = probe_one(next, req.clone_head(), version, account, manifest_container).await {
         return Some(r);
     }
     if segment_container != manifest_container {
-        if let Some(r) = probe_one(
-            next,
-            req,
-            version,
-            account,
-            segment_container,
-        )
-        .await
-        {
+        if let Some(r) = probe_one(next, req, version, account, segment_container).await {
             return Some(r);
         }
     }
@@ -3552,7 +3707,8 @@ impl Middleware for Slo {
             || (req.method == "DELETE" && mpm.as_deref() == Some("delete"))
             || ((req.method == "GET" || req.method == "HEAD")
                 && (req.headers.contains_key("If-Match")
-                    || req.headers.contains_key("If-None-Match")))
+                    || req.headers.contains_key("If-None-Match")
+                    || req.headers.contains_key("Range")))
     }
 
     fn intercepts_response(&self) -> bool {
@@ -3920,6 +4076,134 @@ mod tests {
     }
 
     #[test]
+    fn test_slo_multi_range_get_assembles_nonempty_parts() {
+        // Functional test_slo_multi_ranged_get: two ranges across segments.
+        // "onetwo" bytes=0-2,3-5 -> "one" and "two".
+        let be = slo_manifest_backend();
+        let mut resp = Slo::new().handle(slo_get("/v1/a/c/manifest", Some("bytes=0-2,3-5")), &be);
+        assert_eq!(resp.status, 206);
+        let ctype = resp.headers.get("Content-Type").unwrap_or("");
+        assert!(
+            ctype.starts_with("multipart/byteranges"),
+            "content-type={ctype:?}"
+        );
+        let body = body_of(&mut resp);
+        assert!(
+            body.windows(3).any(|w| w == b"one"),
+            "missing first range payload: {body:?}"
+        );
+        assert!(
+            body.windows(3).any(|w| w == b"two"),
+            "missing second range payload: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slo_async_multi_range_get_does_not_drop_channel_body() {
+        // Hyper path used materialize() on Body::Channel, which returns
+        // WouldBlock on a Tokio worker; unwrap_or_default made empty parts.
+        let sync = slo_manifest_backend();
+        let next: crate::AsyncNextFn = Arc::new(move |request| {
+            let sync = Arc::clone(&sync);
+            Box::pin(async move { sync(request) })
+        });
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/manifest", Some("bytes=0-2,3-5")), next)
+            .await;
+        assert_eq!(resp.status, 206);
+        let ctype = resp.headers.get("Content-Type").unwrap_or("");
+        assert!(
+            ctype.starts_with("multipart/byteranges"),
+            "content-type={ctype:?}"
+        );
+        let body = match resp.body.collect_async().await {
+            Ok(bytes) => bytes,
+            Err(err) => panic!("collect_async failed: {err}"),
+        };
+        assert!(
+            body.windows(3).any(|w| w == b"one"),
+            "empty/missing first range: {body:?}"
+        );
+        assert!(
+            body.windows(3).any(|w| w == b"two"),
+            "empty/missing second range: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_slo_head_unsatisfiable_part_keeps_manifest_type_headers() {
+        // Python File.info() on HEAD ?part-number= out of range requires
+        // Content-Type and Last-Modified from the inner SLO object.
+        let manifest_json = two_segment_manifest_json();
+        let json_etag = manifest_etag(&manifest_json);
+        let mut manifest_head = Response::with_body(200, manifest_json.clone());
+        manifest_head.headers.set("X-Static-Large-Object", "True");
+        manifest_head.headers.set("Content-Type", "text/plain");
+        manifest_head
+            .headers
+            .set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
+        manifest_head.headers.set("Etag", &json_etag);
+        manifest_head
+            .headers
+            .set("X-Object-Version-Id", "1788310242.27709");
+        let mut manifest_get = Response::with_body(200, manifest_json);
+        manifest_get.headers.set("X-Static-Large-Object", "True");
+        manifest_get.headers.set("Content-Type", "text/plain");
+        manifest_get
+            .headers
+            .set("Last-Modified", "Tue, 01 Sep 2026 00:00:00 GMT");
+        manifest_get.headers.set("Etag", &json_etag);
+        manifest_get
+            .headers
+            .set("X-Object-Version-Id", "1788310242.27709");
+        let be = backend(vec![
+            ("HEAD", "/v1/a/c/manifest", manifest_head),
+            ("GET", "/v1/a/c/manifest", manifest_get),
+            (
+                "GET",
+                "/v1/a/c/s1",
+                Response::with_body(200, b"one".to_vec()),
+            ),
+            (
+                "GET",
+                "/v1/a/c/s2",
+                Response::with_body(200, b"two".to_vec()),
+            ),
+        ]);
+        let mut req = slo_get("/v1/a/c/manifest", None);
+        req.method = "HEAD".into();
+        req.query_string = "part-number=3".into();
+        let resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 416);
+        assert_eq!(resp.headers.get("X-Parts-Count"), Some("2"));
+        assert_eq!(resp.headers.get("Content-Range"), Some("bytes */6"));
+        assert_eq!(resp.headers.get("Content-Type"), Some("text/plain"));
+        assert_eq!(
+            resp.headers.get("Last-Modified"),
+            Some("Tue, 01 Sep 2026 00:00:00 GMT")
+        );
+        assert_eq!(resp.headers.get("Content-Length"), Some("0"));
+        assert_eq!(
+            resp.headers.get("X-Object-Version-Id"),
+            Some("1788310242.27709")
+        );
+    }
+
+    #[test]
+    fn test_slo_part_number_with_version_id_query_is_not_400() {
+        // parse_part_number must ignore sibling query params. A 400 on
+        // GET/HEAD ?part-number=&version-id= is versioned_writes, not SLO.
+        let be = slo_manifest_backend();
+        let mut req = slo_get("/v1/a/c/manifest", None);
+        req.query_string = "part-number=1&version-id=1787766177.51067".into();
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 206, "SLO itself must not 400 this query");
+        assert_eq!(body_of(&mut resp), b"one");
+        assert_eq!(resp.headers.get("X-Parts-Count"), Some("2"));
+        assert_eq!(resp.headers.get("Content-Range"), Some("bytes 0-2/6"));
+    }
+
+    #[test]
     fn test_slo_range_get() {
         // "onetwo"[2..5] = "etw"
         let be = slo_manifest_backend();
@@ -3943,6 +4227,113 @@ mod tests {
         let mut resp = Slo::new().handle(slo_get("/v1/a/c/plain", None), &be);
         assert_eq!(resp.status, 200);
         assert_eq!(body_of(&mut resp), b"hi");
+    }
+
+    #[tokio::test]
+    async fn test_async_non_slo_range_keeps_206_without_unranged_retry() {
+        // Hyper outbound next() returns the already-completed app GET.
+        // A 206 on a plain object must not be replaced by a second GET
+        // without Range (that was returning 200 + full body).
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let log2 = log.clone();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let range = req.headers.get("Range").map(str::to_string);
+            log2.lock().unwrap().push((req.path.clone(), range.clone()));
+            let body = b"abcdefghij".to_vec();
+            let (status, slice, cr) = if let Some(rh) = range.as_deref() {
+                if let Ok(parsed) = Range::parse(rh) {
+                    if let Some(ranges) = parsed.ranges_for_length(Some(body.len() as u64)) {
+                        if ranges.len() == 1 {
+                            let (a, b) = ranges[0];
+                            let slice = body[a as usize..b as usize].to_vec();
+                            (
+                                206u16,
+                                slice,
+                                Some(format!("bytes {a}-{}/{n}", b - 1, n = body.len())),
+                            )
+                        } else {
+                            (200u16, body, None)
+                        }
+                    } else {
+                        (200u16, body, None)
+                    }
+                } else {
+                    (200u16, body, None)
+                }
+            } else {
+                (200u16, body, None)
+            };
+            let mut out = Response::with_body(status, slice);
+            if let Some(cr) = cr {
+                out.headers.set("Content-Range", cr);
+            }
+            out.headers.set("Content-Type", "application/octet-stream");
+            Box::pin(async move { out })
+        });
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/plain", Some("bytes=2-5")), next)
+            .await;
+        assert_eq!(resp.status, 206, "plain ranged GET must stay 206");
+        assert_eq!(resp.headers.get("Content-Range"), Some("bytes 2-5/10"));
+        let body = match resp.body.collect_async().await {
+            Ok(b) => b,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(body, b"cdef");
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 1, "must not retry without Range: {calls:?}");
+        assert_eq!(calls[0].1.as_deref(), Some("bytes=2-5"));
+    }
+
+    #[tokio::test]
+    async fn test_async_slo_ranged_manifest_206_still_refetches_json() {
+        // Captured first GET is 206 of truncated SLO JSON (ignore-range missed
+        // because S3 rewrote the path after prepare). Must refetch whole JSON.
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let log2 = log.clone();
+        let manifest_json = two_segment_manifest_json();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let range = req.headers.get("Range").map(str::to_string);
+            if req.path == "/v1/a/c/manifest" {
+                log2.lock().unwrap().push(range.clone());
+                let mut manifest = Response::with_body(200, manifest_json.clone());
+                manifest.headers.set("X-Static-Large-Object", "True");
+                manifest.headers.set("Content-Type", "text/plain");
+                if range.is_some() {
+                    // Simulate object-server applying Range to the JSON file.
+                    let slice = manifest_json.get(..12).unwrap_or(&manifest_json).to_vec();
+                    let mut ranged = Response::with_body(206, slice);
+                    ranged.headers = manifest.headers.clone();
+                    ranged.headers.set("Content-Range", "bytes 0-11/99");
+                    return Box::pin(async move { ranged });
+                }
+                return Box::pin(async move { manifest });
+            }
+            let body = match req.path.as_str() {
+                "/v1/a/c/s1" => b"one".to_vec(),
+                "/v1/a/c/s2" => b"two".to_vec(),
+                _ => {
+                    return Box::pin(async { Response::new(404) });
+                }
+            };
+            Box::pin(async move { Response::with_body(200, body) })
+        });
+        let resp = Slo::new()
+            .reassemble_async(slo_get("/v1/a/c/manifest", Some("bytes=0-2")), next)
+            .await;
+        assert_eq!(resp.status, 206);
+        let body = match resp.body.collect_async().await {
+            Ok(b) => b,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(body, b"one");
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.iter().any(|r| r.is_none()),
+            "SLO 206 JSON must refetch without Range: {calls:?}"
+        );
     }
 
     #[test]
@@ -4258,14 +4649,56 @@ mod tests {
         };
         let mut resp = Slo::new().handle(put, &be);
         assert_eq!(resp.status, 202);
-        // Streamed body (no pre-declared Content-Length) — heartbeats can
-        // flush before validation finishes.
+        // Sync handle() still streams whitespace during HEADs.
         assert!(matches!(resp.body, Body::Streamed(_)));
         assert_eq!(resp.body.content_length(), None);
         let b = body_of(&mut resp);
         assert!(b.starts_with(b" "), "{b:?}");
         assert!(b.windows(4).any(|w| w == b"\r\n\r\n"));
         // Leading space + one per HEAD + separator + JSON with 201.
+        let text = String::from_utf8_lossy(&b);
+        assert!(text.contains("201 Created"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_put_async_uses_channel_not_streamed() {
+        let next: crate::AsyncNextFn = Arc::new(|req: Request| {
+            Box::pin(async move {
+                if req.method == "HEAD" {
+                    let mut r = Response::new(200);
+                    r.headers.set("Etag", "e");
+                    r.headers.set("Content-Length", "1");
+                    return r;
+                }
+                if req.method == "PUT" {
+                    return Response::new(201);
+                }
+                Response::new(404)
+            })
+        });
+        let manifest = serde_json::json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}]);
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let put = Request {
+            method: "PUT".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=put&heartbeat=on".into(),
+            headers: HeaderKeyDict::new(),
+            body: body.into(),
+        };
+        let mut resp = Slo::new().handle_request_async(put, next).await;
+        assert_eq!(resp.status, 202);
+        assert!(
+            matches!(resp.body, Body::Channel(_)),
+            "utf8-compat lane forbids Streamed after 202 headers; got {:?}",
+            resp.body
+        );
+        assert_eq!(resp.body.content_length(), None);
+        let b = std::mem::replace(&mut resp.body, Body::empty())
+            .collect_async()
+            .await
+            .expect("channel body");
+        assert!(b.starts_with(b" "), "{b:?}");
+        assert!(b.windows(4).any(|w| w == b"\r\n\r\n"));
         let text = String::from_utf8_lossy(&b);
         assert!(text.contains("201 Created"), "{text}");
     }
@@ -4358,6 +4791,182 @@ mod tests {
         assert!(paths.iter().any(|p| p == "/v1/a/c/manifest"), "{paths:?}");
         // manifest last
         assert_eq!(paths.last().map(String::as_str), Some("/v1/a/c/manifest"));
+    }
+
+    #[test]
+    fn test_multipart_delete_keeps_version_id_on_manifest_only() {
+        // Official TestSloWithVersioning::test_slo_manifest_version:
+        // DELETE ?multipart-manifest=delete&version-id=v1 must load and
+        // remove that historical manifest, not DELETE the current object
+        // (which would write a delete-marker and grow the version count).
+        use std::sync::{Arc as SArc, Mutex};
+        let gets: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let deleted: SArc<Mutex<Vec<(String, String)>>> = SArc::new(Mutex::new(Vec::new()));
+        let g2 = gets.clone();
+        let d2 = deleted.clone();
+        let v1_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/old", "bytes": 3, "hash": "h-old"},
+        ]))
+        .unwrap();
+        let current_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/new", "bytes": 3, "hash": "h-new"},
+        ]))
+        .unwrap();
+        let be: NextFn = Arc::new(move |req: Request| {
+            if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                g2.lock().unwrap().push(req.query_string.clone());
+                let body = if req.param("version-id").as_deref() == Some("v1") {
+                    v1_json.clone()
+                } else {
+                    current_json.clone()
+                };
+                let mut r = Response::with_body(200, body);
+                r.headers.set("X-Static-Large-Object", "True");
+                return r;
+            }
+            if req.method == "DELETE" {
+                d2.lock()
+                    .unwrap()
+                    .push((req.path.clone(), req.query_string.clone()));
+                return Response::new(204);
+            }
+            Response::new(404)
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete&version-id=v1".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle(req, &be);
+        assert_eq!(resp.status, 200);
+        let body = body_of(&mut resp);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Number Deleted"], 2, "{v}");
+        let gets = gets.lock().unwrap().clone();
+        assert!(
+            gets.iter()
+                .any(|q| q.contains("multipart-manifest=get") && q.contains("version-id=v1")),
+            "manifest GET must keep version-id: {gets:?}"
+        );
+        let paths = deleted.lock().unwrap().clone();
+        assert!(
+            paths
+                .iter()
+                .any(|(p, q)| p.ends_with("/c/old") && q.is_empty()),
+            "historical segment must be deleted without version-id: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|(p, _)| p.ends_with("/c/new")),
+            "must not delete current SLO segments: {paths:?}"
+        );
+        let manifest_deletes: Vec<_> = paths
+            .iter()
+            .filter(|(p, _)| p == "/v1/a/c/manifest")
+            .cloned()
+            .collect();
+        assert_eq!(manifest_deletes.len(), 1, "{paths:?}");
+        assert_eq!(
+            manifest_deletes[0].1, "version-id=v1",
+            "manifest DELETE must be version-aware, not a current delete: {paths:?}"
+        );
+        assert!(
+            !manifest_deletes[0].1.contains("multipart-manifest=delete"),
+            "subrequest must not re-enter SLO delete: {paths:?}"
+        );
+        assert_eq!(
+            paths.last().map(|(p, _)| p.as_str()),
+            Some("/v1/a/c/manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multipart_delete_async_keeps_version_id_on_manifest_only() {
+        use std::sync::{Arc as SArc, Mutex};
+        let gets: SArc<Mutex<Vec<String>>> = SArc::new(Mutex::new(Vec::new()));
+        let deleted: SArc<Mutex<Vec<(String, String)>>> = SArc::new(Mutex::new(Vec::new()));
+        let g2 = gets.clone();
+        let d2 = deleted.clone();
+        let v1_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/old", "bytes": 3, "hash": "h-old"},
+        ]))
+        .unwrap();
+        let current_json = serde_json::to_vec(&serde_json::json!([
+            {"name": "/c/new", "bytes": 3, "hash": "h-new"},
+        ]))
+        .unwrap();
+        let next: crate::AsyncNextFn = Arc::new(move |req: Request| {
+            let g2 = g2.clone();
+            let d2 = d2.clone();
+            let v1_json = v1_json.clone();
+            let current_json = current_json.clone();
+            Box::pin(async move {
+                if req.method == "GET" && req.path == "/v1/a/c/manifest" {
+                    g2.lock().unwrap().push(req.query_string.clone());
+                    let body = if req.param("version-id").as_deref() == Some("v1") {
+                        v1_json
+                    } else {
+                        current_json
+                    };
+                    let mut r = Response::with_body(200, body);
+                    r.headers.set("X-Static-Large-Object", "True");
+                    return r;
+                }
+                if req.method == "DELETE" {
+                    d2.lock()
+                        .unwrap()
+                        .push((req.path.clone(), req.query_string.clone()));
+                    return Response::new(204);
+                }
+                Response::new(404)
+            })
+        });
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/a/c/manifest".into(),
+            query_string: "multipart-manifest=delete&version-id=v1".into(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        };
+        let mut resp = Slo::new().handle_request_async(req, next).await;
+        assert_eq!(resp.status, 200);
+        let body = match std::mem::replace(&mut resp.body, Body::empty())
+            .collect_async()
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => panic!("body: {e}"),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Number Deleted"], 2, "{v}");
+        let gets = gets.lock().unwrap().clone();
+        assert!(
+            gets.iter()
+                .any(|q| q.contains("multipart-manifest=get") && q.contains("version-id=v1")),
+            "Hyper manifest GET must keep version-id: {gets:?}"
+        );
+        let paths = deleted.lock().unwrap().clone();
+        assert!(
+            paths
+                .iter()
+                .any(|(p, q)| p.ends_with("/c/old") && q.is_empty()),
+            "historical segment must be deleted without version-id: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|(p, _)| p.ends_with("/c/new")),
+            "must not delete current SLO segments: {paths:?}"
+        );
+        let manifest_deletes: Vec<_> = paths
+            .iter()
+            .filter(|(p, _)| p == "/v1/a/c/manifest")
+            .cloned()
+            .collect();
+        assert_eq!(manifest_deletes.len(), 1, "{paths:?}");
+        assert_eq!(
+            manifest_deletes[0].1, "version-id=v1",
+            "Hyper manifest DELETE must keep version-id: {paths:?}"
+        );
     }
 
     #[test]

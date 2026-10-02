@@ -285,9 +285,10 @@ fn test_proxy_end_to_end_account_and_container() {
     assert_eq!(status, 200);
     assert_eq!(String::from_utf8_lossy(&body), "[]");
     assert!(
-        headers.iter().any(|(k, v)| k.eq_ignore_ascii_case(
-            "X-Backend-Fake-Account-Listing"
-        ) && v.eq_ignore_ascii_case("yes")),
+        headers.iter().any(
+            |(k, v)| k.eq_ignore_ascii_case("X-Backend-Fake-Account-Listing")
+                && v.eq_ignore_ascii_case("yes")
+        ),
         "fake listing must carry X-Backend-Fake-Account-Listing: {headers:?}"
     );
 
@@ -338,9 +339,7 @@ fn test_container_put_does_not_mutate_when_account_autocreate_fails() {
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
 
     let account_ring = single_device_ring(acct_addr.port() as u32);
-    let (account_part, _) = account_ring
-        .get_nodes("AUTH_deleted", None, None)
-        .unwrap();
+    let (account_part, _) = account_ring.get_nodes("AUTH_deleted", None, None).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     let account_path = format!("/sda1/{account_part}/AUTH_deleted");
     let (status, _, _) = http_with_headers(
@@ -378,7 +377,10 @@ fn test_container_put_does_not_mutate_when_account_autocreate_fails() {
     // the container PUT; the old Rust path ignored it, returned 404 from the
     // account-update side channel, but had already created the container DB.
     let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_deleted/ghost", "");
-    assert_eq!(status, 503, "failed account autocreate must stop container PUT");
+    assert_eq!(
+        status, 503,
+        "failed account autocreate must stop container PUT"
+    );
     let (status, _, _) = http(proxy_addr, "HEAD", "/v1/AUTH_deleted/ghost", "");
     assert_eq!(status, 404, "failed PUT must not leave a container behind");
 
@@ -403,9 +405,15 @@ fn test_container_account_gate_handles_all_non_success_and_only_put_autocreates(
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let (status, _, _) = http(proxy_addr, "POST", "/v1/AUTH_down/c", "");
-    assert_eq!(status, 404, "POST must not autocreate an unavailable account");
+    assert_eq!(
+        status, 404,
+        "POST must not autocreate an unavailable account"
+    );
     let (status, _, _) = http(proxy_addr, "DELETE", "/v1/AUTH_down/c", "");
-    assert_eq!(status, 404, "DELETE must not autocreate an unavailable account");
+    assert_eq!(
+        status, 404,
+        "DELETE must not autocreate an unavailable account"
+    );
     assert_eq!(
         account_counts.put.load(Ordering::SeqCst),
         0,
@@ -471,10 +479,7 @@ fn test_container_put_rechecks_account_after_successful_autocreate() {
 fn test_container_put_succeeds_when_one_account_replica_404s() {
     // RSAIO-style replica=3: AUTH exists on two devices, the third 404s.
     // Python `_backend_requests` still reaches write quorum (201).
-    let tmp = std::env::temp_dir().join(format!(
-        "swift-proxy-acct-partial-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("swift-proxy-acct-partial-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     for dev in ["sda1", "sda2", "sda3"] {
         std::fs::create_dir_all(tmp.join(dev)).unwrap();

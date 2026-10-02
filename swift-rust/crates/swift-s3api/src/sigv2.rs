@@ -397,18 +397,28 @@ pub fn check_sigv2_time(
             if exp < now_unix {
                 return Err(SigAuthError::AccessDenied);
             }
+            // Python: Expires >= 2^31 is AccessDenied "Invalid date (should
+            // be seconds since epoch)" — official test_expiration_limits V2
+            // uses expires_in=2**32.
+            if exp >= (1 << 31) {
+                return Err(SigAuthError::AccessDeniedInvalidExpires);
+            }
         }
         return Ok(());
     }
     if header_date_missing(req) {
         return Err(SigAuthError::InvalidDate);
     }
-    if let Some(ts) = signing_ts_v2_header(req) {
-        if ts.abs_diff(now_unix) > allowable_clock_skew {
-            return Err(SigAuthError::RequestTimeTooSkewed);
+    // Python `signing_timestamp`: unparseable or ts < 0 → AccessDenied
+    // (InvalidDate), not SignatureDoesNotMatch / RequestTimeTooSkewed.
+    match signing_ts_v2_header(req) {
+        None => Err(SigAuthError::InvalidDate),
+        Some(ts) if ts < 0 => Err(SigAuthError::InvalidDate),
+        Some(ts) if ts.abs_diff(now_unix) > allowable_clock_skew => {
+            Err(SigAuthError::RequestTimeTooSkewed)
         }
+        Some(_) => Ok(()),
     }
-    Ok(())
 }
 
 fn header_date_missing(req: &Request) -> bool {
@@ -418,9 +428,10 @@ fn header_date_missing(req: &Request) -> bool {
         .or_else(|| req.headers.get("date"))
         .map(|v| v.trim().is_empty())
         .unwrap_or(true);
-    let amz_empty = !req.headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("x-amz-date") && !v.trim().is_empty()
-    });
+    let amz_empty = !req
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-amz-date") && !v.trim().is_empty());
     date_empty && amz_empty
 }
 
@@ -614,6 +625,26 @@ mod tests {
     }
 
     #[test]
+    fn query_auth_expires_past_i32_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.path = "/johnsmith/photos/puppy.jpg".into();
+        let exp: i64 = 1 << 31;
+        let auth = SigV2Auth {
+            access_key: ACCESS.into(),
+            signature: String::new(),
+            query_auth: true,
+            expires: Some(exp),
+        };
+        let sts = string_to_sign_v2(&req, &auth);
+        let sig = compute_signature_v2(SECRET, &sts);
+        req.query_string = format!("AWSAccessKeyId={ACCESS}&Expires={exp}&Signature={sig}");
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(1_700_000_000), None),
+            Err(SigAuthError::AccessDeniedInvalidExpires)
+        );
+        assert_sig_error_xml_matches_normalize(SigAuthError::AccessDeniedInvalidExpires, 403);
+    }
+
     fn query_auth_expired_fails() {
         let mut req = aws_vector_req();
         req.path = "/johnsmith/photos/puppy.jpg".into();
@@ -637,6 +668,41 @@ mod tests {
             verify_sigv2(ACCESS, SECRET, &req, Some(200), None),
             Err(SigAuthError::AccessDenied)
         );
+    }
+
+    #[test]
+    fn verify_sigv2_unparseable_date_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.headers.set("Date", "Bad Date");
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:abcd"));
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(1_000_000), Some(900)),
+            Err(SigAuthError::InvalidDate)
+        );
+    }
+
+    #[test]
+    fn verify_sigv2_empty_date_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.headers.set("Date", "");
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:abcd"));
+        assert_eq!(
+            verify_sigv2(ACCESS, SECRET, &req, Some(1_000_000), Some(900)),
+            Err(SigAuthError::InvalidDate)
+        );
+    }
+
+    #[test]
+    fn verify_sigv2_before_epoch_date_is_invalid_date() {
+        let mut req = aws_vector_req();
+        req.headers.set("Date", "Sun, 01 Jan 1950 00:00:00 +0000");
+        req.headers
+            .set("Authorization", format!("AWS {ACCESS}:abcd"));
+        let err = verify_sigv2(ACCESS, SECRET, &req, Some(1_000_000), Some(900));
+        assert_eq!(err, Err(SigAuthError::InvalidDate), "{err:?}");
+        assert_ne!(err, Err(SigAuthError::RequestTimeTooSkewed));
     }
 
     #[test]

@@ -18,6 +18,7 @@
 
 pub mod auditor_daemon;
 pub mod daemon;
+pub mod dark_data;
 pub mod dispersion;
 pub mod drive_audit;
 pub mod info;

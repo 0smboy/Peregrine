@@ -430,7 +430,10 @@ pub fn parse_object_retention(mode: &str, retain_until: &str) -> Option<ObjectRe
 fn persisted_retention(
     headers: &HeaderKeyDict,
 ) -> Result<Option<ObjectRetention>, PersistedLockError> {
-    let mode = headers.get(SYS_LOCK_MODE).map(str::trim).filter(|v| !v.is_empty());
+    let mode = headers
+        .get(SYS_LOCK_MODE)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     let until = headers
         .get(SYS_RETAIN_UNTIL)
         .map(str::trim)
@@ -439,10 +442,10 @@ fn persisted_retention(
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => Err(PersistedLockError::IncompleteRetention),
         (Some(mode), Some(until)) => {
-            let mode = ObjectLockMode::parse(mode)
-                .ok_or(PersistedLockError::InvalidRetentionMode)?;
-            let retain_until_unix = parse_retain_until(until)
-                .ok_or(PersistedLockError::InvalidRetainUntilDate)?;
+            let mode =
+                ObjectLockMode::parse(mode).ok_or(PersistedLockError::InvalidRetentionMode)?;
+            let retain_until_unix =
+                parse_retain_until(until).ok_or(PersistedLockError::InvalidRetainUntilDate)?;
             Ok(Some(ObjectRetention {
                 mode,
                 retain_until: until.to_string(),
@@ -509,10 +512,13 @@ pub fn evaluate_retention_update_with_clock(
             }
         }
         ObjectLockMode::Governance => {
-            if requested.retain_until_unix < old.retain_until_unix && !bypass.effective() {
-                RetentionUpdateDecision::Deny(
-                    RetentionUpdateDenyReason::GovernanceBypassRequired,
-                )
+            // Any change that is not a pure GOVERNANCE extension (shorten
+            // OR mode switch to COMPLIANCE) needs bypass. AWS/Ceph
+            // test_object_lock_changing_mode_from_governance_with_bypass.
+            let mode_change = requested.mode != ObjectLockMode::Governance;
+            let shorten = requested.retain_until_unix < old.retain_until_unix;
+            if (mode_change || shorten) && !bypass.effective() {
+                RetentionUpdateDecision::Deny(RetentionUpdateDenyReason::GovernanceBypassRequired)
             } else {
                 RetentionUpdateDecision::Allow
             }
@@ -585,7 +591,11 @@ pub fn parse_retain_until(s: &str) -> Option<i64> {
                 return None;
             }
             let offset = (off_h as i64) * 3_600 + (off_m as i64) * 60;
-            if *sign == b'+' { offset } else { -offset }
+            if *sign == b'+' {
+                offset
+            } else {
+                -offset
+            }
         }
         _ => return None,
     };
@@ -616,9 +626,7 @@ pub fn format_retain_until_iso(unix: i64) -> String {
 /// The root must enable Object Lock. A rule is optional, but when present it
 /// must contain one mode and exactly one positive Days/Years period. Unknown,
 /// duplicate, mixed-content, DTD, comment, and malformed elements are rejected.
-pub fn parse_object_lock_configuration(
-    xml: &[u8],
-) -> Result<Option<DefaultRetention>, String> {
+pub fn parse_object_lock_configuration(xml: &[u8]) -> Result<Option<DefaultRetention>, String> {
     let root = parse_xml_document(xml)?;
     require_node_name(&root, "ObjectLockConfiguration")?;
     require_branch_text_empty(&root)?;
@@ -813,11 +821,9 @@ pub fn parse_retention_body(body: &[u8]) -> Result<(String, String), String> {
     require_only_children(&root, &["Mode", "RetainUntilDate"])?;
     let mode = leaf_text(required_child(&root, "Mode")?)?;
     let until = leaf_text(required_child(&root, "RetainUntilDate")?)?;
-    let retention = parse_object_retention(mode, until).ok_or_else(|| "MalformedXML".to_string())?;
-    Ok((
-        retention.mode.as_str().to_string(),
-        retention.retain_until,
-    ))
+    let retention =
+        parse_object_retention(mode, until).ok_or_else(|| "MalformedXML".to_string())?;
+    Ok((retention.mode.as_str().to_string(), retention.retain_until))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,7 +988,11 @@ impl<'a> XmlParser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.input.get(self.pos).is_some_and(u8::is_ascii_whitespace) {
+        while self
+            .input
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
             self.pos += 1;
         }
     }
@@ -1278,13 +1288,20 @@ mod tests {
             now,
             true
         ));
-        // Upgrade to COMPLIANCE (same or later date) → allow.
-        assert!(!worm_blocks_retention_put(
+        // Upgrade to COMPLIANCE requires bypass (Ceph governance-with-bypass).
+        assert!(worm_blocks_retention_put(
             &h,
             "COMPLIANCE",
             "2030-01-01T00:00:00Z",
             now,
             false
+        ));
+        assert!(!worm_blocks_retention_put(
+            &h,
+            "COMPLIANCE",
+            "2030-01-01T00:00:00Z",
+            now,
+            true
         ));
     }
 
@@ -1731,7 +1748,10 @@ mod tests {
         assert_eq!(token, lock_if_match_token(&state, 3));
         assert_ne!(token, lock_if_match_token(&state, 4));
         assert!(lock_if_match_matches(&token, &token));
-        assert!(!lock_if_match_matches(&token, &lock_if_match_token(&state, 4)));
+        assert!(!lock_if_match_matches(
+            &token,
+            &lock_if_match_token(&state, 4)
+        ));
         let until = state.retention.as_ref().unwrap().retain_until_unix;
         assert_eq!(
             canonical_lock_tuple(&state, 3),

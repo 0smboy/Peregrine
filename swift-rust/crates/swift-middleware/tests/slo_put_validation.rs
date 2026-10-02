@@ -67,6 +67,15 @@ fn run_manifest_put_with_client_etag(
     heads: Vec<(&str, Response)>,
     client_etag: Option<&str>,
 ) -> (Response, Vec<CapturedPut>) {
+    run_manifest_put_with_headers(manifest, heads, client_etag, &[])
+}
+
+fn run_manifest_put_with_headers(
+    manifest: Value,
+    heads: Vec<(&str, Response)>,
+    client_etag: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (Response, Vec<CapturedPut>) {
     // Canned HEAD responses likewise torn into Sync parts.
     let heads: Arc<HashMap<String, (u16, HeaderKeyDict)>> = Arc::new(
         heads
@@ -112,6 +121,9 @@ fn run_manifest_put_with_client_etag(
     headers.set("Content-Length", body.len().to_string());
     if let Some(client_etag) = client_etag {
         headers.set("Etag", client_etag);
+    }
+    for (name, value) in extra_headers {
+        headers.set(name, value);
     }
     let request = Request {
         method: "PUT".to_string(),
@@ -492,9 +504,7 @@ async fn async_put_reuses_head_for_duplicate_ranged_paths() {
         body: body.into(),
     };
 
-    let mut response = Slo::new()
-        .handle_request_async(request, backend)
-        .await;
+    let mut response = Slo::new().handle_request_async(request, backend).await;
     response.body.materialize(u64::MAX).unwrap();
     assert_eq!(response.status, 201, "{}", body_string(&response));
     let captured = writes.lock().unwrap().clone();
@@ -527,7 +537,8 @@ fn typo_etag_key_is_rejected_as_extraneous() {
 /// forces `application/json; charset=utf-8` on the stored listing.
 #[tokio::test]
 async fn async_manifest_get_sets_json_content_type() {
-    let stored = serde_json::to_vec(&json!([{"name": "/c/segment", "bytes": 3, "hash": "abc"}])).unwrap();
+    let stored =
+        serde_json::to_vec(&json!([{"name": "/c/segment", "bytes": 3, "hash": "abc"}])).unwrap();
     let backend: AsyncNextFn = Arc::new(move |request: Request| {
         let stored = stored.clone();
         Box::pin(async move {
@@ -564,7 +575,8 @@ fn container_listing_splits_slo_etag_from_hash() {
     let backend_body = listing.clone();
     let backend: NextFn = Arc::new(move |_r: Request| {
         let mut resp = Response::with_body(200, backend_body.clone());
-        resp.headers.set("Content-Type", "application/json; charset=utf-8");
+        resp.headers
+            .set("Content-Type", "application/json; charset=utf-8");
         resp
     });
     let req = Request {
@@ -579,11 +591,135 @@ fn container_listing_splits_slo_etag_from_hash() {
     let v: Value = serde_json::from_slice(match &resp.body {
         swift_http::Body::Buffered(b) => b,
         _ => panic!("expected buffered"),
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(v[0]["hash"], "deadbeef");
     assert_eq!(v[0]["slo_etag"], "\"slohash\"");
+    assert!(v[0].get("s3_etag").is_none(), "{v}");
     assert_eq!(v[1]["subdir"], "p/");
     let _ = listing;
+}
+
+fn listing_json_via_slo(hash: &str) -> Value {
+    let listing = serde_json::to_vec(&json!([{
+        "name": "assembled.bin",
+        "bytes": 6,
+        "hash": hash,
+        "content_type": "application/octet-stream",
+        "last_modified": "2020-01-01T00:00:00.000000"
+    }]))
+    .unwrap();
+    let backend: NextFn = Arc::new(move |_r: Request| {
+        let mut resp = Response::with_body(200, listing.clone());
+        resp.headers
+            .set("Content-Type", "application/json; charset=utf-8");
+        resp
+    });
+    let req = Request {
+        method: "GET".into(),
+        path: "/v1/a/c".into(),
+        query_string: "format=json".into(),
+        headers: HeaderKeyDict::new(),
+        body: Vec::<u8>::new().into(),
+    };
+    let mut resp = Slo::new().handle(req, &backend);
+    resp.body.materialize(u64::MAX).unwrap();
+    serde_json::from_slice(match &resp.body {
+        swift_http::Body::Buffered(b) => b,
+        _ => panic!("expected buffered"),
+    })
+    .unwrap()
+}
+
+#[test]
+fn container_listing_promotes_s3_etag_and_slo_etag() {
+    let composite = "65d79814053817eae59f7c7cee98d3f8-2";
+    let v = listing_json_via_slo(&format!("cafef00d; s3_etag={composite}; slo_etag=slohash"));
+    assert_eq!(v[0]["hash"], "cafef00d");
+    assert_eq!(v[0]["slo_etag"], "\"slohash\"");
+    assert_eq!(v[0]["s3_etag"], format!("\"{composite}\""));
+}
+
+#[test]
+fn mpu_s3_etag_override_survives_slo_put_and_listing() {
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let composite = "b4b77f5320cfe9ce9c0c70c35e84d511-2";
+    let (response, writes) = run_manifest_put_with_headers(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        None,
+        &[
+            (
+                "X-Object-Sysmeta-Container-Update-Override-Etag",
+                &format!("; s3_etag={composite}"),
+            ),
+            ("X-Object-Sysmeta-S3Api-Etag", composite),
+        ],
+    );
+    assert_eq!(response.status, 201);
+    let physical_etag = md5_hex(&writes[0].body);
+    let override_etag = writes[0]
+        .headers
+        .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        .expect("SLO PUT must set listing override");
+    assert!(
+        override_etag.contains(&format!("s3_etag={composite}")),
+        "{override_etag}"
+    );
+    assert!(
+        override_etag.contains(&format!("slo_etag={slo_etag}")),
+        "{override_etag}"
+    );
+    assert!(
+        override_etag.contains(&physical_etag),
+        "blank-base override must use stored-manifest MD5: {override_etag}"
+    );
+
+    let listed = listing_json_via_slo(override_etag);
+    assert_eq!(listed[0]["hash"], physical_etag);
+    assert_eq!(listed[0]["slo_etag"], format!("\"{slo_etag}\""));
+    assert_eq!(listed[0]["s3_etag"], format!("\"{composite}\""));
+}
+
+#[test]
+fn mpu_s3_etag_sysmeta_seeds_override_when_complete_sent_bare_composite() {
+    let segment_etag = md5_hex(b"abc");
+    let slo_etag = md5_hex(segment_etag.as_bytes());
+    let composite = "65d79814053817eae59f7c7cee98d3f8-1";
+    let (response, writes) = run_manifest_put_with_headers(
+        json!([{
+            "path": "/c/segment",
+            "etag": segment_etag,
+            "size_bytes": 3
+        }]),
+        vec![("/v1/a/c/segment", head_response(&segment_etag, 3))],
+        None,
+        &[
+            ("X-Object-Sysmeta-Container-Update-Override-Etag", composite),
+            ("X-Object-Sysmeta-S3Api-Etag", composite),
+        ],
+    );
+    assert_eq!(response.status, 201);
+    let override_etag = writes[0]
+        .headers
+        .get("X-Object-Sysmeta-Container-Update-Override-Etag")
+        .expect("SLO PUT must set listing override");
+    assert!(
+        override_etag.contains(&format!("s3_etag={composite}")),
+        "{override_etag}"
+    );
+    assert!(
+        override_etag.contains(&format!("slo_etag={slo_etag}")),
+        "{override_etag}"
+    );
+    let listed = listing_json_via_slo(override_etag);
+    assert_eq!(listed[0]["s3_etag"], format!("\"{composite}\""));
+    assert_eq!(listed[0]["slo_etag"], format!("\"{slo_etag}\""));
 }
 
 #[test]
@@ -616,13 +752,15 @@ async fn async_heartbeat_put_is_202_chunked() {
                 let _ = request.body.materialize(u64::MAX);
                 let mut r = Response::new(201);
                 r.headers.set("Etag", "\"slo\"");
-                r.headers.set("Last-Modified", "Mon, 01 Jan 2020 00:00:00 GMT");
+                r.headers
+                    .set("Last-Modified", "Mon, 01 Jan 2020 00:00:00 GMT");
                 return r;
             }
             Response::new(404)
         })
     });
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("Content-Type", "application/json");
     headers.set("Content-Length", body.len().to_string());
@@ -636,10 +774,11 @@ async fn async_heartbeat_put_is_202_chunked() {
     let mut resp = Slo::new().handle_request_async(request, backend).await;
     assert_eq!(resp.status, 202);
     assert_eq!(resp.body.content_length(), None);
-    let bytes = resp.body.materialize(u64::MAX).unwrap();
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    let bytes = body.collect_async().await.unwrap();
     assert!(bytes.starts_with(b" "), "{bytes:?}");
     assert!(bytes.windows(4).any(|w| w == b"\r\n\r\n"));
-    let text = String::from_utf8_lossy(bytes);
+    let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("201 Created"), "{text}");
     assert!(text.contains("Etag"), "{text}");
 }
@@ -647,7 +786,8 @@ async fn async_heartbeat_put_is_202_chunked() {
 #[test]
 fn if_none_match_not_star_is_400() {
     let backend: NextFn = Arc::new(|_r: Request| Response::new(500));
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("If-None-Match", "\"not-star\"");
     let req = Request {
@@ -685,7 +825,8 @@ async fn if_none_match_star_does_not_412_segment_heads() {
             Response::new(404)
         })
     });
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("If-None-Match", "*");
     headers.set("Content-Length", body.len().to_string());
@@ -736,7 +877,9 @@ async fn heartbeat_missing_segment_lists_404_error() {
     };
     let mut resp = Slo::new().handle_request_async(request, backend).await;
     assert_eq!(resp.status, 202);
-    let text = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    let bytes = body.collect_async().await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("Response Status: 400 Bad Request"), "{text}");
     assert!(text.contains("Response Body: Bad Request"), "{text}");
     assert!(
@@ -759,7 +902,8 @@ async fn heartbeat_bad_etag_json_uses_webob_422_body() {
             Response::new(201)
         })
     });
-    let body = serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
+    let body =
+        serde_json::to_vec(&json!([{"path": "/c/s1", "etag": "e", "size_bytes": 1}])).unwrap();
     let mut headers = HeaderKeyDict::new();
     headers.set("Accept", "application/json");
     headers.set("Etag", "bad etag");
@@ -773,7 +917,9 @@ async fn heartbeat_bad_etag_json_uses_webob_422_body() {
     };
     let mut resp = Slo::new().handle_request_async(request, backend).await;
     assert_eq!(resp.status, 202);
-    let text = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+    let body = std::mem::replace(&mut resp.body, swift_http::Body::empty());
+    let bytes = body.collect_async().await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
     let json_start = text.find('{').expect(&text);
     let v: Value = serde_json::from_str(&text[json_start..]).unwrap();
     assert_eq!(v["Response Status"], "422 Unprocessable Entity");
@@ -873,7 +1019,8 @@ async fn head_part_number_refetches_manifest() {
 
 #[tokio::test]
 async fn part_number_out_of_range_is_plain_416() {
-    let stored = serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 3, "hash": "aaa"}])).unwrap();
+    let stored =
+        serde_json::to_vec(&json!([{"name": "/c/s1", "bytes": 3, "hash": "aaa"}])).unwrap();
     let backend: AsyncNextFn = Arc::new(move |request: Request| {
         let stored = stored.clone();
         Box::pin(async move {
@@ -897,7 +1044,10 @@ async fn part_number_out_of_range_is_plain_416() {
     let mut resp = Slo::new().reassemble_async(request, backend).await;
     assert_eq!(resp.status, 416);
     let body = resp.body.materialize(u64::MAX).unwrap();
-    assert_eq!(body, b"The requested part number is not satisfiable".as_slice());
+    assert_eq!(
+        body,
+        b"The requested part number is not satisfiable".as_slice()
+    );
     assert_eq!(resp.headers.get("X-Parts-Count"), Some("1"));
     assert_eq!(resp.headers.get("Content-Range"), Some("bytes */3"));
 }

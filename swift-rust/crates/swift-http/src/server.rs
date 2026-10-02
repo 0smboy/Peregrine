@@ -797,8 +797,6 @@ pub(crate) async fn wait_shutdown(config: &ServerConfig, flag: &AtomicBool) {
     wait_flag(flag).await;
 }
 
-
-
 /// Buffered async read half. Leftover from a request body can be prepended
 /// so the next keep-alive head parse sees the next request, not a hole.
 #[allow(dead_code)]
@@ -855,10 +853,7 @@ impl AsyncRead for ConnRead {
 
 #[allow(dead_code)]
 impl AsyncBufRead for ConnRead {
-    fn poll_fill_buf(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<&[u8]>> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
         let this = self.get_mut();
         if this.pos < this.buf.len() {
             return Poll::Ready(Ok(&this.buf[this.pos..]));
@@ -915,7 +910,89 @@ pub struct IncomingBody {
     on_upgrade: Option<hyper::upgrade::OnUpgrade>,
     metrics: Option<ConcurrencyMetrics>,
     buffered: usize,
+    // The returned Vec has no RAII metric capability. Keep its channel
+    // ticket until the consumer asks for the next chunk (or drops this body).
+    // Consumers that retain several returned Vecs must account for them in
+    // their own bounded domain; this is not an arbitrary-allocation gauge.
+    channel_inflight: Option<RequestBodyBufferTicket>,
     async_interim: Option<tokio::sync::mpsc::Sender<AsyncInterimCommand>>,
+}
+
+/// The one producer for a byte-metered incoming request channel.
+///
+/// A mutable borrow across `send` prevents an unbounded number of pending
+/// producers from parking payloads outside the bounded channel. There is no
+/// `Clone` implementation or escape hatch to the raw mpsc sender.
+pub struct IncomingBodySender {
+    tx: tokio::sync::mpsc::Sender<MeteredRequestFrame>,
+    metrics: Option<ConcurrencyMetrics>,
+    max_chunk_bytes: usize,
+}
+
+struct RequestBodyBufferTicket {
+    metrics: Option<ConcurrencyMetrics>,
+    bytes: usize,
+}
+
+impl RequestBodyBufferTicket {
+    fn new(metrics: Option<ConcurrencyMetrics>, bytes: usize) -> Self {
+        if let Some(metrics) = &metrics {
+            metrics.add_request_body_buffer(bytes as i64);
+        }
+        Self { metrics, bytes }
+    }
+}
+
+impl Drop for RequestBodyBufferTicket {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.add_request_body_buffer(-(self.bytes as i64));
+        }
+    }
+}
+
+struct MeteredRequestFrame {
+    payload: Result<Vec<u8>, std::io::Error>,
+    ticket: RequestBodyBufferTicket,
+}
+
+impl IncomingBodySender {
+    /// Count the owned allocation immediately, including an unpolled or
+    /// backpressured send future. Cancellation, closed receivers, and queued
+    /// frame drops all release the same ticket exactly once.
+    ///
+    /// `Vec::capacity`, not Content-Length or Vec::len, is counted: a short
+    /// slice retained in an object-sized allocation is still object-sized.
+    /// Oversized allocations are rejected and dropped before returning the
+    /// future. A send error does not hand an unmetered allocation back out.
+    pub fn send(
+        &mut self,
+        payload: Result<Vec<u8>, std::io::Error>,
+    ) -> impl Future<Output = std::io::Result<()>> + Send + '_ {
+        let bytes = payload.as_ref().map_or(0, Vec::capacity);
+        let frame = if bytes > self.max_chunk_bytes {
+            drop(payload);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "request channel chunk allocation exceeds its bound",
+            ))
+        } else {
+            Ok(MeteredRequestFrame {
+                payload,
+                ticket: RequestBodyBufferTicket::new(self.metrics.clone(), bytes),
+            })
+        };
+        async move {
+            self.tx.send(frame?).await.map_err(|error| {
+                // Dropping SendError also drops its frame and metric ticket.
+                drop(error);
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "request channel receiver closed",
+                )
+            })
+        }
+    }
 }
 
 /// One capability-bearing informational response requested by a native async
@@ -930,9 +1007,17 @@ pub(crate) struct AsyncInterimCommand {
 
 enum IncomingInner {
     Hyper(hyper::body::Incoming),
-    Memory { data: Vec<u8>, pos: usize },
+    Memory {
+        data: Vec<u8>,
+        pos: usize,
+    },
     Channel {
         rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        _scope: Option<swift_runtime::TaskScope>,
+        content_length: Option<u64>,
+    },
+    MeteredChannel {
+        rx: tokio::sync::mpsc::Receiver<MeteredRequestFrame>,
         _scope: Option<swift_runtime::TaskScope>,
         content_length: Option<u64>,
     },
@@ -956,6 +1041,7 @@ impl IncomingBody {
             on_upgrade: None,
             metrics: ConcurrencyMetrics::current(),
             buffered: 0,
+            channel_inflight: None,
             async_interim: None,
         }
     }
@@ -975,23 +1061,30 @@ impl IncomingBody {
             on_upgrade: None,
             metrics,
             buffered,
+            channel_inflight: None,
             async_interim: None,
         }
     }
 
     /// Drive a [`crate::Body::Channel`] as a request body (COPY source GET
     /// teed into a destination PUT without materializing the object).
+    ///
+    /// Legacy raw-channel adapter: the receiver cannot observe allocations
+    /// owned by senders or queued payload lengths.
+    ///
+    /// Content-Length is protocol metadata only. This constructor must not
+    /// charge `request_body_buffer_bytes` with the declared object length —
+    /// that number is not memory occupancy. New request producers must use
+    /// [`Self::metered_channel`]. COPY adapters still use this until a
+    /// metered response-body handoff exists; their occupancy is therefore
+    /// uncounted, not falsely counted as the whole object.
     pub fn from_channel(
         rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
         content_length: Option<u64>,
         scope: Option<swift_runtime::TaskScope>,
         max_body: u64,
     ) -> Self {
-        let buffered = content_length.unwrap_or(0) as usize;
         let metrics = ConcurrencyMetrics::current();
-        if let Some(ref m) = metrics {
-            m.add_request_body_buffer(buffered as i64);
-        }
         Self {
             inner: IncomingInner::Channel {
                 rx,
@@ -1004,9 +1097,70 @@ impl IncomingBody {
             upload_lifetime: None,
             on_upgrade: None,
             metrics,
-            buffered,
+            buffered: 0,
+            channel_inflight: None,
             async_interim: None,
         }
+    }
+
+    /// Construct a bounded incoming channel and its single metered producer.
+    ///
+    /// Content-Length is protocol metadata only, never an allocation charge.
+    /// Actual queued and pending-send allocations are counted from the moment
+    /// `send` takes ownership, using the registry current at construction.
+    /// The current returned chunk remains charged until the next pull/drop.
+    /// Bind the server's ConcurrencyMetrics before constructing this pair.
+    ///
+    /// With a consumer retaining at most one returned chunk, owned payload
+    /// memory is at most `(capacity + 2) * max_chunk_bytes`: the queue, one
+    /// pending send, and one current consumer chunk. This is not a metric for
+    /// arbitrary retained caller allocations or a transform's private window.
+    pub fn metered_channel(
+        capacity: usize,
+        max_chunk_bytes: usize,
+        content_length: Option<u64>,
+        scope: Option<swift_runtime::TaskScope>,
+        max_body: u64,
+    ) -> std::io::Result<(IncomingBodySender, Self)> {
+        let bound = capacity
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(max_chunk_bytes));
+        if capacity == 0
+            || capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || max_chunk_bytes == 0
+            || max_chunk_bytes > STREAM_CHUNK
+            || !bound.is_some_and(|n| n <= i64::MAX as usize)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid request channel bounds",
+            ));
+        }
+        let metrics = ConcurrencyMetrics::current();
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        Ok((
+            IncomingBodySender {
+                tx,
+                metrics: metrics.clone(),
+                max_chunk_bytes,
+            },
+            Self {
+                inner: IncomingInner::MeteredChannel {
+                    rx,
+                    _scope: scope,
+                    content_length,
+                },
+                max_body,
+                decoded: 0,
+                body_idle: None,
+                upload_lifetime: None,
+                on_upgrade: None,
+                metrics,
+                buffered: 0,
+                channel_inflight: None,
+                async_interim: None,
+            },
+        ))
     }
 
     pub(crate) fn attach_async_interim(
@@ -1076,6 +1230,7 @@ impl IncomingBody {
             on_upgrade: None,
             metrics,
             buffered: 0,
+            channel_inflight: None,
             async_interim,
         }
     }
@@ -1104,12 +1259,17 @@ impl IncomingBody {
         match &self.inner {
             IncomingInner::Memory { data, pos } => Some((data.len().saturating_sub(*pos)) as u64),
             IncomingInner::Hyper(incoming) => http_body::Body::size_hint(incoming).exact(),
-            IncomingInner::Channel { content_length, .. } => *content_length,
+            IncomingInner::Channel { content_length, .. }
+            | IncomingInner::MeteredChannel { content_length, .. } => *content_length,
             IncomingInner::Transform { decoded_len, .. } => *decoded_len,
         }
     }
 
     pub async fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        // Pulling again transfers responsibility for the preceding returned
+        // Vec to the caller's bounded domain. A timed-out/cancelled next pull
+        // must not retain the previous chunk's metric ticket indefinitely.
+        drop(self.channel_inflight.take());
         if self
             .upload_lifetime
             .as_ref()
@@ -1138,7 +1298,7 @@ impl IncomingBody {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "body idle timeout",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -1222,6 +1382,21 @@ impl IncomingBody {
                 Some(Err(e)) => Err(e),
                 None => Ok(None),
             },
+            IncomingInner::MeteredChannel { rx, .. } => match rx.recv().await {
+                Some(MeteredRequestFrame { payload, ticket }) => {
+                    let chunk = payload?;
+                    if chunk.is_empty() {
+                        return Ok(None);
+                    }
+                    self.decoded = self.decoded.saturating_add(chunk.len() as u64);
+                    if self.decoded > self.max_body {
+                        return Err(too_large_error());
+                    }
+                    self.channel_inflight = Some(ticket);
+                    Ok(Some(chunk))
+                }
+                None => Ok(None),
+            },
             IncomingInner::Transform {
                 source,
                 xform,
@@ -1277,6 +1452,7 @@ impl IncomingBody {
 
 impl Drop for IncomingBody {
     fn drop(&mut self) {
+        drop(self.channel_inflight.take());
         if self.buffered > 0 {
             if let Some(ref m) = self.metrics {
                 m.add_request_body_buffer(-(self.buffered as i64));
@@ -1353,7 +1529,11 @@ async fn read_head_async(
         if empty {
             break;
         }
-        if acc.len() > config.max_header_bytes.saturating_add(config.max_request_line_bytes) {
+        if acc.len()
+            > config
+                .max_header_bytes
+                .saturating_add(config.max_request_line_bytes)
+        {
             return Err(ProtocolError::Http(400, "request headers too large"));
         }
     }
@@ -2292,6 +2472,338 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
+    fn production_http_pumps_use_metered_channel_not_legacy_occupancy() {
+        let hyper = include_str!("hyper_serve.rs");
+        let prod = hyper.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            prod.contains("IncomingBody::metered_channel"),
+            "production HTTP pumps must meter occupancy"
+        );
+        assert!(
+            !prod.contains("IncomingBody::from_channel"),
+            "production HTTP pumps must not use the uncounted Content-Length channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_channel_does_not_charge_declared_object_length() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let baseline = IncomingBody::from_bytes(vec![0; 37], u64::MAX);
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
+                let declared = 64 * 1024 * 1024;
+                let mut body = IncomingBody::from_channel(rx, Some(declared), None, u64::MAX);
+                assert_eq!(body.content_length(), Some(declared));
+                assert_eq!(
+                    metrics.snapshot().request_body_buffer_bytes,
+                    37,
+                    "Content-Length is not memory occupancy"
+                );
+                tx.send(Ok(vec![7; 19])).await.unwrap();
+                let chunk = body.next_chunk().await.unwrap().unwrap();
+                assert_eq!(chunk, vec![7; 19]);
+                assert_eq!(
+                    metrics.snapshot().request_body_buffer_bytes,
+                    37,
+                    "legacy channel occupancy stays uncounted, not object-sized"
+                );
+                drop((baseline, body, tx));
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_counts_allocations_not_declared_length() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let baseline = IncomingBody::from_bytes(vec![0; 37], u64::MAX);
+                for declared in [None, Some(65 * 1024 * 1024 + 17)] {
+                    let (mut tx, mut body) =
+                        IncomingBody::metered_channel(2, STREAM_CHUNK, declared, None, u64::MAX)
+                            .unwrap();
+                    assert_eq!(body.content_length(), declared);
+                    assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37);
+                    let mut first = Vec::with_capacity(4096);
+                    first.extend_from_slice(b"abc");
+                    tx.send(Ok(first)).await.unwrap();
+                    tx.send(Ok(vec![9; 2048])).await.unwrap();
+                    assert_eq!(
+                        metrics.snapshot().request_body_buffer_bytes,
+                        37 + 4096 + 2048
+                    );
+                    let first = body.next_chunk().await.unwrap().unwrap();
+                    assert_eq!(first, b"abc");
+                    assert_eq!(
+                        metrics.snapshot().request_body_buffer_bytes,
+                        37 + 4096 + 2048
+                    );
+                    drop(first);
+                    let second = body.next_chunk().await.unwrap().unwrap();
+                    assert_eq!(second, vec![9; 2048]);
+                    assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37 + 2048);
+                    drop(second);
+                    drop(tx);
+                    assert!(body.next_chunk().await.unwrap().is_none());
+                    assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37);
+                    drop(body);
+                    assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37);
+                }
+                drop(baseline);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_unpolled_send_cancellation_releases_ticket() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let (mut tx, body) =
+                    IncomingBody::metered_channel(1, STREAM_CHUNK, None, None, u64::MAX).unwrap();
+                tx.send(Ok(vec![1; 19])).await.unwrap();
+                let pending = tx.send(Ok(vec![2; 23]));
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 42);
+                drop(pending);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 19);
+                drop(body);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_backpressured_send_closed_receiver_releases_once() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let baseline = IncomingBody::from_bytes(vec![0; 37], u64::MAX);
+                let (mut tx, body) =
+                    IncomingBody::metered_channel(1, STREAM_CHUNK, None, None, u64::MAX).unwrap();
+                tx.send(Ok(vec![1; 19])).await.unwrap();
+                let mut pending = Box::pin(tx.send(Ok(vec![2; 23])));
+                std::future::poll_fn(|cx| match pending.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Ready(()),
+                    Poll::Ready(_) => panic!("full request queue did not backpressure"),
+                })
+                .await;
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37 + 42);
+                drop(body);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37 + 23);
+                assert_eq!(
+                    pending.await.unwrap_err().kind(),
+                    std::io::ErrorKind::BrokenPipe
+                );
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 37);
+                drop(baseline);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_rejects_invalid_bounds_and_oversized_allocations() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                for (capacity, bytes) in [(0, 1), (1, 0), (1, STREAM_CHUNK + 1), (usize::MAX, 1)] {
+                    assert!(
+                        IncomingBody::metered_channel(capacity, bytes, None, None, u64::MAX)
+                            .is_err()
+                    );
+                }
+                let (mut tx, mut body) =
+                    IncomingBody::metered_channel(1, 1024, None, None, u64::MAX).unwrap();
+                let mut short_but_large_allocation = Vec::with_capacity(2048);
+                short_but_large_allocation.push(1);
+                let rejected = tx.send(Ok(short_but_large_allocation));
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+                assert_eq!(
+                    rejected.await.unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                tx.send(Ok(vec![7; 1024])).await.unwrap();
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 1024);
+                assert_eq!(body.next_chunk().await.unwrap().unwrap(), vec![7; 1024]);
+                drop(body);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_error_and_body_limit_do_not_leak_queue_tickets() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let (mut tx, mut body) =
+                    IncomingBody::metered_channel(2, STREAM_CHUNK, None, None, u64::MAX).unwrap();
+                tx.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "test",
+                )))
+                .await
+                .unwrap();
+                tx.send(Ok(vec![3; 31])).await.unwrap();
+                assert_eq!(
+                    body.next_chunk().await.unwrap_err().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 31);
+                drop(body);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+                let (mut tx, mut body) =
+                    IncomingBody::metered_channel(2, STREAM_CHUNK, Some(2), None, 1).unwrap();
+                tx.send(Ok(vec![4; 2])).await.unwrap();
+                tx.send(Ok(vec![5; 31])).await.unwrap();
+                assert!(body_too_large(&body.next_chunk().await.unwrap_err()));
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 31);
+                drop(body);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_task_abort_releases_queued_and_current_chunk() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let (mut tx, mut body) =
+                    IncomingBody::metered_channel(2, STREAM_CHUNK, None, None, u64::MAX).unwrap();
+                tx.send(Ok(vec![1; 19])).await.unwrap();
+                tx.send(Ok(vec![2; 23])).await.unwrap();
+                let (entered, observed) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let chunk = body.next_chunk().await.unwrap().unwrap();
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(chunk);
+                    drop(body);
+                });
+                observed.await.unwrap();
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 42);
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+                assert!(tx.send(Ok(vec![3; 17])).await.is_err());
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_timeout_then_drop_releases_unconsumed_queue() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let (mut tx, mut body) =
+                    IncomingBody::metered_channel(1, STREAM_CHUNK, None, None, u64::MAX).unwrap();
+                tx.send(Ok(vec![1; 19])).await.unwrap();
+                body.set_body_idle(swift_runtime::BodyIdleDeadline::from_timeout(
+                    Duration::ZERO,
+                ));
+                assert_eq!(
+                    body.next_chunk().await.unwrap_err().kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 19);
+                drop(body);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_ticket_keeps_construction_registry_across_tasks() {
+        let metrics = ConcurrencyMetrics::new();
+        let foreign = ConcurrencyMetrics::new();
+        let (mut tx, body) = metrics
+            .bind(async {
+                IncomingBody::metered_channel(1, STREAM_CHUNK, None, None, u64::MAX).unwrap()
+            })
+            .await;
+        foreign
+            .bind(async { tx.send(Ok(vec![1; 19])).await })
+            .await
+            .unwrap();
+        assert_eq!(metrics.snapshot().request_body_buffer_bytes, 19);
+        assert_eq!(foreign.snapshot().request_body_buffer_bytes, 0);
+        tokio::spawn(async move { drop(body) }).await.unwrap();
+        assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+        assert_eq!(foreign.snapshot().request_body_buffer_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn metered_incoming_65mib_stream_has_real_nonzero_bounded_peak() {
+        const TOTAL: usize = 65 * 1024 * 1024 + 17;
+        const CAPACITY: usize = 2;
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let (mut tx, mut body) = IncomingBody::metered_channel(
+                    CAPACITY,
+                    STREAM_CHUNK,
+                    Some(TOTAL as u64),
+                    None,
+                    TOTAL as u64,
+                )
+                .unwrap();
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+                let producer_metrics = metrics.clone();
+                let (filled, observed) = tokio::sync::oneshot::channel();
+                let (resume, resumed) = tokio::sync::oneshot::channel();
+                let producer = tokio::spawn(async move {
+                    let mut filled = Some(filled);
+                    let mut resumed = Some(resumed);
+                    let mut offset = 0;
+                    while offset < TOTAL {
+                        let n = STREAM_CHUNK.min(TOTAL - offset);
+                        let chunk: Vec<u8> =
+                            (offset..offset + n).map(|i| (i % 251) as u8).collect();
+                        tx.send(Ok(chunk)).await.unwrap();
+                        offset += n;
+                        assert!(
+                            producer_metrics.snapshot().request_body_buffer_bytes
+                                <= ((CAPACITY + 2) * STREAM_CHUNK) as u64
+                        );
+                        if offset == CAPACITY * STREAM_CHUNK {
+                            filled.take().unwrap().send(()).unwrap();
+                            resumed.take().unwrap().await.unwrap();
+                        }
+                    }
+                });
+                observed.await.unwrap();
+                assert_eq!(
+                    metrics.snapshot().request_body_buffer_bytes,
+                    (CAPACITY * STREAM_CHUNK) as u64
+                );
+                resume.send(()).unwrap();
+                let mut offset = 0;
+                let mut peak = metrics.snapshot().request_body_buffer_bytes;
+                while let Some(chunk) = body.next_chunk().await.unwrap() {
+                    assert!(!chunk.is_empty() && chunk.len() <= STREAM_CHUNK);
+                    assert!(chunk
+                        .iter()
+                        .enumerate()
+                        .all(|(i, byte)| *byte == ((offset + i) % 251) as u8));
+                    offset += chunk.len();
+                    peak = peak.max(metrics.snapshot().request_body_buffer_bytes);
+                    assert!(peak <= ((CAPACITY + 2) * STREAM_CHUNK) as u64);
+                }
+                producer.await.unwrap();
+                assert_eq!(offset, TOTAL);
+                assert!(peak >= (CAPACITY * STREAM_CHUNK) as u64);
+                assert!(peak < 8 * 1024 * 1024);
+                assert_eq!(metrics.snapshot().request_body_buffer_bytes, 0);
+            })
+            .await;
+    }
+
+    #[test]
     fn bind_listener_always_enables_reuseaddr() {
         let listener = bind_listener("127.0.0.1:0", false).unwrap();
         let mut enabled: libc::c_int = 0;
@@ -3004,6 +3516,69 @@ mod tests {
     }
 
     #[test]
+    fn isolated_identity_sized_put_without_expect_completes() {
+        // Field `/workspace/rebuild-nondurable-4e284ae/` (2026-09-06):
+        // IsolatedIdentity rust_http_send_body Content-Length + 64KiB
+        // writes of 3735552 bytes got BrokenPipe. Production serve peeks
+        // the head then hands leftover body to Hyper; header-sized
+        // max_buf reset the socket. This is that PUT on the Hyper path.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = ServerConfig {
+            worker_threads: 2,
+            shutdown: Some(Arc::clone(&shutdown)),
+            ..ServerConfig::default()
+        };
+        let payload_len = 3_735_552usize;
+        let seen = Arc::new(Mutex::new(0usize));
+        let seen_c = Arc::clone(&seen);
+        let handler: Handler = Arc::new(move |mut request: Request| {
+            match request.body.materialize(u64::MAX) {
+                Ok(body) => {
+                    *seen_c.lock().unwrap() = body.len();
+                    Response::new(201)
+                }
+                Err(error) => Response::error(500, &error.to_string()),
+            }
+        });
+        let server =
+            std::thread::spawn(move || serve_forever_with_config(listener, handler, config));
+        let mut client = TcpStream::connect(address).unwrap();
+        let _ = client.set_nodelay(true);
+        client
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "PUT /v1/AUTH_ec/c/o HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Length: {payload_len}\r\nX-Backend-No-Commit: True\r\n\
+             Connection: close\r\n\r\n"
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut left = payload_len;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            client.write_all(&chunk[..n]).unwrap();
+            left -= n;
+        }
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        assert_eq!(
+            status(&response),
+            201,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(*seen.lock().unwrap(), payload_len);
+    }
+
+    #[test]
     fn shutdown_flag_stops_the_accept_loop_after_draining() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3153,7 +3728,10 @@ mod tests {
             .unwrap();
         let accepted_deadline = Instant::now() + Duration::from_secs(2);
         while metrics.snapshot().runtime_tasks == 0 {
-            assert!(Instant::now() < accepted_deadline, "connection was not accepted");
+            assert!(
+                Instant::now() < accepted_deadline,
+                "connection was not accepted"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
 

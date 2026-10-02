@@ -31,8 +31,8 @@ use swift_core::statsd::StatsdClient;
 use swift_ring::{Ring, RingData};
 
 fn parse_conf_file(path: &str) -> Result<SwiftConfig, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read {path}: {error}"))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("could not read {path}: {error}"))?;
     SwiftConfig::parse_lenient(&content, &[], false)
         .map_err(|error| format!("could not parse {path}: {error}"))
 }

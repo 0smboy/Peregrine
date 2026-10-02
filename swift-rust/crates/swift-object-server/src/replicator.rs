@@ -20,22 +20,43 @@
 //!
 //! The loop walks every partition directory on a local device. For a partition
 //! the local device is a *primary* for, it fetches each peer primary's suffix
-//! hashes via the REPLICATE verb, rsyncs the suffix dirs whose hashes differ,
-//! then asks the peer to invalidate+rehash them (Python `update`). For a
+//! hashes via the REPLICATE verb, then SSYNCs the suffix dirs whose hashes
+//! differ (Python `update`). For a
 //! partition the local device is *not* a primary for (a handoff holding a
-//! misplaced partition), it rsyncs every suffix to all primaries and, if all
-//! succeed, deletes the local copy (Python `update_deleted`, "revert").
+//! misplaced partition), it SSYNCs every suffix to all primaries and deletes
+//! only source generations that every primary confirms at identical logical
+//! timestamps (Python `update_deleted`, "revert").
 //!
 //! The peer-hash RPC and the suffix transfer are pluggable traits so the
 //! decision logic is unit-tested without a live cluster or a real rsync; the
-//! HTTP/rsync adapters live in the `swift-object-replicator` binary.
+//! HTTP/SSYNC adapters live in the `swift-object-replicator` binary.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use swift_core::pickle::{self, Value};
-use swift_diskfile::{get_data_dir, get_partition_hashes, get_tmp_dir, CleanupConfig, PolicyKind};
+use swift_diskfile::{
+    get_data_dir, get_partition_hashes, get_tmp_dir, invalidate_hash, CleanupConfig, PolicyKind,
+};
 use swift_ring::{Ring, RingDevice};
+
+use crate::ssync_sender::{object_timestamps_from_hash_dir, ObjectTimestamps, SenderReport};
+
+/// Replication suffix hashes. `None` is meaningful: the suffix exists but its
+/// digest is invalidated or could not be recalculated. It must not collapse
+/// into "suffix absent", because absence on both sides would silently suppress
+/// the repair attempt.
+pub type SuffixHashMap = HashMap<String, Option<String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuffixHashError {
+    /// HTTP 507: the target's device is unmounted, so the primary slot must be
+    /// retried on a handoff node.
+    InsufficientStorage,
+    /// Transport, protocol, parse, or any other status failure.
+    Failed,
+}
 
 /// Peer suffix-hash RPC (the object-server REPLICATE verb), pluggable so the
 /// loop is testable without a live peer.
@@ -48,34 +69,24 @@ pub trait SuffixHashClient {
         device: &str,
         partition: u32,
         policy_index: u32,
-    ) -> Option<HashMap<String, String>>;
+    ) -> Result<SuffixHashMap, SuffixHashError>;
+}
 
-    /// REPLICATE `/<device>/<partition>/<s1-s2-...>`: ask the peer to
-    /// invalidate + rehash the named suffixes after a sync. Returns success.
-    fn peer_rehash(
+/// Partition suffix transfer (SSYNC), pluggable so the loop is testable
+/// without a live peer.
+pub trait SuffixSyncer {
+    /// Reconcile the selected suffixes with one peer in a single SSYNC
+    /// session. A successful report carries only object states confirmed
+    /// present on the receiver. `None` means transport or protocol failure.
+    fn sync_suffixes(
         &self,
+        local_partition_dir: &Path,
         peer: &RingDevice,
         device: &str,
         partition: u32,
         suffixes: &[String],
         policy_index: u32,
-    ) -> bool;
-}
-
-/// Suffix-directory transfer (rsync), pluggable so the loop is testable
-/// without a real rsync.
-pub trait SuffixSyncer {
-    /// Push one suffix directory to the peer's partition directory. Returns
-    /// success.
-    fn sync_suffix(
-        &self,
-        local_suffix_dir: &Path,
-        peer: &RingDevice,
-        device: &str,
-        partition: u32,
-        suffix: &str,
-        policy_index: u32,
-    ) -> bool;
+    ) -> Option<SenderReport>;
 }
 
 /// Per-pass stats (a subset of Python replicator `stats`).
@@ -89,21 +100,77 @@ pub struct ReplicatorStats {
     pub reverts: u64,
     /// Peers/partitions that failed a step.
     pub failures: u64,
+    /// The pass stopped before another job because its ring file changed.
+    /// Continuing with the old primary set could authorize an unsafe handoff
+    /// purge after a rebalance.
+    pub aborted_ring_change: bool,
+    /// The pass stopped because the local device no longer satisfied the
+    /// configured drive/mount contract.
+    pub aborted_device: bool,
+    /// Replication is deliberately disabled while a partition-power increase
+    /// is in progress because both old and new layouts are hard-linked and a
+    /// normal replication pass cannot safely distinguish them.
+    pub skipped_next_part_power: bool,
 }
 
-/// Parse a pickled `{suffix: md5hex}` dict into a map, keeping only
-/// string->string pairs (Python may store `None` for a suffix pending rehash).
-pub fn hashes_from_pickle(body: &[u8]) -> Option<HashMap<String, String>> {
-    dict_value_to_map(pickle::loads(body).ok()?)
+/// Result of the daemon's safety checks immediately before each partition
+/// job. Python performs these checks per job, not merely once per sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationJobGuard {
+    Continue,
+    RingChanged,
+    DeviceUnavailable,
 }
 
-fn dict_value_to_map(value: Value) -> Option<HashMap<String, String>> {
+/// Decode a bounded `{suffix: md5hex | None}` response. Invalid wire data
+/// must not become an apparently empty or partially populated peer.
+pub fn hashes_from_pickle(body: &[u8]) -> Option<SuffixHashMap> {
+    dict_value_to_map(decode_suffix_hashes(body)?)
+}
+
+pub(crate) fn decode_suffix_hashes(body: &[u8]) -> Option<Value> {
+    pickle::loads_with_limits(
+        body,
+        pickle::DecodeLimits {
+            max_container_depth: 4,
+            ..pickle::DecodeLimits::default()
+        },
+    )
+    .ok()
+}
+
+pub(crate) fn suffix_ascii_string(value: Value) -> Option<String> {
+    match value {
+        Value::Str(value) if value.is_ascii() => Some(value),
+        Value::Bytes(value) if value.is_ascii() => String::from_utf8(value).ok(),
+        _ => None,
+    }
+}
+
+fn dict_value_to_map(value: Value) -> Option<SuffixHashMap> {
     match value {
         Value::Dict(pairs) => {
+            if pairs.len() > 4096 {
+                return None;
+            }
             let mut out = HashMap::new();
             for (k, v) in pairs {
-                if let (Value::Str(k), Value::Str(v)) = (k, v) {
-                    out.insert(k, v);
+                let k = suffix_ascii_string(k)?;
+                if !is_lower_hex(&k, 3) {
+                    return None;
+                }
+                let value = match v {
+                    Value::None => None,
+                    value => {
+                        let hash = suffix_ascii_string(value)?;
+                        if !is_lower_hex(&hash, 32) {
+                            return None;
+                        }
+                        Some(hash)
+                    }
+                };
+                if out.insert(k, value).is_some() {
+                    return None;
                 }
             }
             Some(out)
@@ -116,10 +183,7 @@ fn dict_value_to_map(value: Value) -> Option<HashMap<String, String>> {
 /// the peer. Suffixes the peer has but we do not are the peer's job to push to
 /// us on its own pass, so they are ignored here (Python compares in this same
 /// local-drives-the-diff direction). Returned sorted for determinism.
-pub fn divergent_suffixes(
-    local: &HashMap<String, String>,
-    remote: &HashMap<String, String>,
-) -> Vec<String> {
+pub fn divergent_suffixes(local: &SuffixHashMap, remote: &SuffixHashMap) -> Vec<String> {
     let mut out: Vec<String> = local
         .iter()
         .filter(|(suffix, hash)| remote.get(*suffix) != Some(*hash))
@@ -154,15 +218,18 @@ fn local_hashes(
     partition_path: &Path,
     policy: PolicyKind,
     cleanup: &CleanupConfig,
-) -> HashMap<String, String> {
-    match get_partition_hashes(partition_path, policy, &[], false, cleanup) {
-        Ok((_hashed, hashes)) => dict_value_to_map(hashes.to_value()).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+    recalculate: &[String],
+) -> Option<SuffixHashMap> {
+    match get_partition_hashes(partition_path, policy, recalculate, false, cleanup) {
+        Ok((_hashed, hashes)) => dict_value_to_map(hashes.to_value()),
+        Err(_) => None,
     }
 }
 
-/// Python `update`: the local device is a primary for this partition. Push the
-/// divergent suffixes to every other primary and trigger a rehash there.
+/// Python `update`: the local device is a primary for this partition. SSYNC the
+/// divergent suffixes to every other primary. The receiver's ordinary object
+/// mutation path invalidates its suffix hash; a second REPLICATE rehash RPC is
+/// an rsync-era operation and would race the SSYNC receiver's own updates.
 #[allow(clippy::too_many_arguments)]
 pub fn replicate_partition(
     partition_path: &Path,
@@ -172,17 +239,48 @@ pub fn replicate_partition(
     policy: PolicyKind,
     cleanup: &CleanupConfig,
     peers: &[&RingDevice],
+    handoffs: &[&RingDevice],
     hash_client: &dyn SuffixHashClient,
     syncer: &dyn SuffixSyncer,
     stats: &mut ReplicatorStats,
 ) {
-    let local = {
+    let Some(local) = ({
         let _scan =
             swift_core::stage::StageTimer::start("object-replicator", "replication", "scan");
-        local_hashes(partition_path, policy, cleanup)
+        local_hashes(partition_path, policy, cleanup, &[])
+    }) else {
+        stats.failures += 1;
+        return;
     };
-    for peer in peers {
-        let Some(remote) = hash_client.peer_hashes(peer, device, partition, policy_index) else {
+    let mut candidates = peers.iter().chain(handoffs.iter()).copied();
+    let mut attempts_left = peers.len();
+    while attempts_left > 0 {
+        let Some(peer) = candidates.next() else {
+            break;
+        };
+        attempts_left -= 1;
+        let remote = match hash_client.peer_hashes(peer, device, partition, policy_index) {
+            Ok(remote) => remote,
+            Err(SuffixHashError::InsufficientStorage) => {
+                stats.failures += 1;
+                // Replace this unavailable primary with the next handoff.
+                attempts_left += 1;
+                continue;
+            }
+            Err(SuffixHashError::Failed) => {
+                stats.failures += 1;
+                continue;
+            }
+        };
+        let diff = divergent_suffixes(&local, &remote);
+        if diff.is_empty() {
+            continue;
+        }
+        // Python `update`: rehash the candidate suffixes locally, then
+        // diff again. A stale hashes.pkl entry must not hide a newer
+        // primary .ts from an older handoff/peer .data (or the reverse).
+        // This is a local get_hashes(recalculate=), not a second REPLICATE.
+        let Some(local) = local_hashes(partition_path, policy, cleanup, &diff) else {
             stats.failures += 1;
             continue;
         };
@@ -190,45 +288,422 @@ pub fn replicate_partition(
         if diff.is_empty() {
             continue;
         }
-        let mut ok = true;
         {
             let _sync =
                 swift_core::stage::StageTimer::start("object-replicator", "replication", "sync");
-            for suffix in &diff {
-                if syncer.sync_suffix(
-                    &partition_path.join(suffix),
-                    peer,
-                    device,
-                    partition,
-                    suffix,
-                    policy_index,
-                ) {
-                    stats.suffix_syncs += 1;
-                } else {
-                    ok = false;
-                }
+            if syncer
+                .sync_suffixes(partition_path, peer, device, partition, &diff, policy_index)
+                .is_some()
+            {
+                stats.suffix_syncs += diff.len() as u64;
+            } else {
+                stats.failures += 1;
             }
-        }
-        // Only ask the peer to rehash once the pushes it depends on succeeded.
-        {
-            let _fin = swift_core::stage::StageTimer::start(
-                "object-replicator",
-                "replication",
-                "finalize",
-            );
-            if ok && !hash_client.peer_rehash(peer, device, partition, &diff, policy_index) {
-                ok = false;
-            }
-        }
-        if !ok {
-            stats.failures += 1;
         }
     }
 }
 
-/// Python `conf.replication_lock_timeout` default: seconds to wait for the
-/// partition 'replication' lock before skipping a handoff revert.
-const REPLICATION_LOCK_TIMEOUT: f64 = 15.0;
+/// Python's handoff revert lock budget: background replication must yield
+/// quickly to an incoming SSYNC receiver or a foreground mutation.
+const REPLICATION_LOCK_TIMEOUT: f64 = 0.2;
+
+/// Handoff cleanup is background work. If a foreground request owns an object
+/// stripe, leave that exact generation for the next pass rather than deleting
+/// from a stale snapshot or stalling the whole partition.
+const HANDOFF_OBJECT_LOCK_TIMEOUT: f64 = 0.2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    name: String,
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HashDirIdentity {
+    device: u64,
+    inode: u64,
+    files: Vec<FileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreObjectSnapshot {
+    suffix: String,
+    timestamps: Option<ObjectTimestamps>,
+    identity: HashDirIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectSnapshot {
+    suffix: String,
+    object_hash: String,
+    timestamps: ObjectTimestamps,
+    identity: HashDirIdentity,
+}
+
+const MAX_HANDOFF_CENSUS_OBJECTS: usize = 100_000;
+const MAX_HANDOFF_SNAPSHOT_FILES: usize = 1024;
+const MAX_HANDOFF_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Keep deletion attached to the opened directory even if an administrator
+/// replaces a mount or pathname during a maintenance pass.
+struct PinnedDirectory {
+    file: std::fs::File,
+    #[cfg(not(target_os = "linux"))]
+    path: PathBuf,
+}
+
+impl PinnedDirectory {
+    fn open(path: &Path) -> Option<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file,
+            #[cfg(not(target_os = "linux"))]
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", self.file.as_raw_fd()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.clone()
+        }
+    }
+}
+
+/// Derive the same logical timestamp tuple that the SSYNC sender offers during
+/// missing-check. A meta-only or otherwise invalid directory has no offerable
+/// object state and must never become handoff-deletion authority.
+fn current_object_timestamps(hash_dir: &Path) -> Option<ObjectTimestamps> {
+    object_timestamps_from_hash_dir(hash_dir, PolicyKind::Replication, None, None)
+}
+
+fn snapshot_hash_dir(hash_dir: &Path) -> Option<HashDirIdentity> {
+    let dir_metadata = hash_dir.symlink_metadata().ok()?;
+    if !dir_metadata.file_type().is_dir() {
+        return None;
+    }
+    let entries = std::fs::read_dir(hash_dir).ok()?;
+    let mut files = Vec::new();
+    for entry in entries {
+        if files.len() >= MAX_HANDOFF_SNAPSHOT_FILES {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let metadata = entry.path().symlink_metadata().ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        files.push(FileIdentity {
+            name: entry.file_name().to_str()?.to_string(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        });
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(HashDirIdentity {
+        device: dir_metadata.dev(),
+        inode: dir_metadata.ino(),
+        files,
+    })
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Strictly census every object directory before transfer. Unknown entries,
+/// symlinks and malformed suffix/hash layouts make the pass retry rather than
+/// silently treating an incompletely understood partition as empty.
+fn snapshot_all_object_files(
+    partition_path: &Path,
+    policy_index: u32,
+) -> Option<BTreeMap<String, PreObjectSnapshot>> {
+    snapshot_all_object_files_bounded(
+        partition_path,
+        policy_index,
+        MAX_HANDOFF_CENSUS_OBJECTS,
+        MAX_HANDOFF_SNAPSHOT_BYTES,
+    )
+}
+
+fn snapshot_all_object_files_bounded(
+    partition_path: &Path,
+    policy_index: u32,
+    max_objects: usize,
+    mut remaining_bytes: usize,
+) -> Option<BTreeMap<String, PreObjectSnapshot>> {
+    let device_path = partition_path.parent().and_then(Path::parent)?;
+    let lock_dir = device_path
+        .join(get_tmp_dir(policy_index))
+        .join("object-mutation-locks");
+    let mut snapshots = BTreeMap::new();
+    for partition_entry in std::fs::read_dir(partition_path).ok()? {
+        let partition_entry = partition_entry.ok()?;
+        let name = partition_entry.file_name().to_str()?.to_string();
+        let metadata = partition_entry.path().symlink_metadata().ok()?;
+        if metadata.file_type().is_file()
+            && matches!(
+                name.as_str(),
+                ".lock" | ".lock-replication" | "hashes.pkl" | "hashes.invalid"
+            )
+        {
+            continue;
+        }
+        if !metadata.file_type().is_dir() || !is_lower_hex(&name, 3) {
+            return None;
+        }
+        for hash_entry in std::fs::read_dir(partition_entry.path()).ok()? {
+            if snapshots.len() >= max_objects {
+                return None;
+            }
+            let hash_entry = hash_entry.ok()?;
+            let object_hash = hash_entry.file_name().to_str()?.to_string();
+            let hash_metadata = hash_entry.path().symlink_metadata().ok()?;
+            if !hash_metadata.file_type().is_dir()
+                || !is_lower_hex(&object_hash, 32)
+                || !object_hash.ends_with(&name)
+            {
+                return None;
+            }
+            let _mutation_guard = swift_core::lockutil::lock_path(
+                &lock_dir,
+                HANDOFF_OBJECT_LOCK_TIMEOUT,
+                Some(&format!("obj-{name}")),
+            )
+            .ok()?;
+            let snapshot = PreObjectSnapshot {
+                suffix: name.clone(),
+                timestamps: current_object_timestamps(&hash_entry.path()),
+                identity: snapshot_hash_dir(&hash_entry.path())?,
+            };
+            // Include allocation slack and map-node overhead. The largest
+            // temporary before this check is one bounded hash directory.
+            let file_bytes = snapshot
+                .identity
+                .files
+                .iter()
+                .try_fold(0usize, |sum, file| {
+                    sum.checked_add(2 * (std::mem::size_of::<FileIdentity>() + file.name.len()))
+                })?;
+            remaining_bytes = remaining_bytes.checked_sub(file_bytes.checked_add(512)?)?;
+            if snapshots.insert(object_hash, snapshot).is_some() {
+                return None;
+            }
+        }
+    }
+    Some(snapshots)
+}
+
+/// Empty-partition proof does not materialize any object census. Unknown
+/// entries and I/O failures retain the handoff for a later pass.
+fn partition_has_no_objects(partition_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(partition_path) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let Ok(metadata) = entry.path().symlink_metadata() else {
+            return false;
+        };
+        if metadata.is_file()
+            && matches!(
+                name,
+                ".lock" | ".lock-replication" | "hashes.pkl" | "hashes.invalid"
+            )
+        {
+            continue;
+        }
+        if !metadata.is_dir() || !is_lower_hex(name, 3) {
+            return false;
+        }
+        let Ok(mut hashes) = std::fs::read_dir(entry.path()) else {
+            return false;
+        };
+        if hashes.next().is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Freeze only source generations that SSYNC successfully confirmed on every
+/// required primary. A generation changed after SSYNC is omitted here and will
+/// remain for the next replicator pass.
+fn snapshot_confirmed_objects(
+    partition_path: &Path,
+    confirmed: &BTreeMap<String, ObjectTimestamps>,
+    before_transfer: &BTreeMap<String, PreObjectSnapshot>,
+) -> Option<Vec<ObjectSnapshot>> {
+    let mut snapshots = Vec::new();
+    for (object_hash, expected_timestamps) in confirmed {
+        if !is_lower_hex(object_hash, 32) {
+            return None;
+        }
+        let suffix = object_hash[object_hash.len() - 3..].to_string();
+        let Some(before) = before_transfer.get(object_hash) else {
+            continue;
+        };
+        if before.suffix != suffix || before.timestamps.as_ref() != Some(expected_timestamps) {
+            continue;
+        }
+        let hash_dir = partition_path.join(&suffix).join(object_hash);
+        if current_object_timestamps(&hash_dir).as_ref() != Some(expected_timestamps) {
+            continue;
+        }
+        let Some(files) = snapshot_hash_dir(&hash_dir) else {
+            continue;
+        };
+        if files != before.identity {
+            continue;
+        }
+        snapshots.push(ObjectSnapshot {
+            suffix,
+            object_hash: object_hash.clone(),
+            timestamps: expected_timestamps.clone(),
+            identity: files,
+        });
+    }
+    Some(snapshots)
+}
+
+fn intersect_confirmations(
+    peer_confirmations: &[BTreeMap<String, ObjectTimestamps>],
+) -> BTreeMap<String, ObjectTimestamps> {
+    let Some((first, rest)) = peer_confirmations.split_first() else {
+        return BTreeMap::new();
+    };
+    let mut common = first.clone();
+    for confirmations in rest {
+        common.retain(|object_hash, timestamps| confirmations.get(object_hash) == Some(timestamps));
+    }
+    common
+}
+
+fn valid_confirmation_map(
+    confirmations: &BTreeMap<String, ObjectTimestamps>,
+    requested_suffixes: &[String],
+) -> bool {
+    confirmations.keys().all(|object_hash| {
+        is_lower_hex(object_hash, 32)
+            && requested_suffixes
+                .iter()
+                .any(|suffix| object_hash.ends_with(suffix))
+    })
+}
+
+/// Purge only the exact source generations observed before SSYNC. The
+/// partition directory and its persistent lock inode are intentionally kept;
+/// recursive partition deletion would let a waiter lock a replacement inode
+/// while an older holder still owns the unlinked one.
+fn purge_handoff_snapshot(
+    partition_path: &Path,
+    policy_index: u32,
+    snapshots: &[ObjectSnapshot],
+    before_each_object: &mut dyn FnMut() -> bool,
+) -> bool {
+    let Some(device_path) = partition_path.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let lock_dir = device_path
+        .join(get_tmp_dir(policy_index))
+        .join("object-mutation-locks");
+    let Some(partition_pin) = PinnedDirectory::open(partition_path) else {
+        return false;
+    };
+    let pinned_partition_path = partition_pin.path();
+    let mut complete = true;
+    for snapshot in snapshots {
+        let stripe = &snapshot.object_hash[snapshot.object_hash.len() - 3..];
+        let lock_name = format!("obj-{stripe}");
+        let Ok(_mutation_guard) = swift_core::lockutil::lock_path(
+            &lock_dir,
+            HANDOFF_OBJECT_LOCK_TIMEOUT,
+            Some(&lock_name),
+        ) else {
+            complete = false;
+            continue;
+        };
+        if !before_each_object() {
+            return false;
+        }
+        let suffix_dir = pinned_partition_path.join(&snapshot.suffix);
+        let Some(suffix_pin) = PinnedDirectory::open(&suffix_dir) else {
+            complete = false;
+            continue;
+        };
+        let requested_hash_dir = suffix_pin.path().join(&snapshot.object_hash);
+        let Some(hash_pin) = PinnedDirectory::open(&requested_hash_dir) else {
+            complete = false;
+            continue;
+        };
+        let hash_dir = hash_pin.path();
+        if current_object_timestamps(&hash_dir).as_ref() != Some(&snapshot.timestamps) {
+            complete = false;
+            continue;
+        }
+        let Some(current) = snapshot_hash_dir(&hash_dir) else {
+            if hash_dir.exists() {
+                complete = false;
+            }
+            continue;
+        };
+        if current != snapshot.identity {
+            complete = false;
+            continue;
+        }
+        let mut object_removed = true;
+        for file in &snapshot.identity.files {
+            if let Err(error) = std::fs::remove_file(hash_dir.join(&file.name)) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    object_removed = false;
+                }
+            }
+        }
+        if let Err(error) = std::fs::remove_dir(&requested_hash_dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                object_removed = false;
+            }
+        }
+        if invalidate_hash(&suffix_dir).is_err() {
+            object_removed = false;
+        }
+        if object_removed {
+            let _ = std::fs::remove_dir(&suffix_dir);
+        } else {
+            complete = false;
+        }
+    }
+    complete && before_each_object() && partition_has_no_objects(&pinned_partition_path)
+}
 
 /// Python `update_deleted` (revert): the local device is NOT a primary for this
 /// partition (it is a handoff). Push every suffix to every primary and, only if
@@ -241,13 +716,37 @@ pub fn revert_handoff(
     partition: u32,
     policy_index: u32,
     primaries: &[&RingDevice],
-    hash_client: &dyn SuffixHashClient,
     syncer: &dyn SuffixSyncer,
     stats: &mut ReplicatorStats,
 ) -> bool {
+    revert_handoff_guarded(
+        partition_path,
+        device,
+        partition,
+        policy_index,
+        primaries,
+        syncer,
+        stats,
+        &mut || true,
+    )
+}
+
+/// Guarded handoff revert. The caller revalidates the ring generation and
+/// local mount after the network phase but before any source deletion.
+#[allow(clippy::too_many_arguments)]
+pub fn revert_handoff_guarded(
+    partition_path: &Path,
+    device: &str,
+    partition: u32,
+    policy_index: u32,
+    primaries: &[&RingDevice],
+    syncer: &dyn SuffixSyncer,
+    stats: &mut ReplicatorStats,
+    before_purge: &mut dyn FnMut() -> bool,
+) -> bool {
     // Python `update_deleted` wraps the whole revert in the partition
     // 'replication' lock (`DiskFileManager.replication_lock`, default
-    // `replication_lock_timeout` 15s) so an incoming SSYNC/receiver on the
+    // short replication lock timeout) so an incoming SSYNC/receiver on the
     // same partition cannot race the delete. A timeout skips the handoff for
     // this pass — a lock-failure, not an error.
     let Ok(_lock) = swift_core::lockutil::lock_path(
@@ -257,37 +756,55 @@ pub fn revert_handoff(
     ) else {
         return false;
     };
+    let Some(before_transfer) = snapshot_all_object_files(partition_path, policy_index) else {
+        stats.failures += 1;
+        return false;
+    };
+    if before_transfer.is_empty() {
+        // Keep the persistent partition lock inode, but do not count the same
+        // lock-only directory as a newly reverted handoff on every pass.
+        return false;
+    }
     let suffixes = suffix_dirs(partition_path);
     let mut all_ok = !primaries.is_empty();
+    let mut peer_confirmations = Vec::new();
     for peer in primaries {
-        let mut peer_ok = true;
-        for suffix in &suffixes {
-            if syncer.sync_suffix(
-                &partition_path.join(suffix),
-                peer,
-                device,
-                partition,
-                suffix,
-                policy_index,
-            ) {
-                stats.suffix_syncs += 1;
-            } else {
-                peer_ok = false;
+        match syncer.sync_suffixes(
+            partition_path,
+            peer,
+            device,
+            partition,
+            &suffixes,
+            policy_index,
+        ) {
+            Some(report)
+                if !report.limited_by_max_objects
+                    && valid_confirmation_map(&report.can_delete_objs, &suffixes) =>
+            {
+                stats.suffix_syncs += suffixes.len() as u64;
+                peer_confirmations.push(report.can_delete_objs);
             }
-        }
-        if peer_ok
-            && !suffixes.is_empty()
-            && !hash_client.peer_rehash(peer, device, partition, &suffixes, policy_index)
-        {
-            peer_ok = false;
-        }
-        if !peer_ok {
-            all_ok = false;
+            Some(_) | None => all_ok = false,
         }
     }
-    if all_ok && std::fs::remove_dir_all(partition_path).is_ok() {
-        stats.reverts += 1;
-        return true;
+    if all_ok {
+        if !before_purge() {
+            // Ring generation or mount ownership changed while SSYNC was in
+            // flight. The remote copies may be useful, but none of that work
+            // authorizes deletion under the old topology.
+            return false;
+        }
+        let confirmed = intersect_confirmations(&peer_confirmations);
+        let Some(snapshot) =
+            snapshot_confirmed_objects(partition_path, &confirmed, &before_transfer)
+        else {
+            stats.failures += 1;
+            return false;
+        };
+        if purge_handoff_snapshot(partition_path, policy_index, &snapshot, before_purge) {
+            stats.reverts += 1;
+            return true;
+        }
     }
     stats.failures += 1;
     false
@@ -332,7 +849,42 @@ pub fn run_once(
     hash_client: &dyn SuffixHashClient,
     syncer: &dyn SuffixSyncer,
 ) -> ReplicatorStats {
+    run_once_guarded(
+        device_dir,
+        device,
+        policy_index,
+        policy,
+        cleanup,
+        ring,
+        local_id,
+        hash_client,
+        syncer,
+        &mut || ReplicationJobGuard::Continue,
+    )
+}
+
+/// One replication pass with a fail-closed check immediately before every
+/// partition job. The daemon uses this to abort on ring replacement or a lost
+/// mount; the simpler [`run_once`] remains useful for deterministic library
+/// tests and callers with an immutable in-memory ring.
+#[allow(clippy::too_many_arguments)]
+pub fn run_once_guarded(
+    device_dir: &Path,
+    device: &str,
+    policy_index: u32,
+    policy: PolicyKind,
+    cleanup: &CleanupConfig,
+    ring: &Ring,
+    local_id: u64,
+    hash_client: &dyn SuffixHashClient,
+    syncer: &dyn SuffixSyncer,
+    job_guard: &mut dyn FnMut() -> ReplicationJobGuard,
+) -> ReplicatorStats {
     let mut stats = ReplicatorStats::default();
+    if ring.next_part_power().is_some() {
+        stats.skipped_next_part_power = true;
+        return stats;
+    }
     // replicator.py 855-857: before scanning partitions, each pass reaps the
     // temp files that crashed PUTs orphaned in the device tmp dir, once they
     // are older than reclaim_age.
@@ -362,6 +914,18 @@ pub fn run_once(
         else {
             continue;
         };
+        match job_guard() {
+            ReplicationJobGuard::Continue => {}
+            ReplicationJobGuard::RingChanged => {
+                stats.aborted_ring_change = true;
+                return stats;
+            }
+            ReplicationJobGuard::DeviceUnavailable => {
+                stats.aborted_device = true;
+                stats.failures += 1;
+                return stats;
+            }
+        }
         stats.partitions += 1;
         let Ok(nodes) = ring.get_part_nodes(partition) else {
             stats.failures += 1;
@@ -374,6 +938,13 @@ pub fn run_once(
                 .copied()
                 .filter(|d| d.id != local_id)
                 .collect();
+            let handoffs: Vec<&RingDevice> = match ring.get_more_nodes(partition) {
+                Ok(nodes) => nodes.into_iter().map(|node| node.dev).collect(),
+                Err(_) => {
+                    stats.failures += 1;
+                    Vec::new()
+                }
+            };
             replicate_partition(
                 &path,
                 device,
@@ -382,21 +953,38 @@ pub fn run_once(
                 policy,
                 cleanup,
                 &peers,
+                &handoffs,
                 hash_client,
                 syncer,
                 &mut stats,
             );
         } else {
-            revert_handoff(
+            let mut final_guard = ReplicationJobGuard::Continue;
+            revert_handoff_guarded(
                 &path,
                 device,
                 partition,
                 policy_index,
                 &primaries,
-                hash_client,
                 syncer,
                 &mut stats,
+                &mut || {
+                    final_guard = job_guard();
+                    final_guard == ReplicationJobGuard::Continue
+                },
             );
+            match final_guard {
+                ReplicationJobGuard::Continue => {}
+                ReplicationJobGuard::RingChanged => {
+                    stats.aborted_ring_change = true;
+                    return stats;
+                }
+                ReplicationJobGuard::DeviceUnavailable => {
+                    stats.aborted_device = true;
+                    stats.failures += 1;
+                    return stats;
+                }
+            }
         }
     }
     stats
@@ -405,6 +993,7 @@ pub fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use swift_core::hashing::HashPathConfig;
     use swift_ring::{RingData, RingDevice};
@@ -433,12 +1022,31 @@ mod tests {
         Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
     }
 
+    fn ring3_with_next_part_power() -> Ring {
+        let devs = vec![Some(dev(0)), Some(dev(1)), Some(dev(2))];
+        let r2p2d = vec![vec![0u32], vec![1u32], vec![2u32]];
+        let mut data = RingData::from_parts(devs, 32, r2p2d);
+        data.next_part_power = Some(1);
+        Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
+    }
+
+    /// Partition 0 primaries are 0/1/2; device 3 is discoverable as a handoff
+    /// through partition 1.
+    fn ring4_with_handoff() -> Ring {
+        let devs = vec![Some(dev(0)), Some(dev(1)), Some(dev(2)), Some(dev(3))];
+        let r2p2d = vec![vec![0u32, 3], vec![1u32, 0], vec![2u32, 1]];
+        Ring::new(
+            RingData::from_parts(devs, 31, r2p2d),
+            HashPathConfig::new("", "changeme").unwrap(),
+        )
+    }
+
     #[derive(Default)]
     struct FakeHashClient {
         /// suffix->hash the peer reports (empty = peer has nothing).
-        remote: HashMap<String, String>,
+        remote: SuffixHashMap,
         hashed: Mutex<Vec<(u64, Vec<String>)>>,
-        rehashed: Mutex<Vec<(u64, Vec<String>)>>,
+        unmounted_peer: Option<u64>,
     }
     impl SuffixHashClient for FakeHashClient {
         fn peer_hashes(
@@ -447,65 +1055,151 @@ mod tests {
             _device: &str,
             _partition: u32,
             _policy_index: u32,
-        ) -> Option<HashMap<String, String>> {
+        ) -> Result<SuffixHashMap, SuffixHashError> {
             self.hashed.lock().unwrap().push((peer.id, vec![]));
-            Some(self.remote.clone())
+            if self.unmounted_peer == Some(peer.id) {
+                Err(SuffixHashError::InsufficientStorage)
+            } else {
+                Ok(self.remote.clone())
+            }
         }
-        fn peer_rehash(
-            &self,
-            peer: &RingDevice,
-            _device: &str,
-            _partition: u32,
-            suffixes: &[String],
-            _policy_index: u32,
-        ) -> bool {
-            self.rehashed
-                .lock()
-                .unwrap()
-                .push((peer.id, suffixes.to_vec()));
-            true
+    }
+
+    fn fake_report(local_partition_dir: &Path, suffixes: &[String]) -> Option<SenderReport> {
+        let mut report = SenderReport::default();
+        for suffix in suffixes {
+            let suffix_dir = local_partition_dir.join(suffix);
+            for entry in std::fs::read_dir(suffix_dir).ok()?.flatten() {
+                let object_hash = entry.file_name().to_str()?.to_string();
+                if is_lower_hex(&object_hash, 32) {
+                    if let Some(timestamps) = current_object_timestamps(&entry.path()) {
+                        report.can_delete_objs.insert(object_hash, timestamps);
+                    }
+                }
+            }
         }
+        Some(report)
     }
 
     struct FakeSyncer {
         synced: Mutex<Vec<(u64, String)>>,
         fail_peer: Option<u64>,
+        omit_confirmations_peer: Option<u64>,
     }
     impl SuffixSyncer for FakeSyncer {
-        fn sync_suffix(
+        fn sync_suffixes(
             &self,
-            _local_suffix_dir: &Path,
+            local_partition_dir: &Path,
             peer: &RingDevice,
             _device: &str,
             _partition: u32,
-            suffix: &str,
+            suffixes: &[String],
             _policy_index: u32,
-        ) -> bool {
+        ) -> Option<SenderReport> {
             self.synced
                 .lock()
                 .unwrap()
-                .push((peer.id, suffix.to_string()));
-            self.fail_peer != Some(peer.id)
+                .extend(suffixes.iter().cloned().map(|suffix| (peer.id, suffix)));
+            if self.fail_peer == Some(peer.id) {
+                return None;
+            }
+            if self.omit_confirmations_peer == Some(peer.id) {
+                return Some(SenderReport::default());
+            }
+            fake_report(local_partition_dir, suffixes)
         }
     }
 
     #[test]
     fn test_divergent_suffixes() {
         let local = HashMap::from([
-            ("abc".to_string(), "h1".to_string()),
-            ("def".to_string(), "h2".to_string()),
+            ("abc".to_string(), Some("h1".to_string())),
+            ("def".to_string(), Some("h2".to_string())),
         ]);
         // peer matches abc, missing def -> only def is divergent
-        let remote = HashMap::from([("abc".to_string(), "h1".to_string())]);
+        let remote = HashMap::from([("abc".to_string(), Some("h1".to_string()))]);
         assert_eq!(divergent_suffixes(&local, &remote), vec!["def".to_string()]);
         // peer has a stale abc -> abc is divergent too
-        let remote2 = HashMap::from([("abc".to_string(), "STALE".to_string())]);
+        let remote2 = HashMap::from([("abc".to_string(), Some("STALE".to_string()))]);
         assert_eq!(
             divergent_suffixes(&local, &remote2),
             vec!["abc".to_string(), "def".to_string()]
         );
         // peer fully matches -> nothing to push
         assert!(divergent_suffixes(&local, &local).is_empty());
+
+        // An invalidated local suffix remains present. A peer that omits it
+        // must trigger SSYNC rather than looking like two empty maps.
+        let invalid = HashMap::from([("abc".to_string(), None)]);
+        assert_eq!(
+            divergent_suffixes(&invalid, &HashMap::new()),
+            vec!["abc".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_suffix_hash_newer_tombstone_diverges_from_older_data() {
+        // Primary .ts and handoff .data in the same suffix must not compare
+        // equal or update() skips SSYNC and the live .data survives.
+        let root = tmpdir("suffix-ts-vs-data");
+        let data_suffix = root.join("data").join("abc");
+        let ts_suffix = root.join("ts").join("abc");
+        let hash = "00000000000000000000000000000abc";
+        std::fs::create_dir_all(data_suffix.join(hash)).unwrap();
+        std::fs::create_dir_all(ts_suffix.join(hash)).unwrap();
+        std::fs::write(data_suffix.join(hash).join("1788832700.00000.data"), b"old").unwrap();
+        std::fs::write(ts_suffix.join(hash).join("1788832710.00000.ts"), b"").unwrap();
+        let cfg = CleanupConfig {
+            reclaim_age: 365.0 * 24.0 * 3600.0 * 50.0,
+            ..CleanupConfig::default()
+        };
+        let data_hash = swift_diskfile::hash_suffix_repl(&data_suffix, &cfg)
+            .unwrap()
+            .expect("data suffix");
+        let ts_hash = swift_diskfile::hash_suffix_repl(&ts_suffix, &cfg)
+            .unwrap()
+            .expect("ts suffix");
+        assert_ne!(
+            data_hash, ts_hash,
+            "tombstone and older .data must diverge so SSYNC runs"
+        );
+        let local = HashMap::from([("abc".to_string(), Some(ts_hash))]);
+        let remote = HashMap::from([("abc".to_string(), Some(data_hash))]);
+        assert_eq!(divergent_suffixes(&local, &remote), vec!["abc".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_suffix_hash_older_tombstone_diverges_from_newer_recreate() {
+        // Inverse of newer-tombstone-vs-older-data: expirer .ts at T(delete-at)
+        // and a later overwrite .data must not compare equal or update()
+        // skips SSYNC and revert can drop the only recreate copy.
+        let root = tmpdir("suffix-old-ts-vs-new-data");
+        let data_suffix = root.join("data").join("abc");
+        let ts_suffix = root.join("ts").join("abc");
+        let hash = "00000000000000000000000000000abc";
+        std::fs::create_dir_all(data_suffix.join(hash)).unwrap();
+        std::fs::create_dir_all(ts_suffix.join(hash)).unwrap();
+        std::fs::write(data_suffix.join(hash).join("1893456003.00000.data"), b"new").unwrap();
+        std::fs::write(ts_suffix.join(hash).join("1893456002.00000.ts"), b"").unwrap();
+        let cfg = CleanupConfig {
+            reclaim_age: 365.0 * 24.0 * 3600.0 * 50.0,
+            ..CleanupConfig::default()
+        };
+        let data_hash = swift_diskfile::hash_suffix_repl(&data_suffix, &cfg)
+            .unwrap()
+            .expect("data suffix");
+        let ts_hash = swift_diskfile::hash_suffix_repl(&ts_suffix, &cfg)
+            .unwrap()
+            .expect("ts suffix");
+        assert_ne!(
+            data_hash, ts_hash,
+            "older tombstone and newer recreate .data must diverge so SSYNC runs"
+        );
+        let local = HashMap::from([("abc".to_string(), Some(ts_hash))]);
+        let remote = HashMap::from([("abc".to_string(), Some(data_hash))]);
+        assert_eq!(divergent_suffixes(&local, &remote), vec!["abc".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -517,9 +1211,60 @@ mod tests {
         let body = pickle::dumps(&value).unwrap();
         let map = hashes_from_pickle(&body).unwrap();
         assert_eq!(
-            map.get("abc").map(String::as_str),
+            map.get("abc").and_then(Option::as_deref),
             Some("0123456789abcdef0123456789abcdef")
         );
+
+        let invalid = Value::Dict(vec![(Value::Str("def".to_string()), Value::None)]);
+        let invalid_map = hashes_from_pickle(&pickle::dumps(&invalid).unwrap()).unwrap();
+        assert_eq!(invalid_map.get("def"), Some(&None));
+    }
+
+    #[test]
+    fn suffix_hash_schema_rejects_malformed_or_duplicate_entries() {
+        let digest = Value::Str("a".repeat(32));
+        for invalid in [
+            Value::List(Vec::new()),
+            Value::Dict(vec![(Value::Str("ABC".into()), digest.clone())]),
+            Value::Dict(vec![(Value::Str("../".into()), digest.clone())]),
+            Value::Dict(vec![(Value::Str("abc".into()), Value::Str("hash".into()))]),
+            Value::Dict(vec![(Value::Str("abc".into()), Value::Int(42))]),
+            Value::Dict(vec![
+                (Value::Str("abc".into()), Value::None),
+                (Value::Bytes(b"abc".to_vec()), digest.clone()),
+            ]),
+        ] {
+            assert!(hashes_from_pickle(&pickle::dumps(&invalid).unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    fn suffix_hash_schema_accepts_dense_python2_byte_strings() {
+        let value = Value::Dict(
+            (0..4096)
+                .map(|suffix| {
+                    (
+                        Value::Bytes(format!("{suffix:03x}").into_bytes()),
+                        if suffix == 0 {
+                            Value::None
+                        } else {
+                            Value::Bytes(vec![b'a'; 32])
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let decoded = hashes_from_pickle(&pickle::dumps(&value).unwrap()).unwrap();
+        assert_eq!(decoded.len(), 4096);
+        assert_eq!(decoded.get("000"), Some(&None));
+        assert_eq!(decoded.get("fff"), Some(&Some("a".repeat(32))));
+    }
+
+    #[test]
+    fn suffix_hash_wire_requires_complete_single_pickle() {
+        let mut body = pickle::dumps(&Value::Dict(Vec::new())).unwrap();
+        body.extend_from_slice(b"unparsed-tail");
+        assert!(hashes_from_pickle(&body).is_none());
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -540,6 +1285,7 @@ mod tests {
         let sy = FakeSyncer {
             synced: Mutex::new(Vec::new()),
             fail_peer: None,
+            omit_confirmations_peer: None,
         };
         let stats = run_once(
             &root.join("sdb1"),
@@ -566,17 +1312,175 @@ mod tests {
     }
 
     #[test]
+    fn test_unmounted_primary_slot_retries_on_handoff_node() {
+        let root = tmpdir("primary-handoff-fallback");
+        let part = root.join("sdb1/objects/0");
+        std::fs::create_dir_all(&part).unwrap();
+        let hc = FakeHashClient {
+            unmounted_peer: Some(1),
+            ..FakeHashClient::default()
+        };
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let stats = run_once(
+            &root.join("sdb1"),
+            "sdb1",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring4_with_handoff(),
+            0,
+            &hc,
+            &sy,
+        );
+        let queried: Vec<u64> = hc
+            .hashed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(queried, vec![1, 2, 3]);
+        assert_eq!(stats.failures, 1, "the unavailable primary is observable");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_ring_change_guard_aborts_before_handoff_network_or_purge() {
+        let root = tmpdir("ring-change-handoff");
+        let device = root.join("sdb9");
+        let hash_dir = device
+            .join("objects/0/abc")
+            .join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let stats = run_once_guarded(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+            &mut || ReplicationJobGuard::RingChanged,
+        );
+        assert!(stats.aborted_ring_change);
+        assert_eq!(stats.partitions, 0);
+        assert_eq!(stats.reverts, 0);
+        assert!(sy.synced.lock().unwrap().is_empty());
+        assert!(hash_dir.exists(), "old-ring state must not authorize purge");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_ring_change_after_ssync_aborts_before_handoff_purge() {
+        let root = tmpdir("ring-change-after-ssync");
+        let device = root.join("sdb9");
+        let hash_dir = device
+            .join("objects/0/abc")
+            .join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let guard_calls = AtomicUsize::new(0);
+        let stats = run_once_guarded(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+            &mut || {
+                if guard_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ReplicationJobGuard::Continue
+                } else {
+                    ReplicationJobGuard::RingChanged
+                }
+            },
+        );
+        assert!(stats.aborted_ring_change);
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(sy.synced.lock().unwrap().len(), 3);
+        assert!(
+            hash_dir.exists(),
+            "a ring replacement after transfer must revoke deletion authority"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_next_part_power_skips_before_handoff_network_or_purge() {
+        let root = tmpdir("next-part-power-handoff");
+        let device = root.join("sdb9");
+        let hash_dir = device
+            .join("objects/0/abc")
+            .join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let stats = run_once(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3_with_next_part_power(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert!(stats.skipped_next_part_power);
+        assert_eq!(stats.partitions, 0);
+        assert!(sy.synced.lock().unwrap().is_empty());
+        assert!(hash_dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn test_run_once_handoff_reverts_and_deletes() {
         // Local device id 99 is NOT a primary -> handoff. One suffix present.
         let root = tmpdir("handoff");
         let part = root.join("sdb9/objects/0");
         let suffix = part.join("abc");
-        std::fs::create_dir_all(&suffix).unwrap();
-        std::fs::write(suffix.join("1700000000.00000.data"), b"x").unwrap();
+        let hash_dir = suffix.join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"x").unwrap();
+        std::fs::write(hash_dir.join(".1700000000.00000.data.6MbL6r"), b"partial").unwrap();
+        drop(
+            swift_core::lockutil::lock_path(&part, 1.0, Some("replication"))
+                .expect("create the persistent partition lock inode"),
+        );
+        let lock_path = part.join(".lock-replication");
+        let lock_inode_before = std::fs::metadata(&lock_path).unwrap().ino();
         let hc = FakeHashClient::default();
         let sy = FakeSyncer {
             synced: Mutex::new(Vec::new()),
             fail_peer: None,
+            omit_confirmations_peer: None,
         };
         let stats = run_once(
             &root.join("sdb9"),
@@ -599,8 +1503,492 @@ mod tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(peers, vec![0, 1, 2]);
-        // local partition removed after a full revert
-        assert!(!part.exists());
+        assert!(
+            !hash_dir.exists(),
+            "the exact transferred generation is purged"
+        );
+        assert!(
+            part.exists(),
+            "the partition remains as the home of its persistent lock inode"
+        );
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().ino(),
+            lock_inode_before,
+            "handoff cleanup must never unlink and replace the active lock inode"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_lock_only_handoff_is_not_recounted_or_failed() {
+        let root = tmpdir("handoff-lock-only");
+        let part = root.join("sdb9/objects/0");
+        std::fs::create_dir_all(&part).unwrap();
+        drop(
+            swift_core::lockutil::lock_path(&part, 1.0, Some("replication"))
+                .expect("create the persistent partition lock inode"),
+        );
+        let lock_inode = std::fs::metadata(part.join(".lock-replication"))
+            .unwrap()
+            .ino();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        for _ in 0..2 {
+            let stats = run_once(
+                &root.join("sdb9"),
+                "sdb9",
+                0,
+                PolicyKind::Replication,
+                &CleanupConfig::default(),
+                &ring3(),
+                99,
+                &hc,
+                &sy,
+            );
+            assert_eq!(stats.reverts, 0);
+            assert_eq!(stats.failures, 0);
+        }
+        assert_eq!(
+            std::fs::metadata(part.join(".lock-replication"))
+                .unwrap()
+                .ino(),
+            lock_inode
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_handoff_busy_object_stripe_is_retryable_and_preserves_source() {
+        let root = tmpdir("handoff-busy-stripe");
+        let device = root.join("sdb9");
+        let part = device.join("objects/0");
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"x").unwrap();
+        let lock_dir = device.join("tmp/object-mutation-locks");
+        let _busy = swift_core::lockutil::lock_path(&lock_dir, 1.0, Some("obj-abc"))
+            .expect("hold foreground object stripe");
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let stats = run_once(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert!(hash_dir.exists());
+        assert!(sy.synced.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_handoff_malformed_or_symlink_entries_fail_closed() {
+        let root = tmpdir("handoff-invalid-layout");
+        let device = root.join("sdb9");
+        let part = device.join("objects/0");
+        let valid_hash = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&valid_hash).unwrap();
+        std::fs::write(valid_hash.join("1700000000.00000.data"), b"valid").unwrap();
+        let target = root.join("outside-hash");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(part.join("def")).unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            part.join("def").join("00000000000000000000000000000def"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(part.join("ABC")).unwrap();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let stats = run_once(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert!(valid_hash.exists());
+        assert!(sy.synced.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    struct InjectingSyncer {
+        partition: std::path::PathBuf,
+        injected: AtomicBool,
+    }
+
+    impl SuffixSyncer for InjectingSyncer {
+        fn sync_suffixes(
+            &self,
+            local_partition_dir: &Path,
+            peer: &RingDevice,
+            _device: &str,
+            _partition: u32,
+            suffixes: &[String],
+            _policy_index: u32,
+        ) -> Option<SenderReport> {
+            let report = fake_report(local_partition_dir, suffixes)?;
+            if peer.id == 2 && !self.injected.swap(true, Ordering::SeqCst) {
+                let new_hash = self
+                    .partition
+                    .join("def")
+                    .join("00000000000000000000000000000def");
+                std::fs::create_dir_all(&new_hash).unwrap();
+                std::fs::write(new_hash.join("1700000001.00000.data"), b"new").unwrap();
+            }
+            Some(report)
+        }
+    }
+
+    #[test]
+    fn test_handoff_cleanup_preserves_object_created_after_sync_snapshot() {
+        let root = tmpdir("handoff-race");
+        let part = root.join("sdb9/objects/0");
+        let old_hash = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&old_hash).unwrap();
+        std::fs::write(old_hash.join("1700000000.00000.data"), b"old").unwrap();
+        let new_hash = part.join("def").join("00000000000000000000000000000def");
+        let hc = FakeHashClient::default();
+        let sy = InjectingSyncer {
+            partition: part.clone(),
+            injected: AtomicBool::new(false),
+        };
+        let stats = run_once(
+            &root.join("sdb9"),
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert_eq!(stats.reverts, 0, "a changed handoff is not fully reverted");
+        assert_eq!(stats.failures, 1, "the next pass must retry the handoff");
+        assert!(!old_hash.exists(), "the transferred snapshot may be purged");
+        assert!(
+            new_hash.exists(),
+            "an object created after the snapshot must never be recursively deleted"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_handoff_cleanup_requires_every_primary_confirmation() {
+        let root = tmpdir("handoff-confirm-all");
+        let part = root.join("sdb9/objects/0");
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"old").unwrap();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: Some(1),
+        };
+        let stats = run_once(
+            &root.join("sdb9"),
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert!(
+            hash_dir.exists(),
+            "one primary omitting the exact timestamp must veto source deletion"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    struct MismatchingSyncer;
+
+    impl SuffixSyncer for MismatchingSyncer {
+        fn sync_suffixes(
+            &self,
+            local_partition_dir: &Path,
+            peer: &RingDevice,
+            _device: &str,
+            _partition: u32,
+            suffixes: &[String],
+            _policy_index: u32,
+        ) -> Option<SenderReport> {
+            let mut report = fake_report(local_partition_dir, suffixes)?;
+            if peer.id == 1 {
+                for timestamps in report.can_delete_objs.values_mut() {
+                    timestamps.ts_data = "1700000001.00000".parse().unwrap();
+                }
+            }
+            Some(report)
+        }
+    }
+
+    #[test]
+    fn test_handoff_cleanup_rejects_cross_primary_timestamp_disagreement() {
+        let root = tmpdir("handoff-timestamp-mismatch");
+        let part = root.join("sdb9/objects/0");
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"old").unwrap();
+        let stats = run_once(
+            &root.join("sdb9"),
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &FakeHashClient::default(),
+            &MismatchingSyncer,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert!(hash_dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    struct TruncatedSyncer;
+
+    impl SuffixSyncer for TruncatedSyncer {
+        fn sync_suffixes(
+            &self,
+            local_partition_dir: &Path,
+            _peer: &RingDevice,
+            _device: &str,
+            _partition: u32,
+            suffixes: &[String],
+            _policy_index: u32,
+        ) -> Option<SenderReport> {
+            let mut report = fake_report(local_partition_dir, suffixes)?;
+            report.limited_by_max_objects = true;
+            Some(report)
+        }
+    }
+
+    #[test]
+    fn test_handoff_cleanup_rejects_truncated_sender_report() {
+        let root = tmpdir("handoff-truncated");
+        let part = root.join("sdb9/objects/0");
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"old").unwrap();
+        let stats = run_once(
+            &root.join("sdb9"),
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &FakeHashClient::default(),
+            &TruncatedSyncer,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert!(hash_dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_handoff_cleanup_never_deletes_unoffered_meta_only_hash() {
+        let root = tmpdir("handoff-meta-only");
+        let part = root.join("sdb9/objects/0");
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.meta"), b"meta-only").unwrap();
+        let hc = FakeHashClient::default();
+        let sy = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let stats = run_once(
+            &root.join("sdb9"),
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert!(
+            hash_dir.exists(),
+            "a hash that SSYNC cannot offer is never deletion-authorized"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    struct ReplacingSyncer {
+        data_file: std::path::PathBuf,
+        replaced: AtomicBool,
+    }
+
+    impl SuffixSyncer for ReplacingSyncer {
+        fn sync_suffixes(
+            &self,
+            local_partition_dir: &Path,
+            peer: &RingDevice,
+            _device: &str,
+            _partition: u32,
+            suffixes: &[String],
+            _policy_index: u32,
+        ) -> Option<SenderReport> {
+            let report = fake_report(local_partition_dir, suffixes)?;
+            if peer.id == 2 && !self.replaced.swap(true, Ordering::SeqCst) {
+                std::fs::remove_file(&self.data_file).unwrap();
+                std::fs::write(&self.data_file, b"replacement-at-the-same-timestamp").unwrap();
+            }
+            Some(report)
+        }
+    }
+
+    #[test]
+    fn test_handoff_cleanup_rejects_same_timestamp_inode_replacement() {
+        let root = tmpdir("handoff-replaced-inode");
+        let part = root.join("sdb9/objects/0");
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        let data_file = hash_dir.join("1700000000.00000.data");
+        std::fs::write(&data_file, b"old").unwrap();
+        let hc = FakeHashClient::default();
+        let sy = ReplacingSyncer {
+            data_file: data_file.clone(),
+            replaced: AtomicBool::new(false),
+        };
+        let stats = run_once(
+            &root.join("sdb9"),
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &hc,
+            &sy,
+        );
+        assert_eq!(stats.reverts, 0);
+        assert_eq!(stats.failures, 1);
+        assert_eq!(
+            std::fs::read(&data_file).unwrap(),
+            b"replacement-at-the-same-timestamp",
+            "logical timestamp equality cannot authorize deleting a replaced inode"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn handoff_census_enforces_object_and_allocation_limits() {
+        let root = tmpdir("handoff-census-bounds");
+        let part = root.join("sda1/objects/0");
+        for index in 1..=2 {
+            let hash_dir = part.join("abc").join(format!("{index:029x}abc"));
+            std::fs::create_dir_all(&hash_dir).unwrap();
+            std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        }
+        assert!(snapshot_all_object_files_bounded(&part, 0, 1, 1024 * 1024).is_none());
+        assert!(snapshot_all_object_files_bounded(&part, 0, 2, 511).is_none());
+        assert_eq!(
+            snapshot_all_object_files_bounded(&part, 0, 2, 1024 * 1024)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!partition_has_no_objects(&part));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ring_change_between_handoff_objects_revokes_remaining_deletes() {
+        let root = tmpdir("handoff-ring-change-between-objects");
+        let device = root.join("sdb9");
+        let part = device.join("objects/0");
+        let first = part.join("abc").join(format!("{:029x}abc", 1));
+        let second = part.join("abc").join(format!("{:029x}abc", 2));
+        for hash_dir in [&first, &second] {
+            std::fs::create_dir_all(hash_dir).unwrap();
+            std::fs::write(hash_dir.join("1700000000.00000.data"), b"source").unwrap();
+        }
+        let syncer = FakeSyncer {
+            synced: Mutex::new(Vec::new()),
+            fail_peer: None,
+            omit_confirmations_peer: None,
+        };
+        let mut guard_calls = 0;
+        let stats = run_once_guarded(
+            &device,
+            "sdb9",
+            0,
+            PolicyKind::Replication,
+            &CleanupConfig::default(),
+            &ring3(),
+            99,
+            &FakeHashClient::default(),
+            &syncer,
+            &mut || {
+                guard_calls += 1;
+                if guard_calls <= 3 {
+                    ReplicationJobGuard::Continue
+                } else {
+                    ReplicationJobGuard::RingChanged
+                }
+            },
+        );
+        assert!(stats.aborted_ring_change);
+        assert_eq!(stats.reverts, 0);
+        assert!(!first.exists());
+        assert!(second.join("1700000000.00000.data").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pinned_handoff_directory_does_not_follow_replacement_path() {
+        let root = tmpdir("handoff-pin-replacement");
+        let path = root.join("hash");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("data"), b"old").unwrap();
+        let pin = PinnedDirectory::open(&path).unwrap();
+        std::fs::rename(&path, root.join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("data"), b"replacement").unwrap();
+        std::fs::remove_file(pin.path().join("data")).unwrap();
+        assert_eq!(std::fs::read(path.join("data")).unwrap(), b"replacement");
+        assert!(!root.join("original/data").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -654,6 +2042,7 @@ mod tests {
         let sy = FakeSyncer {
             synced: Mutex::new(Vec::new()),
             fail_peer: None,
+            omit_confirmations_peer: None,
         };
         let cleanup = CleanupConfig {
             reclaim_age: 5_000.0,
@@ -679,13 +2068,14 @@ mod tests {
     fn test_revert_keeps_partition_when_a_primary_fails() {
         let root = tmpdir("revert-fail");
         let part = root.join("sdb9/objects/0");
-        let suffix = part.join("abc");
-        std::fs::create_dir_all(&suffix).unwrap();
-        std::fs::write(suffix.join("1700000000.00000.data"), b"x").unwrap();
+        let hash_dir = part.join("abc").join("00000000000000000000000000000abc");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("1700000000.00000.data"), b"x").unwrap();
         let hc = FakeHashClient::default();
         let sy = FakeSyncer {
             synced: Mutex::new(Vec::new()),
             fail_peer: Some(2),
+            omit_confirmations_peer: None,
         };
         let stats = run_once(
             &root.join("sdb9"),

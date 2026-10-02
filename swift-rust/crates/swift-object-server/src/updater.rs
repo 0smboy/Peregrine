@@ -209,7 +209,10 @@ pub enum NodeResult {
     /// HTTP 301 with a sharding `Location`. Not a replica success: Python
     /// rewrites `container_path` and retries the destination.
     Redirect(String),
-    /// Any non-2xx / connection error; the update must be retried later.
+    /// HTTP 503 from the container server: explicit transient DB lock
+    /// contention. Safe to retry because updates are timestamp-idempotent.
+    TransientFailure,
+    /// Any other non-2xx / connection error; the update must be retried later.
     Failure,
 }
 
@@ -288,6 +291,7 @@ fn parse_status(buf: &[u8]) -> NodeResult {
             }
             NodeResult::Failure
         }
+        Some(503) => NodeResult::TransientFailure,
         _ => NodeResult::Failure,
     }
 }
@@ -324,10 +328,7 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn ensure_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case(name))
-    {
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
         headers.push((name.to_string(), value.to_string()));
     }
 }
@@ -414,11 +415,7 @@ impl UpdaterStats {
 
     fn track_update_failure(&mut self, update: &AsyncUpdate) {
         if let Ok(timestamp) = update.timestamp.parse::<Timestamp>() {
-            self.track_failure(
-                &update.account,
-                &update.container,
-                timestamp.as_secs_f64(),
-            );
+            self.track_failure(&update.account, &update.container, timestamp.as_secs_f64());
         }
     }
 
@@ -434,11 +431,7 @@ impl UpdaterStats {
         self.errors += other.errors;
         self.redirects += other.redirects;
         for failure in other.failed_updates {
-            self.track_failure(
-                &failure.account,
-                &failure.container,
-                failure.timestamp,
-            );
+            self.track_failure(&failure.account, &failure.container, failure.timestamp);
         }
     }
 }
@@ -446,6 +439,12 @@ impl UpdaterStats {
 /// Replay one update against the given container-ring nodes, then unlink or
 /// rewrite the async file. `nodes` are the primary container nodes for the
 /// update's account/container.
+/// Bounded in-sweep retry for explicit transient HTTP 503 container updates.
+/// Daemon threads may sleep; mirrors the idempotent replicator retry so a
+/// momentarily busy container server does not defer the whole sweep.
+const UPDATER_TRANSIENT_ATTEMPTS: u32 = 8;
+const UPDATER_TRANSIENT_BACKOFF_MS: u64 = 50;
+
 pub fn process_update(
     update: &AsyncUpdate,
     part: u32,
@@ -474,13 +473,31 @@ pub fn process_update(
         if successes.contains(&(node.id as i64)) {
             continue;
         }
-        match client.send(node, part, &update.op, &path, update.policy_index, &headers) {
-            NodeResult::Success => successes.push(node.id as i64),
-            NodeResult::Redirect(loc) => {
-                all_ok = false;
-                redirects.push(loc);
+        let mut transient_attempts = 0u32;
+        loop {
+            match client.send(node, part, &update.op, &path, update.policy_index, &headers) {
+                NodeResult::Success => {
+                    successes.push(node.id as i64);
+                    break;
+                }
+                NodeResult::Redirect(loc) => {
+                    all_ok = false;
+                    redirects.push(loc);
+                    break;
+                }
+                NodeResult::TransientFailure
+                    if transient_attempts + 1 < UPDATER_TRANSIENT_ATTEMPTS =>
+                {
+                    transient_attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        UPDATER_TRANSIENT_BACKOFF_MS * transient_attempts as u64,
+                    ));
+                }
+                NodeResult::TransientFailure | NodeResult::Failure => {
+                    all_ok = false;
+                    break;
+                }
             }
-            NodeResult::Failure => all_ok = false,
         }
     }
     if all_ok {
@@ -488,7 +505,9 @@ pub fn process_update(
         stats.successes += 1;
         stats.unlinks += 1;
         Ok(UpdateOutcome::Unlinked)
-    } else if let Some(dest) = redirects.iter().find_map(|loc| redirect_container_path(loc))
+    } else if let Some(dest) = redirects
+        .iter()
+        .find_map(|loc| redirect_container_path(loc))
     {
         // Python: erase successes, persist container_path, retry once.
         match update.repickle_redirect(&dest) {
@@ -539,8 +558,7 @@ pub fn process_update_following_redirects(
             retry.container_path = Some(dest);
             retry.successes.clear();
             let (acct, cont) = retry.ring_account_container();
-            let Ok((retry_part, retry_nodes)) =
-                container_ring.get_nodes(acct, Some(cont), None)
+            let Ok((retry_part, retry_nodes)) = container_ring.get_nodes(acct, Some(cont), None)
             else {
                 stats.errors += 1;
                 return Ok(UpdateOutcome::Failed);
@@ -679,9 +697,7 @@ pub fn run_once_with_concurrency_and_tracker(
     if concurrency == 1 {
         for update in updates {
             let (acct, cont) = update.ring_account_container();
-            let Ok((part, nodes)) =
-                container_ring.get_nodes(acct, Some(cont), None)
-            else {
+            let Ok((part, nodes)) = container_ring.get_nodes(acct, Some(cont), None) else {
                 stats.errors += 1;
                 continue;
             };
@@ -709,9 +725,7 @@ pub fn run_once_with_concurrency_and_tracker(
                 let stats = &stats;
                 scope.spawn(move || {
                     let (acct, cont) = update.ring_account_container();
-                    let Ok((part, nodes)) =
-                        container_ring.get_nodes(acct, Some(cont), None)
-                    else {
+                    let Ok((part, nodes)) = container_ring.get_nodes(acct, Some(cont), None) else {
                         stats.lock().unwrap().errors += 1;
                         return;
                     };
@@ -899,6 +913,97 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A client that answers from a script, one entry per send.
+    struct ScriptClient {
+        calls: Mutex<Vec<(u64, String)>>,
+        answers: Mutex<Vec<NodeResult>>,
+    }
+    impl ContainerNodeClient for ScriptClient {
+        fn send(
+            &self,
+            node: &swift_ring::RingDevice,
+            _part: u32,
+            op: &str,
+            _path: &str,
+            _pi: u32,
+            _h: &[(String, String)],
+        ) -> NodeResult {
+            self.calls.lock().unwrap().push((node.id, op.to_string()));
+            self.answers
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or(NodeResult::Failure)
+        }
+    }
+
+    #[test]
+    fn test_transient_failures_retried_in_sweep() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
+        std::fs::write(&file, make_async_pickle("PUT", "a", "c", "o")).unwrap();
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        // one node: two transient BUSY-style failures, then success.
+        // script is stored reversed because the client pops from the back.
+        let client = ScriptClient {
+            calls: Mutex::new(Vec::new()),
+            answers: Mutex::new(vec![
+                NodeResult::Success,
+                NodeResult::TransientFailure,
+                NodeResult::TransientFailure,
+            ]),
+        };
+        let nodes = [dev(1)];
+        let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
+        let outcome = process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        assert_eq!(outcome, UpdateOutcome::Unlinked);
+        assert!(!file.exists(), "async file unlinked after transient retry");
+        assert_eq!(client.calls.lock().unwrap().len(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_persistent_transient_failure_keeps_file() {
+        let dir = std::env::temp_dir().join(format!("swift-upd-retx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ap = dir.join("async_pending/abc");
+        std::fs::create_dir_all(&ap).unwrap();
+        let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
+        std::fs::write(&file, make_async_pickle("PUT", "a", "c", "o")).unwrap();
+        let mut stats = UpdaterStats::default();
+        let updates = iter_async_pendings(&dir, &mut stats);
+        let client = ScriptClient {
+            calls: Mutex::new(Vec::new()),
+            answers: Mutex::new(vec![NodeResult::TransientFailure; 16]),
+        };
+        let nodes = [dev(1), dev(2)];
+        let refs: Vec<&swift_ring::RingDevice> = nodes.iter().collect();
+        let outcome = process_update(&updates[0], 5, &refs, &client, &mut stats).unwrap();
+        assert_eq!(outcome, UpdateOutcome::Failed);
+        assert!(file.exists(), "async file kept when transient never clears");
+        assert_eq!(
+            client.calls.lock().unwrap().len(),
+            2 * UPDATER_TRANSIENT_ATTEMPTS as usize
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_status_maps_busy_to_transient() {
+        let busy = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec();
+        assert_eq!(parse_status(&busy), NodeResult::Failure);
+        let unavailable = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec();
+        assert_eq!(parse_status(&unavailable), NodeResult::TransientFailure);
+        let worn = b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 0\r\n\r\n".to_vec();
+        assert_eq!(parse_status(&worn), NodeResult::Failure);
+        let notfound = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec();
+        assert_eq!(parse_status(&notfound), NodeResult::Failure);
+    }
+
     #[test]
     fn test_outdated_duplicates_unlinked() {
         let dir = std::env::temp_dir().join(format!("swift-upd-dup-{}", std::process::id()));
@@ -994,7 +1099,11 @@ X-Backend-Redirect-Timestamp: 1.00000\r\n\r\n";
         let ap = dir.join("async_pending/abc");
         std::fs::create_dir_all(&ap).unwrap();
         let file = ap.join("00000000000000000000000000000abc-1751500000.00000");
-        std::fs::write(&file, make_async_pickle("PUT", "AUTH_test", "root", "alpha")).unwrap();
+        std::fs::write(
+            &file,
+            make_async_pickle("PUT", "AUTH_test", "root", "alpha"),
+        )
+        .unwrap();
         let mut stats = UpdaterStats::default();
         let updates = iter_async_pendings(&dir, &mut stats);
         let client = FakeClient {

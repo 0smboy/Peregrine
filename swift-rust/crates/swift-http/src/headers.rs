@@ -127,7 +127,10 @@ mod tests {
         assert_eq!(title_case("content-length"), "Content-Length");
         assert_eq!(title_case("X-OBJECT-META-foo_bar"), "X-Object-Meta-Foo_Bar");
         assert_eq!(title_case("etag"), "Etag");
-        assert_eq!(title_case("x-container-sysmeta-a b"), "X-Container-Sysmeta-A B");
+        assert_eq!(
+            title_case("x-container-sysmeta-a b"),
+            "X-Container-Sysmeta-A B"
+        );
     }
 
     #[test]

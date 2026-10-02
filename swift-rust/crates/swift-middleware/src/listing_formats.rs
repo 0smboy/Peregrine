@@ -30,11 +30,15 @@
 //! - Content negotiation is simplified to the `format=` param plus an
 //!   `Accept` substring match, matching the golden-tested account/container
 //!   servers' `listing_content_type`. Full RFC-7231 `Accept.best_match`
-//!   q-value negotiation and its `406 Not Acceptable` / `400 Invalid Accept
-//!   header` error responses are not reproduced.
+//!   q-value negotiation is not reproduced. Unmatched `Accept` (e.g. `foo/bar`)
+//!   is `406 Not Acceptable`, as `get_listing_content_type` does in Python.
 //! - The `swift.format_listing` opt-out env flag and the WSGI
-//!   `call_application` plumbing have no analog in this buffered pipeline;
-//!   the filter always formats.
+//!   `call_application` plumbing have no analog in this buffered pipeline.
+//!   Python `object_versioning._list_versions` sets that flag so `?versions`
+//!   listings stay JSON; this filter skips reformatting when the `versions`
+//!   query param is present. `?versions` plus a non-JSON `format=` / `Accept`
+//!   is `406` here (Python raises that in object_versioning after this filter
+//!   rewrites `req.accept` from `format=`).
 //! - `filter_reserved` still drops entries carrying the reserved byte but
 //!   does not emit the warning log lines (the pipeline has no logger).
 //! - The oversize guard measures the buffered response body rather than the
@@ -73,6 +77,13 @@ impl Default for ListingFormats {
 
 impl Middleware for ListingFormats {
     fn prepare(&self, req: &mut Request) -> MwPrep {
+        if req
+            .headers
+            .get("X-Backend-Source")
+            .is_some_and(|s| s.eq_ignore_ascii_case("staticweb"))
+        {
+            return MwPrep::Continue;
+        }
         let parts = match split_path(&req.path, 2, 3, false) {
             Ok(p) => p,
             Err(_) => return MwPrep::Continue,
@@ -87,6 +98,13 @@ impl Middleware for ListingFormats {
             // Must run on the raw query. `force_format_json` uses lossy
             // `unquote` (`%FF` → U+FFFD), after which the proxy's UTF-8
             // check would 200 (probe test_sharding_listing delimiter=%ff).
+            return MwPrep::ShortCircuit(resp);
+        }
+        let is_container = parts
+            .get(2)
+            .and_then(|c| c.as_ref())
+            .is_some_and(|c| !c.is_empty());
+        if let Some(resp) = listing_not_acceptable(req, is_container) {
             return MwPrep::ShortCircuit(resp);
         }
         let out = get_listing_content_type(req);
@@ -124,6 +142,10 @@ impl Middleware for ListingFormats {
             return resp;
         }
 
+        if let Some(resp) = listing_not_acceptable(&req, cont.is_some()) {
+            return resp;
+        }
+
         // Desired output content-type, then force the subrequest to JSON.
         let stashed = req.headers.get(LISTING_OUT_TYPE).map(str::to_string);
         let out_content_type = stashed
@@ -133,6 +155,16 @@ impl Middleware for ListingFormats {
         let params = req.params();
         let can_vary = req.headers.get(LISTING_CAN_VARY).is_some()
             || !params.iter().any(|(k, _)| k == "format");
+        // Python object_versioning._list_versions sets
+        // `swift.format_listing = False` so `?versions` stays JSON.
+        // Staticweb listing subrequests set `swift.source = SW` and expect
+        // JSON (`json.loads`). Hyper prepare may have stamped a client
+        // text/plain out-type on the original GET; do not convert those.
+        let skip_format_listing = (cont.is_some() && params.iter().any(|(k, _)| k == "versions"))
+            || req
+                .headers
+                .get("X-Backend-Source")
+                .is_some_and(|s| s.eq_ignore_ascii_case("staticweb"));
         let allow_reserved = req
             .headers
             .get("X-Backend-Allow-Reserved-Names")
@@ -140,6 +172,10 @@ impl Middleware for ListingFormats {
         req.query_string = force_format_json(&params);
 
         let mut resp = next(req);
+
+        if skip_format_listing {
+            return resp;
+        }
 
         // 200/204 only; anything else passes through untouched.
         if resp.status != 200 && resp.status != 204 {
@@ -159,15 +195,22 @@ impl Middleware for ListingFormats {
             add_vary_accept(&mut resp.headers);
         }
 
-        // Only reformat a JSON body; otherwise (staticweb, etc.) pass through.
-        if resp_content_type != "application/json" {
-            return resp;
-        }
-
+        // HEAD 204 from the container/account servers is `text/plain` with no
+        // body. Python listing_formats still stamps the negotiated type
+        // (`format=json` → application/json). Do that before the JSON-body
+        // guard or official test_GET_HEAD_content_type fails on HEAD.
         if method == "HEAD" {
             resp.headers
                 .set("Content-Type", format!("{out_content_type}; charset=utf-8"));
             resp.headers.set("Content-Length", 0);
+            return resp;
+        }
+
+        // Only reformat a JSON body; otherwise (staticweb, etc.) pass through.
+        // Isolated container GETs sometimes omit Content-Type after a
+        // clone_head() hop. An empty type still converts when the body is a
+        // JSON array (`parse_listing` fails closed and returns the original).
+        if resp_content_type != "application/json" && !resp_content_type.is_empty() {
             return resp;
         }
 
@@ -223,6 +266,60 @@ impl Middleware for ListingFormats {
         resp.headers.set("Content-Length", body.len());
         resp.body = body.into();
         resp
+    }
+}
+
+fn not_acceptable() -> Response {
+    Response::error(
+        406,
+        "The resource could not be generated in the requested format.",
+    )
+}
+
+/// Python `get_listing_content_type`: unmatched Accept is 406. `format=`
+/// always maps (unknown → text/plain) and never 406s by itself.
+fn accept_header_unmatched(req: &Request) -> bool {
+    if req.param("format").filter(|f| !f.is_empty()).is_some() {
+        return false;
+    }
+    let Some(accept) = req.headers.get("Accept") else {
+        return false;
+    };
+    let accept = accept.to_lowercase();
+    let accept = accept.trim();
+    if accept.is_empty() || accept == "*" || accept.contains("*/*") {
+        return false;
+    }
+    !(accept.contains("application/json")
+        || accept.contains("application/xml")
+        || accept.contains("text/xml")
+        || accept.contains("text/plain"))
+}
+
+/// Python `object_versioning._list_versions`: after listing_formats may
+/// rewrite Accept from `format=`, `best_match(['application/json'])` or 406.
+fn versions_listing_rejects_non_json(req: &Request, is_container: bool) -> bool {
+    if !is_container || !req.params().iter().any(|(k, _)| k == "versions") {
+        return false;
+    }
+    if let Some(format) = req.param("format").filter(|f| !f.is_empty()) {
+        return !format.eq_ignore_ascii_case("json");
+    }
+    match req.headers.get("Accept") {
+        None => false,
+        Some(accept) => {
+            let accept = accept.to_lowercase();
+            let accept = accept.trim();
+            !(accept.contains("application/json") || accept.contains("*/*") || accept == "*")
+        }
+    }
+}
+
+fn listing_not_acceptable(req: &Request, is_container: bool) -> Option<Response> {
+    if accept_header_unmatched(req) || versions_listing_rejects_non_json(req, is_container) {
+        Some(not_acceptable())
+    } else {
+        None
     }
 }
 
@@ -952,6 +1049,44 @@ mod tests {
     }
 
     #[test]
+    fn empty_content_type_json_listing_still_converts() {
+        let body = br#"[{"name": "a"}, {"subdir": "b/"}]"#;
+        let resp = call(req("GET", "/v1/a/c", ""), move |_| {
+            Response::with_body(200, body.to_vec())
+        });
+        assert_eq!(body_bytes(&resp), b"a\nb/\n");
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn staticweb_source_listing_stays_json() {
+        let body = br#"[{"name":"idx.html","bytes":4,"content_type":"text/html","last_modified":"2026-07-16T00:00:00.0"}]"#;
+        let mut request = req("GET", "/v1/a/c", "delimiter=/&format=json");
+        request.headers.set("X-Backend-Source", "staticweb");
+        request
+            .headers
+            .set("X-Backend-Listing-Out-Content-Type", "text/plain");
+        request.headers.set("Accept", "application/json");
+        let resp = call(request, move |_| json_backend(body));
+        assert_eq!(
+            body_bytes(&resp),
+            body,
+            "staticweb listing subrequests must not be rewritten to text/plain"
+        );
+        assert!(
+            resp.headers
+                .get("Content-Type")
+                .unwrap_or("")
+                .contains("application/json"),
+            "{:?}",
+            resp.headers.get("Content-Type")
+        );
+    }
+
+    #[test]
     fn test_empty_text_becomes_204() {
         let resp = call(req("GET", "/v1/a/c", "format=plain"), move |_| {
             json_backend(b"[]")
@@ -1116,6 +1251,22 @@ mod tests {
     }
 
     #[test]
+    fn test_head_format_json_when_backend_head_is_plain_204() {
+        let resp = call(req("HEAD", "/v1/a/c", "format=json"), move |_| {
+            let mut r = Response::new(204);
+            r.headers.set("Content-Type", "text/plain; charset=utf-8");
+            r.headers.set("Content-Length", 0);
+            r
+        });
+        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(resp.headers.get("Content-Length"), Some("0"));
+    }
+
+    #[test]
     fn test_head_sets_content_type_and_zero_length() {
         let resp = call(req("HEAD", "/v1/a", "format=xml"), move |_| {
             let mut r = Response::new(204);
@@ -1190,6 +1341,74 @@ mod tests {
             resp.headers.get("X-Seen-Query"),
             Some("prefix=a%2Fb&limit=5&format=json")
         );
+    }
+
+    #[test]
+    fn test_versions_query_stays_json_without_format() {
+        // Python object_versioning._list_versions opts listing_formats out.
+        // GET ?versions (no format=) must remain application/json, not names+\n.
+        let body = br#"[{"bytes": 5, "content_type": "text/plain", "hash": "h", "is_latest": true, "last_modified": "2026-09-01T00:00:00.000000", "name": "obj1", "version_id": "1788248172.69139"}]"#;
+        for query in ["versions", "versions=None", "versions="] {
+            let resp = call(req("GET", "/v1/a/c", query), {
+                let body = body;
+                move |_| json_backend(body)
+            });
+            assert_eq!(resp.status, 200, "query={query}");
+            assert_eq!(body_bytes(&resp), body, "query={query}");
+            let ct = resp.headers.get("Content-Type").unwrap_or("");
+            assert!(
+                ct.starts_with("application/json"),
+                "query={query} content-type={ct:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_versions_empty_listing_stays_json_array() {
+        // Empty text listings collapse to 204; versions listings must stay `[]`.
+        let resp = call(req("GET", "/v1/a/c", "versions"), move |_| {
+            json_backend(b"[]")
+        });
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"[]");
+        assert_eq!(
+            resp.headers.get("Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn test_versions_format_plain_or_xml_is_406() {
+        // test.functional.test_object_versioning.TestContainerOperations::test_unacceptable
+        for query in ["format=plain&versions", "format=xml&versions"] {
+            let resp = call(req("GET", "/v1/a/c", query), |_| {
+                panic!("backend must not run for versions non-json format")
+            });
+            assert_eq!(resp.status, 406, "query={query}");
+        }
+    }
+
+    #[test]
+    fn test_versions_non_json_accept_is_406() {
+        for accept in ["text/plain", "text/xml", "application/xml", "foo/bar"] {
+            let mut request = req("GET", "/v1/a/c", "versions");
+            request.headers.set("Accept", accept);
+            let resp = call(request, {
+                let accept = accept.to_string();
+                move |_| panic!("backend must not run for versions Accept={accept}")
+            });
+            assert_eq!(resp.status, 406, "Accept={accept}");
+        }
+    }
+
+    #[test]
+    fn test_unmatched_accept_without_versions_is_406() {
+        let mut request = req("GET", "/v1/a/c", "");
+        request.headers.set("Accept", "foo/bar");
+        let resp = call(request, |_| {
+            panic!("backend must not run for Accept=foo/bar")
+        });
+        assert_eq!(resp.status, 406);
     }
 
     #[test]

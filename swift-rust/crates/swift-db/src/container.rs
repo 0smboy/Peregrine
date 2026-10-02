@@ -440,11 +440,9 @@ impl ContainerBroker {
         self.commit_pending()?;
         let (acct, cont): (String, String) = {
             let conn = self.conn()?;
-            conn.query_row(
-                "SELECT account, container FROM container_stat",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?
+            conn.query_row("SELECT account, container FROM container_stat", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
         };
         if self.account.is_empty() {
             self.account = acct;
@@ -972,9 +970,7 @@ impl ContainerBroker {
         }
         let pending = self.pending_file();
         let _lock = lock_parent_directory(&pending, PENDING_TIMEOUT)?;
-        let pending_size = std::fs::metadata(&pending)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let pending_size = std::fs::metadata(&pending).map(|m| m.len()).unwrap_or(0);
         if pending_size > PENDING_CAP {
             self.commit_puts(vec![record])
         } else {
@@ -1186,25 +1182,30 @@ impl ContainerBroker {
         let state = self.get_db_state()?;
         match state {
             DbState::Sharding => {
+                let mut oc: i64 = 0;
+                let mut bu: i64 = 0;
                 if let Some(mut retiring) = self.retiring_broker() {
                     retiring.commit_pending()?;
-                    let (oc, bu) = {
-                        let conn = retiring.conn()?;
-                        let oc: i64 = conn.query_row(
-                            "SELECT object_count FROM container_stat",
-                            [],
-                            |r| r.get(0),
-                        )?;
-                        let bu: i64 = conn.query_row(
-                            "SELECT bytes_used FROM container_stat",
-                            [],
-                            |r| r.get(0),
-                        )?;
-                        (oc, bu)
-                    };
-                    set_info_i64(&mut out, "object_count", oc);
-                    set_info_i64(&mut out, "bytes_used", bu);
+                    let conn = retiring.conn()?;
+                    oc = conn
+                        .query_row("SELECT object_count FROM container_stat", [], |r| r.get(0))?;
+                    bu =
+                        conn.query_row("SELECT bytes_used FROM container_stat", [], |r| r.get(0))?;
                 }
+                // After the first cleaved ranges, retiring policy_stat can
+                // already be 0 while shard-range rows still hold live objects.
+                // HEAD must report that count so object-versioning DELETE
+                // returns 409 ("delete all versions") instead of 500.
+                if oc <= 0 {
+                    if let Ok((bytes, count)) = self.get_shard_usage() {
+                        if count > 0 {
+                            oc = count;
+                            bu = bytes;
+                        }
+                    }
+                }
+                set_info_i64(&mut out, "object_count", oc);
+                set_info_i64(&mut out, "bytes_used", bu);
             }
             DbState::Sharded if self.is_root_container()? => {
                 let (bytes, count) = self.get_shard_usage()?;
@@ -1585,9 +1586,8 @@ impl ContainerBroker {
         let own = self.get_own_shard_range(false)?;
         let own_lower = own.as_ref().map(|o| o.lower.clone()).unwrap_or_default();
         let own_upper = own.as_ref().map(|o| o.upper.clone()).unwrap_or_default();
-        let past_own = |upper: &str| {
-            !own_upper.is_empty() && (upper.is_empty() || upper > own_upper.as_str())
-        };
+        let past_own =
+            |upper: &str| !own_upper.is_empty() && (upper.is_empty() || upper > own_upper.as_str());
 
         let mut found = Vec::new();
         let mut progress: i64 = 0;
@@ -1643,11 +1643,9 @@ impl ContainerBroker {
     pub fn tombstone_count(&mut self) -> Result<i64, DbError> {
         self.commit_pending()?;
         let conn = self.conn()?;
-        let n: i64 = conn.query_row(
-            "SELECT count(*) FROM object WHERE deleted = 1",
-            [],
-            |r| r.get(0),
-        )?;
+        let n: i64 = conn.query_row("SELECT count(*) FROM object WHERE deleted = 1", [], |r| {
+            r.get(0)
+        })?;
         Ok(n)
     }
 
@@ -2028,10 +2026,8 @@ mod tests {
         // Filename has no epoch so get_db_state is Unsharded; own is not
         // CLEAVING so sharding_initiated is false. Still must keep the
         // handoff so the sharder can cleave.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-shard-req-unsharded-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-shard-req-unsharded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 4);
         let epoch = "1751500099.00000";
@@ -2117,7 +2113,11 @@ mod tests {
         s1b.meta_timestamp = "1751500099.00000".into();
         s1b.reported = 0;
         b.merge_shard_ranges(vec![s1b]).unwrap();
-        assert_eq!(b.get_shard_usage().unwrap(), (150, 200), "first-range stats");
+        assert_eq!(
+            b.get_shard_usage().unwrap(),
+            (150, 200),
+            "first-range stats"
+        );
         let info = b.get_info().unwrap();
         let oc = info
             .iter()
@@ -2131,10 +2131,7 @@ mod tests {
     fn test_merge_newer_own_without_epoch_stays_collapsed() {
         // Probe L2088: a newer no-epoch own must not make get_db_state()
         // Unsharded. merge_shards keeps the existing epoch.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-db-l2088-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-db-l2088-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let unsuffixed = dir.join("hash.db");
@@ -2177,10 +2174,8 @@ mod tests {
         // Match Python ContainerBroker.get_db_state exactly.  An ACTIVE own
         // without an epoch must not let an epoch filename manufacture a
         // Collapsed/Sharded state; replication depends on this distinction.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-db-epoch-mismatch-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-db-epoch-mismatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let unsuffixed = dir.join("hash.db");
@@ -2202,10 +2197,7 @@ mod tests {
     fn test_sharded_root_revive_uses_shard_usage_for_is_deleted() {
         // Probe test_sharded_delete L2506 vs shrink-to-root L2095:
         // SHARDED + shard usage > 0 revives; COLLAPSED leftover rows do not.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-revive-shard-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-revive-shard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 0);
         let epoch = "1751500010.00000";
@@ -2231,10 +2223,7 @@ mod tests {
         // L2095: shrink-to-root leaves a COLLAPSED root with no other
         // live shard ranges. delete_timestamp > put_timestamp and
         // container_stat object_count stay decisive.
-        let dir2 = std::env::temp_dir().join(format!(
-            "swift-revive-coll-{}",
-            std::process::id()
-        ));
+        let dir2 = std::env::temp_dir().join(format!("swift-revive-coll-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir2);
         let mut c = shard_broker(&dir2, 0);
         c.enable_sharding(epoch).unwrap();
@@ -2261,10 +2250,7 @@ mod tests {
         // Probe L2094: shrink-to-root leaves a COLLAPSED epoch DB with the
         // last live row. DELETE that object must make empty() true so
         // DELETE_container is 204, not 409.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-empty-coll-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-empty-coll-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 0);
         b.put_object(
@@ -2320,8 +2306,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 0);
         for name in ["obj-0000", "obj-0001", "obj-0002"] {
-            b.put_object(name, "1751500001.00000", 0, "text/plain", "e", 0, 0, None, None)
-                .unwrap();
+            b.put_object(
+                name,
+                "1751500001.00000",
+                0,
+                "text/plain",
+                "e",
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let pending = b.pending_file();
         assert!(
@@ -2332,7 +2328,10 @@ mod tests {
             b.delete_object(name, "1751500099.00000", 0).unwrap();
         }
         let pending_len = pending.metadata().map(|m| m.len()).unwrap_or(0);
-        assert_eq!(pending_len, 0, "DELETE must drain PUT pending, len={pending_len}");
+        assert_eq!(
+            pending_len, 0,
+            "DELETE must drain PUT pending, len={pending_len}"
+        );
         let info = b.get_info().unwrap();
         let count = info
             .iter()
@@ -2356,10 +2355,7 @@ mod tests {
     fn test_find_shard_ranges_caps_last_upper_at_own() {
         // Nested sharding: a shard's last sub-range must end at own.upper,
         // not namespace MAX (probe assert_shard_ranges_contiguous last_upper).
-        let dir = std::env::temp_dir().join(format!(
-            "swift-find-own-upper-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-find-own-upper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 0);
         for i in 0..150 {
@@ -2397,10 +2393,7 @@ mod tests {
     fn test_find_shard_ranges_starts_at_own_lower() {
         // repair_shard L3752: find_and_replace on shard (obj-0006, obj-0014]
         // must not emit MinBound leftover FOUND.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-find-own-lower-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("swift-find-own-lower-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 0);
         for i in 7..=14 {
@@ -2429,10 +2422,7 @@ mod tests {
             found[0].lower, "obj-0006",
             "first sub-shard must start at own.lower, not MIN: {found:?}"
         );
-        assert_eq!(
-            found.last().unwrap().upper, "obj-0014",
-            "{found:?}"
-        );
+        assert_eq!(found.last().unwrap().upper, "obj-0014", "{found:?}");
         assert!(
             found.iter().all(|f| f.lower != ""),
             "no leftover MinBound FOUND: {found:?}"
@@ -2566,10 +2556,8 @@ mod tests {
     fn test_fill_gaps_appends_own_range_after_cleaved() {
         use crate::shard::{resolve_shard_range_states, state, ShardRange};
 
-        let dir = std::env::temp_dir().join(format!(
-            "swift-shard-fill-gaps-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-shard-fill-gaps-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut b = shard_broker(&dir, 0);
         b.enable_sharding("1751500010.00000").unwrap();
@@ -2795,10 +2783,8 @@ mod tests {
         // merge_items those tombstones onto a peer that still lists the
         // objects. Restarting usync from -1 is not enough if the rows are
         // missing or merge_items drops deleted=1.
-        let dir = std::env::temp_dir().join(format!(
-            "swift-tombstone-usync-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("swift-tombstone-usync-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut src = shard_broker(&dir.join("src"), 50);
         let mut dst = shard_broker(&dir.join("dst"), 50);
@@ -2867,7 +2853,10 @@ mod tests {
             )])
             .unwrap();
         let md = broker.metadata().unwrap();
-        let b = md.iter().find(|(k, _)| k == "X-Container-Meta-B").map(|(_, (v, _))| v.as_str());
+        let b = md
+            .iter()
+            .find(|(k, _)| k == "X-Container-Meta-B")
+            .map(|(_, (v, _))| v.as_str());
         assert_eq!(b, Some("2"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3049,11 +3038,10 @@ impl ContainerBroker {
             DbValue::Int(i) => Timestamp::from_secs(*i as f64).ok(),
             DbValue::Null => None,
         };
-        zero
-            && matches!(
-                (parse(&delete_ts), parse(&put_ts)),
-                (Some(d), Some(p)) if d > p
-            )
+        zero && matches!(
+            (parse(&delete_ts), parse(&put_ts)),
+            (Some(d), Some(p)) if d > p
+        )
     }
 
     pub fn is_deleted(&mut self) -> Result<bool, DbError> {
@@ -3388,9 +3376,7 @@ impl ContainerBroker {
     pub fn sharding_required(&mut self) -> Result<bool, DbError> {
         match self.get_db_state()? {
             DbState::Sharding => Ok(true),
-            DbState::Unsharded => {
-                Ok(self.sharding_initiated()? || self.has_other_shard_ranges()?)
-            }
+            DbState::Unsharded => Ok(self.sharding_initiated()? || self.has_other_shard_ranges()?),
             _ => Ok(false),
         }
     }
@@ -3401,11 +3387,10 @@ impl ContainerBroker {
     fn live_object_rows_empty(&mut self) -> Result<bool, DbError> {
         self.commit_pending()?;
         let conn = self.conn()?;
-        let n: i64 = conn.query_row(
-            "SELECT count(*) FROM object WHERE deleted = 0",
-            [],
-            |row| row.get(0),
-        )?;
+        let n: i64 =
+            conn.query_row("SELECT count(*) FROM object WHERE deleted = 0", [], |row| {
+                row.get(0)
+            })?;
         Ok(n == 0)
     }
 
@@ -3463,7 +3448,10 @@ impl ContainerBroker {
         // (shard usage on SHARDED roots). Collapsed roots do not substitute
         // shard usage, so leftover shrink-to-root rows cannot revive L2095.
         let deleted = Self::info_shows_deleted(&info);
-        let _ = (zero(&get("object_count")), newer(&get("delete_timestamp"), &get("put_timestamp")));
+        let _ = (
+            zero(&get("object_count")),
+            newer(&get("delete_timestamp"), &get("put_timestamp")),
+        );
         Ok((info, deleted))
     }
 

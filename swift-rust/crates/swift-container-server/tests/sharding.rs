@@ -219,12 +219,7 @@ fn test_put_object_without_spi_uses_container_policy_for_object_count() {
     );
     assert_eq!(server.handle(r).status, 201);
     let db = server
-        .db_file_for_request(&req(
-            "HEAD",
-            "/sda1/0/AUTH_test/c",
-            &[],
-            b"",
-        ))
+        .db_file_for_request(&req("HEAD", "/sda1/0/AUTH_test/c", &[], b""))
         .unwrap();
     let mut broker = ContainerBroker::new(&db, "AUTH_test", "c");
     let info = broker.get_info().unwrap();
@@ -239,7 +234,10 @@ fn test_put_object_without_spi_uses_container_policy_for_object_count() {
         .and_then(|(_, v)| v.as_i64())
         .unwrap();
     assert_eq!(spi, 1, "{info:?}");
-    assert_eq!(oc, 1, "object_count must follow container SPI, got {info:?}");
+    assert_eq!(
+        oc, 1,
+        "object_count must follow container SPI, got {info:?}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -345,10 +343,7 @@ fn test_sharded_root_head_count_rolls_up_after_shard_stats_put() {
     {
         let mut broker = swift_db::ContainerBroker::new(&db, "AUTH_test", "c");
         broker.enable_sharding(epoch).unwrap();
-        assert!(
-            broker.set_sharding_state().unwrap(),
-            "UNSHARDED → SHARDING"
-        );
+        assert!(broker.set_sharding_state().unwrap(), "UNSHARDED → SHARDING");
         assert!(broker.set_sharded_state().unwrap(), "SHARDING → SHARDED");
         assert_eq!(broker.get_shard_usage().unwrap(), (0, 100));
     }

@@ -59,10 +59,13 @@ pub use sharder::{
     TcpShardHttpTransport, CLEAVING_CONTEXT_KEY, CLEAVING_CONTEXT_KEY_PREFIX,
 };
 pub use sync::{
-    build_sync_headers, get_sig, owns_object, process_container_db, run_once as sync_run_once,
-    sync_auth_header, sync_rows, validate_sync_to, ContainerSyncConfig, ContainerSyncRealms,
-    ContainerSyncStore, EmptyObjectSource, HttpSyncClient, MapObjectSource, ObjectSource,
-    SyncAction, SyncClient, SyncContext, SyncRow, SyncStats, ValidatedSyncTo, SYNC_DATADIR,
+    build_sync_headers, container_sync_ordinal, destination_already_current,
+    destination_put_accepted, get_sig, is_static_large_object, owns_object, process_container_db,
+    run_once as sync_run_once, run_once_for_ring as sync_run_once_for_ring, sync_auth_header,
+    sync_rows, validate_sync_to, ContainerSyncConfig, ContainerSyncLocality, ContainerSyncRealms,
+    ContainerSyncStore, EmptyObjectSource, HttpCallResult, HttpSyncClient, MapObjectSource,
+    ObjectSource, SyncAction, SyncClient, SyncContext, SyncRow, SyncStats, ValidatedSyncTo,
+    SYNC_DATADIR,
 };
 pub use updater::{
     process_container, run_once as updater_run_once, AccountNodeClient, ContainerOutcome,
@@ -541,7 +544,6 @@ impl ContainerServer {
         })
     }
 
-
     /// Python recon middleware: GET `/recon/<check>` never uses obj_path.
     /// Isolated G6 container-server.conf pipelines `healthcheck recon
     /// container-server`, but this binary ignores the pipeline, so `/recon/*`
@@ -769,6 +771,9 @@ impl ContainerServer {
         if swift_db::is_corruption_error(e) {
             let _ = swift_db::quarantine_db(db_file, "containers");
             return swob_response(404, None);
+        }
+        if swift_db::is_lock_contention(e) {
+            return error_response(503, &e.to_string());
         }
         error_response(500, &e.to_string())
     }
@@ -1610,7 +1615,8 @@ impl ContainerServer {
             })
         });
         let include_own = states_raw.as_deref().is_some_and(|csv| {
-            csv.split(',').any(|p| p.trim().eq_ignore_ascii_case("auditing"))
+            csv.split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("auditing"))
         });
         let states = match states_raw {
             Some(csv) => {
@@ -1883,7 +1889,7 @@ impl ContainerServer {
                 match broker.empty() {
                     Ok(false) => return swob_response(409, None),
                     Ok(true) => {}
-                    Err(e) => return error_response(500, &e.to_string()),
+                    Err(e) => return self.db_error_response(&e, broker.db_file()),
                 }
                 let put_ts_nonzero = broker
                     .get_info()
@@ -1898,7 +1904,7 @@ impl ContainerServer {
                     .unwrap_or(false);
                 let existed = put_ts_nonzero && !matches!(broker.is_deleted(), Ok(true));
                 if let Err(e) = broker.delete_db(&req_timestamp.internal()) {
-                    return error_response(500, &e.to_string());
+                    return self.db_error_response(&e, broker.db_file());
                 }
                 if !matches!(broker.is_deleted(), Ok(true)) {
                     return swob_response(409, None);
@@ -2655,7 +2661,10 @@ mod shard_format_tests {
         let arr = body.as_array().expect("namespace listing is a JSON array");
         assert_eq!(arr.len(), 1, "includes returns the covering namespace");
         assert_eq!(arr[0]["name"], ".shards_AUTH_test/c-1");
-        assert!(arr[0].get("object_count").is_none(), "namespace omits full fields");
+        assert!(
+            arr[0].get("object_count").is_none(),
+            "namespace omits full fields"
+        );
 
         // Override-Shard-Name-Filter=sharded on a SHARDED db ignores includes.
         broker
@@ -2677,12 +2686,8 @@ mod shard_format_tests {
             headers,
             body: Vec::new().into(),
         };
-        let resp = test_server().get_shard(
-            &req,
-            &mut broker,
-            HeaderKeyDict::new(),
-            "application/json",
-        );
+        let resp =
+            test_server().get_shard(&req, &mut broker, HeaderKeyDict::new(), "application/json");
         let override_hdr = resp.headers.get("X-Backend-Override-Shard-Name-Filter");
         let body: serde_json::Value =
             serde_json::from_slice(&resp.body.into_vec(1024 * 1024).unwrap()).unwrap();
@@ -2728,5 +2733,4 @@ mod shard_format_tests {
         assert!(v.get("sharding_stats").is_some());
         let _ = std::fs::remove_dir_all(&srv.config.recon_cache_path);
     }
-
 }

@@ -166,6 +166,18 @@ impl XattrSource<'_> {
     }
 
     fn set(&self, name: &str, value: &[u8]) -> std::io::Result<()> {
+        // Isolated G7 A15 hook. Two exact values are required so an accidental
+        // inherited or misspelled environment variable cannot fault a live
+        // object server. The G7 harness also guards the isolated port, data
+        // root, production PID and production binary before arming this.
+        if xattr_eio_injection_enabled(
+            std::env::var("PEREGRINE_FAULT_INJECTION_SCOPE")
+                .ok()
+                .as_deref(),
+            std::env::var("PEREGRINE_INJECT_XATTR_EIO").ok().as_deref(),
+        ) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
         match self {
             XattrSource::Path(p) => xattr::set(p, name, value),
             XattrSource::File(f) => {
@@ -181,6 +193,10 @@ impl XattrSource<'_> {
             XattrSource::File(_) => "<fd>".to_string(),
         }
     }
+}
+
+fn xattr_eio_injection_enabled(scope: Option<&str>, trigger: Option<&str>) -> bool {
+    scope == Some("isolated-g7-a15") && trigger == Some("1")
 }
 
 /// Read the raw pickled metadata blob from a file's xattrs, verifying the
@@ -318,5 +334,22 @@ mod tests {
             read_metadata(Path::new("/nonexistent/nowhere.data")),
             Err(DiskFileError::NotExist)
         ));
+    }
+
+    #[test]
+    fn test_xattr_eio_fault_requires_two_exact_arming_values() {
+        assert!(xattr_eio_injection_enabled(
+            Some("isolated-g7-a15"),
+            Some("1")
+        ));
+        for (scope, trigger) in [
+            (None, None),
+            (Some("isolated-g7-a15"), None),
+            (None, Some("1")),
+            (Some("isolated-g7-a15"), Some("true")),
+            (Some("production"), Some("1")),
+        ] {
+            assert!(!xattr_eio_injection_enabled(scope, trigger));
+        }
     }
 }

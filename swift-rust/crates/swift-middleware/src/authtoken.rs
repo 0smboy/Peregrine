@@ -611,18 +611,16 @@ impl Middleware for AuthToken {
                 }
                 TokenOutcome::Confirmed(mut validated) => {
                     let service = match service_token.as_deref() {
-                        Some(t) if !t.is_empty() => {
-                            match self.validator.validate_async(t).await {
-                                TokenOutcome::Confirmed(svc) => {
-                                    validated.identity.service_roles = svc.identity.roles.clone();
-                                    Some(svc)
-                                }
-                                TokenOutcome::Invalid => {
-                                    return MwPrep::ShortCircuit(self.unauthorized())
-                                }
-                                TokenOutcome::Indeterminate => None,
+                        Some(t) if !t.is_empty() => match self.validator.validate_async(t).await {
+                            TokenOutcome::Confirmed(svc) => {
+                                validated.identity.service_roles = svc.identity.roles.clone();
+                                Some(svc)
                             }
-                        }
+                            TokenOutcome::Invalid => {
+                                return MwPrep::ShortCircuit(self.unauthorized())
+                            }
+                            TokenOutcome::Indeterminate => None,
+                        },
                         _ => None,
                     };
                     Self::stamp(req, &validated, service.as_deref());

@@ -77,6 +77,11 @@ struct Node {
     /// 404 from such a node with no tombstone timestamp is not
     /// authoritative (base.py:1104-1112, 1617-1624).
     handoff: bool,
+    /// Ring primary position. For EC this is the fragment index the
+    /// proxy assigned at PUT. Used when a backend 200 omits
+    /// `X-Object-Sysmeta-Ec-Frag-Index` so gather can still count the
+    /// source (field `9a95747` harvest saw 0 of those headers).
+    backend_index: Option<i32>,
 }
 
 /// `swift.common.error_limiter.ErrorLimiter`.
@@ -725,6 +730,11 @@ pub struct ProxyApp {
     /// Account/container info cache (L1 local + optional shared memcache L2).
     /// Rebuilt whenever the app is reconstructed (ring reload).
     info_cache: InfoCache,
+    /// Syslog logger used by the daemon (`log_name`, usually `proxy-server`).
+    /// Isolated lab manager.log / syslog harvest this path; `eprintln!` does not.
+    logger: Option<Arc<swift_core::obslog::Logger>>,
+    /// Test capture for the same lines the daemon sends to syslog.
+    log_sink: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// A backend response.
@@ -733,6 +743,63 @@ struct BackendResponse {
     reason: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+pub(crate) fn with_g6_diag(mut resp: Response, reason: impl Into<String>) -> Response {
+    if resp.g6_diag.is_none() {
+        resp.set_g6_diag(reason);
+    }
+    resp
+}
+
+fn finalize_service_g6_diag(mut resp: Response, via: &str, method: &str, path: &str) -> Response {
+    match resp.g6_diag.as_mut() {
+        Some(inner) => {
+            if !inner.contains("via=") {
+                *inner = format!("via={via} {inner}");
+            }
+        }
+        None => {
+            resp.set_g6_diag(format!(
+                "reason=unstamped via={via} method={method} path={path} status={}",
+                resp.status
+            ));
+        }
+    }
+    resp
+}
+
+/// Python `server.py get_controller` / `obj.py GETorHEAD`: an explicit
+/// `X-Backend-Storage-Policy-Index` — including `0` — selects that policy's
+/// object ring and controller. Remapping `0` onto an EC container made
+/// InternalClient GETs for Policy-0 and ec42 hit the same fragments, so
+/// `test_expirer_object_split_brain` saw the object in both policies
+/// (L131) or a timestamp-less EC 404 when the data lived on Policy-0 (L105).
+pub(crate) fn resolve_object_storage_policy(
+    header_policy: Option<i64>,
+    container_policy: i64,
+) -> i64 {
+    header_policy.unwrap_or(container_policy)
+}
+
+/// Python EC GET `best_response` on fragment 404s copies the winning
+/// `X-Backend-Timestamp`. A synthesized HTML 404 must do the same so
+/// InternalClient / `get_object_metadata(..., acceptable_statuses=(4,))`
+/// can see the tombstone (probe `test_expirer_object_split_brain`).
+pub(crate) fn swob_404_with_backend_timestamp(ts: Timestamp) -> Response {
+    attach_backend_timestamp(swob_response(404), ts)
+}
+
+pub(crate) fn attach_backend_timestamp(mut resp: Response, ts: Timestamp) -> Response {
+    if resp.status == 404 && ts.is_truthy() {
+        if resp.headers.get("X-Backend-Timestamp").is_none() {
+            resp.headers.set("X-Backend-Timestamp", ts.internal());
+        }
+        if resp.headers.get("X-Timestamp").is_none() {
+            resp.headers.set("X-Timestamp", ts.normal());
+        }
+    }
+    resp
 }
 
 fn swob_response(status: u16) -> Response {
@@ -1559,6 +1626,37 @@ impl ProxyApp {
             config,
             error_limiter,
             info_cache: InfoCache::new(),
+            logger: None,
+            log_sink: None,
+        }
+    }
+
+    /// Attach the daemon syslog logger. Ring reload must re-apply this.
+    pub fn with_logger(mut self, logger: Arc<swift_core::obslog::Logger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// Capture `proxy-server:` lines in tests (same strings as syslog).
+    pub fn with_log_sink(mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.log_sink = Some(sink);
+        self
+    }
+
+    /// INFO (or ERROR when `error`) on the real proxy logger, plus any test sink.
+    /// Isolated lab harvests `G6_DIAG` from stderr (manager.log); syslog
+    /// `Logger` alone was silent on `2c64a89`.
+    pub(crate) fn emit_proxy_log(&self, error: bool, msg: &str) {
+        eprintln!("G6_DIAG {msg}");
+        if let Some(sink) = &self.log_sink {
+            sink(msg);
+        }
+        if let Some(logger) = &self.logger {
+            if error {
+                logger.error(msg);
+            } else {
+                logger.info(msg);
+            }
         }
     }
 
@@ -1595,6 +1693,23 @@ impl ProxyApp {
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect();
         self
+    }
+
+    /// EC scheme for a GET: exact policy index, else a configured scheme
+    /// whose `ndata + nparity` matches this object ring's replica count.
+    pub(crate) fn ec_params_for_object_ring(
+        &self,
+        policy_index: i64,
+        object_ring: &Ring,
+    ) -> Option<EcPolicyParams> {
+        if let Some(&ec) = self.ec_policies.get(&policy_index) {
+            return Some(ec);
+        }
+        let n = object_ring.replica_count().round() as usize;
+        self.ec_policies
+            .values()
+            .copied()
+            .find(|ec| ec.ndata + ec.nparity == n)
     }
 
     /// The object ring for a configured storage policy index (Python
@@ -1681,6 +1796,7 @@ impl ProxyApp {
                 port: n.dev.port,
                 device: n.dev.device.clone(),
                 handoff: false,
+                backend_index: Some(n.index as i32),
             })
             .collect()
     }
@@ -1867,15 +1983,17 @@ impl ProxyApp {
     fn iter_nodes(&self, ring: &Ring, part: u32) -> Vec<Node> {
         let primaries = ring.get_part_nodes(part).unwrap_or_default();
         let limit = (self.config.request_node_count_factor as usize) * primaries.len().max(1);
-        let to_node = |dev: &swift_ring::RingDevice, handoff: bool| Node {
-            ip: dev.ip.clone(),
-            port: dev.port,
-            device: dev.device.clone(),
-            handoff,
-        };
+        let to_node =
+            |dev: &swift_ring::RingDevice, handoff: bool, backend_index: Option<i32>| Node {
+                ip: dev.ip.clone(),
+                port: dev.port,
+                device: dev.device.clone(),
+                handoff,
+                backend_index,
+            };
         let mut out: Vec<Node> = Vec::new();
         for node in &primaries {
-            let n = to_node(node.dev, false);
+            let n = to_node(node.dev, false, Some(node.index as i32));
             if !self.error_limiter.is_limited(&n) {
                 out.push(n);
             }
@@ -1886,7 +2004,7 @@ impl ProxyApp {
                     if out.len() >= limit {
                         break;
                     }
-                    let n = to_node(handoff.dev, true);
+                    let n = to_node(handoff.dev, true, None);
                     if !self.error_limiter.is_limited(&n) {
                         out.push(n);
                     }
@@ -3214,11 +3332,11 @@ impl ProxyApp {
                 body: swift_http::Body::empty(),
             };
             if let Some(resp) = utf8_or_null_rejected(&req) {
-                return resp;
+                return with_g6_diag(resp, "reason=utf8_or_null");
             }
             let account = segs[2].to_string();
             if segs.get(3) == Some(&"") {
-                return swob_response(404);
+                return with_g6_diag(swob_response(404), "reason=empty_container_seg");
             }
             let container = segs.get(3).map(|s| s.to_string()).filter(|s| !s.is_empty());
             let object = segs.get(4).map(|s| s.to_string()).filter(|s| !s.is_empty());
@@ -3234,7 +3352,11 @@ impl ProxyApp {
                 .authorize_async(&mut req, &account, container.as_deref(), object.as_deref())
                 .await
             {
-                return denied;
+                let status = denied.status;
+                return with_g6_diag(
+                    denied,
+                    format!("reason=authorize method={} status={status}", req.method),
+                );
             }
             if req
                 .headers
@@ -3260,7 +3382,36 @@ impl ProxyApp {
             return match (req.method.as_str(), container.as_deref(), object.as_deref()) {
                 ("GET" | "HEAD", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
-                    self.object_get_head_async(&mut req, &account, &c, &o).await
+                    self.emit_proxy_log(
+                        false,
+                        &format!(
+                            "proxy-server: EC GET {}/{}/{} status=start \
+                             reason=handle_async method={}",
+                            percent_encode(&account),
+                            percent_encode(&c),
+                            percent_encode(&o),
+                            req.method
+                        ),
+                    );
+                    let mut resp = self.object_get_head_async(&mut req, &account, &c, &o).await;
+                    self.emit_proxy_log(
+                        resp.status >= 400,
+                        &format!(
+                            "proxy-server: EC GET {}/{}/{} status={} \
+                             reason=handle_async_done",
+                            percent_encode(&account),
+                            percent_encode(&c),
+                            percent_encode(&o),
+                            resp.status
+                        ),
+                    );
+                    if resp.g6_diag.is_none() {
+                        resp.set_g6_diag(format!(
+                            "reason=handle_async_done method={} status={}",
+                            req.method, resp.status
+                        ));
+                    }
+                    resp
                 }
                 ("POST", Some(c), Some(o)) => {
                     let (c, o) = (c.to_string(), o.to_string());
@@ -3399,7 +3550,13 @@ impl ProxyApp {
             let allowed = self.allowed_methods(segs.get(3).is_some_and(|s| !s.is_empty()));
             return method_not_allowed(allowed);
         }
-        swob_response(404)
+        with_g6_diag(
+            swob_response(404),
+            format!(
+                "reason=handle_async_fallthrough method={} path={}",
+                areq.method, areq.path
+            ),
+        )
     }
 
     async fn options_response_async(
@@ -3474,7 +3631,7 @@ impl ProxyApp {
         if !info.exists() {
             return swob_response(info.write_failure_status());
         }
-        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let policy_index: i64 = resolve_object_storage_policy(header_policy, info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return text_response(
                 503,
@@ -3757,7 +3914,10 @@ impl ProxyApp {
                     .get("X-Backend-Record-Type")
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if record_type != "shard" && !req.query_string.contains("states=") {
+                if record_type != "object"
+                    && record_type != "shard"
+                    && !req.query_string.contains("states=")
+                {
                     if let Some(mut fan) =
                         self.maybe_sharded_container_listing(req, account, container)
                     {
@@ -3780,6 +3940,7 @@ impl ProxyApp {
                             fan.headers.set("X-Container-Object-Count", count);
                             fan.headers.set("X-Container-Bytes-Used", bytes);
                         }
+                        finalize_container_listing_headers(req, &mut fan);
                         return fan;
                     }
                 }
@@ -3815,6 +3976,7 @@ impl ProxyApp {
                         self.patch_sharded_head_counts(req, account, container, &mut resp);
                     }
                 }
+                finalize_container_listing_headers(req, &mut resp);
                 resp
             }
             "PUT" | "POST" | "DELETE" => {
@@ -5284,9 +5446,12 @@ impl ProxyApp {
             if !info.exists() {
                 return swob_response(info.write_failure_status());
             }
-            header_policy.unwrap_or(info.policy_index)
+            resolve_object_storage_policy(header_policy, info.policy_index)
         } else {
-            header_policy.unwrap_or_else(|| self.container_policy_index(account, container))
+            resolve_object_storage_policy(
+                header_policy,
+                self.container_policy_index(account, container),
+            )
         };
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return text_response(
@@ -5308,9 +5473,9 @@ impl ProxyApp {
         // and fans a distinct fragment archive to each node; GET/HEAD gather
         // `ndata` fragments and decode. POST (metadata) and DELETE (tombstone)
         // carry no object data, so they take the replication fan-out unchanged.
-        if let Some(&ec) = self.ec_policies.get(&policy_index) {
+        if let Some(ec) = self.ec_params_for_object_ring(policy_index, object_ring) {
             match req.method.as_str() {
-                "PUT" => {
+                "PUT" if self.ec_policies.contains_key(&policy_index) => {
                     return self.ec_put(
                         req,
                         account,
@@ -5323,7 +5488,23 @@ impl ProxyApp {
                     )
                 }
                 "GET" | "HEAD" => {
-                    return self.ec_get(req, &path, policy_index, object_ring, object_part, ec);
+                    self.emit_proxy_log(
+                        false,
+                        &format!(
+                            "proxy-server: EC GET {path} status=start reason=sync_ec_get \
+                             policy={policy_index} ndata={}",
+                            ec.ndata
+                        ),
+                    );
+                    let resp = self.ec_get(req, &path, policy_index, object_ring, object_part, ec);
+                    self.emit_proxy_log(
+                        resp.status >= 400,
+                        &format!(
+                            "proxy-server: EC GET {path} status={} reason=sync_ec_get_done",
+                            resp.status
+                        ),
+                    );
+                    return resp;
                 }
                 _ => {}
             }
@@ -5576,6 +5757,7 @@ impl ProxyApp {
                     port: h.dev.port,
                     device: h.dev.device.clone(),
                     handoff: true,
+                    backend_index: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -5874,38 +6056,77 @@ impl ProxyApp {
         }
         drop(tx);
 
-        let mut sources: HashMap<i32, (Node, BackendHead)> = HashMap::new();
-        let mut meta: Option<Vec<(String, String)>> = None;
-        let mut saw_404 = false;
+        let mut goods: Vec<(Node, BackendHead)> = Vec::new();
+        let mut latest_404_timestamp = Timestamp::zero();
+        let mut saw_auth_404 = false;
         for (node, r) in rx.iter() {
             match r {
-                Ok(head) if head.status == 200 => {
-                    let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                        .and_then(|v| v.parse::<i32>().ok());
-                    if let Some(fi) = fi {
-                        if sources.len() >= ec.ndata && !sources.contains_key(&fi) {
-                            continue; // enough sources; surplus conns just drop
+                Ok(head) if head.status == 200 => goods.push((node, head)),
+                Ok(head) if head.status == 404 => {
+                    let ts = backend_404_timestamp(&head.headers);
+                    if !node.handoff || ts.is_truthy() {
+                        saw_auth_404 = true;
+                        if ts > latest_404_timestamp {
+                            latest_404_timestamp = ts;
                         }
-                        if meta.is_none() {
-                            meta = Some(head.headers.clone());
-                        }
-                        sources.entry(fi).or_insert((node, head));
                     }
                 }
-                Ok(head) if head.status == 404 => saw_404 = true,
                 Ok(head) if head.status == 507 => self.error_limiter.limit(&node),
                 Ok(head) if head.status >= 500 => self.error_limiter.increment(&node),
                 Ok(_) => {}
                 Err(_) => self.error_limiter.increment(&node),
             }
         }
+        let n200 = goods.len();
+        let mut sources: HashMap<i32, (Node, BackendHead)> = HashMap::new();
+        let mut meta: Option<Vec<(String, String)>> = None;
+        for (node, head) in goods {
+            // obj.py ECGetResponseCollection.best_bucket: a newer tombstone
+            // trumps older fragment archives left on nodes that missed DELETE.
+            if source_timestamp(&head.headers) < latest_404_timestamp {
+                continue;
+            }
+            let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
+                .and_then(|v| v.parse::<i32>().ok())
+                .or(node.backend_index);
+            if let Some(fi) = fi {
+                if sources.len() >= ec.ndata && !sources.contains_key(&fi) {
+                    continue;
+                }
+                if meta.is_none() {
+                    meta = Some(head.headers.clone());
+                }
+                sources.entry(fi).or_insert((node, head));
+            }
+        }
 
-        if sources.len() < ec.ndata {
-            return if saw_404 && sources.is_empty() {
-                swob_response(404)
+        let required = if is_head { 1 } else { ec.ndata };
+        if sources.len() < required {
+            let idxs: Vec<i32> = sources.keys().copied().collect();
+            // GET: empty + 404 → gone; leftover durables below ndata → 503.
+            // HEAD: one fragment's metadata is enough (official lonely-frag
+            // client HEAD is 2xx). Zero sources still follow GET's miss map.
+            let status = if sources.is_empty() && saw_auth_404 {
+                404
             } else {
-                swob_response(503)
+                503
             };
+            self.emit_proxy_log(
+                true,
+                &format!(
+                    "proxy-server: EC GET {path} status={status} reason=sync_ec_gather \
+                     policy={policy_index} ndata={} 200s={} idxs={idxs:?}",
+                    ec.ndata, n200
+                ),
+            );
+            return with_g6_diag(
+                attach_backend_timestamp(swob_response(status), latest_404_timestamp),
+                format!(
+                    "reason=sync_ec_gather status={status} ndata={} idxs={idxs:?} \
+                     ec=1 policy={policy_index} 200s={n200}",
+                    ec.ndata
+                ),
+            );
         }
         let meta = meta.unwrap_or_default();
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
@@ -6273,6 +6494,7 @@ fn ring_nodes(part_nodes: Vec<swift_ring::PartNode<'_>>) -> Vec<Node> {
             port: pn.dev.port,
             device: pn.dev.device.clone(),
             handoff: false,
+            backend_index: Some(pn.index as i32),
         })
         .collect()
 }
@@ -6422,6 +6644,24 @@ pub(crate) fn constrain_listing_limit(req: &Request) -> Result<usize, Response> 
             Ok(limit.max(0) as usize)
         }
         _ => Ok(max as usize),
+    }
+}
+
+/// Python container.GET owns this response contract, not InternalClient.
+/// Auto/default (including unknown) GET record types return an object listing
+/// without backend record-type/format headers. Explicit object/shard requests
+/// are internal direct-backend operations and must preserve their headers.
+/// HEAD is not container.GET and must not inherit its response filtering.
+pub(crate) fn finalize_container_listing_headers(req: &Request, resp: &mut Response) {
+    let explicit_record_type = req
+        .headers
+        .get("X-Backend-Record-Type")
+        .is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("object") || kind.eq_ignore_ascii_case("shard")
+        });
+    if req.method == "GET" && !explicit_record_type {
+        resp.headers.remove("X-Backend-Record-Type");
+        resp.headers.remove("X-Backend-Record-Shard-Format");
     }
 }
 
@@ -8045,7 +8285,19 @@ async fn dispatch_streaming_remaining(
             let next = remaining_streaming_next(Arc::clone(&filters), j + 1, Arc::clone(&app));
             let mut resp = filters[j].handle_streaming_request(req, next).await;
             buffer_manifest_channel(&mut resp).await;
-            return apply_outbound_filters(filters, start, j, app, head, resp).await;
+            resp = apply_outbound_filters(
+                Arc::clone(&filters),
+                start,
+                j,
+                Arc::clone(&app),
+                head.clone_head(),
+                resp,
+            )
+            .await;
+            // Streaming intercepts skip this filter in apply_outbound_filters
+            // (end=j). SLO part-number reassemble can drop X-Object-Version-Id;
+            // versioned_writes::finish restamps it from the client query.
+            return filters[j].finish(&head, resp);
         }
 
         if filters[j].intercepts_request(&head) {
@@ -8256,133 +8508,148 @@ impl AsyncService for ProxyAsyncService {
         };
         let filters = self.filters.clone();
         Box::pin(async move {
-            let mut req = req;
-            if filters.is_empty() {
-                let head = Request {
+            let method = req.method.clone();
+            let path = req.path.clone();
+            let via = if filters.is_empty() {
+                "no_filters"
+            } else {
+                "filters"
+            };
+            let resp = async move {
+                let mut req = req;
+                if filters.is_empty() {
+                    let head = Request {
+                        method: req.method.clone(),
+                        path: req.path.clone(),
+                        query_string: req.query_string.clone(),
+                        headers: req.headers.clone(),
+                        body: swift_http::Body::empty(),
+                    };
+                    let mut resp = app.handle_async(req).await;
+                    app.apply_pipeline_cors(
+                        head.method.clone(),
+                        head.path.clone(),
+                        head.headers.get("Origin").map(str::to_string),
+                        &mut resp,
+                    )
+                    .await;
+                    return resp;
+                }
+                let mut head = Request {
                     method: req.method.clone(),
                     path: req.path.clone(),
                     query_string: req.query_string.clone(),
                     headers: req.headers.clone(),
                     body: swift_http::Body::empty(),
                 };
-                let mut resp = app.handle_async(req).await;
-                app.apply_pipeline_cors(
-                    head.method.clone(),
-                    head.path.clone(),
-                    head.headers.get("Origin").map(str::to_string),
-                    &mut resp,
-                )
-                .await;
-                return resp;
-            }
-            let mut head = Request {
-                method: req.method.clone(),
-                path: req.path.clone(),
-                query_string: req.query_string.clone(),
-                headers: req.headers.clone(),
-                body: swift_http::Body::empty(),
-            };
-            for filter in &filters {
-                match filter.prepare_async(&mut head).await {
-                    swift_middleware::MwPrep::Continue => {}
-                    swift_middleware::MwPrep::ShortCircuit(resp) => {
-                        let mut resp = resp;
-                        for g in filters.iter().rev() {
-                            resp = g.finish(&head, resp);
-                        }
-                        return resp;
-                    }
-                }
-            }
-            req.headers = head.headers.clone();
-            req.query_string = head.query_string.clone();
-            if filters.iter().any(|f| f.streams_request(&head)) {
-                let mut resp =
-                    dispatch_streaming_remaining(Arc::new(filters), 0, Arc::clone(&app), req).await;
-                app.apply_pipeline_cors(
-                    head.method.clone(),
-                    head.path.clone(),
-                    head.headers.get("Origin").map(str::to_string),
-                    &mut resp,
-                )
-                .await;
-                return resp;
-            }
-            if filters.iter().any(|f| f.intercepts_request(&head)) {
-                let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
-                    Ok(bytes) => swift_http::Body::Buffered(bytes),
-                    Err(e) if swift_http::body_too_large(&e) => {
-                        return Response::error(413, "Your request is too large.")
-                    }
-                    Err(_) => {
-                        // Python s3api PUT maps Swift 499 (short body /
-                        // client hangup) to RequestTimeout 400. The
-                        // intercept path never reaches s3api if Hyper
-                        // fails the body read (Content-Length mismatch).
-                        if head.method == "PUT" {
-                            let mut resp =
-                                swift_s3api::s3_error_response("RequestTimeout", None, &[]);
-                            resp.headers.set("Connection", "close");
+                for filter in &filters {
+                    match filter.prepare_async(&mut head).await {
+                        swift_middleware::MwPrep::Continue => {}
+                        swift_middleware::MwPrep::ShortCircuit(resp) => {
+                            let mut resp = resp;
+                            for g in filters.iter().rev() {
+                                resp = g.finish(&head, resp);
+                            }
                             return resp;
                         }
-                        return swob_response(499);
-                    }
-                };
-                let request = Request {
-                    method: req.method,
-                    path: req.path,
-                    query_string: req.query_string,
-                    headers: req.headers,
-                    body,
-                };
-                let filters_arc = Arc::new(filters.clone());
-                for (i, filter) in filters.iter().enumerate() {
-                    if filter.intercepts_request(&head) {
-                        let next =
-                            remaining_async_next(Arc::clone(&filters_arc), i + 1, Arc::clone(&app));
-                        let mut resp = filter.handle_request_async(request, next).await;
-                        buffer_manifest_channel(&mut resp).await;
-                        resp = apply_outbound_filters(
-                            Arc::clone(&filters_arc),
-                            0,
-                            i,
-                            Arc::clone(&app),
-                            head.clone_head(),
-                            resp,
-                        )
-                        .await;
-                        app.apply_pipeline_cors(
-                            head.method.clone(),
-                            head.path.clone(),
-                            head.headers.get("Origin").map(str::to_string),
-                            &mut resp,
-                        )
-                        .await;
-                        return resp;
                     }
                 }
-                return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
+                req.headers = head.headers.clone();
+                req.query_string = head.query_string.clone();
+                if filters.iter().any(|f| f.streams_request(&head)) {
+                    let mut resp =
+                        dispatch_streaming_remaining(Arc::new(filters), 0, Arc::clone(&app), req)
+                            .await;
+                    app.apply_pipeline_cors(
+                        head.method.clone(),
+                        head.path.clone(),
+                        head.headers.get("Origin").map(str::to_string),
+                        &mut resp,
+                    )
+                    .await;
+                    return resp;
+                }
+                if filters.iter().any(|f| f.intercepts_request(&head)) {
+                    let body = match req.body.materialize(swift_http::MAX_CONTROL_BODY).await {
+                        Ok(bytes) => swift_http::Body::Buffered(bytes),
+                        Err(e) if swift_http::body_too_large(&e) => {
+                            return Response::error(413, "Your request is too large.")
+                        }
+                        Err(_) => {
+                            // Python s3api PUT maps Swift 499 (short body /
+                            // client hangup) to RequestTimeout 400. The
+                            // intercept path never reaches s3api if Hyper
+                            // fails the body read (Content-Length mismatch).
+                            if head.method == "PUT" {
+                                let mut resp =
+                                    swift_s3api::s3_error_response("RequestTimeout", None, &[]);
+                                resp.headers.set("Connection", "close");
+                                return resp;
+                            }
+                            return swob_response(499);
+                        }
+                    };
+                    let request = Request {
+                        method: req.method,
+                        path: req.path,
+                        query_string: req.query_string,
+                        headers: req.headers,
+                        body,
+                    };
+                    let filters_arc = Arc::new(filters.clone());
+                    for (i, filter) in filters.iter().enumerate() {
+                        if filter.intercepts_request(&head) {
+                            let next = remaining_async_next(
+                                Arc::clone(&filters_arc),
+                                i + 1,
+                                Arc::clone(&app),
+                            );
+                            let mut resp = filter.handle_request_async(request, next).await;
+                            buffer_manifest_channel(&mut resp).await;
+                            resp = apply_outbound_filters(
+                                Arc::clone(&filters_arc),
+                                0,
+                                i,
+                                Arc::clone(&app),
+                                head.clone_head(),
+                                resp,
+                            )
+                            .await;
+                            app.apply_pipeline_cors(
+                                head.method.clone(),
+                                head.path.clone(),
+                                head.headers.get("Origin").map(str::to_string),
+                                &mut resp,
+                            )
+                            .await;
+                            return resp;
+                        }
+                    }
+                    return remaining_async_next(filters_arc, 0, Arc::clone(&app))(request).await;
+                }
+                let mut resp = app.handle_async(req).await;
+                buffer_manifest_channel(&mut resp).await;
+                let filters_arc = Arc::new(filters);
+                resp = apply_outbound_filters(
+                    Arc::clone(&filters_arc),
+                    0,
+                    filters_arc.len(),
+                    Arc::clone(&app),
+                    head.clone_head(),
+                    resp,
+                )
+                .await;
+                app.apply_pipeline_cors(
+                    head.method.clone(),
+                    head.path.clone(),
+                    head.headers.get("Origin").map(str::to_string),
+                    &mut resp,
+                )
+                .await;
+                resp
             }
-            let mut resp = app.handle_async(req).await;
-            buffer_manifest_channel(&mut resp).await;
-            let filters_arc = Arc::new(filters);
-            resp = apply_outbound_filters(
-                Arc::clone(&filters_arc),
-                0,
-                filters_arc.len(),
-                Arc::clone(&app),
-                head.clone_head(),
-                resp,
-            )
             .await;
-            app.apply_pipeline_cors(
-                head.method.clone(),
-                head.path.clone(),
-                head.headers.get("Origin").map(str::to_string),
-                &mut resp,
-            )
-            .await;
-            resp
+            finalize_service_g6_diag(resp, via, &method, &path)
         })
     }
 }
@@ -8567,6 +8834,93 @@ mod pipeline_async_tests {
         assert!(
             resp.headers.get("X-Trans-Id").is_some(),
             "catch_errors must stamp X-Trans-Id on the async path"
+        );
+    }
+
+    /// Field G4 on isolated :18080 (frozen 2a6110c) returned 401 for TempURL
+    /// because HMAC lived only in `handle()`, which Hyper never calls.
+    /// `prepare` must stamp `X-Backend-Authorize-Override` so
+    /// `authorize_async` does not treat a signed URL as anonymous.
+    #[tokio::test]
+    async fn tempurl_prepare_runs_on_hyper_path_so_signed_get_is_not_auth_401() {
+        const KEY: &str = "mykey";
+        const EXPIRES: &str = "4102444800";
+        const SIG: &str = "beb29507e95de0350c1076f7671d128cc02120c3186c0ba7c70d4d3a1bba6bfe";
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                // No live object nodes in this unit test; fail the backend
+                // connect quickly once authorize has accepted the TempURL.
+                conn_timeout: Duration::from_millis(50),
+                node_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec![KEY.to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![
+                Arc::new(swift_middleware::CatchErrors::new("")),
+                Arc::new(swift_middleware::Gatekeeper::default()),
+                Arc::new(tu),
+            ],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: format!("temp_url_sig={SIG}&temp_url_expires={EXPIRES}"),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_ne!(
+            resp.status, 401,
+            "valid TempURL on the Hyper path must not 401 (got {} {:?})",
+            resp.status, resp.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn tempurl_prepare_rejects_bad_sig_on_hyper_path() {
+        let app = Arc::new(ProxyApp::new(
+            policy_ring_tests::ring(1),
+            policy_ring_tests::ring(2),
+            ProxyConfig {
+                auth_enabled: true,
+                ..Default::default()
+            },
+        ));
+        let tu = swift_middleware::TempUrl::new(Arc::new(
+            swift_middleware::ClosureKeyProvider::new(|_a, _c| vec!["mykey".to_string()]),
+        ));
+        let svc = ProxyAsyncService {
+            app: Arc::new(RwLock::new(app)),
+            filters: vec![Arc::new(tu)],
+        };
+        let resp = svc
+            .call(AsyncRequest {
+                method: "GET".into(),
+                path: "/v1/AUTH_account/container/object".into(),
+                query_string: "temp_url_sig=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&temp_url_expires=4102444800".into(),
+                headers: HeaderKeyDict::new(),
+                body: IncomingBody::from_bytes(Vec::new(), u64::MAX),
+            })
+            .await;
+        assert_eq!(resp.status, 401);
+        let mut resp = resp;
+        resp.body.materialize(u64::MAX).unwrap();
+        let body = match &resp.body {
+            swift_http::Body::Buffered(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("Temp URL invalid"),
+            "bad HMAC on Hyper path must use TempURL 401 body, got {body:?}"
         );
     }
 }
@@ -8780,6 +9134,115 @@ mod stale_read_and_post_tests {
     }
 
     #[test]
+    fn test_ec_tombstone_404_carries_backend_timestamp() {
+        // Probe test_expirer_object_split_brain (L105): after expire +
+        // get_to_final_state, GET 404 must expose x-backend-timestamp.
+        // EC gather used to return a bare HTML 404.
+        let ts: Timestamp = "1788834800.12345".parse().unwrap();
+        let resp = swob_404_with_backend_timestamp(ts);
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            resp.headers.get("X-Backend-Timestamp"),
+            Some(ts.internal().as_str())
+        );
+        assert_eq!(resp.headers.get("X-Timestamp"), Some(ts.normal().as_str()));
+        let bare = swob_404_with_backend_timestamp(Timestamp::zero());
+        assert_eq!(bare.status, 404);
+        assert!(bare.headers.get("X-Backend-Timestamp").is_none());
+        let unavailable = attach_backend_timestamp(swob_response(503), ts);
+        assert_eq!(unavailable.status, 503);
+        assert!(unavailable.headers.get("X-Backend-Timestamp").is_none());
+    }
+
+    fn policies_with_backend_timestamp(per_policy: &[(i64, Option<Timestamp>)]) -> Vec<i64> {
+        per_policy
+            .iter()
+            .filter_map(|(policy, ts)| ts.filter(|ts| ts.is_truthy()).map(|_| *policy))
+            .collect()
+    }
+
+    #[test]
+    fn test_expirer_split_brain_ec42_policy0_isolation() {
+        // Probe test_expirer_object_split_brain with forced
+        // old_policy=ec42 (2) ↔ wrong_policy=Policy-0 (0) and the inverse.
+        // InternalClient GET/DELETE send X-Backend-Storage-Policy-Index.
+        const POLICY_0: i64 = 0;
+        const EC42: i64 = 2;
+        let create_ts: Timestamp = "1788834800.00000".parse().unwrap();
+        let tombstone_ts: Timestamp = "1788834802.00000".parse().unwrap();
+
+        // GET/DELETE must not remap explicit 0 onto an EC container (or
+        // the reverse). Python get_controller / GETorHEAD use the header.
+        assert_eq!(
+            resolve_object_storage_policy(Some(POLICY_0), EC42),
+            POLICY_0,
+            "Policy-0 GET on an ec42 container stays on Policy-0"
+        );
+        assert_eq!(
+            resolve_object_storage_policy(Some(EC42), POLICY_0),
+            EC42,
+            "ec42 GET on a Policy-0 container stays on ec42"
+        );
+        assert_eq!(resolve_object_storage_policy(None, EC42), EC42);
+        assert_eq!(resolve_object_storage_policy(None, POLICY_0), POLICY_0);
+        assert_eq!(
+            resolve_object_storage_policy(Some(POLICY_0), POLICY_0),
+            POLICY_0
+        );
+        assert_eq!(resolve_object_storage_policy(Some(EC42), EC42), EC42);
+
+        // L105 Policy-0 → ec42: object lives on Policy-0. Isolated GET
+        // with header 0 must see the expired timestamp, not a bare EC 404.
+        let old = POLICY_0;
+        let wrong = EC42;
+        let get_old = resolve_object_storage_policy(Some(old), wrong);
+        let get_wrong = resolve_object_storage_policy(Some(wrong), wrong);
+        assert_eq!(get_old, POLICY_0);
+        assert_eq!(get_wrong, EC42);
+        let expired_on_old = swob_404_with_backend_timestamp(create_ts);
+        let empty_wrong = swob_404_with_backend_timestamp(Timestamp::zero());
+        assert_eq!(
+            expired_on_old.headers.get("X-Backend-Timestamp"),
+            Some(create_ts.internal().as_str())
+        );
+        assert!(empty_wrong.headers.get("X-Backend-Timestamp").is_none());
+
+        // L131 ec42 → Policy-0 after 2nd expire: DELETE tombstones only
+        // the policy that actually held the object. The other policy's
+        // empty 404 must not count as "found".
+        let after_delete = policies_with_backend_timestamp(&[
+            (EC42, Some(tombstone_ts)),
+            (POLICY_0, None),
+        ]);
+        assert_eq!(after_delete, vec![EC42]);
+        assert!(tombstone_ts > create_ts);
+
+        // The old remap (header 0 + EC container → EC) made both probe
+        // GETs observe the same timestamped 404.
+        let remapped_both = policies_with_backend_timestamp(&[
+            (POLICY_0, Some(tombstone_ts)),
+            (EC42, Some(tombstone_ts)),
+        ]);
+        assert_eq!(
+            remapped_both.len(),
+            2,
+            "sanity: a crossed GET is what L131 reports"
+        );
+        let isolated = policies_with_backend_timestamp(&[
+            (
+                POLICY_0,
+                if resolve_object_storage_policy(Some(POLICY_0), EC42) == EC42 {
+                    Some(tombstone_ts)
+                } else {
+                    None
+                },
+            ),
+            (EC42, Some(tombstone_ts)),
+        ]);
+        assert_eq!(isolated, vec![EC42]);
+    }
+
+    #[test]
     fn test_backend_404_timestamp_absent_is_not_truthy() {
         // no tombstone header -> zero -> a handoff 404 is thrown out
         assert!(!backend_404_timestamp(&hdrs(&[])).is_truthy());
@@ -8874,6 +9337,58 @@ mod stale_read_and_post_tests {
         // and a non-404 final pick is never rewritten
         let resp = app.best_response_with_quorum(&combined, 2);
         assert_eq!(post_existence_proof_guard(resp, 1).status, 202);
+    }
+
+    #[test]
+    fn container_listing_record_headers_follow_python_get_contract() {
+        for method in ["GET", "HEAD", "POST"] {
+            for record_type in [
+                None,
+                Some(""),
+                Some("auto"),
+                Some("AuTo"),
+                Some("banana"),
+                Some("object"),
+                Some("OBJECT"),
+                Some("shard"),
+                Some("SHARD"),
+            ] {
+                let mut req = Request {
+                    method: method.into(),
+                    path: "/v1/AUTH_test/c".into(),
+                    query_string: "format=json".into(),
+                    headers: HeaderKeyDict::new(),
+                    body: swift_http::Body::empty(),
+                };
+                if let Some(kind) = record_type {
+                    req.headers.set("X-Backend-Record-Type", kind);
+                }
+                let mut resp = Response::with_body(200, b"[]".to_vec());
+                resp.headers.set("X-Backend-Record-Type", "shard");
+                resp.headers
+                    .set("X-Backend-Record-Shard-Format", "namespace");
+                resp.headers.set("X-Backend-Sharding-State", "sharded");
+                let preserve = method != "GET"
+                    || record_type.is_some_and(|kind| {
+                        kind.eq_ignore_ascii_case("object") || kind.eq_ignore_ascii_case("shard")
+                    });
+                finalize_container_listing_headers(&req, &mut resp);
+                assert_eq!(
+                    resp.headers.get("X-Backend-Record-Type").as_deref(),
+                    preserve.then_some("shard"),
+                    "method={method} record_type={record_type:?}"
+                );
+                assert_eq!(
+                    resp.headers.get("X-Backend-Record-Shard-Format").as_deref(),
+                    preserve.then_some("namespace"),
+                    "method={method} record_type={record_type:?}"
+                );
+                assert_eq!(
+                    resp.headers.get("X-Backend-Sharding-State").as_deref(),
+                    Some("sharded")
+                );
+            }
+        }
     }
 
     #[test]
@@ -11713,6 +12228,7 @@ mod account_update_headers_tests {
             port,
             device: device.into(),
             handoff: false,
+            backend_index: None,
         }
     }
 
@@ -11814,6 +12330,10 @@ mod account_update_headers_tests {
         assert!(keep_ec_client_metadata("x-object-manifest"));
         assert!(keep_ec_client_metadata("x-object-sysmeta-slo-etag"));
         assert!(keep_ec_client_metadata("x-object-meta-color"));
+        assert!(keep_ec_client_metadata("x-object-meta-è-probe"));
+        assert!(keep_ec_client_metadata(
+            &"X-Object-Meta-è-probe".to_lowercase()
+        ));
         assert!(keep_ec_client_metadata("x-backend-data-timestamp"));
         assert!(keep_ec_client_metadata("x-backend-durable-timestamp"));
         assert!(!keep_ec_client_metadata("content-length"));

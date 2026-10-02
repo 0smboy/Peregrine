@@ -36,6 +36,8 @@ use swift_ring::{Ring, RingData, RingDevice};
 
 const PER_DIFF: i64 = 1000;
 const MAX_DIFFS: i64 = 100;
+const IDEMPOTENT_RPC_ATTEMPTS: u32 = 8;
+const IDEMPOTENT_RPC_BACKOFF_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ContainerPolicyInfo {
@@ -342,11 +344,7 @@ fn load_object_ring(policy_index: i64) -> Option<Ring> {
     Some(Ring::new(data, hash))
 }
 
-fn head_object_request(
-    host: &str,
-    path: &str,
-    policy_index: i64,
-) -> String {
+fn head_object_request(host: &str, path: &str, policy_index: i64) -> String {
     // X-Backend-Open-Expired: an object past X-Delete-At still has a data
     // file. Probe test_expirer_object_split_brain L110 requires that name
     // to stay in the listing until the expirer reaps it. A plain HEAD 404s
@@ -715,6 +713,7 @@ fn replicate_rpc(
 ) -> Result<(u16, Vec<u8>), DbError> {
     let mut conn = std::net::TcpStream::connect(host)
         .map_err(|e| DbError::Connection(format!("connect {host}: {e}")))?;
+
     conn.set_nodelay(true).ok();
     conn.set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();
@@ -740,6 +739,40 @@ fn replicate_rpc(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| DbError::Connection("bad status line".into()))?;
     Ok((status, raw[split + 4..].to_vec()))
+}
+
+/// Retry only idempotent replication RPCs when the peer explicitly reports
+/// transient SQLite lock contention as HTTP 503. A 500 may represent a moved
+/// or damaged DB and 507 means the device is unavailable; neither is retried.
+///
+/// Callers must never route `complete_rsync` or `rsync_then_merge` through
+/// this helper: replaying stage adoption can apply the same staged DB twice.
+fn replicate_idempotent_rpc(
+    operation: &'static str,
+    host: &str,
+    device: &str,
+    partition: &str,
+    hsh: &str,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), DbError> {
+    let mut last = None;
+    for attempt in 0..IDEMPOTENT_RPC_ATTEMPTS {
+        match replicate_rpc(host, device, partition, hsh, body) {
+            Ok((503, resp)) if attempt + 1 < IDEMPOTENT_RPC_ATTEMPTS => {
+                eprintln!(
+                    "db-replicator: transient 503 operation={operation} hsh={hsh} attempt={}/{}",
+                    attempt + 1,
+                    IDEMPOTENT_RPC_ATTEMPTS
+                );
+                last = Some((503, resp));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    IDEMPOTENT_RPC_BACKOFF_MS * (attempt as u64 + 1),
+                ));
+            }
+            other => return other,
+        }
+    }
+    Ok(last.expect("idempotent RPC retries"))
 }
 
 /// Replicate the local container DB to a peer: negotiate the peer's
@@ -833,7 +866,8 @@ pub fn replicate_container_db_role(
         local_count,
         local_policy_index,
     ]);
-    let (status, resp) = replicate_rpc(
+    let (status, resp) = replicate_idempotent_rpc(
+        "sync",
         peer_host,
         peer_device,
         partition,
@@ -1049,7 +1083,8 @@ pub fn replicate_container_db_role(
             })
             .collect();
         let body = serde_json::json!(["merge_items", json_items, local_id]);
-        let (status, _) = replicate_rpc(
+        let (status, _) = replicate_idempotent_rpc(
+            "merge_items",
             peer_host,
             peer_device,
             partition,
@@ -1124,7 +1159,8 @@ pub fn sync_shard_ranges_to_peer(
     }
     let json_ranges: Vec<serde_json::Value> = ranges.iter().map(|r| r.to_json()).collect();
     let body = serde_json::json!(["merge_shard_ranges", json_ranges, local_id]);
-    let (status, _) = replicate_rpc(
+    let (status, _) = replicate_idempotent_rpc(
+        "merge_shard_ranges",
         peer_host,
         peer_device,
         partition,
@@ -1261,7 +1297,8 @@ pub fn replicate_account_db(
             })
             .collect();
         let body = serde_json::json!(["merge_items", json_items, local_id]);
-        let (status, _) = replicate_rpc(
+        let (status, _) = replicate_idempotent_rpc(
+            "merge_items",
             peer_host,
             peer_device,
             partition,
@@ -1393,6 +1430,104 @@ mod tests {
     fn spawn_fake_peer(body: String) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let (addr, handle, _) = spawn_recording_fake_peer(body);
         (addr, handle)
+    }
+
+    /// A fake peer that accepts one connection per scripted status.
+    fn spawn_scripted_fake_peer(
+        statuses: Vec<u16>,
+    ) -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<()>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let handle = std::thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            for line in String::from_utf8_lossy(&buf[..pos]).lines() {
+                                if let Some((key, value)) = line.split_once(':') {
+                                    if key.eq_ignore_ascii_case("content-length") {
+                                        content_length = value.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_length {
+                            break;
+                        }
+                    }
+                    let n = stream.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                captured.lock().unwrap().push(buf);
+                let reason = match status {
+                    200 => "OK",
+                    503 => "Service Unavailable",
+                    507 => "Insufficient Storage",
+                    _ => "Internal Server Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (addr, handle, requests)
+    }
+
+    fn call_scripted_idempotent_peer(
+        statuses: Vec<u16>,
+    ) -> (Result<(u16, Vec<u8>), DbError>, Vec<Vec<u8>>) {
+        let (addr, handle, requests) = spawn_scripted_fake_peer(statuses);
+        let result = replicate_idempotent_rpc(
+            "merge_items",
+            &addr.to_string(),
+            "sda1",
+            "1",
+            "0123456789abcdef0123456789abcdef",
+            br#"["merge_items",[],"local"]"#,
+        );
+        handle.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    #[test]
+    fn idempotent_rpc_retries_only_503() {
+        let (result, requests) = call_scripted_idempotent_peer(vec![503, 503, 200]);
+        assert_eq!(result.unwrap().0, 200);
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests.windows(2).all(|pair| pair[0] == pair[1]),
+            "every retry must replay the identical HTTP request"
+        );
+
+        for terminal in [404, 500, 507] {
+            let (result, requests) = call_scripted_idempotent_peer(vec![terminal]);
+            assert_eq!(result.unwrap().0, terminal);
+            assert_eq!(requests.len(), 1, "status {terminal} must not be retried");
+        }
+
+        let (result, requests) =
+            call_scripted_idempotent_peer(vec![503; IDEMPOTENT_RPC_ATTEMPTS as usize]);
+        assert_eq!(result.unwrap().0, 503);
+        assert_eq!(requests.len(), IDEMPOTENT_RPC_ATTEMPTS as usize);
     }
 
     #[test]
@@ -1655,12 +1790,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut shard = crate::shard::ShardRange::new(
-            ".shards_a/c-0",
-            "0000000003.00000",
-            "",
-            "",
-        );
+        let mut shard = crate::shard::ShardRange::new(".shards_a/c-0", "0000000003.00000", "", "");
         shard.state = crate::shard::state::ACTIVE;
         broker.merge_shard_ranges(vec![shard]).unwrap();
         assert!(broker.has_other_shard_ranges().unwrap());
@@ -1889,18 +2019,9 @@ mod tests {
     #[test]
     fn test_head_object_request_opens_expired() {
         let req = head_object_request("127.0.0.1:16210", "/sdb1/1/a/c/o", 0);
-        assert!(
-            req.contains("X-Backend-Open-Expired: true"),
-            "{req}"
-        );
-        assert!(
-            req.contains("X-Backend-Replication: true"),
-            "{req}"
-        );
-        assert!(
-            req.contains("X-Backend-Storage-Policy-Index: 0"),
-            "{req}"
-        );
+        assert!(req.contains("X-Backend-Open-Expired: true"), "{req}");
+        assert!(req.contains("X-Backend-Replication: true"), "{req}");
+        assert!(req.contains("X-Backend-Storage-Policy-Index: 0"), "{req}");
     }
 
     #[test]

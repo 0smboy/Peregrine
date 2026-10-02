@@ -125,7 +125,10 @@ mod tests {
     #[test]
     fn object_params_only_version_id() {
         assert!(website_object_params(&[]));
-        assert!(website_object_params(&[("versionId".into(), "null".into())]));
+        assert!(website_object_params(&[(
+            "versionId".into(),
+            "null".into()
+        )]));
         assert!(!website_object_params(&[("list-type".into(), "2".into())]));
     }
 }

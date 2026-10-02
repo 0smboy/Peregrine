@@ -36,9 +36,7 @@ fn spawn_max_connections(max_connections: usize) -> harness::Server {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut ready = false;
     while std::time::Instant::now() < deadline {
-        if let Ok((200, _)) =
-            harness::get_close_timed(addr, Duration::from_millis(50))
-        {
+        if let Ok((200, _)) = harness::get_close_timed(addr, Duration::from_millis(50)) {
             ready = true;
             break;
         }
@@ -65,16 +63,19 @@ fn extra_connection_is_503_when_max_connections_is_full() {
     extra
         .set_write_timeout(Some(Duration::from_millis(800)))
         .unwrap();
-    let _ = extra.write_all(
-        b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    );
+    let _ =
+        extra.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     let _ = extra.flush();
     let _ = extra.shutdown(Shutdown::Write);
     let (status, buf) = harness::read_http_response(&mut extra).expect("overflow response");
+    let text = String::from_utf8_lossy(&buf);
     assert_eq!(
         status, 503,
-        "shipped Hyper must fail-closed at max_connections, got {status} {}",
-        String::from_utf8_lossy(&buf)
+        "shipped Hyper must fail-closed at max_connections, got {status} {text}"
+    );
+    assert!(
+        text.contains("admission"),
+        "overflow 503 must name admission, not a bare Service Unavailable: {text}"
     );
     drop(held);
 }

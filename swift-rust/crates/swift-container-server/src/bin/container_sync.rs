@@ -21,15 +21,17 @@
 //! when `//realm/cluster/...` is configured, else the legacy sync-key header.
 //!
 //! PUT bodies require a local object source. This binary uses a proxy HTTP
-//! GET via `internal_client_url` (default `http://127.0.0.1:8080`) — the
-//! same role Python's InternalClient fills. Without a reachable proxy,
-//! DELETE still works; PUT rows fail and are retried next pass.
+//! GET via `internal_client_url`. The default base is `PROXY_BASE_URL`, then
+//! `[probe_test] proxy_base_url`, then `{SWIFT_DIR}/proxy-server.conf`
+//! `bind_ip`/`bind_port` (isolated `/etc/g6-rust` → `:18080`), else Python's
+//! historic `http://127.0.0.1:8080`. Without a reachable proxy, DELETE still
+//! works; PUT rows fail and are retried next pass.
 
 use std::path::Path;
 
 use swift_container_server::sync::{
-    run_once, ContainerSyncConfig, ContainerSyncRealms, EmptyObjectSource, HttpSyncClient,
-    ObjectSource,
+    run_once, run_once_for_ring, ContainerSyncConfig, ContainerSyncLocality, ContainerSyncRealms,
+    EmptyObjectSource, HttpSyncClient, ObjectSource,
 };
 use swift_core::config::SwiftConfig;
 use swift_core::daemon;
@@ -39,8 +41,19 @@ use swift_core::statsd::StatsdClient;
 use swift_ring::{Ring, RingData};
 
 /// Probe/G6: prefer `PROXY_BASE_URL`, then `[probe_test] proxy_base_url`
-/// from `SWIFT_TEST_CONFIG_FILE`, else Python's historic `:8080`.
-fn resolve_proxy_base(env_proxy: Option<&str>, test_conf: Option<&SwiftConfig>) -> String {
+/// from `SWIFT_TEST_CONFIG_FILE`, then `{SWIFT_DIR}/proxy-server.conf`
+/// listen address, else Python's historic `:8080`.
+///
+/// `Manager.once()` children often inherit `SWIFT_DIR=/etc/g6-rust` but not
+/// the Python-module `PROXY_BASE_URL`. Hardcoding `:8080` then GETs
+/// production objects; dest PUTs never leave the node. DELETE rows do not
+/// need a source GET — that is why `test_delete_propagate` can PASS while
+/// the rest of `container_sync` stays FAIL.
+fn resolve_proxy_base(
+    env_proxy: Option<&str>,
+    test_conf: Option<&SwiftConfig>,
+    proxy_server_conf: Option<&SwiftConfig>,
+) -> String {
     if let Some(u) = env_proxy.map(str::trim).filter(|s| !s.is_empty()) {
         return u.trim_end_matches('/').to_string();
     }
@@ -52,19 +65,338 @@ fn resolve_proxy_base(env_proxy: Option<&str>, test_conf: Option<&SwiftConfig>) 
             }
         }
     }
+    if let Some(conf) = proxy_server_conf {
+        if let Some(base) = proxy_base_from_proxy_server_conf(conf) {
+            return base;
+        }
+    }
     "http://127.0.0.1:8080".to_string()
 }
 
+/// Listen URL from proxy-server.conf (`[DEFAULT]` or `[app:proxy-server]`).
+///
+/// Wildcard `0.0.0.0` / `::` become `127.0.0.1` so a Manager child on the
+/// isolated stack talks to the local proxy, not a VIP guess.
+fn proxy_base_from_proxy_server_conf(conf: &SwiftConfig) -> Option<String> {
+    let bind_port = conf
+        .get("DEFAULT", "bind_port")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("app:proxy-server", "bind_port").ok().flatten())?;
+    let bind_port = bind_port.trim();
+    if bind_port.is_empty() {
+        return None;
+    }
+    let bind_ip = conf
+        .get("DEFAULT", "bind_ip")
+        .ok()
+        .flatten()
+        .or_else(|| conf.get("app:proxy-server", "bind_ip").ok().flatten())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    Some(format!(
+        "http://{}:{bind_port}",
+        listen_host_for_proxy_base(&bind_ip)
+    ))
+}
+
+fn listen_host_for_proxy_base(bind_ip: &str) -> String {
+    match bind_ip.trim() {
+        "" | "0.0.0.0" | "*" | "::" | "[::]" => "127.0.0.1".to_string(),
+        ip if ip.starts_with('[') => ip.to_string(),
+        ip if ip.contains(':') => format!("[{ip}]"),
+        ip => ip.to_string(),
+    }
+}
+
 /// Copied SAIO samples hardcode `:8080`; a probe base on another port wins.
+/// Also matches `http://127.0.0.1:8080` with no trailing slash (the old
+/// `://127.0.0.1:8080/` needle missed that form).
 fn rewrite_loopback_8080(url: &str, replacement: &str) -> String {
-    if replacement == "http://127.0.0.1:8080" {
+    if replacement.contains("://127.0.0.1:8080") {
         return url.to_string();
     }
-    if url.contains("://127.0.0.1:8080/") || url.contains("://localhost:8080/") {
+    const STALE: &[&str] = &["://127.0.0.1:8080", "://localhost:8080", "://[::1]:8080"];
+    if STALE.iter().any(|needle| url.contains(needle)) {
         replacement.to_string()
     } else {
         url.to_string()
     }
+}
+
+fn strip_swift_v1(proxy_base: &str) -> String {
+    let base = proxy_base.trim().trim_end_matches('/');
+    base.strip_suffix("/v1").unwrap_or(base).to_string()
+}
+
+/// `{proxy_base}/v1` without doubling when PROXY_BASE_URL already ends in `/v1`.
+fn proxy_base_to_internal_url(proxy_base: &str) -> String {
+    let base = proxy_base.trim().trim_end_matches('/');
+    if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    }
+}
+
+fn proxy_base_to_auth_url(proxy_base: &str) -> String {
+    format!("{}/auth/v1.0", strip_swift_v1(proxy_base))
+}
+
+/// Source GET / TempAuth base. Realms cluster URLs are dest-only
+/// (`X-Container-Sync-To` → `HttpSyncClient`); they never feed this path.
+///
+/// IsolatedIdentity sets `PROXY_BASE_URL`. A copied
+/// `[container-sync] internal_client_url` (SAIO `:8080` or a production
+/// host) used to win via `get()` and ignore the env — field on `1e1c515`
+/// had `PROXY_BASE_URL=http://127.0.0.1:18080` and still transport-failed.
+fn resolve_internal_client_url(
+    env_proxy_set: bool,
+    conf_internal_url: Option<&str>,
+    default_internal: &str,
+) -> String {
+    if env_proxy_set {
+        return default_internal.to_string();
+    }
+    match conf_internal_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(conf_url) => rewrite_loopback_8080(conf_url, default_internal),
+        None => default_internal.to_string(),
+    }
+}
+
+fn resolve_internal_auth_url(
+    env_proxy_set: bool,
+    conf_auth_url: Option<&str>,
+    default_auth: &str,
+) -> String {
+    if env_proxy_set {
+        return default_auth.to_string();
+    }
+    match conf_auth_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(conf_url) => rewrite_loopback_8080(conf_url, default_auth),
+        None => default_auth.to_string(),
+    }
+}
+
+/// If PROXY_BASE_URL is loopback but `{SWIFT_DIR}/proxy-server.conf` binds a
+/// specific IP, retry that host after connection refused / timeout / DNS.
+fn fallback_listen_addr(
+    url_host: &str,
+    bind_ip: Option<&str>,
+    bind_port: Option<u16>,
+) -> Option<(String, u16)> {
+    let bind_host = listen_host_for_proxy_base(bind_ip?);
+    let port = bind_port?;
+    if bind_host == url_host {
+        return None;
+    }
+    Some((bind_host, port))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpErrorKind {
+    UnsupportedScheme,
+    InvalidUrl,
+    Dns,
+    ConnectionRefused,
+    Timeout,
+    Tls,
+    Reset,
+    IncompleteHeaders,
+    BadStatus,
+    Io,
+}
+
+impl HttpErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedScheme => "unsupported scheme",
+            Self::InvalidUrl => "invalid url",
+            Self::Dns => "dns",
+            Self::ConnectionRefused => "connection refused",
+            Self::Timeout => "timeout",
+            Self::Tls => "tls",
+            Self::Reset => "reset",
+            Self::IncompleteHeaders => "incomplete headers",
+            Self::BadStatus => "bad status line",
+            Self::Io => "io",
+        }
+    }
+
+    fn is_connect(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionRefused | Self::Timeout | Self::Dns | Self::Reset
+        )
+    }
+}
+
+#[derive(Debug)]
+struct HttpExchangeError {
+    url: String,
+    kind: HttpErrorKind,
+    detail: String,
+}
+
+impl HttpExchangeError {
+    fn new(url: impl Into<String>, kind: HttpErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        self.kind.as_str()
+    }
+}
+
+impl std::fmt::Display for HttpExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "kind={} url={} detail={}",
+            self.kind.as_str(),
+            self.url,
+            self.detail
+        )
+    }
+}
+
+fn io_error_kind(err: &std::io::Error) -> HttpErrorKind {
+    use std::io::ErrorKind::*;
+    match err.kind() {
+        ConnectionRefused => HttpErrorKind::ConnectionRefused,
+        TimedOut | WouldBlock => HttpErrorKind::Timeout,
+        ConnectionReset | ConnectionAborted | BrokenPipe => HttpErrorKind::Reset,
+        NotFound | AddrNotAvailable => HttpErrorKind::Dns,
+        _ => {
+            let msg = err.to_string().to_ascii_lowercase();
+            if msg.contains("failed to lookup")
+                || msg.contains("name or service")
+                || msg.contains("nodename nor servname")
+                || msg.contains("no address associated")
+            {
+                HttpErrorKind::Dns
+            } else if msg.contains("timed out") {
+                HttpErrorKind::Timeout
+            } else if msg.contains("connection refused") {
+                HttpErrorKind::ConnectionRefused
+            } else {
+                HttpErrorKind::Io
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ParsedHttpUrl {
+    scheme: String,
+    host: String,
+    hostport: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, HttpExchangeError> {
+    let raw = url.trim();
+    let (scheme, rest) = if let Some(rest) = raw.strip_prefix("http://") {
+        ("http", rest)
+    } else if raw.starts_with("https://") {
+        return Err(HttpExchangeError::new(
+            raw,
+            HttpErrorKind::Tls,
+            "https source GET is not implemented; use http:// PROXY_BASE_URL",
+        ));
+    } else if let Some((scheme, _)) = raw.split_once("://") {
+        return Err(HttpExchangeError::new(
+            raw,
+            HttpErrorKind::UnsupportedScheme,
+            scheme,
+        ));
+    } else {
+        return Err(HttpExchangeError::new(
+            raw,
+            HttpErrorKind::InvalidUrl,
+            "missing http:// scheme",
+        ));
+    };
+    let rest = rest.rsplit_once('@').map(|(_, host)| host).unwrap_or(rest);
+    let (hostport, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
+    if hostport.is_empty() {
+        return Err(HttpExchangeError::new(
+            raw,
+            HttpErrorKind::InvalidUrl,
+            "empty host",
+        ));
+    }
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let (ip, after) = rest.split_once(']').ok_or_else(|| {
+            HttpExchangeError::new(raw, HttpErrorKind::InvalidUrl, "unclosed IPv6 bracket")
+        })?;
+        let port = if after.is_empty() {
+            80
+        } else if let Some(p) = after.strip_prefix(':') {
+            p.parse::<u16>().map_err(|_| {
+                HttpExchangeError::new(raw, HttpErrorKind::InvalidUrl, "invalid IPv6 port")
+            })?
+        } else {
+            return Err(HttpExchangeError::new(
+                raw,
+                HttpErrorKind::InvalidUrl,
+                "junk after IPv6 address",
+            ));
+        };
+        (ip.to_string(), port)
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| HttpExchangeError::new(raw, HttpErrorKind::InvalidUrl, "invalid port"))?;
+        (h.to_string(), port)
+    } else {
+        (hostport.to_string(), 80)
+    };
+    if host.is_empty() {
+        return Err(HttpExchangeError::new(
+            raw,
+            HttpErrorKind::InvalidUrl,
+            "empty host",
+        ));
+    }
+    Ok(ParsedHttpUrl {
+        scheme: scheme.to_string(),
+        host,
+        hostport: hostport.to_string(),
+        port,
+        path,
+    })
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i);
+        }
+    }
+    for i in 0..buf.len().saturating_sub(1) {
+        if &buf[i..i + 2] == b"\n\n" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn replace_url_host_port(url: &str, host: &str, port: u16) -> Result<String, HttpExchangeError> {
+    let parsed = parse_http_url(url)?;
+    let hostport = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(format!("{}://{hostport}{}", parsed.scheme, parsed.path))
 }
 
 fn parse_conf_file(path: &str) -> SwiftConfig {
@@ -90,6 +422,8 @@ struct ProxyObjectSource {
     /// Cached token (Mutex so ObjectSource stays Sync via interior mutability).
     token: std::sync::Mutex<Option<String>>,
     timeout: std::time::Duration,
+    /// `{SWIFT_DIR}/proxy-server.conf` bind when it differs from `base`.
+    fallback: Option<(String, u16)>,
 }
 
 impl ProxyObjectSource {
@@ -111,11 +445,19 @@ impl ProxyObjectSource {
             ("X-Auth-Key".into(), self.auth_key.clone()),
             ("Connection".into(), "close".into()),
         ];
-        let Some((status, resp_headers, _)) =
-            http_exchange("GET", &self.auth_url, &headers, &[], self.timeout)
-        else {
-            eprintln!("container-sync: auth transport failure");
-            return None;
+        let (status, resp_headers, _) = match http_exchange_with_fallback(
+            "GET",
+            &self.auth_url,
+            &headers,
+            &[],
+            self.timeout,
+            self.fallback.as_ref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("container-sync: auth transport failure {e}");
+                return None;
+            }
         };
         if !(200..300).contains(&status) {
             eprintln!("container-sync: auth status={status}");
@@ -144,12 +486,21 @@ impl ProxyObjectSource {
     }
 }
 
-fn object_source_url(base: &str, account: &str, container: &str, name: &str) -> String {
+fn object_source_url(base: &str, account: &str, container: &str, name: &str, slo: bool) -> String {
     // Python's container-sync InternalClient always asks symlink middleware
     // for the link object itself.  Without this query a dynamic link is
     // dereferenced and the target body is copied as an ordinary object.
+    // Field `/workspace/g6-csync-next-rootcause.txt`: Isolated proxy has
+    // SLO in the pipeline. GET `?symlink=get` only reassembles an SLO to
+    // the segment text and dest PUT 422s. When slo=True, also ask for
+    // `multipart-manifest=get` (raw JSON) matching Python.
+    let qs = if slo {
+        "symlink=get&multipart-manifest=get"
+    } else {
+        "symlink=get"
+    };
     format!(
-        "{}/{}/{}/{}?symlink=get",
+        "{}/{}/{}/{}?{qs}",
         base.trim_end_matches('/'),
         pe(account),
         pe(container),
@@ -184,15 +535,11 @@ fn debug_object_source(name: &str, headers: &[(String, String)], body: &[u8]) {
     );
 }
 
-impl ObjectSource for ProxyObjectSource {
-    fn get_object(
-        &self,
-        account: &str,
-        container: &str,
-        name: &str,
-        _storage_policy_index: i64,
-    ) -> Option<(Vec<(String, String)>, Vec<u8>)> {
-        let url = object_source_url(&self.base, account, container, name);
+impl ProxyObjectSource {
+    fn get_once(&self, url: &str) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
+        if std::env::var("G6_CONTAINER_SYNC_DEBUG").as_deref() == Ok("1") {
+            eprintln!("container-sync-debug: source GET url={url}");
+        }
         let mut headers = vec![
             ("X-Newest".into(), "True".into()),
             ("Connection".into(), "close".into()),
@@ -200,11 +547,19 @@ impl ObjectSource for ProxyObjectSource {
         if let Some(tok) = self.ensure_token() {
             headers.push(("X-Auth-Token".into(), tok));
         }
-        let Some((status, resp_headers, body)) =
-            http_exchange("GET", &url, &headers, &[], self.timeout)
-        else {
-            eprintln!("container-sync: source GET transport failure");
-            return None;
+        let (status, resp_headers, body) = match http_exchange_with_fallback(
+            "GET",
+            url,
+            &headers,
+            &[],
+            self.timeout,
+            self.fallback.as_ref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("container-sync: source GET transport failure {e}");
+                return None;
+            }
         };
         // One retry on 401 with a fresh token (expired / first static miss).
         if status == 401 && !self.auth_user.is_empty() {
@@ -216,21 +571,49 @@ impl ObjectSource for ProxyObjectSource {
             if let Some(tok) = self.ensure_token() {
                 headers.push(("X-Auth-Token".into(), tok));
             }
-            let Some((status, resp_headers, body)) =
-                http_exchange("GET", &url, &headers, &[], self.timeout)
-            else {
-                eprintln!("container-sync: source GET retry transport failure");
-                return None;
+            return match http_exchange_with_fallback(
+                "GET",
+                url,
+                &headers,
+                &[],
+                self.timeout,
+                self.fallback.as_ref(),
+            ) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("container-sync: source GET retry transport failure {e}");
+                    None
+                }
             };
-            if !(200..300).contains(&status) {
-                eprintln!("container-sync: source GET retry status={status}");
-                return None;
-            }
+        }
+        Some((status, resp_headers, body))
+    }
+}
+
+impl ObjectSource for ProxyObjectSource {
+    fn get_object(
+        &self,
+        account: &str,
+        container: &str,
+        name: &str,
+        _storage_policy_index: i64,
+    ) -> Option<(Vec<(String, String)>, Vec<u8>)> {
+        let url = object_source_url(&self.base, account, container, name, false);
+        let (status, resp_headers, body) = self.get_once(&url)?;
+        if !(200..300).contains(&status) {
+            eprintln!("container-sync: source GET status={status}");
+            return None;
+        }
+        if !swift_container_server::is_static_large_object(&resp_headers) {
             debug_object_source(name, &resp_headers, &body);
             return Some((resp_headers, body));
         }
+        // slo=True: Isolated proxy SLO would have returned the segment
+        // bytes. Re-GET the raw JSON manifest for dest PUT.
+        let slo_url = object_source_url(&self.base, account, container, name, true);
+        let (status, resp_headers, body) = self.get_once(&slo_url)?;
         if !(200..300).contains(&status) {
-            eprintln!("container-sync: source GET status={status}");
+            eprintln!("container-sync: source SLO GET status={status}");
             return None;
         }
         debug_object_source(name, &resp_headers, &body);
@@ -251,6 +634,35 @@ fn pe(s: &str) -> String {
     out
 }
 
+fn http_exchange_with_fallback(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout: std::time::Duration,
+    fallback: Option<&(String, u16)>,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), HttpExchangeError> {
+    match http_exchange(method, url, headers, body, timeout) {
+        Err(e) if e.kind.is_connect() => {
+            let Some((host, port)) = fallback else {
+                return Err(e);
+            };
+            let Ok(retry_url) = replace_url_host_port(url, host, *port) else {
+                return Err(e);
+            };
+            if retry_url == url {
+                return Err(e);
+            }
+            eprintln!(
+                "container-sync: source GET fallback url={retry_url} after {}",
+                e.kind()
+            );
+            http_exchange(method, &retry_url, headers, body, timeout)
+        }
+        other => other,
+    }
+}
+
 /// HTTP/1.1 request; returns (status, headers, body). HTTP only (lab proxy).
 fn http_exchange(
     method: &str,
@@ -258,23 +670,17 @@ fn http_exchange(
     headers: &[(String, String)],
     body: &[u8],
     timeout: std::time::Duration,
-) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), HttpExchangeError> {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpStream, ToSocketAddrs};
 
-    let rest = url.strip_prefix("http://")?;
-    let (hostport, path) = match rest.split_once('/') {
-        Some((h, p)) => (h, format!("/{p}")),
-        None => (rest, "/".to_string()),
-    };
-    let (host, port) = if let Some((h, p)) = hostport.rsplit_once(':') {
-        (h, p.parse().unwrap_or(80))
-    } else {
-        (hostport, 80u16)
-    };
+    let parsed = parse_http_url(url)?;
     // Omit Content-Length on empty GET/HEAD — some front-ends mishandle
     // `GET … Content-Length: 0` and TempAuth token headers never appear.
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
+    let mut req = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        parsed.path, parsed.hostport
+    );
     if !body.is_empty() || matches!(method, "PUT" | "POST" | "PATCH") {
         req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
@@ -285,12 +691,46 @@ fn http_exchange(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    let mut conn = TcpStream::connect(format!("{host}:{port}")).ok()?;
+    let connect_host = if parsed.host.contains(':') {
+        format!("[{}]:{}", parsed.host, parsed.port)
+    } else {
+        format!("{}:{}", parsed.host, parsed.port)
+    };
+    let addrs = connect_host.to_socket_addrs().map_err(|e| {
+        HttpExchangeError::new(
+            url,
+            io_error_kind(&e),
+            format!("resolve {connect_host}: {e}"),
+        )
+    })?;
+    let mut last_err = HttpExchangeError::new(
+        url,
+        HttpErrorKind::Dns,
+        format!("no addresses for {connect_host}"),
+    );
+    let mut conn = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => {
+                conn = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err =
+                    HttpExchangeError::new(url, io_error_kind(&e), format!("connect {addr}: {e}"));
+            }
+        }
+    }
+    let mut conn = conn.ok_or(last_err)?;
     let _ = conn.set_read_timeout(Some(timeout));
     let _ = conn.set_write_timeout(Some(timeout));
-    conn.write_all(req.as_bytes()).ok()?;
+    conn.write_all(req.as_bytes()).map_err(|e| {
+        HttpExchangeError::new(url, io_error_kind(&e), format!("write request: {e}"))
+    })?;
     if !body.is_empty() {
-        conn.write_all(body).ok()?;
+        conn.write_all(body).map_err(|e| {
+            HttpExchangeError::new(url, io_error_kind(&e), format!("write body: {e}"))
+        })?;
     }
     // Read until end-of-headers. Do NOT read_to_end: HAProxy/proxy often
     // answers with Connection: keep-alive, so EOF never arrives and the
@@ -299,30 +739,45 @@ fn http_exchange(
     let mut tmp = [0u8; 8192];
     let mut headers_end = None;
     while headers_end.is_none() {
-        let n = conn.read(&mut tmp).ok()?;
+        let n = match conn.read(&mut tmp) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(HttpExchangeError::new(
+                    url,
+                    io_error_kind(&e),
+                    format!("read headers: {e}"),
+                ));
+            }
+        };
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
-        for i in 0..buf.len().saturating_sub(3) {
-            if &buf[i..i + 4] == b"\r\n\r\n" {
-                headers_end = Some(i);
-                break;
-            }
-        }
+        headers_end = find_headers_end(&buf);
         if buf.len() > 1024 * 1024 {
             break;
         }
     }
-    let end = headers_end?;
+    let end = headers_end.ok_or_else(|| {
+        HttpExchangeError::new(
+            url,
+            HttpErrorKind::IncompleteHeaders,
+            format!("buffered {} bytes without header terminator", buf.len()),
+        )
+    })?;
     let head = String::from_utf8_lossy(&buf[..end]);
     let status = head
         .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            HttpExchangeError::new(
+                url,
+                HttpErrorKind::BadStatus,
+                head.lines().next().unwrap_or(""),
+            )
+        })?;
     let mut resp_headers = Vec::new();
     for line in head.lines().skip(1) {
         let line = line.trim_end_matches('\r');
@@ -340,10 +795,24 @@ fn http_exchange(
 
     // Finish body: Content-Length exact, or chunked until 0-chunk, or
     // whatever already buffered when neither is present.
-    let mut body_buf = buf[end + 4..].to_vec();
+    let header_term = if end + 4 <= buf.len() && &buf[end..end + 4] == b"\r\n\r\n" {
+        4
+    } else {
+        2
+    };
+    let mut body_buf = buf[end + header_term..].to_vec();
     if let Some(cl) = content_len {
         while body_buf.len() < cl {
-            let n = conn.read(&mut tmp).ok()?;
+            let n = match conn.read(&mut tmp) {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(HttpExchangeError::new(
+                        url,
+                        io_error_kind(&e),
+                        format!("read body: {e}"),
+                    ));
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -372,7 +841,7 @@ fn http_exchange(
     } else {
         body_buf
     };
-    Some((status, resp_headers, body))
+    Ok((status, resp_headers, body))
 }
 
 /// Decode HTTP/1.1 chunked body; returns None if the framing is corrupt.
@@ -458,21 +927,40 @@ fn main() {
     // SWIFT_TEST_CONFIG_FILE [probe_test] proxy_base_url is the same source
     // Python test.probe uses; honor it when the env var is missing (Manager
     // children do not always inherit a Python module global).
+    // When both are absent, `{SWIFT_DIR}/proxy-server.conf` bind is the
+    // isolated stack's listen address — not a guessed :18080 host.
     let test_conf_for_base = std::env::var("SWIFT_TEST_CONFIG_FILE")
         .ok()
         .map(|p| parse_conf_file(&p));
+    let proxy_server_conf = {
+        let path = format!("{swift_dir}/proxy-server.conf");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| SwiftConfig::parse_lenient(&content, &[], false).ok())
+    };
+    let env_proxy = std::env::var("PROXY_BASE_URL").ok();
+    let env_proxy_set = env_proxy
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
     let proxy_base = resolve_proxy_base(
-        std::env::var("PROXY_BASE_URL").ok().as_deref(),
+        env_proxy.as_deref(),
         test_conf_for_base.as_ref(),
+        proxy_server_conf.as_ref(),
     );
-    let default_internal = format!("{proxy_base}/v1");
-    let default_auth = format!("{proxy_base}/auth/v1.0");
-    let mut internal_url = get("container-sync", "internal_client_url", &default_internal);
-    // TempAuth (or static token) so proxy GETs succeed — unauth → 401 and
-    // PUT bodies never leave the node.
-    let mut auth_url = get("container-sync", "internal_client_auth_url", &default_auth);
-    internal_url = rewrite_loopback_8080(&internal_url, &default_internal);
-    auth_url = rewrite_loopback_8080(&auth_url, &default_auth);
+    let default_internal = proxy_base_to_internal_url(&proxy_base);
+    let default_auth = proxy_base_to_auth_url(&proxy_base);
+    let conf_internal = get("container-sync", "internal_client_url", "");
+    let conf_auth = get("container-sync", "internal_client_auth_url", "");
+    // IsolatedIdentity PROXY_BASE_URL wins over a stale conf URL. Realms
+    // cluster endpoints are dest-only and never used here.
+    let internal_url = resolve_internal_client_url(
+        env_proxy_set,
+        Some(conf_internal.as_str()),
+        &default_internal,
+    );
+    let auth_url =
+        resolve_internal_auth_url(env_proxy_set, Some(conf_auth.as_str()), &default_auth);
     let mut auth_user = get("container-sync", "internal_client_auth_user", "");
     let mut auth_key = get("container-sync", "internal_client_auth_key", "");
     let auth_token = get("container-sync", "internal_client_auth_token", "");
@@ -537,6 +1025,27 @@ fn main() {
                  internal_client_auth_token — object GET will 401 under TempAuth",
             );
         }
+        let fallback = parse_http_url(&internal_url).ok().and_then(|parsed| {
+            fallback_listen_addr(
+                &parsed.host,
+                proxy_server_conf
+                    .as_ref()
+                    .and_then(|c| {
+                        c.get("DEFAULT", "bind_ip")
+                            .ok()
+                            .flatten()
+                            .or_else(|| c.get("app:proxy-server", "bind_ip").ok().flatten())
+                    })
+                    .as_deref(),
+                proxy_server_conf.as_ref().and_then(|c| {
+                    c.get("DEFAULT", "bind_port")
+                        .ok()
+                        .flatten()
+                        .or_else(|| c.get("app:proxy-server", "bind_port").ok().flatten())
+                        .and_then(|p| p.parse().ok())
+                }),
+            )
+        });
         Box::new(ProxyObjectSource {
             base: internal_url.clone(),
             auth_url: auth_url.clone(),
@@ -544,20 +1053,36 @@ fn main() {
             auth_key: auth_key.clone(),
             token: std::sync::Mutex::new(initial),
             timeout: std::time::Duration::from_secs_f64(cfg.conn_timeout.max(0.1)),
+            fallback,
         })
     };
     let client = HttpSyncClient::with_tls(object_source, cfg.conn_timeout, cfg.tls_options());
     let stop = swift_http::install_sigterm_flag();
 
     // Local bind identity for primary-node ordinal (Python is_local_device).
-    let bind_ip = get("container-sync", "bind_ip", "0.0.0.0");
-    let bind_port: u16 = get("container-sync", "bind_port", "6201")
-        .parse()
-        .unwrap_or(6201);
-    let _ = (bind_ip, bind_port); // residual: full is_local_device scan
+    // Prefer the container-server listen identity; [container-sync] may override.
+    let bind_ip = get(
+        "container-sync",
+        "bind_ip",
+        &get("app:container-server", "bind_ip", "0.0.0.0"),
+    );
+    let bind_port: u32 = get(
+        "container-sync",
+        "bind_port",
+        &get("app:container-server", "bind_port", "6201"),
+    )
+    .parse()
+    .unwrap_or(6201);
+    let local_ips = swift_core::localdev::ips_for_ring_lookup(&bind_ip);
 
+    // eprintln so IsolatedIdentity file logs see the URL. logger.info
+    // is syslog-only — field on `1e1c515` grepped container-sync*.log
+    // for `internal_url=` and found none next to the transport failures.
+    eprintln!(
+        "container-sync: proxy_base={proxy_base} internal_url={internal_url} auth_url={auth_url}"
+    );
     logger.info(&format!(
-        "swift-container-sync: devices={} interval={}s container_time={} once={run_once_only} internal_url={internal_url}",
+        "swift-container-sync: devices={} bind={bind_ip}:{bind_port} interval={}s container_time={} once={run_once_only} internal_url={internal_url}",
         cfg.devices.display(),
         cfg.interval,
         cfg.container_time,
@@ -565,41 +1090,50 @@ fn main() {
 
     loop {
         let sweep_start = std::time::Instant::now();
-        // Without a full local-IP scan, use ordinal 0 / replica_count 1 so a
-        // single-node (or SAIO) ships every new row; multi-node deployments
-        // still backfill via pass A (point2→point1).
-        let (ordinal, replica_count) = container_ring
-            .as_ref()
-            .map(|r| (0usize, r.replica_count().max(1.0) as usize))
-            .map(|(o, c)| {
-                // Prefer shipping every new row only when replica_count is
-                // treated as 1 (dev). Production multi-replica keeps
-                // replica_count and relies on pass-A backfill for missed
-                // hashes when ordinal is always 0 — honest residual.
-                let _ = o;
-                (0usize, if c <= 1 { 1 } else { c })
-            })
-            .unwrap_or((0, 1));
-
-        let stats = run_once(
-            &cfg.devices,
-            &client,
-            &realms,
-            &cfg.allowed_sync_hosts,
-            &hash_config,
-            ordinal,
-            // SAIO / single-node: force full ownership of new rows.
-            if ordinal == 0 && replica_count > 1 {
-                // Multi-replica with unknown local ordinal: only backfill
-                // (pass A). Pass B still runs but owns_object(0, N) only
-                // ships 1/N; other primaries need their own ordinal. Use
-                // replica_count=1 so this node is useful without IP scan.
-                1
+        let stats = if let Some(ring) = container_ring.as_ref() {
+            if local_ips.is_empty() {
+                logger.warning(
+                    "no local interface addresses for container-sync ordinal; \
+                     falling back to ordinal 0 / replica_count 1",
+                );
+                run_once(
+                    &cfg.devices,
+                    &client,
+                    &realms,
+                    &cfg.allowed_sync_hosts,
+                    &hash_config,
+                    0,
+                    1,
+                    cfg.container_time,
+                )
             } else {
-                replica_count
-            },
-            cfg.container_time,
-        );
+                let locality = ContainerSyncLocality {
+                    ring,
+                    local_ips: &local_ips,
+                    bind_port,
+                };
+                run_once_for_ring(
+                    &cfg.devices,
+                    &client,
+                    &realms,
+                    &cfg.allowed_sync_hosts,
+                    &hash_config,
+                    &locality,
+                    cfg.container_time,
+                )
+            }
+        } else {
+            run_once(
+                &cfg.devices,
+                &client,
+                &realms,
+                &cfg.allowed_sync_hosts,
+                &hash_config,
+                0,
+                1,
+                cfg.container_time,
+            )
+        };
         logger.info(&format!(
             "container-sync pass: syncs={} puts={} deletes={} skips={} failures={}",
             stats.syncs, stats.puts, stats.deletes, stats.skips, stats.failures
@@ -643,7 +1177,16 @@ fn main() {
 
 #[cfg(test)]
 mod proxy_base_tests {
-    use super::{object_source_url, resolve_proxy_base, rewrite_loopback_8080};
+    use super::{
+        fallback_listen_addr, find_headers_end, http_exchange, listen_host_for_proxy_base,
+        object_source_url, parse_http_url, proxy_base_from_proxy_server_conf,
+        proxy_base_to_auth_url, proxy_base_to_internal_url, replace_url_host_port,
+        resolve_internal_client_url, resolve_proxy_base, rewrite_loopback_8080, HttpErrorKind,
+        ProxyObjectSource,
+    };
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
     use swift_core::config::SwiftConfig;
 
     #[test]
@@ -654,8 +1197,10 @@ mod proxy_base_tests {
             false,
         )
         .unwrap();
+        let proxy =
+            SwiftConfig::parse_lenient("[DEFAULT]\nbind_port = 18080\n", &[], false).unwrap();
         assert_eq!(
-            resolve_proxy_base(Some("http://127.0.0.1:19999/"), Some(&conf)),
+            resolve_proxy_base(Some("http://127.0.0.1:19999/"), Some(&conf), Some(&proxy)),
             "http://127.0.0.1:19999"
         );
     }
@@ -668,25 +1213,87 @@ mod proxy_base_tests {
             false,
         )
         .unwrap();
+        let proxy =
+            SwiftConfig::parse_lenient("[DEFAULT]\nbind_port = 19999\n", &[], false).unwrap();
         assert_eq!(
-            resolve_proxy_base(None, Some(&conf)),
+            resolve_proxy_base(None, Some(&conf), Some(&proxy)),
             "http://127.0.0.1:18080"
         );
         assert_eq!(
-            resolve_proxy_base(Some("  "), Some(&conf)),
+            resolve_proxy_base(Some("  "), Some(&conf), Some(&proxy)),
             "http://127.0.0.1:18080"
         );
     }
 
     #[test]
+    fn isolated_swift_dir_proxy_bind_used_when_env_and_probe_url_missing() {
+        // Failed first: resolve_proxy_base ignored SWIFT_DIR/proxy-server.conf
+        // and returned historic :8080, so Manager children on IsolatedIdentity
+        // GETs production while dest PUTs never fire.
+        let proxy = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nbind_ip = 0.0.0.0\nbind_port = 18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, None, Some(&proxy)),
+            "http://127.0.0.1:18080"
+        );
+        let named = SwiftConfig::parse_lenient(
+            "[DEFAULT]\nbind_ip = 10.0.0.1\nbind_port = 18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, None, Some(&named)),
+            "http://10.0.0.1:18080"
+        );
+        let app_section = SwiftConfig::parse_lenient(
+            "[app:proxy-server]\nbind_ip = 0.0.0.0\nbind_port = 18080\n",
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            proxy_base_from_proxy_server_conf(&app_section).as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+    }
+
+    #[test]
     fn default_is_python_historic_8080() {
-        assert_eq!(resolve_proxy_base(None, None), "http://127.0.0.1:8080");
+        assert_eq!(
+            resolve_proxy_base(None, None, None),
+            "http://127.0.0.1:8080"
+        );
+        let empty_proxy =
+            SwiftConfig::parse_lenient("[DEFAULT]\nlog_name = proxy\n", &[], false).unwrap();
+        assert_eq!(
+            resolve_proxy_base(None, None, Some(&empty_proxy)),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn listen_host_maps_wildcards_to_loopback() {
+        assert_eq!(listen_host_for_proxy_base("0.0.0.0"), "127.0.0.1");
+        assert_eq!(listen_host_for_proxy_base("::"), "127.0.0.1");
+        assert_eq!(listen_host_for_proxy_base("10.0.0.1"), "10.0.0.1");
+        assert_eq!(listen_host_for_proxy_base("2001:db8::1"), "[2001:db8::1]");
     }
 
     #[test]
     fn rewrite_replaces_copied_saio_8080_when_probe_base_differs() {
         assert_eq!(
             rewrite_loopback_8080("http://127.0.0.1:8080/v1", "http://127.0.0.1:18080/v1"),
+            "http://127.0.0.1:18080/v1"
+        );
+        // Failed first: needle required `://127.0.0.1:8080/` and missed
+        // the no-path SAIO form.
+        assert_eq!(
+            rewrite_loopback_8080("http://127.0.0.1:8080", "http://127.0.0.1:18080/v1"),
             "http://127.0.0.1:18080/v1"
         );
         assert_eq!(
@@ -700,15 +1307,158 @@ mod proxy_base_tests {
     }
 
     #[test]
+    fn env_proxy_overrides_stale_conf_internal_client_url() {
+        // Failed first: get(conf) + rewrite left http://10.0.0.1:8080/v1
+        // even when IsolatedIdentity exported PROXY_BASE_URL=:18080.
+        assert_eq!(
+            resolve_internal_client_url(
+                true,
+                Some("http://10.0.0.1:8080/v1"),
+                "http://127.0.0.1:18080/v1"
+            ),
+            "http://127.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            resolve_internal_client_url(
+                false,
+                Some("http://10.0.0.1:18080/v1"),
+                "http://127.0.0.1:18080/v1"
+            ),
+            "http://10.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            resolve_internal_client_url(false, Some("  "), "http://127.0.0.1:18080/v1"),
+            "http://127.0.0.1:18080/v1"
+        );
+    }
+
+    #[test]
+    fn proxy_base_with_v1_suffix_does_not_double() {
+        assert_eq!(
+            proxy_base_to_internal_url("http://127.0.0.1:18080/v1/"),
+            "http://127.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            proxy_base_to_internal_url("http://127.0.0.1:18080"),
+            "http://127.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            proxy_base_to_auth_url("http://127.0.0.1:18080/v1"),
+            "http://127.0.0.1:18080/auth/v1.0"
+        );
+    }
+
+    #[test]
+    fn fallback_listen_uses_proxy_bind_when_url_is_loopback() {
+        assert_eq!(
+            fallback_listen_addr("127.0.0.1", Some("10.0.0.1"), Some(18080)),
+            Some(("10.0.0.1".into(), 18080))
+        );
+        assert_eq!(
+            fallback_listen_addr("127.0.0.1", Some("0.0.0.0"), Some(18080)),
+            None
+        );
+        assert_eq!(
+            fallback_listen_addr("10.0.0.1", Some("10.0.0.1"), Some(18080)),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_http_url_ipv6_and_https_tls_kind() {
+        let p = parse_http_url("http://[::1]:18080/v1/AUTH_a/c/o?symlink=get").unwrap();
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 18080);
+        assert_eq!(p.path, "/v1/AUTH_a/c/o?symlink=get");
+        let err = parse_http_url("https://127.0.0.1:18080/v1/a/c/o").unwrap_err();
+        assert_eq!(err.kind, HttpErrorKind::Tls);
+        assert_eq!(err.kind(), "tls");
+        assert!(err.url.contains("https://127.0.0.1:18080"), "{}", err.url);
+    }
+
+    #[test]
+    fn http_exchange_reports_connection_refused_url() {
+        // Failed first: http_exchange returned None with no URL / kind.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}/v1/AUTH_a/c/o?symlink=get");
+        let err = http_exchange("GET", &url, &[], &[], Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.kind(), "connection refused", "{err}");
+        assert_eq!(err.url, url);
+        let msg = err.to_string();
+        assert!(msg.contains("kind=connection refused"), "{msg}");
+        assert!(msg.contains(&url), "{msg}");
+    }
+
+    #[test]
+    fn http_exchange_reports_timeout_when_peer_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/v1/AUTH_a/c/o");
+        let err = http_exchange("GET", &url, &[], &[], Duration::from_millis(80)).unwrap_err();
+        assert_eq!(err.kind(), "timeout", "{err}");
+        assert_eq!(err.url, url);
+        drop(listener);
+    }
+
+    #[test]
+    fn lf_only_headers_are_not_incomplete() {
+        // Failed first: only `\r\n\r\n` counted as end-of-headers, so an
+        // LF-only peer became "source GET transport failure".
+        assert_eq!(find_headers_end(b"HTTP/1.1 200 OK\n\nbody"), Some(15));
+        assert_eq!(find_headers_end(b"HTTP/1.1 200 OK\r\n\r\nbody"), Some(15));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf);
+            sock.write_all(b"HTTP/1.1 200 OK\nContent-Length: 4\n\nabcd")
+                .unwrap();
+        });
+        let url = format!("http://127.0.0.1:{}/v1/a/c/o", addr.port());
+        let (status, _, body) =
+            http_exchange("GET", &url, &[], &[], Duration::from_secs(2)).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"abcd");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn replace_url_host_port_keeps_path_and_query() {
+        assert_eq!(
+            replace_url_host_port(
+                "http://127.0.0.1:18080/v1/AUTH_a/c/o?symlink=get",
+                "10.0.0.1",
+                18080
+            )
+            .unwrap(),
+            "http://10.0.0.1:18080/v1/AUTH_a/c/o?symlink=get"
+        );
+    }
+
+    #[test]
     fn internal_object_get_preserves_symlink_objects() {
         assert_eq!(
             object_source_url(
                 "http://127.0.0.1:18082/v1/",
                 "AUTH_a",
                 "source container",
-                "link/name"
+                "link/name",
+                false,
             ),
             "http://127.0.0.1:18082/v1/AUTH_a/source%20container/link%2Fname?symlink=get"
+        );
+        assert_eq!(
+            object_source_url(
+                "http://127.0.0.1:18082/v1/",
+                "AUTH_a",
+                "source container",
+                "manifest",
+                true,
+            ),
+            "http://127.0.0.1:18082/v1/AUTH_a/source%20container/manifest?symlink=get&multipart-manifest=get"
         );
     }
 
@@ -729,5 +1479,67 @@ mod proxy_base_tests {
             Some(b"abc".to_vec())
         );
         assert_eq!(super::dechunk(b"0\r\nX-Check: yes\r\n"), None);
+    }
+
+    #[test]
+    fn source_get_refetches_slo_manifest_json() {
+        use std::sync::{Arc, Mutex};
+        use swift_container_server::ObjectSource;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_thread = seen.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = vec![0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                seen_thread.lock().unwrap().push(req.clone());
+                let (slo, body): (&str, &[u8]) = if req.contains("multipart-manifest=get") {
+                    ("True", br#"[{"name":"/segs/s1","hash":"abc","bytes":12}]"#)
+                } else {
+                    ("True", b"segment body")
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nX-Static-Large-Object: {slo}\r\n\
+                     X-Timestamp: 1751500001.00000\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.write_all(body);
+            }
+        });
+        let src = ProxyObjectSource {
+            base: format!("http://127.0.0.1:{port}/v1"),
+            auth_url: String::new(),
+            auth_user: String::new(),
+            auth_key: String::new(),
+            token: std::sync::Mutex::new(None),
+            timeout: Duration::from_secs(2),
+            fallback: None,
+        };
+        let (_headers, body) = src.get_object("a", "c", "manifest", 0).expect("SLO GET");
+        assert_eq!(
+            body, br#"[{"name":"/segs/s1","hash":"abc","bytes":12}]"#,
+            "must PUT raw JSON, not segment text"
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert!(
+            reqs[0].contains("symlink=get") && !reqs[0].contains("multipart-manifest=get"),
+            "first GET is symlink-only: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1].contains("multipart-manifest=get"),
+            "slo=True re-GET: {}",
+            reqs[1]
+        );
     }
 }

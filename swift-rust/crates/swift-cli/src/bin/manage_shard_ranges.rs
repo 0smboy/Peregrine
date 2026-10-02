@@ -484,8 +484,8 @@ fn cmd_find_and_replace(
     }
 
     let epoch = Timestamp::now().internal();
-    let (root_account, root_container) = root_account_container(&mut broker)
-        .unwrap_or_else(|| (account.clone(), container.clone()));
+    let (root_account, root_container) =
+        root_account_container(&mut broker).unwrap_or_else(|| (account.clone(), container.clone()));
     let shards_account = shards_account_name(&root_account);
     let mut ranges = Vec::with_capacity(found.len());
     for f in &found {
@@ -617,7 +617,8 @@ fn cmd_analyze(broker: &mut ContainerBroker) -> i32 {
 
     // Compactible preview (defaults matching common Python conf)
     let sequences = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, false, None);
-    let sequences_cleaved = find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, true, None);
+    let sequences_cleaved =
+        find_compactible_sequences(&ranges, 100_000, 500_000, 1, -1, true, None);
     println!(
         "analyze: compactible_sequences (shrink_threshold=100000 expansion_limit=500000) = {}",
         sequences.len()
@@ -668,7 +669,10 @@ fn find_paths(shard_ranges: &[ShardRange]) -> Vec<Vec<ShardRange>> {
         if sr.state == shard_state::SHRINKING {
             continue;
         }
-        node_successors.entry(sr.lower.clone()).or_default().push(sr.clone());
+        node_successors
+            .entry(sr.lower.clone())
+            .or_default()
+            .push(sr.clone());
     }
     let mut paths: Vec<Vec<ShardRange>> = Vec::new();
     let mut paths_to_node: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -678,7 +682,10 @@ fn find_paths(shard_ranges: &[ShardRange]) -> Vec<Vec<ShardRange>> {
         }
         if paths_to_node.get(node).map(Vec::is_empty).unwrap_or(true) {
             paths.push(Vec::new());
-            paths_to_node.entry(node.clone()).or_default().push(paths.len() - 1);
+            paths_to_node
+                .entry(node.clone())
+                .or_default()
+                .push(paths.len() - 1);
         }
         let arriving = paths_to_node.get(node).cloned().unwrap_or_default();
         for path_idx in arriving {
@@ -690,7 +697,10 @@ fn find_paths(shard_ranges: &[ShardRange]) -> Vec<Vec<ShardRange>> {
                     paths.len() - 1
                 };
                 paths[idx].push(edge.clone());
-                paths_to_node.entry(edge.upper.clone()).or_default().push(idx);
+                paths_to_node
+                    .entry(edge.upper.clone())
+                    .or_default()
+                    .push(idx);
             }
         }
     }
@@ -725,8 +735,10 @@ fn rank_paths(mut paths: Vec<Vec<ShardRange>>, own: &ShardRange) -> Vec<Vec<Shar
         let progress_b = path_progress_key(b);
         let objects_a: i64 = a.iter().map(|sr| sr.object_count).sum();
         let objects_b: i64 = b.iter().map(|sr| sr.object_count).sum();
-        let ts_a: std::collections::BTreeSet<&str> = a.iter().map(|sr| sr.timestamp.as_str()).collect();
-        let ts_b: std::collections::BTreeSet<&str> = b.iter().map(|sr| sr.timestamp.as_str()).collect();
+        let ts_a: std::collections::BTreeSet<&str> =
+            a.iter().map(|sr| sr.timestamp.as_str()).collect();
+        let ts_b: std::collections::BTreeSet<&str> =
+            b.iter().map(|sr| sr.timestamp.as_str()).collect();
         let newest_a = ts_a.iter().max().copied().unwrap_or("");
         let newest_b = ts_b.iter().max().copied().unwrap_or("");
         includes_a
@@ -1219,10 +1231,7 @@ fn is_child_of(child: &ShardRange, parent: &ShardRange) -> bool {
     child_root == parent_root && child_parent_hash == hash_container_name(parent_container)
 }
 
-fn remove_parent_child_donors(
-    acceptors: &[ShardRange],
-    donors: &mut Vec<ShardRange>,
-) -> usize {
+fn remove_parent_child_donors(acceptors: &[ShardRange], donors: &mut Vec<ShardRange>) -> usize {
     let before = donors.len();
     donors.retain(|donor| {
         !acceptors
@@ -1631,7 +1640,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(cmd_find_and_replace(&mut broker, 3, 1, false, true), EXIT_OK);
+        assert_eq!(
+            cmd_find_and_replace(&mut broker, 3, 1, false, true),
+            EXIT_OK
+        );
         let ranges = broker
             .get_shard_ranges(&GetShardRangesArgs::default())
             .unwrap();
@@ -1751,7 +1763,6 @@ mod tests {
 
     #[test]
     fn find_compactible_shrink_to_root_appends_own() {
-
         // Two small ACTIVE shards covering MIN-MAX: Python appends own as
         // acceptor so both become donors (probe compact L3401).
         let mut a = ShardRange::new("a/c-0", "1", "", "m");
@@ -1763,7 +1774,8 @@ mod tests {
         let mut own = ShardRange::new("AUTH_test/c", "1", "", "");
         own.state = shard_state::SHARDED;
         own.epoch = Some("1751500010.00000".into());
-        let without = find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 2, -1, false, None);
+        let without =
+            find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 2, -1, false, None);
         assert_eq!(without.len(), 1);
         assert_eq!(without[0].len(), 2);
         assert_eq!(without[0][1].name, "a/c-1");
@@ -1783,7 +1795,8 @@ mod tests {
         b.state = shard_state::CLEAVED;
         b.object_count = 50;
         assert!(
-            find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 1, -1, false, None).is_empty()
+            find_compactible_sequences(&[a.clone(), b.clone()], 20, 100, 1, -1, false, None)
+                .is_empty()
         );
         let seqs = find_compactible_sequences(&[a, b], 20, 100, 1, -1, true, None);
         assert_eq!(seqs.len(), 1);

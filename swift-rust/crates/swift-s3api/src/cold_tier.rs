@@ -86,13 +86,8 @@ pub enum ColdArchiveState {
     MetadataOnly,
     UnverifiedReference,
     Durable,
-    Restoring {
-        days: i64,
-        restore_until_unix: i64,
-    },
-    Restored {
-        restore_until_unix: i64,
-    },
+    Restoring { days: i64, restore_until_unix: i64 },
+    Restored { restore_until_unix: i64 },
     Failed,
 }
 
@@ -331,10 +326,7 @@ pub fn begin_restore(
 }
 
 /// Restoring → Restored. Allowed immediately; expiry is `restore_until_unix`.
-pub fn complete_restore(
-    state: ColdArchiveState,
-    now: i64,
-) -> Result<ColdArchiveState, String> {
+pub fn complete_restore(state: ColdArchiveState, now: i64) -> Result<ColdArchiveState, String> {
     match state {
         ColdArchiveState::Restoring {
             restore_until_unix, ..
@@ -359,9 +351,7 @@ pub fn maybe_rearchive(
 ) -> Result<ColdArchiveState, String> {
     let _ = delete_hot_enabled;
     match state {
-        ColdArchiveState::Restored { restore_until_unix } if now < restore_until_unix => {
-            Ok(state)
-        }
+        ColdArchiveState::Restored { restore_until_unix } if now < restore_until_unix => Ok(state),
         ColdArchiveState::Restoring { .. } => Ok(state),
         ColdArchiveState::Restored { .. } => Ok(ColdArchiveState::Durable),
         other => Ok(other),
@@ -632,13 +622,7 @@ pub fn maybe_stamp_and_archive_due_cold(
         let receipt = if let Some(receipt) = verified_existing {
             receipt
         } else {
-            be.archive_durable(
-                stamp.cold_policy_index,
-                account,
-                container,
-                key,
-                bytes,
-            )?
+            be.archive_durable(stamp.cold_policy_index, account, container, key, bytes)?
         };
         if archive_commit(&receipt, bytes, false).ok() != Some(ColdArchiveState::Durable) {
             return Err("cold backend returned a non-durable or mismatched archive receipt".into());
@@ -728,14 +712,10 @@ pub trait ColdBackend: Send + Sync {
     /// Fetch archived bytes and return them only after strict length and
     /// checksum validation. This is object-safe so middleware can perform a
     /// real rehydrate through `Arc<dyn ColdBackend>`.
-    fn fetch_verified(
-        &self,
-        backend_uri: &str,
-    ) -> Result<(Vec<u8>, ColdArchiveReceipt), String>;
+    fn fetch_verified(&self, backend_uri: &str) -> Result<(Vec<u8>, ColdArchiveReceipt), String>;
     /// Re-read and validate an archive without retaining its payload.
     fn verify_archive(&self, backend_uri: &str) -> Result<ColdArchiveReceipt, String> {
-        self.fetch_verified(backend_uri)
-            .map(|(_, receipt)| receipt)
+        self.fetch_verified(backend_uri).map(|(_, receipt)| receipt)
     }
     /// Stage restore from cold media into hot policy path.
     fn restore_stage(&self, backend_uri: &str, _days: i64) -> Result<(), String> {
@@ -773,10 +753,7 @@ impl ColdBackend for MemoryColdBackend {
         Ok(receipt)
     }
 
-    fn fetch_verified(
-        &self,
-        backend_uri: &str,
-    ) -> Result<(Vec<u8>, ColdArchiveReceipt), String> {
+    fn fetch_verified(&self, backend_uri: &str) -> Result<(Vec<u8>, ColdArchiveReceipt), String> {
         let guard = self.blobs.lock().map_err(|e| e.to_string())?;
         let body = guard
             .get(backend_uri)
@@ -1000,10 +977,7 @@ impl LocalDirColdBackend {
             File::open(directory_path)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| {
-                    format!(
-                        "cold directory sync {}: {error}",
-                        directory_path.display()
-                    )
+                    format!("cold directory sync {}: {error}", directory_path.display())
                 })?;
             if directory_path == self.root {
                 synced_root = true;
@@ -1136,7 +1110,9 @@ impl LocalDirColdBackend {
         let payload_length = usize::try_from(declared_length)
             .map_err(|_| format!("cold archive length unsupported: {backend_uri}"))?;
         if stored_policy_index != uri_policy_index {
-            return Err(format!("cold archive policy identity mismatch: {backend_uri}"));
+            return Err(format!(
+                "cold archive policy identity mismatch: {backend_uri}"
+            ));
         }
         let identity_digest_end = cursor
             .checked_add(32)
@@ -1193,7 +1169,9 @@ impl LocalDirColdBackend {
         if stored_identity_digest != computed_identity_digest.as_slice()
             || uri_identity_sha256 != computed_identity_sha256.as_str()
         {
-            return Err(format!("cold archive object identity mismatch: {backend_uri}"));
+            return Err(format!(
+                "cold archive object identity mismatch: {backend_uri}"
+            ));
         }
 
         let payload = &encoded[key_end..];
@@ -1213,10 +1191,7 @@ impl LocalDirColdBackend {
         Ok((payload.to_vec(), receipt))
     }
 
-    fn read_verified(
-        &self,
-        backend_uri: &str,
-    ) -> Result<(Vec<u8>, ColdArchiveReceipt), String> {
+    fn read_verified(&self, backend_uri: &str) -> Result<(Vec<u8>, ColdArchiveReceipt), String> {
         let path = self.path_for_uri(backend_uri)?;
         let encoded = std::fs::read(&path).map_err(|error| format!("cold read: {error}"))?;
         Self::decode_archive(backend_uri, &encoded)
@@ -1229,10 +1204,7 @@ impl LocalDirColdBackend {
     }
 
     /// Fetch and additionally require an exact match to a caller-held receipt.
-    pub fn fetch_with_receipt(
-        &self,
-        expected: &ColdArchiveReceipt,
-    ) -> Result<Vec<u8>, String> {
+    pub fn fetch_with_receipt(&self, expected: &ColdArchiveReceipt) -> Result<Vec<u8>, String> {
         let (body, actual) = self.read_verified(&expected.backend_uri)?;
         if !actual.same_archive_identity(expected) || !actual.verifies_payload(&body) {
             return Err(format!(
@@ -1255,25 +1227,17 @@ impl ColdBackend for LocalDirColdBackend {
     ) -> Result<ColdArchiveReceipt, String> {
         let (backend_uri, path, expected) =
             self.archive_location(policy_index, account, container, key, body)?;
-        let existing_is_valid = self
-            .read_verified(&backend_uri)
-            .ok()
-            .is_some_and(|(existing_body, existing_receipt)| {
+        let existing_is_valid = self.read_verified(&backend_uri).ok().is_some_and(
+            |(existing_body, existing_receipt)| {
                 existing_receipt == expected && expected.verifies_payload(&existing_body)
-            });
+            },
+        );
         if existing_is_valid {
             Self::ensure_private_permissions(&path)?;
             self.sync_archive_path(&path)?;
             return Ok(expected);
         }
-        self.write_atomic_archive(
-            &path,
-            policy_index,
-            account,
-            container,
-            key,
-            body,
-        )?;
+        self.write_atomic_archive(&path, policy_index, account, container, key, body)?;
         let (_, committed_receipt) = self.read_verified(&backend_uri)?;
         if committed_receipt != expected {
             return Err(format!(
@@ -1283,10 +1247,7 @@ impl ColdBackend for LocalDirColdBackend {
         Ok(committed_receipt)
     }
 
-    fn fetch_verified(
-        &self,
-        backend_uri: &str,
-    ) -> Result<(Vec<u8>, ColdArchiveReceipt), String> {
+    fn fetch_verified(&self, backend_uri: &str) -> Result<(Vec<u8>, ColdArchiveReceipt), String> {
         self.read_verified(backend_uri)
     }
 }
@@ -1341,9 +1302,7 @@ mod tests {
     #[test]
     fn memory_backend_archive_restore() {
         let be = MemoryColdBackend::default();
-        let receipt = be
-            .archive_durable(2, "a", "c", "k", b"payload")
-            .unwrap();
+        let receipt = be.archive_durable(2, "a", "c", "k", b"payload").unwrap();
         assert!(receipt.backend_uri.starts_with("memory://"));
         assert_eq!(receipt.content_length, 7);
         assert!(receipt.verifies_payload(b"payload"));
@@ -1358,9 +1317,7 @@ mod tests {
     #[test]
     fn memory_backend_restore_rejects_corruption() {
         let be = MemoryColdBackend::default();
-        let receipt = be
-            .archive_durable(2, "a", "c", "k", b"payload")
-            .unwrap();
+        let receipt = be.archive_durable(2, "a", "c", "k", b"payload").unwrap();
         be.blobs
             .lock()
             .unwrap()
@@ -1393,11 +1350,7 @@ mod tests {
         assert!(encoded.starts_with(LOCAL_ARCHIVE_MAGIC));
         assert_eq!(
             encoded.len(),
-            LOCAL_ARCHIVE_FIXED_HEADER_LEN
-                + "AUTH_test".len()
-                + "bkt".len()
-                + "dir/obj".len()
-                + 7
+            LOCAL_ARCHIVE_FIXED_HEADER_LEN + "AUTH_test".len() + "bkt".len() + "dir/obj".len() + 7
         );
         let parent_entries = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
@@ -1493,7 +1446,10 @@ mod tests {
         for (index, uri) in uris.iter().enumerate() {
             assert!(uris[..index].iter().all(|prior| prior != uri));
         }
-        assert!(uris.iter().map(String::len).all(|length| length == uris[0].len()));
+        assert!(uris
+            .iter()
+            .map(String::len)
+            .all(|length| length == uris[0].len()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1627,15 +1583,9 @@ mod tests {
         assert_eq!(h.get(SYS_TRANSITIONED), Some("1"));
         be.restore_stage(&stamp.backend_uri, 1).unwrap();
 
-        let reconstructed = maybe_stamp_due_cold_transition(
-            &mut h,
-            &map,
-            100,
-            "AUTH_test",
-            "bkt",
-            "obj",
-        )
-        .expect("reconstruct durable receipt from sysmeta");
+        let reconstructed =
+            maybe_stamp_due_cold_transition(&mut h, &map, 100, "AUTH_test", "bkt", "obj")
+                .expect("reconstruct durable receipt from sysmeta");
         assert_eq!(
             reconstructed.archive_state,
             ColdArchiveState::UnverifiedReference
@@ -1702,10 +1652,7 @@ mod tests {
         h.set(SYS_COLD_BACKEND_URI, "filecold://legacy/object");
         let stamp = maybe_stamp_due_cold_transition(&mut h, &map, 100, "a", "c", "k")
             .expect("legacy cold stamp");
-        assert_eq!(
-            stamp.archive_state,
-            ColdArchiveState::UnverifiedReference
-        );
+        assert_eq!(stamp.archive_state, ColdArchiveState::UnverifiedReference);
         assert!(stamp.archive_receipt.is_none());
         assert!(!stamp.hot_reclamation_safe_for(b"payload"));
     }
@@ -1766,11 +1713,8 @@ mod tests {
             archive_commit(&receipt, body, false).unwrap(),
             ColdArchiveState::Durable
         );
-        let failed = ColdStateMachine::new().apply_archive_commit_or_fail(
-            receipt.clone(),
-            body,
-            true,
-        );
+        let failed =
+            ColdStateMachine::new().apply_archive_commit_or_fail(receipt.clone(), body, true);
         assert_eq!(failed.state, ColdArchiveState::Failed);
         assert_ne!(failed.state, ColdArchiveState::Durable);
         assert_eq!(failed.archive_generation, 0);
@@ -1916,11 +1860,8 @@ mod tests {
         tampered.content_sha256 = "0".repeat(64);
         assert!(!tampered.verifies_payload(body));
         assert!(archive_commit(&tampered, body, false).is_err());
-        let failed = ColdStateMachine::new().apply_archive_commit_or_fail(
-            tampered.clone(),
-            body,
-            false,
-        );
+        let failed =
+            ColdStateMachine::new().apply_archive_commit_or_fail(tampered.clone(), body, false);
         assert_eq!(failed.state, ColdArchiveState::Failed);
         assert_eq!(failed.archive_generation, 0);
         assert!(!hot_reclamation_allowed(
@@ -1934,11 +1875,9 @@ mod tests {
         let mut wrong_len = good.clone();
         wrong_len.content_length += 1;
         assert!(archive_commit(&wrong_len, body, false).is_err());
-        assert!(
-            ColdStateMachine::new()
-                .apply_archive_commit(wrong_len, body, false)
-                .is_err()
-        );
+        assert!(ColdStateMachine::new()
+            .apply_archive_commit(wrong_len, body, false)
+            .is_err());
     }
 
     #[test]

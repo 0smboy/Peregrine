@@ -29,11 +29,8 @@ fn http(addr: std::net::SocketAddr, req: &[u8]) -> String {
 #[test]
 fn production_binary_starts_async_without_legacy_flag() {
     let bin = env!("CARGO_BIN_EXE_swift-object-server");
-    let root = std::env::temp_dir().join(format!(
-        "async-default-{}-{}",
-        std::process::id(),
-        line!()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("async-default-{}-{}", std::process::id(), line!()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("devices/sda1")).unwrap();
     let swift_conf = root.join("swift.conf");

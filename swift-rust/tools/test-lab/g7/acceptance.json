@@ -1,7 +1,7 @@
 {
   "gate": "G7",
-  "frozen_at": "2026-08-23T21:40:00Z",
-  "candidate_commit": "02eb0202dd74ef36a19fa0860ee1da229bb6db20",
+  "frozen_at": "2026-09-06T00:00:00Z",
+  "candidate_commit": "PENDING_FREEZE",
   "rule": "opened must equal target; do not change this file after freeze",
   "target": {
     "impl": "rust",
@@ -45,7 +45,9 @@
     "enospc": {"kind": "enospc"},
     "eio": {"kind": "eio"},
     "partial_write": {"kind": "partial_write"},
-    "backend_connect_timeout": {"kind": "backend_connect_timeout", "blackhole_ip": "127.0.0.9", "port": 16210}
+    "backend_connect_timeout": {"kind": "backend_connect_timeout", "blackhole_ip": "127.0.0.9", "port": 16210},
+    "ssync_interrupt": {"kind": "ssync_interrupt"},
+    "ec_fragment_loss": {"kind": "ec_fragment_loss"}
   },
   "bounds": {
     "health_head_p99_ms": 250,

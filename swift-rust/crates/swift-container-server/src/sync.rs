@@ -30,14 +30,18 @@
 //! - [`HttpSyncClient`] issues signed PUT/DELETE over HTTP/1.1
 //! - [`SyncClient`] trait is mockable for unit tests
 //!
-//! Residual vs Python: remote HEAD-before-PUT short-circuit, InternalClient
-//! object GET (PUT body is supplied by [`ObjectSource`]), ring ordinal
-//! locality filter (caller can pass `ordinal`/`replica_count`), and live
-//! multi-cluster soak. HTTPS remotes use `native-tls` with system roots by
+//! Residual vs Python: InternalClient object GET still uses [`ObjectSource`]
+//! (the daemon supplies a proxy GET), and live multi-cluster soak stays on
+//! the isolated lab. HTTPS remotes use `native-tls` with system roots by
 //! default; optional `[container-sync] ssl_ca_file` and
 //! `insecure_skip_verify` (default **false**) tune verification.
+//!
+//! Python-aligned remote PUT short-circuit: HEAD the destination first and
+//! skip when its `X-Timestamp` is already at least as new as the source;
+//! a destination PUT `409` is success (newer remote already won). Pass B
+//! hash-sharding uses the local replica ordinal from the container ring.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -48,9 +52,11 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use swift_core::config::config_true_value;
 use swift_core::hashing::HashPathConfig;
+use swift_core::localdev::ring_address_is_local;
 use swift_core::timestamp::Timestamp;
 use swift_db::{db_locations, ContainerBroker, DbError, DbValue};
 use swift_http::normalize_etag;
+use swift_ring::Ring;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -713,6 +719,13 @@ pub fn build_tls_connector(opts: &TlsOptions) -> Result<native_tls::TlsConnector
         .map_err(|e| format!("tls connector build: {e}"))
 }
 
+/// Status plus response headers from a remote container-sync request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpCallResult {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
 /// Issue a bare HTTP/1.1 request; returns status code (0 on transport error).
 ///
 /// HTTPS uses `native-tls` (system trust store by default). Pass
@@ -737,8 +750,21 @@ pub fn http_request_with_tls(
     timeout: Duration,
     tls_opts: &TlsOptions,
 ) -> u16 {
+    http_request_full(method, url, headers, body, timeout, tls_opts).status
+}
+
+/// Like [`http_request_with_tls`] but keeps response headers for HEAD
+/// timestamp comparison.
+pub fn http_request_full(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout: Duration,
+    tls_opts: &TlsOptions,
+) -> HttpCallResult {
     let Some((host, port, path, tls)) = parse_http_url(url) else {
-        return 0;
+        return HttpCallResult::default();
     };
     // Omit default ports from Host (RFC 7230).
     let host_header = if (!tls && port == 80) || (tls && port == 443) {
@@ -746,16 +772,22 @@ pub fn http_request_with_tls(
     } else {
         format!("{host}:{port}")
     };
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    // Omit Content-Length on empty GET/HEAD — some front-ends mishandle
+    // `HEAD … Content-Length: 0` and never return X-Timestamp.
+    let mut req =
+        format!("{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n");
+    if !body.is_empty() || matches!(method, "PUT" | "POST" | "PATCH") {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     for (k, v) in headers {
+        if k.eq_ignore_ascii_case("Connection") || k.eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
     let Ok(mut conn) = TcpStream::connect(format!("{host}:{port}")) else {
-        return 0;
+        return HttpCallResult::default();
     };
     let _ = conn.set_read_timeout(Some(timeout));
     let _ = conn.set_write_timeout(Some(timeout));
@@ -763,32 +795,88 @@ pub fn http_request_with_tls(
 
     if tls {
         let Ok(connector) = build_tls_connector(tls_opts) else {
-            return 0;
+            return HttpCallResult::default();
         };
         // SNI / cert CN uses the hostname (not host:port).
         let Ok(mut tls_stream) = connector.connect(&host, conn) else {
-            return 0;
+            return HttpCallResult::default();
         };
         if tls_stream.write_all(req.as_bytes()).is_err() {
-            return 0;
+            return HttpCallResult::default();
         }
         if !body.is_empty() && tls_stream.write_all(body).is_err() {
-            return 0;
+            return HttpCallResult::default();
         }
         let mut buf = Vec::new();
         let _ = tls_stream.read_to_end(&mut buf);
-        return status_from_response_buf(&buf);
+        return parse_http_call(&buf);
     }
 
     if conn.write_all(req.as_bytes()).is_err() {
-        return 0;
+        return HttpCallResult::default();
     }
     if !body.is_empty() && conn.write_all(body).is_err() {
-        return 0;
+        return HttpCallResult::default();
     }
     let mut buf = Vec::new();
     let _ = conn.read_to_end(&mut buf);
-    status_from_response_buf(&buf)
+    parse_http_call(&buf)
+}
+
+fn parse_http_call(buf: &[u8]) -> HttpCallResult {
+    HttpCallResult {
+        status: status_from_response_buf(buf),
+        headers: headers_from_response_buf(buf),
+    }
+}
+
+fn headers_from_response_buf(buf: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(buf);
+    let head = text.split("\r\n\r\n").next().unwrap_or("");
+    let mut headers = Vec::new();
+    for line in head.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    headers
+}
+
+/// Python container-sync PUT short-circuit: a 2xx destination HEAD whose
+/// timestamp is already at least as new as the source object.
+pub fn destination_already_current(
+    status: u16,
+    headers: &[(String, String)],
+    source_ts: &str,
+) -> bool {
+    if !(200..300).contains(&status) {
+        return false;
+    }
+    let Some(remote_raw) = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("x-timestamp"))
+        .or_else(|| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("x-backend-timestamp"))
+        })
+        .map(|(_, value)| value.as_str())
+    else {
+        return false;
+    };
+    let Ok(remote) = remote_raw.parse::<Timestamp>() else {
+        return false;
+    };
+    let Ok(source) = source_ts.parse::<Timestamp>() else {
+        return false;
+    };
+    remote >= source
+}
+
+/// Python treats destination PUT 409 as success (newer remote already won).
+pub fn destination_put_accepted(status: u16) -> bool {
+    (200..300).contains(&status) || status == 409
 }
 
 /// Production remote client: signs requests and issues HTTP PUT/DELETE.
@@ -822,6 +910,13 @@ impl HttpSyncClient {
         let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
         format!("{n:032x}")
     }
+}
+
+/// Python container-sync: `slo = config_true_value(X-Static-Large-Object)`.
+pub fn is_static_large_object(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("x-static-large-object") && config_true_value(value)
+    })
 }
 
 fn newest_source_timestamp(row: &SyncRow, headers: &[(String, String)]) -> Option<String> {
@@ -894,6 +989,14 @@ impl SyncClient for HttpSyncClient {
                 ) else {
                     return false;
                 };
+                // Python: when slo=True, dest PUT uses multipart-manifest=put
+                // so the JSON manifest is stored as an SLO, not a regular
+                // object. Signing still uses the path without the query.
+                let put_url = if is_static_large_object(&obj_headers) {
+                    format!("{url}?multipart-manifest=put")
+                } else {
+                    url.clone()
+                };
                 // The container row may be stale when an object-server PUT
                 // could not update any container replica.  Python uses the
                 // X-Newest object GET's X-Timestamp for the destination PUT,
@@ -902,6 +1005,26 @@ impl SyncClient for HttpSyncClient {
                 let Some(ts) = newest_source_timestamp(row, &obj_headers) else {
                     return false;
                 };
+                // Python HEADs the destination first. A same-or-newer remote
+                // object is already synced; a PUT would 409 and (before this
+                // short-circuit) fail the row.
+                let head_nonce = self.next_nonce();
+                let head_headers = build_sync_headers(
+                    "HEAD",
+                    &row.name,
+                    &ctx.sync_to,
+                    &ctx.user_key,
+                    ctx.realm.as_deref(),
+                    ctx.realm_key.as_deref(),
+                    &ts,
+                    &head_nonce,
+                    &[],
+                );
+                let head =
+                    http_request_full("HEAD", &url, &head_headers, &[], self.timeout, &self.tls);
+                if destination_already_current(head.status, &head.headers, &ts) {
+                    return true;
+                }
                 // Strip hop-by-hop / framing headers from the proxy GET.
                 // Forwarding Transfer-Encoding / Content-Length (we recompute
                 // CL from body) makes the remote PUT fail with 4xx/5xx and
@@ -958,12 +1081,18 @@ impl SyncClient for HttpSyncClient {
                     &nonce,
                     &extra,
                 );
-                let status =
-                    http_request_with_tls("PUT", &url, &headers, &body, self.timeout, &self.tls);
-                if !(200..300).contains(&status) {
+                let status = http_request_with_tls(
+                    "PUT",
+                    &put_url,
+                    &headers,
+                    &body,
+                    self.timeout,
+                    &self.tls,
+                );
+                if !destination_put_accepted(status) {
                     eprintln!("container-sync: destination PUT status={status}");
                 }
-                (200..300).contains(&status)
+                destination_put_accepted(status)
             }
         }
     }
@@ -1043,10 +1172,52 @@ pub fn owns_object(
     n % replica_count == ordinal
 }
 
+/// Local replica identity for pass-B hash sharding (Python `is_local_device`
+/// against the container ring primaries).
+#[derive(Debug, Clone)]
+pub struct ContainerSyncLocality<'a> {
+    pub ring: &'a Ring,
+    pub local_ips: &'a BTreeSet<String>,
+    pub bind_port: u32,
+}
+
+/// This node's index among the container's primaries, plus replica count.
+///
+/// Returns `None` when this host is not a primary for the container — the
+/// caller should skip (handoffs do not run pass B).
+pub fn container_sync_ordinal(
+    ring: &Ring,
+    account: &str,
+    container: &str,
+    local_ips: &BTreeSet<String>,
+    bind_port: u32,
+) -> Option<(usize, usize)> {
+    let nodes = ring.get_nodes(account, Some(container), None).ok()?.1;
+    let replica_count = nodes.len();
+    if replica_count == 0 {
+        return None;
+    }
+    for (index, node) in nodes.iter().enumerate() {
+        let repl_ip = node
+            .dev
+            .replication_ip
+            .as_deref()
+            .unwrap_or(node.dev.ip.as_str());
+        let repl_port = node.dev.replication_port.unwrap_or(node.dev.port);
+        if ring_address_is_local(repl_ip, repl_port, local_ips, Some(bind_port))
+            || ring_address_is_local(&node.dev.ip, node.dev.port, local_ips, Some(bind_port))
+        {
+            return Some((index, replica_count));
+        }
+    }
+    None
+}
+
 /// Process one container DB: two-pass sync and advance watermarks.
 ///
 /// `ordinal` / `replica_count` control the point1 hash-shard (pass 0/1 for
-/// single-node tests that ship every new row).
+/// single-node tests that ship every new row). When `locality` is set, those
+/// values are replaced by this node's ring ordinal for the container.
 pub fn process_container_db(
     db_path: &Path,
     client: &dyn SyncClient,
@@ -1056,6 +1227,30 @@ pub fn process_container_db(
     ordinal: usize,
     replica_count: usize,
     container_time_secs: u64,
+) -> SyncStats {
+    process_container_db_inner(
+        db_path,
+        client,
+        realms,
+        allowed_sync_hosts,
+        hash_config,
+        ordinal,
+        replica_count,
+        container_time_secs,
+        None,
+    )
+}
+
+fn process_container_db_inner(
+    db_path: &Path,
+    client: &dyn SyncClient,
+    realms: &ContainerSyncRealms,
+    allowed_sync_hosts: &[String],
+    hash_config: &HashPathConfig,
+    mut ordinal: usize,
+    mut replica_count: usize,
+    container_time_secs: u64,
+    locality: Option<&ContainerSyncLocality<'_>>,
 ) -> SyncStats {
     let mut stats = SyncStats::default();
     let mut broker = ContainerBroker::new(db_path, "", "");
@@ -1078,6 +1273,24 @@ pub fn process_container_db(
     };
     let account = get("account");
     let container = get("container");
+    if let Some(locality) = locality {
+        match container_sync_ordinal(
+            locality.ring,
+            &account,
+            &container,
+            locality.local_ips,
+            locality.bind_port,
+        ) {
+            Some((local_ordinal, local_replicas)) => {
+                ordinal = local_ordinal;
+                replica_count = local_replicas;
+            }
+            None => {
+                stats.skips += 1;
+                return stats;
+            }
+        }
+    }
     // Rebind broker with real account/container for metadata path.
     let mut broker = ContainerBroker::new(db_path, &account, &container);
     if broker.is_deleted().unwrap_or(true) {
@@ -1087,9 +1300,7 @@ pub fn process_container_db(
     let md = broker.metadata().unwrap_or_default();
     let versions_enabled = md
         .iter()
-        .find(|(key, _)| {
-            key.eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Enabled")
-        })
+        .find(|(key, _)| key.eq_ignore_ascii_case("X-Container-Sysmeta-Versions-Enabled"))
         .map(|(_, (value, _))| value.as_str())
         .unwrap_or("");
     // Python object-versioning and container-sync deliberately do not share
@@ -1259,10 +1470,59 @@ pub fn run_once(
     replica_count: usize,
     container_time_secs: u64,
 ) -> SyncStats {
+    run_once_inner(
+        devices,
+        client,
+        realms,
+        allowed_sync_hosts,
+        hash_config,
+        ordinal,
+        replica_count,
+        container_time_secs,
+        None,
+    )
+}
+
+/// Like [`run_once`], but compute pass-B ownership per container from the
+/// local ring identity (Python `is_local_device`). Containers for which this
+/// node is not a primary are skipped.
+pub fn run_once_for_ring(
+    devices: &Path,
+    client: &dyn SyncClient,
+    realms: &ContainerSyncRealms,
+    allowed_sync_hosts: &[String],
+    hash_config: &HashPathConfig,
+    locality: &ContainerSyncLocality<'_>,
+    container_time_secs: u64,
+) -> SyncStats {
+    run_once_inner(
+        devices,
+        client,
+        realms,
+        allowed_sync_hosts,
+        hash_config,
+        0,
+        1,
+        container_time_secs,
+        Some(locality),
+    )
+}
+
+fn run_once_inner(
+    devices: &Path,
+    client: &dyn SyncClient,
+    realms: &ContainerSyncRealms,
+    allowed_sync_hosts: &[String],
+    hash_config: &HashPathConfig,
+    ordinal: usize,
+    replica_count: usize,
+    container_time_secs: u64,
+    locality: Option<&ContainerSyncLocality<'_>>,
+) -> SyncStats {
     let store = ContainerSyncStore::new(devices);
     let mut total = SyncStats::default();
     for path in store.synced_containers() {
-        let s = process_container_db(
+        let s = process_container_db_inner(
             &path,
             client,
             realms,
@@ -1271,6 +1531,7 @@ pub fn run_once(
             ordinal,
             replica_count,
             container_time_secs,
+            locality,
         );
         total.deletes += s.deletes;
         total.puts += s.puts;
@@ -1376,6 +1637,7 @@ impl ContainerSyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::sync::Mutex;
 
     #[test]
@@ -1394,6 +1656,23 @@ mod tests {
     #[test]
     fn test_sync_auth_header() {
         assert_eq!(sync_auth_header("US", "nonce", "sig"), "US nonce sig");
+    }
+
+    #[test]
+    fn test_is_static_large_object() {
+        assert!(is_static_large_object(&[(
+            "X-Static-Large-Object".into(),
+            "True".into()
+        )]));
+        assert!(is_static_large_object(&[(
+            "x-static-large-object".into(),
+            "1".into()
+        )]));
+        assert!(!is_static_large_object(&[(
+            "X-Static-Large-Object".into(),
+            "False".into()
+        )]));
+        assert!(!is_static_large_object(&[("ETag".into(), "abc".into())]));
     }
 
     #[test]
@@ -1665,12 +1944,350 @@ cluster_c1 = http://127.0.0.1:8080/v1/
             etag: "etag".into(),
         };
         assert_eq!(
-            row.ts_data().map(|timestamp| timestamp.internal()).as_deref(),
+            row.ts_data()
+                .map(|timestamp| timestamp.internal())
+                .as_deref(),
             Some("1787757710.91367")
         );
         assert_eq!(
-            row.ts_meta().map(|timestamp| timestamp.internal()).as_deref(),
+            row.ts_meta()
+                .map(|timestamp| timestamp.internal())
+                .as_deref(),
             Some("1787757711.06714")
+        );
+    }
+
+    #[test]
+    fn test_destination_already_current_skips_same_or_newer_remote() {
+        let ts = "1751500001.00000";
+        assert!(destination_already_current(
+            200,
+            &[("X-Timestamp".into(), ts.into())],
+            ts
+        ));
+        assert!(destination_already_current(
+            200,
+            &[("x-timestamp".into(), "1751500002.00000".into())],
+            ts
+        ));
+        assert!(!destination_already_current(
+            200,
+            &[("X-Timestamp".into(), "1751500000.00000".into())],
+            ts
+        ));
+        assert!(!destination_already_current(404, &[], ts));
+        assert!(!destination_already_current(200, &[], ts));
+        assert!(destination_already_current(
+            200,
+            &[("X-Backend-Timestamp".into(), "1751500001.00000".into())],
+            ts
+        ));
+    }
+
+    #[test]
+    fn test_destination_put_accepted_includes_conflict() {
+        assert!(destination_put_accepted(201));
+        assert!(destination_put_accepted(409));
+        assert!(!destination_put_accepted(404));
+        assert!(!destination_put_accepted(500));
+        assert!(!destination_put_accepted(0));
+    }
+
+    fn ring3_for_ordinal() -> Ring {
+        let dev = |id: u64, ip: &str| swift_ring::RingDevice {
+            id,
+            region: 1,
+            zone: id + 1,
+            ip: ip.to_string(),
+            port: 6201,
+            replication_ip: None,
+            replication_port: None,
+            device: format!("sd{id}"),
+            weight: 1.0,
+            meta: String::new(),
+            extra: Default::default(),
+        };
+        let data = swift_ring::RingData::from_parts(
+            vec![
+                Some(dev(0, "10.0.0.1")),
+                Some(dev(1, "10.0.0.2")),
+                Some(dev(2, "10.0.0.3")),
+            ],
+            32,
+            vec![vec![0], vec![1], vec![2]],
+        );
+        Ring::new(data, HashPathConfig::new("", "changeme").unwrap())
+    }
+
+    #[test]
+    fn test_container_sync_ordinal_is_local_primary_index() {
+        let ring = ring3_for_ordinal();
+        let ips = BTreeSet::from(["10.0.0.2".to_string()]);
+        assert_eq!(
+            container_sync_ordinal(&ring, "a", "c", &ips, 6201),
+            Some((1, 3))
+        );
+        let missing = BTreeSet::from(["192.0.2.1".to_string()]);
+        assert!(container_sync_ordinal(&ring, "a", "c", &missing, 6201).is_none());
+        assert!(container_sync_ordinal(&ring, "a", "c", &ips, 6202).is_none());
+    }
+
+    #[test]
+    fn test_process_container_db_skips_when_not_a_primary() {
+        let root = std::env::temp_dir().join(format!(
+            "swift-sync-not-primary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = root.join("c.db");
+        std::fs::create_dir_all(&root).unwrap();
+        let ts = "1751500000.00000";
+        let mut broker = ContainerBroker::new(&db, "a", "c");
+        broker.initialize(ts, 0, ts, "dbid").unwrap();
+        broker
+            .update_metadata(&vec![
+                (
+                    "X-Container-Sync-To".into(),
+                    ("http://127.0.0.1:9/v1/dst/c".into(), ts.into()),
+                ),
+                ("X-Container-Sync-Key".into(), ("secret".into(), ts.into())),
+            ])
+            .unwrap();
+        broker
+            .put_object("o1", ts, 3, "text/plain", "abc", 0, 0, None, None)
+            .unwrap();
+        let client = FakeSync {
+            sent: Mutex::new(Vec::new()),
+            fail_at: None,
+        };
+        let realms = ContainerSyncRealms::default();
+        let hosts = vec!["127.0.0.1".into()];
+        let hash = HashPathConfig::new("changeme", "changeme").unwrap();
+        let ring = ring3_for_ordinal();
+        let ips = BTreeSet::from(["192.0.2.1".to_string()]);
+        let locality = ContainerSyncLocality {
+            ring: &ring,
+            local_ips: &ips,
+            bind_port: 6201,
+        };
+        let stats = process_container_db_inner(
+            &db,
+            &client,
+            &realms,
+            &hosts,
+            &hash,
+            0,
+            1,
+            60,
+            Some(&locality),
+        );
+        assert_eq!(stats.skips, 1);
+        assert_eq!(stats.puts, 0);
+        assert!(client.sent.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_http_sync_put_skips_when_remote_already_current() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_thread = seen.clone();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                seen_thread
+                    .lock()
+                    .unwrap()
+                    .push(req.lines().next().unwrap_or("").to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nX-Timestamp: 1751500002.00000\r\nContent-Length: 0\r\n\r\n",
+                );
+            }
+        });
+        let mut objects = HashMap::new();
+        objects.insert(
+            "a/c/o".into(),
+            (
+                vec![("X-Timestamp".into(), "1751500001.00000".into())],
+                b"body".to_vec(),
+            ),
+        );
+        let client = HttpSyncClient::new(Box::new(MapObjectSource { objects }), 2.0);
+        let row = SyncRow {
+            row_id: 1,
+            name: "o".into(),
+            created_at: "1751500001.00000".into(),
+            deleted: false,
+            size: 4,
+            content_type: "text/plain".into(),
+            etag: "etag".into(),
+        };
+        let ctx = SyncContext {
+            sync_to: format!("http://{addr}/v1/dst/c"),
+            user_key: "secret".into(),
+            realm: None,
+            realm_key: None,
+            account: "a".into(),
+            container: "c".into(),
+            storage_policy_index: 0,
+        };
+        assert!(client.sync_row(&row, &SyncAction::Put, &ctx));
+        server.join().unwrap();
+        let methods = seen.lock().unwrap().clone();
+        assert_eq!(methods.len(), 1, "{methods:?}");
+        assert!(
+            methods[0].starts_with("HEAD "),
+            "must HEAD before PUT: {methods:?}"
+        );
+    }
+
+    #[test]
+    fn test_http_sync_put_treats_409_as_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_thread = seen.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    seen_thread
+                        .lock()
+                        .unwrap()
+                        .push(req.lines().next().unwrap_or("").to_string());
+                    if req.starts_with("HEAD ") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    } else {
+                        let _ =
+                            stream.write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n");
+                    }
+                }
+            }
+        });
+        let mut objects = HashMap::new();
+        objects.insert(
+            "a/c/o".into(),
+            (
+                vec![("X-Timestamp".into(), "1751500001.00000".into())],
+                b"body".to_vec(),
+            ),
+        );
+        let client = HttpSyncClient::new(Box::new(MapObjectSource { objects }), 2.0);
+        let row = SyncRow {
+            row_id: 1,
+            name: "o".into(),
+            created_at: "1751500001.00000".into(),
+            deleted: false,
+            size: 4,
+            content_type: "text/plain".into(),
+            etag: "etag".into(),
+        };
+        let ctx = SyncContext {
+            sync_to: format!("http://{addr}/v1/dst/c"),
+            user_key: "secret".into(),
+            realm: None,
+            realm_key: None,
+            account: "a".into(),
+            container: "c".into(),
+            storage_policy_index: 0,
+        };
+        assert!(
+            client.sync_row(&row, &SyncAction::Put, &ctx),
+            "Python treats destination PUT 409 as success"
+        );
+        server.join().unwrap();
+        let methods = seen.lock().unwrap().clone();
+        assert!(
+            methods.iter().any(|line| line.starts_with("HEAD ")),
+            "{methods:?}"
+        );
+        assert!(
+            methods.iter().any(|line| line.starts_with("PUT ")),
+            "{methods:?}"
+        );
+    }
+
+    #[test]
+    fn test_http_sync_put_slo_uses_multipart_manifest_put() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_thread = seen.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    seen_thread
+                        .lock()
+                        .unwrap()
+                        .push(req.lines().next().unwrap_or("").to_string());
+                    if req.starts_with("HEAD ") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    } else {
+                        let _ =
+                            stream.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+                    }
+                }
+            }
+        });
+        let manifest = br#"[{"name":"/segs/s1","hash":"abc","bytes":12}]"#;
+        let mut objects = HashMap::new();
+        objects.insert(
+            "a/c/manifest".into(),
+            (
+                vec![
+                    ("X-Timestamp".into(), "1751500001.00000".into()),
+                    ("X-Static-Large-Object".into(), "True".into()),
+                    ("ETag".into(), "manifest-etag".into()),
+                ],
+                manifest.to_vec(),
+            ),
+        );
+        let client = HttpSyncClient::new(Box::new(MapObjectSource { objects }), 2.0);
+        let row = SyncRow {
+            row_id: 1,
+            name: "manifest".into(),
+            created_at: "1751500001.00000".into(),
+            deleted: false,
+            size: manifest.len() as i64,
+            content_type: "application/json".into(),
+            etag: "manifest-etag".into(),
+        };
+        let ctx = SyncContext {
+            sync_to: format!("http://{addr}/v1/dst/c"),
+            user_key: "secret".into(),
+            realm: None,
+            realm_key: None,
+            account: "a".into(),
+            container: "c".into(),
+            storage_policy_index: 0,
+        };
+        assert!(client.sync_row(&row, &SyncAction::Put, &ctx), "SLO PUT");
+        server.join().unwrap();
+        let methods = seen.lock().unwrap().clone();
+        assert!(
+            methods
+                .iter()
+                .any(|line| line.starts_with("HEAD ") && !line.contains("multipart-manifest")),
+            "HEAD stays unadorned: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|line| line.starts_with("PUT ") && line.contains("multipart-manifest=put")),
+            "slo=True dest PUT must use multipart-manifest=put: {methods:?}"
         );
     }
 
@@ -1824,17 +2441,7 @@ cluster_c1 = http://127.0.0.1:8080/v1/
             ])
             .unwrap();
         broker
-            .put_object(
-                "o1",
-                ts,
-                3,
-                "text/plain",
-                "abc",
-                0,
-                0,
-                None,
-                None,
-            )
+            .put_object("o1", ts, 3, "text/plain", "abc", 0, 0, None, None)
             .unwrap();
 
         let client = FakeSync {

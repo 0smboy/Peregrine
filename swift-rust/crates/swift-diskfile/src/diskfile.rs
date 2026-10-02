@@ -252,6 +252,67 @@ impl DiskFile {
         &self.datadir
     }
 
+    pub fn device_path(&self) -> &Path {
+        &self.device_path
+    }
+
+    /// Python `DiskFile._quarantine`: move the hash dir under
+    /// `<device>/quarantined/objects[-N]/`. A later object-server GET must
+    /// be `DiskFileNotExist` → 404, not 503.
+    pub fn quarantine_object(&self, msg: &str) -> DiskFileError {
+        let marker = self
+            .state
+            .as_ref()
+            .map(|s| s.data_file.clone())
+            .unwrap_or_else(|| self.datadir.join("made-up-filename"));
+        self.quarantine(&marker, msg)
+    }
+
+    /// Acquire the cross-process mutation stripe for this object.
+    ///
+    /// The lock lives below the policy-specific tmp directory rather than the
+    /// hash directory.  Its name is derived from the final three hex digits of
+    /// the object hash, giving a fixed upper bound of 4096 persistent lock
+    /// files per policy while ensuring every process that can mutate the same
+    /// object contends on the same `flock` inode.  The caller must acquire this
+    /// only after any request body has been staged, and must hold it across a
+    /// fresh precondition check and the durable filesystem mutation.
+    pub fn acquire_mutation_lock(
+        &self,
+        timeout: f64,
+    ) -> Result<swift_core::lockutil::PathLock, DiskFileError> {
+        let hash = self
+            .datadir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                name.len() == 32
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                DiskFileError::ContractBroken(format!(
+                    "object mutation lock requires a lowercase MD5 hash directory: {}",
+                    self.datadir.display()
+                ))
+            })?;
+        let stripe = &hash[hash.len() - 3..];
+        let name = format!("obj-{stripe}");
+        let directory = self.tmpdir.join("object-mutation-locks");
+        swift_core::lockutil::lock_path(&directory, timeout, Some(&name)).map_err(|error| {
+            match error.io {
+                Some(io) if io.raw_os_error() == Some(28) => DiskFileError::NoSpace,
+                Some(io) => DiskFileError::Io(io),
+                None => DiskFileError::LockTimeout(format!(
+                    "{} seconds: {}",
+                    error.timeout,
+                    error.lockpath.display()
+                )),
+            }
+        })
+    }
+
     fn quarantine(&self, data_file: &Path, msg: &str) -> DiskFileError {
         let _ = quarantine_renamer(&self.device_path, data_file);
         DiskFileError::Quarantined(msg.to_string())
@@ -321,7 +382,7 @@ impl DiskFile {
         let datafile_metadata = self.read_and_validate(XattrSource::File(&fp), &data_file)?;
         let data_timestamp = parse_ts(meta_get(&datafile_metadata, "X-Timestamp"));
 
-        let mut metadata = Metadata::new();
+        let mut metadata;
         let mut metafile_metadata: Option<Metadata> = None;
         if let Some(meta_file) = &ondisk.meta_file {
             let mut mf_meta = self.read_and_validate(XattrSource::Path(meta_file), meta_file)?;
@@ -330,6 +391,12 @@ impl DiskFile {
                     self.merge_content_type_metadata(ctype_file, &mut mf_meta, data_timestamp)?;
                 }
             }
+            // Python DiskFile._construct_from_data_file: start empty, apply
+            // the newest .meta, then overlay only reserved / system / object
+            // sysmeta from the datafile. User-meta lives only in .meta after
+            // a fast-POST, so a later GET must not resurrect PUT-time
+            // X-Object-Meta-* keys the POST dropped (func test_metadata /
+            // versioned_writes test_overwriting).
             let sys_metadata: Metadata = datafile_metadata
                 .iter()
                 .filter(|(k, _)| match k {
@@ -343,6 +410,7 @@ impl DiskFile {
                 })
                 .cloned()
                 .collect();
+            metadata = Metadata::new();
             meta_update(&mut metadata, &mf_meta);
             meta_update(&mut metadata, &sys_metadata);
             // the diskfile writer added 'name' to the metafile; drop it
@@ -538,12 +606,44 @@ impl DiskFile {
         Ok(&self.opened()?.metadata)
     }
 
+    /// On-disk `.data` path of the opened object (Python auditor
+    /// `data_file_path` handed to watchers).
+    pub fn opened_data_file(&self) -> Result<&Path, DiskFileError> {
+        Ok(&self.opened()?.data_file)
+    }
+
     pub fn get_datafile_metadata(&self) -> Result<&Metadata, DiskFileError> {
         Ok(&self.opened()?.datafile_metadata)
     }
 
     pub fn get_metafile_metadata(&self) -> Result<Option<&Metadata>, DiskFileError> {
         Ok(self.opened()?.metafile_metadata.as_ref())
+    }
+
+    /// Frag index of the opened data file (filename `#N` / `#N#d`), used
+    /// when GET/HEAD must echo `X-Object-Sysmeta-Ec-Frag-Index` even if
+    /// the xattr stored that value as an int.
+    pub fn opened_ec_frag_index(&self) -> Result<Option<i64>, DiskFileError> {
+        Ok(self
+            .opened()?
+            .ondisk
+            .data_info
+            .as_ref()
+            .and_then(|info| info.frag_index))
+    }
+
+    /// True when the opened data file is a durable EC fragment (`#d` or
+    /// a matching `.durable`). GET without fragment-preferences requires
+    /// this or DiskFile reports NotExist.
+    pub fn opened_ec_is_durable(&self) -> Result<bool, DiskFileError> {
+        let state = self.opened()?;
+        Ok(state.ondisk.durable_frag_set_ts.is_some()
+            || state
+                .ondisk
+                .data_info
+                .as_ref()
+                .and_then(|info| info.durable)
+                .unwrap_or(false))
     }
 
     pub fn content_length(&self) -> Result<u64, DiskFileError> {
@@ -665,30 +765,34 @@ impl DiskFile {
         nondurable_purge_delay: f64,
         meta_timestamp: Option<&Timestamp>,
     ) -> Result<(), DiskFileError> {
-        let remove = |p: PathBuf| {
-            let _ = std::fs::remove_file(p);
+        let remove = |p: PathBuf| -> Result<(), DiskFileError> {
+            match std::fs::remove_file(&p) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(DiskFileError::Io(error)),
+            }
         };
         remove(
             self.datadir
                 .join(make_ondisk_filename(timestamp, Some(".ts"), None)),
-        );
+        )?;
         if let Some(mts) = meta_timestamp {
             remove(
                 self.datadir
                     .join(make_ondisk_filename(mts, Some(".meta"), None)),
-            );
+            )?;
         }
         if let Some(fi) = frag_index {
             let nondurable = self
                 .datadir
                 .join(make_ec_ondisk_filename(timestamp, fi, false)?);
             if crate::cleanup::is_file_older(&nondurable, nondurable_purge_delay) {
-                remove(nondurable);
+                remove(nondurable)?;
             }
             remove(
                 self.datadir
                     .join(make_ec_ondisk_filename(timestamp, fi, true)?),
-            );
+            )?;
             let _ = std::fs::remove_dir(&self.datadir);
         }
         if let Some(suffix_dir) = self.datadir.parent() {
@@ -774,6 +878,52 @@ fn relink_next_path(
     Ok(())
 }
 
+/// Resolve EC data sysmeta identically for the two-phase writer and the
+/// owned durability/no-commit path. Explicit metadata wins; only an absent
+/// value may use the diskfile's index, which is then persisted in sysmeta.
+/// Non-data files and replicated objects must keep their normal filenames.
+fn resolve_ec_data_fragment_index(
+    policy: PolicyKind,
+    extension: &str,
+    writer_index: Option<i64>,
+    metadata: &mut Metadata,
+) -> Result<Option<i64>, DiskFileError> {
+    let PolicyKind::Ec { n_unique_fragments } = policy else {
+        return Ok(None);
+    };
+    if extension != ".data" {
+        return Ok(None);
+    }
+    const KEY: &str = "X-Object-Sysmeta-Ec-Frag-Index";
+    let supplied = meta_get(metadata, KEY).cloned();
+    let needs_backfill = supplied.is_none();
+    let value = supplied
+        .or_else(|| writer_index.map(MetaValue::Int))
+        .ok_or_else(|| DiskFileError::BadFragmentIndex("Bad fragment index: None".into()))?;
+    let index = match &value {
+        MetaValue::Int(index) => Some(*index),
+        MetaValue::Str(text) => crate::naming::python_int(text),
+        MetaValue::Bytes(_) => None,
+    }
+    .ok_or_else(|| DiskFileError::BadFragmentIndex(format!("Bad fragment index: {value:?}")))?;
+    if index < 0 {
+        return Err(DiskFileError::BadFragmentIndex(format!(
+            "Fragment index must not be negative: {index}"
+        )));
+    }
+    if let Some(limit) = n_unique_fragments {
+        if index >= i64::from(limit) {
+            return Err(DiskFileError::BadFragmentIndex(format!(
+                "Fragment index must be less than {limit}: {index}"
+            )));
+        }
+    }
+    if needs_backfill {
+        meta_set(metadata, KEY, MetaValue::Int(index));
+    }
+    Ok(Some(index))
+}
+
 /// The Rust `BaseDiskFileWriter` (+ repl/EC `put`/`commit` overrides).
 ///
 /// Owned (`'static`, `Send`) so a finite `write` can run on
@@ -850,45 +1000,13 @@ impl DiskFileWriter {
     /// `put()`: finalize on disk. For EC `.data` files the fragment index
     /// is stamped into sysmeta and cleanup is deferred to `commit()`.
     pub fn put(&mut self, mut metadata: Metadata) -> Result<(), DiskFileError> {
-        let mut cleanup = true;
-        let mut frag_index_arg: Option<i64> = None;
-        if matches!(self.policy, PolicyKind::Ec { .. }) && self.extension == ".data" {
-            let n = match self.policy {
-                PolicyKind::Ec { n_unique_fragments } => n_unique_fragments,
-                PolicyKind::Replication => None,
-            };
-            let fi_value = match meta_get(&metadata, "X-Object-Sysmeta-Ec-Frag-Index") {
-                Some(v) => v.clone(),
-                None => {
-                    let fi = self.frag_index.ok_or_else(|| {
-                        DiskFileError::BadFragmentIndex("Bad fragment index: None".into())
-                    })?;
-                    let v = MetaValue::Int(fi);
-                    meta_set(&mut metadata, "X-Object-Sysmeta-Ec-Frag-Index", v.clone());
-                    v
-                }
-            };
-            let fi = match &fi_value {
-                MetaValue::Int(i) => Some(*i),
-                MetaValue::Str(s) => crate::naming::python_int(s),
-                MetaValue::Bytes(_) => None,
-            }
-            .ok_or_else(|| {
-                DiskFileError::BadFragmentIndex(format!("Bad fragment index: {fi_value:?}"))
-            })?;
-            if fi < 0 {
-                return Err(DiskFileError::BadFragmentIndex(format!(
-                    "Fragment index must not be negative: {fi}"
-                )));
-            }
-            if let Some(n) = n {
-                if fi >= n as i64 {
-                    return Err(DiskFileError::BadFragmentIndex(format!(
-                        "Fragment index must be less than {n}: {fi}"
-                    )));
-                }
-            }
-            frag_index_arg = Some(fi);
+        let frag_index_arg = resolve_ec_data_fragment_index(
+            self.policy,
+            &self.extension,
+            self.frag_index,
+            &mut metadata,
+        )?;
+        if let Some(fi) = frag_index_arg {
             // Persist the resolved fragment index so a subsequent commit()
             // (which reads self.frag_index) can rename the .data to its durable
             // ts#N#d.data name. The proxy supplies the index in the PUT
@@ -896,9 +1014,8 @@ impl DiskFileWriter {
             // sees frag_index=None and the fragment never becomes durable.
             // Python: ECDiskFileWriter.put sets self._diskfile._frag_index = fi.
             self.frag_index = Some(fi);
-            cleanup = false;
         }
-        self.finalize_put(metadata, cleanup, frag_index_arg)
+        self.finalize_put(metadata, frag_index_arg.is_none(), frag_index_arg)
     }
 
     fn finalize_put(
@@ -975,6 +1092,13 @@ impl DiskFileWriter {
         match std::fs::rename(&data_file_path, &durable_data_file_path) {
             Ok(()) => {
                 std::fs::File::open(&self.datadir)?.sync_all()?;
+                if let Some(suffix_dir) = self.datadir.parent() {
+                    // `put()` invalidates for the initial non-durable publish,
+                    // but a hasher may consume that entry before this second
+                    // phase. The durable rename is a distinct visible state
+                    // transition and therefore needs its own invalidation.
+                    invalidate_hash(suffix_dir)?;
+                }
                 if let Some(next_datadir) = &self.next_datadir {
                     let next_data =
                         next_datadir.join(make_ec_ondisk_filename(timestamp, fi, false)?);
@@ -983,6 +1107,9 @@ impl DiskFileWriter {
                     if next_data.exists() {
                         std::fs::rename(&next_data, &next_durable)?;
                         std::fs::File::open(next_datadir)?.sync_all()?;
+                        if let Some(next_suffix_dir) = next_datadir.parent() {
+                            invalidate_hash(next_suffix_dir)?;
+                        }
                     }
                 }
                 let _ = cleanup_ondisk_files(&self.datadir, self.policy, &self.cfg.cleanup);
@@ -1079,19 +1206,12 @@ impl DurablePut {
                 DiskFileError::InvalidFilename("missing X-Timestamp in metadata".into())
             })?;
         let ctype_timestamp = parse_ts(meta_get(&metadata, "Content-Type-Timestamp"));
-        let mut frag_index = self.frag_index;
-        if frag_index.is_none()
-            && matches!(self.policy, PolicyKind::Ec { .. })
-            && self.extension == ".data"
-        {
-            if let Some(v) = meta_get(&metadata, "X-Object-Sysmeta-Ec-Frag-Index") {
-                frag_index = match v {
-                    MetaValue::Int(i) => Some(*i),
-                    MetaValue::Str(s) => crate::naming::python_int(s),
-                    MetaValue::Bytes(_) => None,
-                };
-            }
-        }
+        let frag_index = resolve_ec_data_fragment_index(
+            self.policy,
+            &self.extension,
+            self.frag_index,
+            &mut metadata,
+        )?;
         let filename = match frag_index {
             // DurablePut::commit is the durability barrier: write the
             // durable EC name (`ts#N#d.data`) in one step. The two-phase

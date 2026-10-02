@@ -32,6 +32,8 @@ use std::pin::Pin;
 pub mod daemonutil;
 pub mod expirer;
 pub mod localdev;
+pub mod object_server_conf;
+pub mod reconstruction_spool;
 /// The EC object reconstructor: ssync-driven SYNC/REVERT partition jobs
 /// (feature-independent) plus the fragment rebuild path, which links
 /// liberasurecode and is behind the `ec` feature.
@@ -73,10 +75,10 @@ use swift_diskfile::{
 };
 use swift_http::{
     http_date, split_path, unquote, AsyncRequest, AsyncService, Body, ChainReader, ClockHealth,
-    HeaderKeyDict, Match, MimeDocs, Range, Request, Response, STREAM_CHUNK,
+    HeaderKeyDict, IncomingBodySender, Match, MimeDocs, Range, Request, Response, STREAM_CHUNK,
 };
 use swift_runtime::{
-    ConcurrencyMetrics, DeviceId, DeviceIoLimits, DurabilityBarrier, StorageExecutor,
+    ConcurrencyMetrics, DeviceId, DeviceIoLimits, DurabilityBarrier, StorageError, StorageExecutor,
     StorageExecutorConfig, TaskScope, TrafficClass,
 };
 
@@ -84,6 +86,9 @@ use crate::ssync::{MissingOffer, SsyncEvent, SsyncParser, SsyncSubrequest};
 
 pub const MAX_FILE_SIZE: i64 = 5_368_709_122;
 const MISPLACED_OBJECTS_ACCOUNT: &str = ".misplaced_objects";
+const OBJECT_MUTATION_LOCK_TIMEOUT: f64 = 15.0;
+const EXPECTED_S3_VERSION_ID_HEADER: &str = "X-Backend-Expected-S3-Version-Id";
+const S3_VERSION_ID_SYSMETA: &str = "X-Object-Sysmeta-S3-Version-Id";
 
 fn validate_internal_name(name: &str, type_: &str) -> Result<(), Response> {
     if name.contains(RESERVED_STR) && !name.starts_with(RESERVED_STR) {
@@ -153,13 +158,91 @@ fn async_body_read_error(error: &std::io::Error) -> Response {
     }
 }
 
-async fn ingest_mime_object_async(
-    storage: &StorageExecutor,
+/// Open PUT writer whose unlink cannot run on the reactor thread.
+///
+/// Drop submits `close()` onto the storage domain and keeps the device
+/// permit until the physical cleanup returns. `take()` yields the writer
+/// for a later storage-bound put/commit without running Drop cleanup.
+struct WriterLease {
+    writer: Option<swift_diskfile::DiskFileWriter>,
+    storage: StorageExecutor,
     device: DeviceId,
-    mut writer: swift_diskfile::DiskFileWriter,
+    class: TrafficClass,
+}
+
+impl WriterLease {
+    fn new(
+        storage: StorageExecutor,
+        device: DeviceId,
+        class: TrafficClass,
+        writer: swift_diskfile::DiskFileWriter,
+    ) -> Self {
+        Self {
+            writer: Some(writer),
+            storage,
+            device,
+            class,
+        }
+    }
+
+    fn writer(&self) -> &swift_diskfile::DiskFileWriter {
+        self.writer.as_ref().expect("writer lease empty")
+    }
+
+    async fn write_chunk(&mut self, chunk: Vec<u8>) -> Result<(), Response> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let writer = self.writer.take().expect("writer lease empty");
+        match self
+            .storage
+            .run_finite(self.device.clone(), self.class, move || {
+                let mut writer = writer;
+                writer.write(&chunk)?;
+                Ok::<_, DiskFileError>(writer)
+            })
+            .await
+        {
+            Ok(Ok(writer)) => {
+                self.writer = Some(writer);
+                Ok(())
+            }
+            Ok(Err(DiskFileError::NoSpace)) => {
+                Err(swob_insufficient_storage(self.device.as_str(), "enospc"))
+            }
+            Ok(Err(DiskFileError::Io(error))) if error.raw_os_error() == Some(28) => {
+                Err(swob_insufficient_storage(self.device.as_str(), "enospc"))
+            }
+            Ok(Err(DiskFileError::Io(_))) => Err(plain_response(500, "disk I/O error")),
+            Ok(Err(error)) => Err(plain_response(500, &error.to_string())),
+            Err(error) => Err(plain_response(500, &error.to_string())),
+        }
+    }
+
+    fn take(mut self) -> swift_diskfile::DiskFileWriter {
+        let writer = self.writer.take().expect("writer lease empty");
+        std::mem::forget(self);
+        writer
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        if let Some(mut writer) = self.writer.take() {
+            let _ = self
+                .storage
+                .submit_held(self.device.clone(), self.class, move || {
+                    writer.close();
+                });
+        }
+    }
+}
+
+async fn ingest_mime_object_async(
+    lease: &mut WriterLease,
     body: &mut swift_http::IncomingBody,
     boundary: &[u8],
-) -> Result<(swift_diskfile::DiskFileWriter, Vec<u8>), Response> {
+) -> Result<Vec<u8>, Response> {
     let mut delim = b"\r\n--".to_vec();
     delim.extend_from_slice(boundary);
     let start = delim[2..].to_vec();
@@ -191,45 +274,20 @@ async fn ingest_mime_object_async(
             if let Some(i) = find_bytes(&buf, &delim) {
                 let piece = buf[..i].to_vec();
                 let leftover = buf[i + delim.len()..].to_vec();
-                if !piece.is_empty() {
-                    writer = storage
-                        .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                            writer.write(&piece)?;
-                            Ok::<_, DiskFileError>(writer)
-                        })
-                        .await
-                        .map_err(|e| plain_response(500, &e.to_string()))?
-                        .map_err(|e| plain_response(500, &e.to_string()))?;
-                }
-                return Ok((writer, leftover));
+                lease.write_chunk(piece).await?;
+                return Ok(leftover);
             }
             if buf.len() > delim.len() {
                 let keep = delim.len() - 1;
                 let piece = buf[..buf.len() - keep].to_vec();
                 buf.drain(..buf.len() - keep);
-                writer = storage
-                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                        writer.write(&piece)?;
-                        Ok::<_, DiskFileError>(writer)
-                    })
-                    .await
-                    .map_err(|e| plain_response(500, &e.to_string()))?
-                    .map_err(|e| plain_response(500, &e.to_string()))?;
+                lease.write_chunk(piece).await?;
             }
         }
     }
     if phase == 2 {
-        if !buf.is_empty() {
-            writer = storage
-                .run_finite(device, TrafficClass::Foreground, move || {
-                    writer.write(&buf)?;
-                    Ok::<_, DiskFileError>(writer)
-                })
-                .await
-                .map_err(|e| plain_response(500, &e.to_string()))?
-                .map_err(|e| plain_response(500, &e.to_string()))?;
-        }
-        return Ok((writer, Vec::new()));
+        lease.write_chunk(buf).await?;
+        return Ok(Vec::new());
     }
     Err(plain_response(400, "no object body MIME doc"))
 }
@@ -476,36 +534,144 @@ fn ssync_check_missing_owned(
 /// Network wait is `IncomingBody::next_chunk` (async socket via Hyper).
 /// Disk work is a finite `StorageExecutor` job (`TrafficClass::Replication`).
 /// The HTTP 200 head is already on the wire before this future runs.
+fn storage_error_is_busy(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::DeviceBusy { .. }
+            | StorageError::DeviceClassBusy { .. }
+            | StorageError::QueueFull { .. }
+    )
+}
+
+async fn acquire_replication_session_lock(
+    storage: &StorageExecutor,
+    device: DeviceId,
+    part_path: PathBuf,
+    timeout: f64,
+) -> Result<swift_core::lockutil::PathLock, Response> {
+    // Python waits up to replication_lock_timeout on the partition flock.
+    // Rust used to 503 immediately when the device replication slot was
+    // busy (another SSYNC missing-check/PUT on the same device), so
+    // Manager.once×4 never reached the flock wait. Retry DeviceBusy until
+    // the same wall budget expires.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
+    let partition = part_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_string();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(swob_unavailable(
+                device.as_str(),
+                &format!("replication lock timeout partition={partition} timeout={timeout}"),
+            ));
+        }
+        let wait = remaining.as_secs_f64().max(0.01);
+        let part_path = part_path.clone();
+        match storage
+            .run_finite(device.clone(), TrafficClass::Replication, move || {
+                swift_core::lockutil::lock_path(&part_path, wait, Some("replication"))
+            })
+            .await
+        {
+            Ok(Ok(guard)) => return Ok(guard),
+            Ok(Err(_)) => {
+                return Err(swob_unavailable(
+                    device.as_str(),
+                    &format!("replication lock timeout partition={partition} timeout={timeout}"),
+                ));
+            }
+            Err(error) if storage_error_is_busy(&error) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(swob_unavailable(
+                    device.as_str(),
+                    &format!("storage {error} partition={partition}"),
+                ));
+            }
+        }
+    }
+}
+
+/// Keep parser input/event batches bounded even when an in-memory adapter
+/// supplies a large frame. Network waits remain on this async task.
+struct SsyncInput {
+    body: swift_http::IncomingBody,
+    frame: Vec<u8>,
+    offset: usize,
+}
+
+impl SsyncInput {
+    async fn next_events(
+        &mut self,
+        parser: &mut SsyncParser,
+    ) -> Result<Option<Vec<SsyncEvent>>, String> {
+        while self.offset == self.frame.len() {
+            self.frame = match self.body.next_chunk().await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            self.offset = 0;
+        }
+        let end = self
+            .offset
+            .saturating_add(ssync::STREAM_CHUNK_BYTES)
+            .min(self.frame.len());
+        let events = parser
+            .push(&self.frame[self.offset..end])
+            .map_err(|e| e.to_string())?;
+        self.offset = end;
+        if self.offset == self.frame.len() {
+            self.frame = Vec::new();
+            self.offset = 0;
+        }
+        Ok(Some(events))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_ssync_session(
-    mut body: swift_http::IncomingBody,
+    body: swift_http::IncomingBody,
     tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     storage: StorageExecutor,
-    config: ObjectServerConfig,
+    server: ObjectServer,
     device: String,
     partition: String,
     policy_index: u32,
     policy: PolicyKind,
     frag_index: Option<i64>,
+    replication_lock: std::sync::Arc<swift_core::lockutil::PathLock>,
 ) {
+    let config = server.config.clone();
     // Python's first yield: a bare b'\r\n' so WSGI/Hyper flushes the 200
     // head before the sender writes `:MISSING_CHECK:` (ssync_receiver.py:294-296).
     let _ = tx.send(Ok(b"\r\n".to_vec())).await;
     let device_id = DeviceId::new(device.clone());
-    let mut parser = SsyncParser::new();
+    let mut input = SsyncInput {
+        body,
+        frame: Vec::new(),
+        offset: 0,
+    };
+    let max_object = MAX_FILE_SIZE as usize;
+    let max_wire = max_object
+        .saturating_add(ssync::MAX_HEADER_BYTES)
+        .saturating_mul(ssync::MAX_UPDATES)
+        .saturating_add(ssync::MAX_MISSING_OFFERS.saturating_mul(ssync::MAX_LINE_LENGTH));
+    let mut parser = SsyncParser::streaming(max_object, max_wire);
     let mut wanted: Vec<String> = Vec::new();
     let mut missing_done = false;
     while !missing_done {
-        let chunk = match body.next_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) | Err(_) => return,
-        };
-        let events = match parser.push(&chunk) {
-            Ok(e) => e,
+        let events = match input.next_events(&mut parser).await {
+            Ok(Some(events)) => events,
+            Ok(None) => return,
             Err(error) => {
                 let _ = tx
                     .send(Ok(
-                        format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
+                        format!(":ERROR: 0 {}\n", python_repr(&error)).into_bytes()
                     ))
                     .await;
                 return;
@@ -522,7 +688,9 @@ async fn drive_ssync_session(
                             let devices = config.devices.clone();
                             let hash_config = config.hash_config.clone();
                             let diskfile_cfg = config.diskfile.clone();
+                            let replication_lock = std::sync::Arc::clone(&replication_lock);
                             move || {
+                                let _replication_lock = replication_lock;
                                 ssync_check_missing_owned(
                                     devices,
                                     hash_config,
@@ -589,89 +757,233 @@ async fn drive_ssync_session(
     };
     let mut successes = 0usize;
     let mut failures = 0usize;
-    loop {
-        for event in events {
-            match event {
-                SsyncEvent::Update(update) => {
-                    let cfg = config.clone();
-                    let device = device.clone();
-                    let partition = partition.clone();
-                    let result = storage
-                        .run_finite(device_id.clone(), TrafficClass::Replication, move || {
-                            ObjectServer::new(cfg).apply_ssync_update(
-                                &device,
-                                &partition,
-                                policy_index,
-                                frag_index,
-                                update,
-                            )
-                        })
-                        .await;
-                    match result {
-                        Ok(response)
-                            if (200..300).contains(&response.status) || response.status == 404 =>
-                        {
-                            successes += 1;
+    let mut update_scope: Option<TaskScope> = None;
+    let mut update_tx: Option<IncomingBodySender> = None;
+    let mut update_task = None;
+    async {
+        loop {
+            for event in events {
+                match event {
+                    SsyncEvent::UpdateStart(update) => {
+                        if update_task.is_some() {
+                            let _ = tx
+                                .send(Ok(b":ERROR: 0 'overlapping SSYNC updates'\n".to_vec()))
+                                .await;
+                            return;
                         }
-                        Ok(_) | Err(_) => failures += 1,
+                        let mut headers = update.headers;
+                        headers.set("X-Backend-Storage-Policy-Index", policy_index);
+                        headers.set("X-Backend-Replication", "True");
+                        if let Some(frag_index) = frag_index {
+                            headers.set("X-Backend-Ssync-Frag-Index", frag_index);
+                        }
+                        if !update.replication_headers.is_empty() {
+                            headers.set(
+                                "X-Backend-Replication-Headers",
+                                update.replication_headers.join(" "),
+                            );
+                        }
+                        let content_length = headers
+                            .get("Content-Length")
+                            .and_then(|value| value.parse().ok());
+                        let (body_tx, body) = match swift_http::IncomingBody::metered_channel(
+                            2,
+                            STREAM_CHUNK,
+                            content_length,
+                            None,
+                            max_object as u64,
+                        ) {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Ok(format!(
+                                        ":ERROR: 0 {}\n",
+                                        python_repr(&error.to_string())
+                                    )
+                                    .into_bytes()))
+                                    .await;
+                                return;
+                            }
+                        };
+                        let request = AsyncRequest {
+                            method: update.method,
+                            path: format!("/{device}/{partition}{}", unquote(&update.path)),
+                            query_string: String::new(),
+                            headers,
+                            body,
+                        };
+                        let mut child_server = server.clone_execution_context();
+                        child_server.replication_session_lock =
+                            Some(std::sync::Arc::clone(&replication_lock));
+                        let scope = TaskScope::bounded(1);
+                        update_task = match scope
+                            .spawn(async move { child_server.put_streaming_async(request).await })
+                        {
+                            Ok(task) => Some(task),
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Ok(format!(
+                                        ":ERROR: 0 {}\n",
+                                        python_repr(&error.to_string())
+                                    )
+                                    .into_bytes()))
+                                    .await;
+                                return;
+                            }
+                        };
+                        update_scope = Some(scope);
+                        update_tx = Some(body_tx);
                     }
-                    if failures >= REPLICATION_FAILURE_THRESHOLD
-                        && (successes == 0
-                            || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
-                    {
-                        let message =
-                            format!("Too many {failures} failures to {successes} successes");
-                        let _ = tx
-                            .send(Ok(
-                                format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
-                            ))
+                    SsyncEvent::UpdateChunk(bytes) => {
+                        // An early HTTP rejection may close its receiver. Continue
+                        // draining the bounded wire body and count that response at
+                        // UpdateEnd; never retain the rest of a rejected object.
+                        if let Some(sender) = update_tx.as_mut() {
+                            if sender.send(Ok(bytes)).await.is_err() {
+                                update_tx = None;
+                            }
+                        }
+                    }
+                    SsyncEvent::UpdateEnd => {
+                        drop(update_tx.take());
+                        let Some(task) = update_task.take() else {
+                            let _ = tx
+                                .send(Ok(b":ERROR: 0 'missing SSYNC update task'\n".to_vec()))
+                                .await;
+                            return;
+                        };
+                        match task.join().await {
+                            Ok(response)
+                                if (200..300).contains(&response.status)
+                                    || response.status == 404 =>
+                            {
+                                successes += 1
+                            }
+                            _ => failures += 1,
+                        }
+                        if let Some(scope) = update_scope.take() {
+                            if scope.join().await.is_err() {
+                                failures += 1;
+                            }
+                        }
+                        if failures >= REPLICATION_FAILURE_THRESHOLD
+                            && (successes == 0
+                                || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
+                        {
+                            let message =
+                                format!("Too many {failures} failures to {successes} successes");
+                            let _ = tx
+                                .send(Ok(
+                                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                    SsyncEvent::Update(update) => {
+                        let child_server = server.clone_execution_context();
+                        let device = device.clone();
+                        let partition = partition.clone();
+                        let replication_lock = std::sync::Arc::clone(&replication_lock);
+                        let result = storage
+                            .run_finite(device_id.clone(), TrafficClass::Replication, move || {
+                                let _replication_lock = replication_lock;
+                                child_server.apply_ssync_update(
+                                    &device,
+                                    &partition,
+                                    policy_index,
+                                    frag_index,
+                                    update,
+                                )
+                            })
                             .await;
-                        return;
+                        match result {
+                            Ok(response)
+                                if (200..300).contains(&response.status)
+                                    || response.status == 404 =>
+                            {
+                                successes += 1;
+                            }
+                            Ok(_) | Err(_) => failures += 1,
+                        }
+                        if failures >= REPLICATION_FAILURE_THRESHOLD
+                            && (successes == 0
+                                || failures as f64 / successes as f64 > REPLICATION_FAILURE_RATIO)
+                        {
+                            let message =
+                                format!("Too many {failures} failures to {successes} successes");
+                            let _ = tx
+                                .send(Ok(
+                                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
+                                ))
+                                .await;
+                            return;
+                        }
                     }
+                    SsyncEvent::UpdatesEnd => updates_done = true,
+                    _ => {}
                 }
-                SsyncEvent::UpdatesEnd => updates_done = true,
-                _ => {}
             }
-        }
-        if let Some(message) = parser.failure().map(|error| error.message().to_string()) {
-            let _ = tx
-                .send(Ok(
-                    format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
-                ))
-                .await;
-            return;
-        }
-        if updates_done {
-            break;
-        }
-        let chunk = match body.next_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) | Err(_) => break,
-        };
-        events = match parser.push(&chunk) {
-            Ok(e) => e,
-            Err(error) => {
+            if let Some(message) = parser.failure().map(|error| error.message().to_string()) {
                 let _ = tx
                     .send(Ok(
-                        format!(":ERROR: 0 {}\n", python_repr(error.message())).into_bytes()
+                        format!(":ERROR: 0 {}\n", python_repr(&message)).into_bytes()
                     ))
                     .await;
                 return;
             }
-        };
-    }
-    if failures != 0 {
-        let body = format!("ERROR: With :UPDATES: {failures} failures to {successes} successes");
+            if updates_done {
+                break;
+            }
+            events = match input.next_events(&mut parser).await {
+                Ok(Some(events)) => events,
+                Ok(None) => {
+                    let _ = tx
+                        .send(Ok(
+                            b":ERROR: 0 'Unexpected EOF before :UPDATES: END'\n".to_vec()
+                        ))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Ok(format!(
+                            ":ERROR: 0 {}\n",
+                            python_repr(&format!(
+                                "Request body failed before :UPDATES: END: {error}"
+                            ))
+                        )
+                        .into_bytes()))
+                        .await;
+                    return;
+                }
+            };
+        }
+        if failures != 0 {
+            let body =
+                format!("ERROR: With :UPDATES: {failures} failures to {successes} successes");
+            let _ = tx
+                .send(Ok(
+                    format!(":ERROR: 500 b{}\n", python_repr(&body)).into_bytes()
+                ))
+                .await;
+            return;
+        }
         let _ = tx
-            .send(Ok(
-                format!(":ERROR: 500 b{}\n", python_repr(&body)).into_bytes()
-            ))
+            .send(Ok(b":UPDATES: START\r\n:UPDATES: END\r\n".to_vec()))
             .await;
-        return;
     }
-    let _ = tx
-        .send(Ok(b":UPDATES: START\r\n:UPDATES: END\r\n".to_vec()))
-        .await;
+    .await;
+    // EOF/error must close and join the partial PUT before releasing the
+    // session lease. A cancelled channel cannot leave an unobserved child
+    // holding the next session's replication lock.
+    drop(update_tx.take());
+    if let Some(task) = update_task.take() {
+        let _ = task.join().await;
+    }
+    if let Some(scope) = update_scope.take() {
+        let _ = scope.join().await;
+    }
 }
 
 /// How the object server applies the container-listing side channel after a
@@ -727,6 +1039,9 @@ pub struct ObjectServer {
     /// (xattr/fsync/rename). Production is `None`. Tests use it to occupy
     /// the executor during finalize without a dummy `run_finite`.
     commit_stall: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Streaming SSYNC commit jobs keep the partition lease alive even if
+    /// the response future is cancelled during a protected durable commit.
+    replication_session_lock: Option<std::sync::Arc<swift_core::lockutil::PathLock>>,
 }
 
 struct PendingDurable {
@@ -737,6 +1052,7 @@ struct PendingDurable {
 
 struct PutCompletion {
     drive: String,
+    part: u64,
     etag: String,
     upload_size: u64,
     content_type: String,
@@ -747,6 +1063,7 @@ struct PutCompletion {
     container: String,
     obj: String,
     policy_index: u32,
+    policy: PolicyKind,
     headers: HeaderKeyDict,
     path: String,
 }
@@ -755,6 +1072,17 @@ fn meta_get<'m>(meta: &'m Metadata, key: &str) -> Option<&'m str> {
     meta.iter()
         .find(|(k, _)| matches!(k, MetaValue::Str(s) if s.eq_ignore_ascii_case(key)))
         .and_then(|(_, v)| v.as_str())
+}
+
+/// Python GET/HEAD stringifies pickled metadata values. An Int
+/// `X-Object-Sysmeta-Ec-Frag-Index` must still reach the proxy or EC GET
+/// treats the 200 as a non-source and can 404 after reconstruct_fa.
+fn meta_as_header(value: &MetaValue) -> Option<String> {
+    match value {
+        MetaValue::Str(s) => Some(s.clone()),
+        MetaValue::Int(i) => Some(i.to_string()),
+        MetaValue::Bytes(b) => String::from_utf8(b.clone()).ok(),
+    }
 }
 
 /// Parse Python's `X-Backend-Fragment-Preferences` JSON while preserving the
@@ -868,6 +1196,53 @@ fn swob_response(status: u16) -> Response {
     };
     resp.headers.set("Content-Type", "text/html; charset=UTF-8");
     resp
+}
+
+/// Field `1682fdb` once×4 logged `Expected status 200; got 503` with no
+/// reason: generic [`swob_response`] HTML and Hyper admission 503s were
+/// indistinguishable from a partition replication lock. Name the drive and
+/// the concrete wait (`replication lock`, `storage … busy`, mutation lock).
+fn swob_unavailable(drive: &str, reason: &str) -> Response {
+    let drive_html = if drive.is_empty() {
+        String::new()
+    } else {
+        format!(" Drive: {drive}")
+    };
+    let mut resp = Response::with_body(
+        503,
+        format!(
+            "<html><h1>Service Unavailable</h1><p>The server is currently unavailable.{drive_html} Reason: {reason}</p></html>"
+        ),
+    );
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    resp.headers.set("X-Backend-Unavailable-Reason", reason);
+    resp
+}
+
+/// Python `HTTPInsufficientStorage(drive=…)`: the field 507 body on
+/// `57b7456` had an empty `Drive:` because [`swob_response`] never filled
+/// the device name. Keep the swob HTML shape and name the drive.
+fn swob_insufficient_storage(drive: &str, reason: &str) -> Response {
+    let mut resp = Response::with_body(
+        507,
+        format!(
+            "<html><h1>Insufficient Storage</h1><p>There was not enough space to save the resource. Drive: {drive}</p></html>"
+        ),
+    );
+    resp.headers.set("Content-Type", "text/html; charset=UTF-8");
+    resp.headers.set("X-Backend-No-Space-Reason", reason);
+    resp
+}
+
+fn drive_unavailable_response(drive: &str, detail: &str) -> Response {
+    let reason = if detail.contains("is not mounted") {
+        "unmounted"
+    } else if detail.contains("is not a directory") {
+        "not_a_directory"
+    } else {
+        "invalid_drive"
+    };
+    swob_insufficient_storage(drive, reason)
 }
 
 fn plain_response(status: u16, body: &str) -> Response {
@@ -1157,6 +1532,26 @@ fn put_if_match_precondition(
     }
 }
 
+/// Internal ABA guard used by the S3 versioning layer.  An ETag alone is not
+/// a generation identifier: two different versions may legitimately contain
+/// identical bytes.  When the proxy names the version it observed, the object
+/// server verifies that sysmeta under the same mutation lock as the write.
+fn expected_s3_version_precondition(
+    req: &Request,
+    orig_exists: bool,
+    orig_metadata: Option<&Metadata>,
+) -> Option<Response> {
+    let Some(expected) = req.headers.get(EXPECTED_S3_VERSION_ID_HEADER) else {
+        return None;
+    };
+    let actual = orig_metadata.and_then(|metadata| meta_get(metadata, S3_VERSION_ID_SYSMETA));
+    if orig_exists && actual == Some(expected) {
+        None
+    } else {
+        Some(swob_response(412))
+    }
+}
+
 /// Shared PUT pre-body checks (If-None-Match, X-Delete-*, timestamp, lock).
 fn evaluate_put_preconditions(
     req: &Request,
@@ -1182,6 +1577,9 @@ fn evaluate_put_preconditions(
         return Err(resp);
     }
     if let Some(resp) = put_if_match_precondition(req, orig_exists, orig_metadata) {
+        return Err(resp);
+    }
+    if let Some(resp) = expected_s3_version_precondition(req, orig_exists, orig_metadata) {
         return Err(resp);
     }
     if orig_exists || orig_metadata.is_some() {
@@ -1225,20 +1623,91 @@ fn open_put_original(
     }
 }
 
-/// Python `fallocate()`'s FALLOCATE_RESERVE check, absolute-bytes mode: would
-/// writing `size` bytes leave the device's filesystem with `free` bytes
-/// available at or below the reserve? Zero-length writes never trip the
-/// reserve (Python skips the check when `size` is falsy) and a non-positive
-/// reserve disables it. Percent reserves compare against the device's TOTAL
-/// capacity, which the shared `fsutil` contract does not expose, so percent
-/// mode is not enforced here yet.
-fn fallocate_reserve_breached(free: u64, size: u64, reserve: &FallocateReserve) -> bool {
+fn mutation_lock_error_response(error: DiskFileError) -> Response {
+    match error {
+        DiskFileError::LockTimeout(_) => swob_unavailable("", "object mutation lock timeout"),
+        DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
+        other => plain_response(500, &other.to_string()),
+    }
+}
+
+/// Acquire the object's fixed mutation stripe, then re-open and re-evaluate
+/// every PUT condition while that stripe is held.  Returning the guard makes
+/// the lock lifetime explicit at each durability barrier.
+fn acquire_checked_put_guard(
+    df: DiskFile,
+    req: &Request,
+    req_timestamp: &Timestamp,
+    ssync_frag_index: Option<i64>,
+    clock_ok: bool,
+) -> Result<swift_core::lockutil::PathLock, Response> {
+    let guard = df
+        .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        .map_err(mutation_lock_error_response)?;
+    let (exists, orig_ts, orig_meta) = open_put_original(df, ssync_frag_index)?;
+    evaluate_put_preconditions(
+        req,
+        req_timestamp,
+        exists,
+        orig_ts,
+        orig_meta.as_ref(),
+        clock_ok,
+    )?;
+    Ok(guard)
+}
+
+/// Reacquire the stripe for an EC multiphase durable transition. The first
+/// phase already published this request's nondurable fragment, so equality
+/// with the request timestamp is expected and the original If-* generation
+/// guard must not be applied a second time. A strictly newer on-disk
+/// generation still wins and prevents a late commit from reviving stale data.
+fn acquire_ec_commit_guard(
+    df: DiskFile,
+    req_timestamp: &Timestamp,
+    ssync_frag_index: Option<i64>,
+) -> Result<swift_core::lockutil::PathLock, Response> {
+    let guard = df
+        .acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        .map_err(mutation_lock_error_response)?;
+    let (_, current_timestamp, _) = open_put_original(df, ssync_frag_index)?;
+    if current_timestamp > *req_timestamp {
+        let mut response = swob_response(409);
+        response
+            .headers
+            .set("X-Backend-Timestamp", current_timestamp.internal());
+        return Err(response);
+    }
+    Ok(guard)
+}
+
+/// Python `fallocate()`'s FALLOCATE_RESERVE check.
+///
+/// Bytes mode: `(free - size) <= reserve`. Percent mode: remaining free
+/// after the write, as a percent of `total`, is `<=` the configured
+/// percent (`swift.common.utils.fallocate`). Zero-length writes skip the
+/// check (Python treats a falsy `size` as no reservation). A non-positive
+/// reserve disables it. A zero `total` fails open — we cannot compute a
+/// percent without capacity.
+fn fallocate_reserve_breached(
+    free: u64,
+    total: u64,
+    size: u64,
+    reserve: &FallocateReserve,
+) -> bool {
     if size == 0 {
         return false;
     }
     match reserve {
         FallocateReserve::Bytes(reserve) if *reserve > 0 => {
             (free as i128) - (size as i128) <= (*reserve as i128)
+        }
+        FallocateReserve::Percent(percent) if *percent > 0.0 => {
+            if total == 0 {
+                return false;
+            }
+            let free_after = (free as i128) - (size as i128);
+            let remaining_pct = (free_after as f64) / (total as f64) * 100.0;
+            remaining_pct <= *percent
         }
         _ => false,
     }
@@ -1254,6 +1723,21 @@ fn backend_next_part_power(req: &Request) -> Option<u32> {
 }
 
 impl ObjectServer {
+    /// An internal request keeps the parent's operational settings and
+    /// execution domain. Constructing it with `new(config)` would silently
+    /// reset reserve, clock-health and commit hooks.
+    fn clone_execution_context(&self) -> Self {
+        ObjectServer {
+            config: self.config.clone(),
+            recon_cache_path: self.recon_cache_path.clone(),
+            fallocate_reserve: self.fallocate_reserve,
+            worm_clock: self.worm_clock.clone(),
+            storage: std::sync::OnceLock::from(self.storage().clone()),
+            commit_stall: self.commit_stall.clone(),
+            replication_session_lock: self.replication_session_lock.clone(),
+        }
+    }
+
     pub fn new(config: ObjectServerConfig) -> Self {
         ObjectServer {
             config,
@@ -1263,6 +1747,7 @@ impl ObjectServer {
             worm_clock: std::sync::Arc::new(ClockHealth::disabled()),
             storage: std::sync::OnceLock::new(),
             commit_stall: None,
+            replication_session_lock: None,
         }
     }
 
@@ -1314,9 +1799,7 @@ impl ObjectServer {
         if let Some(m) = ConcurrencyMetrics::current() {
             m.attach_storage(self.storage().clone());
         }
-        if areq.path == "/recon/updater/object"
-            && matches!(areq.method.as_str(), "GET" | "HEAD")
-        {
+        if areq.path == "/recon/updater/object" && matches!(areq.method.as_str(), "GET" | "HEAD") {
             let req = Request {
                 method: areq.method,
                 path: areq.path,
@@ -1450,6 +1933,7 @@ impl ObjectServer {
                         worm_clock,
                         storage: std::sync::OnceLock::new(),
                         commit_stall: None,
+                        replication_session_lock: None,
                     }
                     .delete_apply_tombstone(
                         &req_for_disk,
@@ -1519,6 +2003,7 @@ impl ObjectServer {
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
                     commit_stall: None,
+                    replication_session_lock: None,
                 }
                 .handle(req)
             })
@@ -1530,6 +2015,11 @@ impl ObjectServer {
     }
 
     async fn put_streaming_async(&self, mut areq: AsyncRequest) -> Response {
+        let traffic_class = if self.replication_session_lock.is_some() {
+            TrafficClass::Replication
+        } else {
+            TrafficClass::Foreground
+        };
         let req = Request {
             method: areq.method.clone(),
             path: areq.path.clone(),
@@ -1546,7 +2036,7 @@ impl ObjectServer {
             Ok(t) => t,
             Err(resp) => return resp,
         };
-        if let Err(resp) = self.check_drive(&drive) {
+        if let Err(resp) = self.check_drive_async(&drive, traffic_class).await {
             return resp;
         }
         let Some(content_type) = req.headers.get("Content-Type").map(str::to_string) else {
@@ -1594,10 +2084,25 @@ impl ObjectServer {
                 return plain_response(400, "If-None-Match only supports *");
             }
         }
-        if let Ok(free) = swift_core::fsutil::free_bytes(&self.config.devices.join(&drive)) {
-            if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
-            {
-                return swob_response(507);
+        let device_path = self.config.devices.join(&drive);
+        let space = match self
+            .storage()
+            .run_finite(DeviceId::new(drive.clone()), traffic_class, move || {
+                swift_core::fsutil::fs_space(&device_path)
+            })
+            .await
+        {
+            Ok(space) => space,
+            Err(error) => return plain_response(500, &error.to_string()),
+        };
+        if let Ok(space) = space {
+            if fallocate_reserve_breached(
+                space.free_bytes,
+                space.total_bytes,
+                declared_len.unwrap_or(0),
+                &self.fallocate_reserve,
+            ) {
+                return swob_insufficient_storage(&drive, "reserve");
             }
         }
         let device = DeviceId::new(drive.clone());
@@ -1621,7 +2126,7 @@ impl ObjectServer {
         let ts_for_pre = req_timestamp.clone();
         let resolved_delete_at = match self
             .storage()
-            .run_finite(device.clone(), TrafficClass::Foreground, move || {
+            .run_finite(device.clone(), traffic_class, move || {
                 let (exists, orig_ts, orig_meta) = open_put_original(pre_df, ssync_frag_index)?;
                 let pre_req = Request {
                     method: "PUT".into(),
@@ -1656,18 +2161,22 @@ impl ObjectServer {
             Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
             Err(e) => return plain_response(500, &e.to_string()),
         };
-        let mut writer = match self
+        let writer = match self
             .storage()
-            .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                df.create(".data")
-            })
+            .run_finite(device.clone(), traffic_class, move || df.create(".data"))
             .await
         {
             Ok(Ok(w)) => w,
-            Ok(Err(DiskFileError::NoSpace)) => return swob_response(507),
+            Ok(Err(DiskFileError::NoSpace)) => return swob_insufficient_storage(&drive, "enospc"),
             Ok(Err(e)) => return plain_response(500, &e.to_string()),
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        let mut lease = WriterLease::new(
+            self.storage().clone(),
+            device.clone(),
+            traffic_class,
+            writer,
+        );
         let mut footers: Vec<(String, String)> = Vec::new();
         let mut mime_boundary: Option<String> = None;
         if mime {
@@ -1690,40 +2199,28 @@ impl ObjectServer {
                     return swob_response(499);
                 }
             }
-            writer = match ingest_mime_object_async(
-                self.storage(),
-                device.clone(),
-                writer,
-                &mut areq.body,
-                boundary.as_bytes(),
-            )
-            .await
-            {
-                Ok((w, leftover)) => {
-                    let trailing = if have_footer {
-                        match ingest_mime_footer_async(
-                            &mut areq.body,
-                            leftover,
-                            boundary.as_bytes(),
-                        )
-                        .await
-                        {
-                            Ok((found, trailing)) => {
-                                footers = found;
-                                trailing
-                            }
-                            Err(resp) => return resp,
-                        }
-                    } else {
-                        leftover
-                    };
-                    if let Err(resp) = drain_mime_phase(&mut areq.body, trailing).await {
-                        return resp;
+            let leftover =
+                match ingest_mime_object_async(&mut lease, &mut areq.body, boundary.as_bytes())
+                    .await
+                {
+                    Ok(leftover) => leftover,
+                    Err(resp) => return resp,
+                };
+            let trailing = if have_footer {
+                match ingest_mime_footer_async(&mut areq.body, leftover, boundary.as_bytes()).await
+                {
+                    Ok((found, trailing)) => {
+                        footers = found;
+                        trailing
                     }
-                    w
+                    Err(resp) => return resp,
                 }
-                Err(resp) => return resp,
+            } else {
+                leftover
             };
+            if let Err(resp) = drain_mime_phase(&mut areq.body, trailing).await {
+                return resp;
+            }
             mime_boundary = Some(boundary);
         } else {
             loop {
@@ -1732,26 +2229,12 @@ impl ObjectServer {
                     Ok(None) => break,
                     Err(error) => return async_body_read_error(&error),
                 };
-                writer = match self
-                    .storage()
-                    .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                        writer.write(&chunk)?;
-                        Ok::<_, DiskFileError>(writer)
-                    })
-                    .await
-                {
-                    Ok(Ok(w)) => w,
-                    Ok(Err(DiskFileError::NoSpace)) => return swob_response(507),
-                    Ok(Err(DiskFileError::Io(e))) if e.raw_os_error() == Some(28) => {
-                        return swob_response(507)
-                    }
-                    Ok(Err(DiskFileError::Io(_))) => return plain_response(500, "disk I/O error"),
-                    Ok(Err(e)) => return plain_response(500, &e.to_string()),
-                    Err(e) => return plain_response(500, &e.to_string()),
-                };
+                if let Err(resp) = lease.write_chunk(chunk).await {
+                    return resp;
+                }
             }
         }
-        let (upload_size, etag) = writer.chunks_finished();
+        let (upload_size, etag) = lease.writer().chunks_finished();
         if declared_len.is_some_and(|declared| declared != upload_size) {
             return swob_response(499);
         }
@@ -1805,6 +2288,7 @@ impl ObjectServer {
         }
         let completion = PutCompletion {
             drive,
+            part,
             etag,
             upload_size,
             content_type,
@@ -1815,35 +2299,81 @@ impl ObjectServer {
             container,
             obj,
             policy_index,
+            policy,
             headers: req.headers.clone(),
             path: req.path.clone(),
         };
+        let mut writer = lease.take();
         let mut resp = if multiphase {
             let Some(boundary) = mime_boundary else {
                 return plain_response(400, "multiphase commit requires a MIME body");
             };
+            let pre_df = match self.diskfile_for(
+                &completion.drive,
+                completion.part,
+                &completion.account,
+                &completion.container,
+                &completion.obj,
+                (completion.policy_index, completion.policy),
+            ) {
+                Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
+                Err(error) => return plain_response(500, &error.to_string()),
+            };
+            let pre_req = Request {
+                method: "PUT".into(),
+                path: completion.path.clone(),
+                query_string: String::new(),
+                headers: completion.headers.clone(),
+                body: Body::empty(),
+            };
+            let pre_timestamp = completion.req_timestamp.clone();
+            let ssync_frag_index = completion
+                .headers
+                .get("X-Backend-Ssync-Frag-Index")
+                .and_then(|raw| raw.trim().parse().ok());
+            let clock_ok = self.worm_clock.clock_ok();
+            let replication_session_lock = self.replication_session_lock.clone();
             writer = match self
                 .storage()
-                .run_finite(device.clone(), TrafficClass::Foreground, move || {
-                    writer.put(metadata)?;
-                    Ok::<_, DiskFileError>(writer)
+                .run_finite(device.clone(), traffic_class, move || {
+                    let _replication_session_lock = replication_session_lock;
+                    let _guard = acquire_checked_put_guard(
+                        pre_df,
+                        &pre_req,
+                        &pre_timestamp,
+                        ssync_frag_index,
+                        clock_ok,
+                    )?;
+                    writer.put(metadata).map_err(mutation_lock_error_response)?;
+                    Ok::<_, Response>(writer)
                 })
                 .await
             {
                 Ok(Ok(writer)) => writer,
-                Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
-                    return swob_response(507)
-                }
-                Ok(Err(error)) => return plain_response(500, &error.to_string()),
+                Ok(Err(response)) => return response,
                 Err(error) => return plain_response(500, &error.to_string()),
             };
             if areq.body.send_continue(&[]).await.is_err() {
+                drop(WriterLease::new(
+                    self.storage().clone(),
+                    device.clone(),
+                    traffic_class,
+                    writer,
+                ));
                 return swob_response(499);
             }
             let commit_trailing =
                 match ingest_mime_commit_async(&mut areq.body, boundary.as_bytes()).await {
                     Ok(trailing) => trailing,
-                    Err(response) => return response,
+                    Err(response) => {
+                        drop(WriterLease::new(
+                            self.storage().clone(),
+                            device.clone(),
+                            traffic_class,
+                            writer,
+                        ));
+                        return response;
+                    }
                 };
             let no_commit = completion
                 .headers
@@ -1851,27 +2381,49 @@ impl ObjectServer {
                 .is_some_and(config_true_value);
             if !no_commit {
                 let req_timestamp = completion.req_timestamp.clone();
+                let commit_df = match self.diskfile_for(
+                    &completion.drive,
+                    completion.part,
+                    &completion.account,
+                    &completion.container,
+                    &completion.obj,
+                    (completion.policy_index, completion.policy),
+                ) {
+                    Ok(df) => df.with_next_part_power(backend_next_part_power(&req)),
+                    Err(error) => return plain_response(500, &error.to_string()),
+                };
+                let commit_pre_timestamp = completion.req_timestamp.clone();
+                let commit_ssync_frag_index = completion
+                    .headers
+                    .get("X-Backend-Ssync-Frag-Index")
+                    .and_then(|raw| raw.trim().parse().ok());
                 let stall = self.commit_stall.clone();
+                let replication_session_lock = self.replication_session_lock.clone();
                 let exec = self.storage().clone();
                 let commit_device = device.clone();
                 let commit = DurabilityBarrier::run_shielded(async move {
-                    exec.run_finite(commit_device, TrafficClass::Foreground, move || {
+                    exec.run_finite(commit_device, traffic_class, move || {
+                        let _replication_session_lock = replication_session_lock;
+                        let _guard = acquire_ec_commit_guard(
+                            commit_df,
+                            &commit_pre_timestamp,
+                            commit_ssync_frag_index,
+                        )?;
                         if let Some(stall) = stall.as_ref() {
                             stall();
                         }
-                        writer.commit(&req_timestamp)?;
+                        writer
+                            .commit(&req_timestamp)
+                            .map_err(mutation_lock_error_response)?;
                         writer.close();
-                        Ok::<(), DiskFileError>(())
+                        Ok::<(), Response>(())
                     })
                     .await
                 })
                 .await;
                 match commit {
                     Ok(Ok(())) => {}
-                    Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
-                        return swob_response(507)
-                    }
-                    Ok(Err(error)) => return plain_response(500, &error.to_string()),
+                    Ok(Err(response)) => return response,
                     Err(error) => return plain_response(500, &error.to_string()),
                 }
             }
@@ -1928,6 +2480,7 @@ impl ObjectServer {
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
                     commit_stall: None,
+                    replication_session_lock: None,
                 };
                 tmp.get(
                     &Request {
@@ -2002,6 +2555,15 @@ impl ObjectServer {
     }
 
     async fn ssync_async(&self, areq: AsyncRequest) -> Response {
+        self.ssync_async_with_lock_timeout(areq, Self::REPLICATION_LOCK_TIMEOUT)
+            .await
+    }
+
+    async fn ssync_async_with_lock_timeout(
+        &self,
+        areq: AsyncRequest,
+        lock_timeout: f64,
+    ) -> Response {
         // Validation matches Python `Receiver.initialize_request`: it runs
         // before start_response, so 400/507 never become a 200 hijack.
         let req = Request {
@@ -2027,7 +2589,10 @@ impl ObjectServer {
             Ok(p) => p,
             Err(resp) => return resp,
         };
-        if let Err(resp) = self.check_drive(&device) {
+        if let Err(resp) = self
+            .check_drive_async(&device, TrafficClass::Replication)
+            .await
+        {
             return resp;
         }
         let frag_index: Option<i64> = match req.headers.get("X-Backend-Ssync-Frag-Index") {
@@ -2051,18 +2616,35 @@ impl ObjectServer {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
         let scope = TaskScope::bounded(1);
         let storage = self.storage().clone();
-        let config = self.config.clone();
+        let part_path = self
+            .config
+            .devices
+            .join(&device)
+            .join(get_data_dir(policy_index))
+            .join(&partition);
+        let replication_lock = match acquire_replication_session_lock(
+            &storage,
+            DeviceId::new(device.clone()),
+            part_path,
+            lock_timeout,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
         let body = areq.body;
         let _ = scope.spawn(drive_ssync_session(
             body,
             tx,
             storage,
-            config,
+            self.clone_execution_context(),
             device,
             partition,
             policy_index,
             policy,
             frag_index,
+            std::sync::Arc::new(replication_lock),
         ));
         let mut resp = Response::new(200);
         resp.headers.set("X-Backend-Accept-No-Commit", "True");
@@ -2104,31 +2686,73 @@ impl ObjectServer {
             .get("X-Backend-No-Commit")
             .is_some_and(config_true_value);
         let drive = completion.drive.clone();
+        let pre_df = match self.diskfile_for(
+            &completion.drive,
+            completion.part,
+            &completion.account,
+            &completion.container,
+            &completion.obj,
+            (completion.policy_index, completion.policy),
+        ) {
+            Ok(df) => df.with_next_part_power(backend_next_part_power(&Request {
+                method: "PUT".into(),
+                path: completion.path.clone(),
+                query_string: String::new(),
+                headers: completion.headers.clone(),
+                body: Body::empty(),
+            })),
+            Err(error) => return plain_response(500, &error.to_string()),
+        };
+        let pre_req = Request {
+            method: "PUT".into(),
+            path: completion.path.clone(),
+            query_string: String::new(),
+            headers: completion.headers.clone(),
+            body: Body::empty(),
+        };
+        let pre_timestamp = completion.req_timestamp.clone();
+        let ssync_frag_index = completion
+            .headers
+            .get("X-Backend-Ssync-Frag-Index")
+            .and_then(|raw| raw.trim().parse().ok());
+        let clock_ok = self.worm_clock.clock_ok();
         let stall = self.commit_stall.clone();
+        let replication_session_lock = self.replication_session_lock.clone();
+        let traffic_class = if replication_session_lock.is_some() {
+            TrafficClass::Replication
+        } else {
+            TrafficClass::Foreground
+        };
         let exec = self.storage().clone();
         let device = DeviceId::new(drive);
         // Barrier lives on a non-cancelled shield task (L7). Dropping this
         // HTTP future does not abort commit or panic-drop the guard.
         let commit = DurabilityBarrier::run_shielded(async move {
-            exec.run_finite(device, TrafficClass::Foreground, move || {
+            exec.run_finite(device, traffic_class, move || {
+                let _replication_session_lock = replication_session_lock;
+                let _guard = acquire_checked_put_guard(
+                    pre_df,
+                    &pre_req,
+                    &pre_timestamp,
+                    ssync_frag_index,
+                    clock_ok,
+                )?;
                 if let Some(stall) = stall.as_ref() {
                     stall();
                 }
-                if no_commit {
+                let committed = if no_commit {
                     durable.commit_nondurable(metadata)
                 } else {
                     durable.commit(metadata)
-                }
+                };
+                committed.map_err(mutation_lock_error_response)
             })
             .await
         })
         .await;
         match commit {
             Ok(Ok(())) => {}
-            Ok(Err(DiskFileError::NoSpace | DiskFileError::XattrNotSupported)) => {
-                return swob_response(507)
-            }
-            Ok(Err(e)) => return plain_response(500, &e.to_string()),
+            Ok(Err(response)) => return response,
             Err(e) => return plain_response(500, &e.to_string()),
         }
         self.finish_put_completion(completion).await
@@ -2137,6 +2761,7 @@ impl ObjectServer {
     async fn finish_put_completion(&self, completion: PutCompletion) -> Response {
         let PutCompletion {
             drive,
+            part: _,
             etag,
             upload_size,
             content_type,
@@ -2147,6 +2772,7 @@ impl ObjectServer {
             container,
             obj,
             policy_index,
+            policy: _,
             headers,
             path,
         } = completion;
@@ -2226,14 +2852,34 @@ impl ObjectServer {
         resp
     }
 
+    async fn check_drive_async(
+        &self,
+        drive: &str,
+        traffic_class: TrafficClass,
+    ) -> Result<(), Response> {
+        let devices = self.config.devices.clone();
+        let mount_check = self.config.mount_check;
+        let drive = drive.to_string();
+        self.storage()
+            .run_finite(DeviceId::new(drive.clone()), traffic_class, move || {
+                swift_core::constraints::check_drive(&devices, &drive, mount_check)
+                    .map(|_| ())
+                    .map_err(|err| drive_unavailable_response(&drive, &err.0))
+            })
+            .await
+            .map_err(|error| plain_response(500, &error.to_string()))?
+    }
+
     fn check_drive(&self, drive: &str) -> Result<(), Response> {
         // Use the same drive-name and mount semantics as the account and
         // container servers. In production, mount_check prevents a lost mount
         // from redirecting object I/O into the underlying root filesystem;
         // SAIO may explicitly disable it and use a plain device directory.
+        // Isolated G6 dirs on a shared root need mount_check=false or a
+        // `.ismount` stub; same-FS bind mounts are detected via mountinfo.
         swift_core::constraints::check_drive(&self.config.devices, drive, self.config.mount_check)
             .map(|_| ())
-            .map_err(|_| swob_response(507))
+            .map_err(|err| drive_unavailable_response(drive, &err.0))
     }
 
     #[allow(clippy::type_complexity)]
@@ -2440,7 +3086,13 @@ impl ObjectServer {
             Self::REPLICATION_LOCK_TIMEOUT,
             Some("replication"),
         ) else {
-            return swob_response(503);
+            return swob_unavailable(
+                &device,
+                &format!(
+                    "replication lock timeout partition={raw_partition} timeout={}",
+                    Self::REPLICATION_LOCK_TIMEOUT
+                ),
+            );
         };
 
         let Some(mut wire) = req.body.hijack() else {
@@ -2540,7 +3192,11 @@ impl ObjectServer {
         let content_length = body.len();
         let mut resp = Response::with_body(
             200,
-            if req.method == "HEAD" { Vec::new() } else { body },
+            if req.method == "HEAD" {
+                Vec::new()
+            } else {
+                body
+            },
         );
         resp.headers.set("Content-Type", "application/json");
         resp.headers.set("Content-Length", content_length);
@@ -2762,10 +3418,14 @@ impl ObjectServer {
         // statvfs failure fails open; the write itself still ENOSPCs.
         // Chunked transfers declare no length, so (as in Python, which
         // fallocates only when a size is known) they cannot pre-reserve.
-        if let Ok(free) = swift_core::fsutil::free_bytes(&self.config.devices.join(&drive)) {
-            if fallocate_reserve_breached(free, declared_len.unwrap_or(0), &self.fallocate_reserve)
-            {
-                return swob_response(507);
+        if let Ok(space) = swift_core::fsutil::fs_space(&self.config.devices.join(&drive)) {
+            if fallocate_reserve_breached(
+                space.free_bytes,
+                space.total_bytes,
+                declared_len.unwrap_or(0),
+                &self.fallocate_reserve,
+            ) {
+                return swob_insufficient_storage(&drive, "reserve");
             }
         }
 
@@ -2783,7 +3443,7 @@ impl ObjectServer {
 
         let mut writer = match df.create(".data") {
             Ok(w) => w,
-            Err(DiskFileError::NoSpace) => return swob_response(507),
+            Err(DiskFileError::NoSpace) => return swob_insufficient_storage(&drive, "enospc"),
             Err(e) => return plain_response(500, &e.to_string()),
         };
         // MIME mode: advertise the capabilities on the first 100 Continue
@@ -2957,6 +3617,7 @@ impl ObjectServer {
                     metadata,
                     completion: PutCompletion {
                         drive: drive.clone(),
+                        part,
                         etag: etag.clone(),
                         upload_size,
                         content_type: content_type.clone(),
@@ -2967,6 +3628,7 @@ impl ObjectServer {
                         container: container.clone(),
                         obj: obj.clone(),
                         policy_index,
+                        policy,
                         headers: req.headers.clone(),
                         path: req.path.clone(),
                     },
@@ -2976,10 +3638,32 @@ impl ObjectServer {
             // PendingDurable on StorageExecutor. Not a process-wide slot.
             return Response::new(201);
         }
+        let commit_df = match self.diskfile_for(
+            &drive,
+            part,
+            &account,
+            &container,
+            &obj,
+            (policy_index, policy),
+        ) {
+            Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
+            Err(error) => return plain_response(500, &error.to_string()),
+        };
+        let mut mutation_guard = match acquire_checked_put_guard(
+            commit_df,
+            req,
+            &req_timestamp,
+            ssync_frag_index,
+            self.worm_clock.clock_ok(),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(response) => return response,
+        };
         if let Err(e) = writer.put(metadata) {
             writer.close();
             return match e {
-                DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
+                DiskFileError::NoSpace => swob_insufficient_storage(&drive, "enospc"),
+                DiskFileError::XattrNotSupported => swob_insufficient_storage(&drive, "xattr"),
                 other => plain_response(500, &other.to_string()),
             };
         }
@@ -2990,6 +3674,9 @@ impl ObjectServer {
         // require the commit confirmation document before making it
         // durable.
         if multiphase {
+            // Never hold an object stripe while waiting on the proxy's
+            // second phase. The durable transition reacquires and rechecks.
+            drop(mutation_guard.take());
             let Some(docs) = &mut mime_docs else {
                 writer.close();
                 return plain_response(400, "multiphase commit requires a MIME body");
@@ -3027,10 +3714,33 @@ impl ObjectServer {
             .get("X-Backend-No-Commit")
             .is_some_and(config_true_value)
         {
+            let second_phase_guard = if multiphase {
+                let commit_df = match self.diskfile_for(
+                    &drive,
+                    part,
+                    &account,
+                    &container,
+                    &obj,
+                    (policy_index, policy),
+                ) {
+                    Ok(df) => df.with_next_part_power(backend_next_part_power(req)),
+                    Err(error) => return plain_response(500, &error.to_string()),
+                };
+                match acquire_ec_commit_guard(commit_df, &req_timestamp, ssync_frag_index) {
+                    Ok(guard) => Some(guard),
+                    Err(response) => return response,
+                }
+            } else {
+                None
+            };
             if let Err(e) = writer.commit(&req_timestamp) {
                 writer.close();
                 return plain_response(500, &e.to_string());
             }
+            drop(second_phase_guard);
+        }
+        if !multiphase {
+            drop(mutation_guard.take());
         }
         writer.close();
         // Drain any remaining MIME docs (there should be none, but the
@@ -3141,6 +3851,10 @@ impl ObjectServer {
         {
             df = df.with_open_expired(true);
         }
+        let mutation_guard = match df.acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT) {
+            Ok(guard) => guard,
+            Err(error) => return mutation_lock_error_response(error),
+        };
         let orig = match df.open(None) {
             Ok(opened) => opened,
             Err(DiskFileError::NotExist) | Err(DiskFileError::Deleted { .. }) => {
@@ -3207,19 +3921,23 @@ impl ObjectServer {
             Ok(metadata) => metadata.clone(),
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        if let Some(response) = put_if_match_precondition(req, true, Some(&orig_metadata)) {
+            return response;
+        }
+        if let Some(response) = expected_s3_version_precondition(req, true, Some(&orig_metadata)) {
+            return response;
+        }
         let content_length = meta_get(&orig_metadata, "Content-Length")
             .unwrap_or("0")
             .to_string();
-        let etag = meta_get(&orig_metadata, "ETag")
-            .unwrap_or("")
-            .to_string();
+        let etag = meta_get(&orig_metadata, "ETag").unwrap_or("").to_string();
         let orig_sysmeta: Vec<(String, String)> = orig_metadata
             .iter()
-            .filter_map(|(k, v)| match (k, v) {
-                (MetaValue::Str(key), MetaValue::Str(value))
+            .filter_map(|(k, v)| match k {
+                MetaValue::Str(key)
                     if key.to_ascii_lowercase().starts_with("x-object-sysmeta-") =>
                 {
-                    Some((key.clone(), value.clone()))
+                    meta_as_header(v).map(|value| (key.clone(), value))
                 }
                 _ => None,
             })
@@ -3271,11 +3989,10 @@ impl ObjectServer {
                 None => return plain_response(500, "POST preserving absent .meta metadata"),
             }
         };
-        // Python server.py:_conditional_delete_at_update.  A metadata POST
-        // may create a new expiry task and must remove the old task when the
-        // delete-at changes or is cleared.  The queue row records the data
-        // file's byte length and timestamp, not the POST timestamp.
-        if req_timestamp > orig_timestamp {
+        // Save the expirer side effects, but do not issue network/container
+        // updates while the object stripe is held. The metadata publish below
+        // is the transaction's durability boundary.
+        let pending_delete_at_update = if req_timestamp > orig_timestamp {
             let orig_delete_at = orig
                 .get_metadata()
                 .ok()
@@ -3290,35 +4007,15 @@ impl ObjectServer {
                 .map(|value| value as i64)
                 .unwrap_or(0);
             let expirer_bytes = content_length.parse::<u64>().unwrap_or(0);
-            if new_delete_at != 0 {
-                self.delete_at_update(
-                    "PUT",
-                    new_delete_at,
-                    &drive,
-                    &account,
-                    &container,
-                    &obj,
-                    req,
-                    policy_index,
-                    Some(expirer_bytes),
-                    Some(data_timestamp.internal()),
-                );
-            }
-            if orig_delete_at != 0 && orig_delete_at != new_delete_at {
-                self.delete_at_update(
-                    "DELETE",
-                    orig_delete_at,
-                    &drive,
-                    &account,
-                    &container,
-                    &obj,
-                    req,
-                    policy_index,
-                    None,
-                    None,
-                );
-            }
-        }
+            Some((
+                orig_delete_at,
+                new_delete_at,
+                expirer_bytes,
+                data_timestamp.internal(),
+            ))
+        } else {
+            None
+        };
 
         // server.py 733-748: resolve which content-type wins. A newer request
         // content-type goes into the .meta stamped with its own timestamp;
@@ -3358,9 +4055,48 @@ impl ObjectServer {
         // present in the metadata, as decided above.
         if let Err(e) = df.write_metadata(&metadata) {
             return match e {
-                DiskFileError::NoSpace | DiskFileError::XattrNotSupported => swob_response(507),
+                DiskFileError::NoSpace => swob_insufficient_storage(&drive, "enospc"),
+                DiskFileError::XattrNotSupported => swob_insufficient_storage(&drive, "xattr"),
                 other => plain_response(500, &other.to_string()),
             };
+        }
+        drop(mutation_guard);
+
+        // Python server.py:_conditional_delete_at_update. A metadata POST may
+        // create a new expiry task and must remove the old task when the
+        // delete-at changes or is cleared. These side effects happen only
+        // after the object metadata is durably published.
+        if let Some((orig_delete_at, new_delete_at, expirer_bytes, data_timestamp)) =
+            pending_delete_at_update
+        {
+            if new_delete_at != 0 {
+                self.delete_at_update(
+                    "PUT",
+                    new_delete_at,
+                    &drive,
+                    &account,
+                    &container,
+                    &obj,
+                    req,
+                    policy_index,
+                    Some(expirer_bytes),
+                    Some(data_timestamp),
+                );
+            }
+            if orig_delete_at != 0 && orig_delete_at != new_delete_at {
+                self.delete_at_update(
+                    "DELETE",
+                    orig_delete_at,
+                    &drive,
+                    &account,
+                    &container,
+                    &obj,
+                    req,
+                    policy_index,
+                    None,
+                    None,
+                );
+            }
         }
 
         // server.py 755-768: when the winning content-type is not the
@@ -3516,6 +4252,10 @@ impl ObjectServer {
         if if_delete_at.is_some() {
             df = df.with_open_expired(true);
         }
+        let mutation_guard = match df.acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT) {
+            Ok(guard) => guard,
+            Err(error) => return (mutation_lock_error_response(error), false),
+        };
         let (orig_timestamp, was_live, orig_delete_at, orig_metadata) = match df.open(None) {
             Ok(_) => {
                 let ts = df.data_timestamp().unwrap_or_else(|_| "0".parse().unwrap());
@@ -3574,6 +4314,14 @@ impl ObjectServer {
             }
             Err(e) => return (plain_response(500, &e.to_string()), false),
         };
+        if let Some(response) = put_if_match_precondition(req, was_live, orig_metadata.as_ref()) {
+            return (response, false);
+        }
+        if let Some(response) =
+            expected_s3_version_precondition(req, was_live, orig_metadata.as_ref())
+        {
+            return (response, false);
+        }
         if let Some(req_if) = if_delete_at {
             if !was_live {
                 let mut resp = swob_response(404);
@@ -3631,16 +4379,11 @@ impl ObjectServer {
                 Err(e) => return (plain_response(500, &e.to_string()), false),
             };
             if let Err(e) = fresh.delete(&req_timestamp) {
-                return (
-                    match e {
-                        DiskFileError::NoSpace => swob_response(507),
-                        other => plain_response(500, &other.to_string()),
-                    },
-                    false,
-                );
+                return (mutation_lock_error_response(e), false);
             }
             did_cu = true;
         }
+        drop(mutation_guard);
         let mut resp = match response_class {
             // Swift's swob response keeps the default HTML content type even
             // for an empty successful DELETE body. The Python golden oracle
@@ -3721,6 +4464,7 @@ impl ObjectServer {
             }
             Err(e) => return plain_response(500, &e.to_string()),
         };
+        let opened_frag_index = opened.opened_ec_frag_index().ok().flatten();
 
         let metadata = opened.get_metadata().unwrap().clone();
         let obj_size: u64 = meta_get(&metadata, "Content-Length")
@@ -3737,7 +4481,15 @@ impl ObjectServer {
             .data_timestamp()
             .map(|t| t.internal())
             .unwrap_or_default();
-        let durable_ts = opened.durable_timestamp().ok().flatten();
+        let durable_ts = opened.durable_timestamp().ok().flatten().or_else(|| {
+            // Opened `#d.data` must advertise a durable timestamp even when
+            // process_ec could not pair a leftover newer `.durable` file.
+            if opened.opened_ec_is_durable().ok().unwrap_or(false) {
+                opened.data_timestamp().ok()
+            } else {
+                None
+            }
+        });
 
         // Range handling
         // `X-Backend-Ignore-Range-If-Metadata-Present` (set by the SLO/DLO
@@ -3788,6 +4540,21 @@ impl ObjectServer {
                 resp.headers.set("ETag", format!("\"{etag}\""));
                 resp.headers.set("Last-Modified", http_date(x_ts.ceil()));
                 resp.headers.set("X-Timestamp", x_ts.normal());
+                // Python 416 keeps identifying headers so SLO/DLO can see
+                // X-Static-Large-Object and retry without Range.
+                for (k, v) in &metadata {
+                    if let MetaValue::Str(key) = k {
+                        if is_sys_or_user_meta(key)
+                            || is_object_transient_sysmeta(key)
+                            || is_allowed_header(key)
+                            || key.eq_ignore_ascii_case("X-Delete-At")
+                        {
+                            if let Some(value) = meta_as_header(v) {
+                                resp.headers.set(key, value);
+                            }
+                        }
+                    }
+                }
                 return resp;
             }
             Some(Some(ranges)) if ranges.len() == 1 => {
@@ -3903,14 +4670,24 @@ impl ObjectServer {
         resp.body = body;
         resp.headers.set("Content-Type", &content_type);
         for (k, v) in &metadata {
-            if let (MetaValue::Str(key), MetaValue::Str(value)) = (k, v) {
+            if let MetaValue::Str(key) = k {
                 if is_sys_or_user_meta(key)
                     || is_object_transient_sysmeta(key)
                     || is_allowed_header(key)
                     || key.eq_ignore_ascii_case("X-Delete-At")
                 {
-                    resp.headers.set(key, value);
+                    if let Some(value) = meta_as_header(v) {
+                        resp.headers.set(key, value);
+                    }
                 }
+            }
+        }
+        // Filename index is authoritative for the archive we opened.
+        // Metadata may store Int / omit the key after reconstruct_fa POST
+        // stripped partner sysmeta; proxy EC GET drops a 200 without this.
+        if matches!(policy, PolicyKind::Ec { .. }) {
+            if let Some(fi) = opened_frag_index {
+                resp.headers.set("X-Object-Sysmeta-Ec-Frag-Index", fi);
             }
         }
         resp.headers.set("ETag", format!("\"{etag}\""));
@@ -3930,16 +4707,34 @@ impl ObjectServer {
         } else {
             resp.headers.set("Content-Length", obj_size);
         }
+        if matches!(policy, PolicyKind::Ec { .. }) && matches!(status, 200 | 206) {
+            // Field harvest greps object-*.log for this token. HTTP header
+            // is the contract; the line proves GET saw the opened index.
+            eprintln!(
+                "object-server: GET {} Ec-Frag-Index={} durable_ts={} data_ts={} status={}",
+                req.path,
+                resp.headers
+                    .get("X-Object-Sysmeta-Ec-Frag-Index")
+                    .unwrap_or("-"),
+                durable_ts
+                    .as_ref()
+                    .map(|t| t.internal())
+                    .unwrap_or_default(),
+                data_ts,
+                status
+            );
+        }
         resp
     }
 
     /// `container_update`: synchronous PUT/DELETE to the container servers
     /// named by X-Container-Host/Partition/Device. Replicas are contacted in
-    /// parallel under `container_update_timeout`; any node that cannot be
-    /// updated synchronously (unreachable, non-2xx, timeout, or none supplied)
-    /// causes an async_pending write so the object-updater daemon replays the
-    /// update later — without this, a container listing permanently misses the
-    /// object when a container node is down.
+    /// parallel under `container_update_timeout`; any named node that cannot
+    /// be updated synchronously (unreachable, non-2xx, timeout) causes an
+    /// async_pending write so the object-updater daemon replays the update
+    /// later — without this, a container listing permanently misses the
+    /// object when a container node is down. A missing side-channel is not a
+    /// failure: Python leaves `updates` empty and writes no pickle.
     #[allow(clippy::too_many_arguments)]
     fn container_update(
         &self,
@@ -4009,26 +4804,28 @@ impl ObjectServer {
             percent_encode(obj)
         );
         let pending_container_path = shard.map(|(a, c)| format!("{a}/{c}"));
-        // A well-formed side channel gives matching host/device lists and a
-        // partition; otherwise there is nothing to update synchronously and the
-        // whole update goes async.
+        // Python `container_update` (obj/server.py): without a partition the
+        // host/device zip is discarded (`updates = []`) and no
+        // `pickle_async_update` runs. EC fragments not selected by
+        // `num_container_updates` therefore carry no side-channel and must
+        // not emit async_pending — treating that as failure is what pushed
+        // Isolated `TestObjectUpdaterStatsRunForever` to 280 ≥ 240.
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
-        let all_ok = if well_formed {
-            fanout_container_http(
-                op,
-                &hosts,
-                &devices,
-                partition,
-                &path,
-                update,
-                policy_index,
-                self.config.container_update_timeout,
-                Some(&self.config.hash_config),
-            )
-        } else {
-            false
-        };
+        if !well_formed {
+            return;
+        }
+        let all_ok = fanout_container_http(
+            op,
+            &hosts,
+            &devices,
+            partition,
+            &path,
+            update,
+            policy_index,
+            self.config.container_update_timeout,
+            Some(&self.config.hash_config),
+        );
         if !all_ok {
             self.write_async_pending(
                 op,
@@ -4114,26 +4911,28 @@ impl ObjectServer {
         let obj = obj.to_string();
         let well_formed =
             !hosts.is_empty() && hosts.len() == devices.len() && !partition.is_empty();
+        // Same as the sync path: no proxy side-channel means this replica was
+        // not chosen for a container update. Do not invent a ring-wide fanout
+        // or write async_pending (Python `updates = []`).
+        if !well_formed {
+            return;
+        }
         // Python: one container replica per object replica. Replacing hosts
         // with every shard primary (3×3 CU per DELETE) timed out after shard 0
         // (probe L692 leftover obj-0100+). Trust the proxy host first; ring-
         // lookup the shard only when that fanout fails (path/host mismatch).
-        let mut all_ok = if well_formed {
-            fanout_container_http_async(
-                op_owned.clone(),
-                hosts.clone(),
-                devices.clone(),
-                partition.clone(),
-                path.clone(),
-                update.clone(),
-                policy_index,
-                timeout,
-                Some(self.config.hash_config.clone()),
-            )
-            .await
-        } else {
-            false
-        };
+        let mut all_ok = fanout_container_http_async(
+            op_owned.clone(),
+            hosts.clone(),
+            devices.clone(),
+            partition.clone(),
+            path.clone(),
+            update.clone(),
+            policy_index,
+            timeout,
+            Some(self.config.hash_config.clone()),
+        )
+        .await;
         if !all_ok && backend_container_path.is_some() {
             if let Some((part, ring_hosts, ring_devs)) =
                 shard_container_ring_targets(&upd_account, &upd_container, &self.config.hash_config)
@@ -5274,7 +6073,9 @@ impl SsyncSession<'_> {
             if remote.durable {
                 // We have the frag, just missing durable state, so make the
                 // frag durable now. Try this just once to avoid looping.
-                if make_durable && self.commit_frag(&hash_dir, &remote.ts_data, frag_index) {
+                if make_durable
+                    && self.commit_frag(&diskfile, &hash_dir, &remote.ts_data, frag_index)
+                {
                     return self.check_local(remote, false);
                 }
                 // commit failed: fall back to wanting a full update
@@ -5291,7 +6092,23 @@ impl SsyncSession<'_> {
     /// `ECDiskFileWriter.commit` for a fragment that is already on disk:
     /// rename `<ts>#<fi>.data` to its durable `#d` name, fsync the hash dir,
     /// clean up obsolete files.
-    fn commit_frag(&self, hash_dir: &Path, timestamp: &Timestamp, frag_index: i64) -> bool {
+    fn commit_frag(
+        &self,
+        diskfile: &DiskFile,
+        hash_dir: &Path,
+        timestamp: &Timestamp,
+        frag_index: i64,
+    ) -> bool {
+        // The enclosing SSYNC session already holds the partition's
+        // `.lock-replication`.  Keep the global lock order here:
+        // replication -> object mutation stripe -> partition hash lock.
+        // This prevents a missing-check durable promotion from racing a
+        // foreground PUT/POST/DELETE for the same object while still allowing
+        // unrelated objects in the partition to proceed.
+        let Ok(_mutation_guard) = diskfile.acquire_mutation_lock(OBJECT_MUTATION_LOCK_TIMEOUT)
+        else {
+            return false;
+        };
         let (Ok(src), Ok(dst)) = (
             make_ec_ondisk_filename(timestamp, frag_index, false),
             make_ec_ondisk_filename(timestamp, frag_index, true),
@@ -5303,6 +6120,12 @@ impl SsyncSession<'_> {
         }
         if let Ok(dir) = std::fs::File::open(hash_dir) {
             let _ = dir.sync_all();
+        }
+        let Some(suffix_dir) = hash_dir.parent() else {
+            return false;
+        };
+        if invalidate_hash(suffix_dir).is_err() {
+            return false;
         }
         let _ = swift_diskfile::cleanup_ondisk_files(
             hash_dir,
@@ -5407,15 +6230,13 @@ mod delete_header_tests {
         let user_in_reserved =
             validate_internal_obj("AUTH_test", "\0reserved", "object").unwrap_err();
         assert_eq!(user_in_reserved.status, 400);
-        let reserved_in_user =
-            validate_internal_obj("AUTH_test", "user", "\0object").unwrap_err();
+        let reserved_in_user = validate_internal_obj("AUTH_test", "user", "\0object").unwrap_err();
         assert_eq!(reserved_in_user.status, 400);
     }
 
     #[test]
     fn internal_reserved_object_names_reject_embedded_marker_but_allow_system_queue() {
-        let embedded =
-            validate_internal_obj("AUTH_test", "user", "bad\0object").unwrap_err();
+        let embedded = validate_internal_obj("AUTH_test", "user", "bad\0object").unwrap_err();
         assert_eq!(embedded.status, 400);
         assert!(validate_internal_obj(
             ".misplaced_objects",
@@ -5540,30 +6361,62 @@ mod fallocate_reserve_tests {
     fn breach_math_matches_python_fallocate_reserve() {
         let reserve = FallocateReserve::Bytes(100);
         assert!(
-            fallocate_reserve_breached(150, 50, &reserve),
+            fallocate_reserve_breached(150, 0, 50, &reserve),
             "free-after-write equal to the reserve fails (Python: free <= reserve)"
         );
-        assert!(fallocate_reserve_breached(120, 50, &reserve));
+        assert!(fallocate_reserve_breached(120, 0, 50, &reserve));
         assert!(
-            fallocate_reserve_breached(10, 50, &reserve),
+            fallocate_reserve_breached(10, 0, 50, &reserve),
             "write larger than free"
         );
-        assert!(!fallocate_reserve_breached(151, 50, &reserve));
+        assert!(!fallocate_reserve_breached(151, 0, 50, &reserve));
         assert!(
-            !fallocate_reserve_breached(0, 0, &reserve),
+            !fallocate_reserve_breached(0, 0, 0, &reserve),
             "zero-length writes skip the check"
         );
         assert!(!fallocate_reserve_breached(
             0,
+            0,
             10,
             &FallocateReserve::Bytes(0)
         ));
-        // percent mode needs the device's total capacity; not enforced yet
-        assert!(!fallocate_reserve_breached(
-            1,
-            1,
-            &FallocateReserve::Percent(99.0)
-        ));
+        // Swift1 isolated lab: 40G disk, 3.5G free (~8.75%), default 1%.
+        // A reconstruct_fa fragment must not 507 on percent math.
+        assert!(
+            !fallocate_reserve_breached(
+                3_500_000_000,
+                40_000_000_000,
+                1_048_576,
+                &FallocateReserve::Percent(1.0)
+            ),
+            "8.75% free minus 1MiB is still above a 1% reserve"
+        );
+        assert!(
+            !fallocate_reserve_breached(
+                400_000_000,
+                40_000_000_000,
+                0,
+                &FallocateReserve::Percent(1.0)
+            ),
+            "zero-length writes skip percent reserve"
+        );
+        assert!(
+            fallocate_reserve_breached(
+                400_000_000,
+                40_000_000_000,
+                1,
+                &FallocateReserve::Percent(1.0)
+            ),
+            "remaining percent == reserve is a breach (Python: free <= reserve)"
+        );
+        assert!(
+            fallocate_reserve_breached(1, 100, 1, &FallocateReserve::Percent(99.0)),
+            "percent mode must use total capacity"
+        );
+        assert!(
+            !fallocate_reserve_breached(1, 0, 1, &FallocateReserve::Percent(99.0)),
+            "unknown total fails open"
+        );
     }
 
     fn tiny_server(devices: &Path, reserve: FallocateReserve) -> ObjectServer {
@@ -5594,15 +6447,17 @@ mod fallocate_reserve_tests {
             br#"{"object_updater_sweep": 1.5, "object_updater_stats": {"failures_account_container_count": 2}, "object_updater_last": 1700000000.0, "unrelated": true}"#,
         )
         .unwrap();
-        let server = tiny_server(&dir, FallocateReserve::Bytes(1))
-            .with_recon_cache_path(cache.clone());
-        let resp = server.handle_async(AsyncRequest {
-            method: "GET".into(),
-            path: "/recon/updater/object".into(),
-            query_string: String::new(),
-            headers: HeaderKeyDict::new(),
-            body: swift_http::IncomingBody::from_bytes(Vec::new(), 0),
-        }).await;
+        let server =
+            tiny_server(&dir, FallocateReserve::Bytes(1)).with_recon_cache_path(cache.clone());
+        let resp = server
+            .handle_async(AsyncRequest {
+                method: "GET".into(),
+                path: "/recon/updater/object".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_bytes(Vec::new(), 0),
+            })
+            .await;
         assert_eq!(resp.status, 200, "{}", resp.reason);
         assert_eq!(resp.headers.get("Content-Type"), Some("application/json"));
         let body = resp.body.collect_async().await.unwrap();
@@ -5627,7 +6482,6 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sda1")).unwrap();
         let server = tiny_server(&dir, FallocateReserve::Bytes(1));
-        let config = server.config.clone();
         let storage = server.storage().clone();
         let body = b":MISSING_CHECK: START\r\n\
                      :MISSING_CHECK: END\r\n\
@@ -5637,17 +6491,26 @@ mod fallocate_reserve_tests {
                      :UPDATES: END\r\n"
             .to_vec();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let replication_lock = std::sync::Arc::new(
+            swift_core::lockutil::lock_path(
+                &dir.join("sda1").join(get_data_dir(0)).join("0"),
+                1.0,
+                Some("replication"),
+            )
+            .unwrap(),
+        );
 
         drive_ssync_session(
             swift_http::IncomingBody::from_bytes(body, u64::MAX),
             tx,
             storage,
-            config,
+            server.clone_execution_context(),
             "sda1".to_string(),
             "0".to_string(),
             0,
             PolicyKind::Replication,
             None,
+            replication_lock,
         )
         .await;
 
@@ -5664,6 +6527,208 @@ mod fallocate_reserve_tests {
             !output.contains(":UPDATES: START"),
             "failed update must not receive success frames: {output:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ssync_does_not_ack_truncated_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-async-ssync-truncated-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        for tail in [
+            "",
+            ":UPDATES: START\r\n",
+            ":UPDATES: START\r\nPUT /AUTH_test/c/incomplete\r\nContent-Length:",
+            ":UPDATES: START\r\nPUT /AUTH_test/c/incomplete\r\nContent-Length: 10\r\nX-Timestamp: 1700000000.00000\r\n\r\nabc",
+        ] {
+            for transport_error in [false, true] {
+                let prefix = format!(":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n{tail}");
+                let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
+                body_tx.send(Ok(prefix.into_bytes())).await.unwrap();
+                if transport_error {
+                    body_tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset, "peer reset during updates"
+                    ))).await.unwrap();
+                }
+                drop(body_tx);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                let replication_lock = std::sync::Arc::new(
+                    swift_core::lockutil::lock_path(
+                        &dir.join("sda1").join(get_data_dir(0)).join("0"),
+                        1.0, Some("replication"),
+                    ).unwrap(),
+                );
+                drive_ssync_session(
+                    swift_http::IncomingBody::from_channel(body_rx, None, None, u64::MAX),
+                    tx, server.storage().clone(), server.clone_execution_context(),
+                    "sda1".into(), "0".into(), 0, PolicyKind::Replication, None,
+                    replication_lock,
+                ).await;
+                let mut output = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    output.extend_from_slice(&chunk.unwrap());
+                }
+                let output = String::from_utf8_lossy(&output);
+                assert!(output.contains(":ERROR:"), "truncated tail={tail:?}, reset={transport_error}: {output:?}");
+                assert!(!output.contains(":UPDATES: START"), "incomplete session was acknowledged: {output:?}");
+                assert_eq!(server.handle(get_named("incomplete")).status, 404);
+                assert!(
+                    tmp_files(&dir).is_empty(),
+                    "interrupted SSYNC must not leave tmp: {:?}",
+                    tmp_files(&dir)
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ssync_preserves_runtime_settings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-settings-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        for (name, reserve, expected_commit) in [
+            ("denied", FallocateReserve::Bytes(i64::MAX), 0),
+            ("allowed", FallocateReserve::Bytes(1), 1),
+        ] {
+            let commits = std::sync::Arc::new(AtomicUsize::new(0));
+            let server = tiny_server(&dir, reserve).with_commit_stall({
+                let commits = commits.clone();
+                std::sync::Arc::new(move || {
+                    commits.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+            let cloned = server.clone_execution_context();
+            assert!(std::sync::Arc::ptr_eq(
+                &server.worm_clock,
+                &cloned.worm_clock
+            ));
+            let wire = format!(
+                ":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n\
+                 PUT /AUTH_test/c/{name}\r\nContent-Length: 1\r\n\
+                 Content-Type: text/plain\r\nX-Timestamp: 1700000000.00000\r\n\r\nx:UPDATES: END\r\n"
+            );
+            let response = server
+                .handle_async(AsyncRequest {
+                    method: "SSYNC".into(),
+                    path: "/sda1/0".into(),
+                    query_string: String::new(),
+                    headers: HeaderKeyDict::new(),
+                    body: swift_http::IncomingBody::from_bytes(wire.into_bytes(), u64::MAX),
+                })
+                .await;
+            assert_eq!(response.status, 200);
+            let bytes = response.body.collect_async().await.unwrap();
+            let output = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                output.contains(":ERROR:"),
+                expected_commit == 0,
+                "{name}: {output}"
+            );
+            assert_eq!(commits.load(Ordering::SeqCst), expected_commit, "{name}");
+            assert_eq!(
+                server.handle(get_named(name)).status,
+                if expected_commit == 0 { 404 } else { 200 }
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_ssync_streams_large_put_and_next_update() {
+        use md5::{Digest, Md5};
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-large-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let total = 65 * 1024 * 1024 + 17;
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
+        let producer_scope = TaskScope::bounded(1);
+        let producer = producer_scope.spawn(async move {
+            body_tx.send(Ok(format!(
+                ":MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n:UPDATES: START\r\n\
+                 PUT /AUTH_test/c/large-ssync\r\nContent-Length: {total}\r\n\
+                 Content-Type: application/octet-stream\r\nX-Timestamp: 1700000000.00000\r\n\r\n"
+            ).into_bytes())).await.unwrap();
+            let mut hash = Md5::new();
+            let mut sent = 0;
+            while sent < total {
+                let size = ssync::STREAM_CHUNK_BYTES.min(total - sent);
+                let chunk = vec![((sent / ssync::STREAM_CHUNK_BYTES) % 251) as u8; size];
+                hash.update(&chunk);
+                body_tx.send(Ok(chunk)).await.unwrap();
+                sent += size;
+            }
+            body_tx.send(Ok(b"PUT /AUTH_test/c/empty-ssync\r\nContent-Length: 0\r\nContent-Type: text/plain\r\nX-Timestamp: 1700000000.00000\r\n\r\n:UPDATES: END\r\n".to_vec())).await.unwrap();
+            format!("{:x}", hash.finalize())
+        }).unwrap();
+        let before = server.storage().stats().blocking.started_total;
+        let response = server
+            .handle_async(AsyncRequest {
+                method: "SSYNC".into(),
+                path: "/sda1/0".into(),
+                query_string: String::new(),
+                headers: HeaderKeyDict::new(),
+                body: swift_http::IncomingBody::from_channel(body_rx, None, None, u64::MAX),
+            })
+            .await;
+        assert_eq!(response.status, 200);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            response.body.collect_async(),
+        )
+        .await
+        .expect("streaming SSYNC must finish")
+        .unwrap();
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains(":UPDATES: END") && !output.contains(":ERROR:"),
+            "{output}"
+        );
+        let expected_etag = producer.join().await.unwrap();
+        producer_scope.join().await.unwrap();
+        assert!(
+            server.storage().stats().blocking.started_total - before
+                >= (total / ssync::STREAM_CHUNK_BYTES) as u64
+        );
+        let got = server.handle(get_named("large-ssync"));
+        assert_eq!(got.status, 200);
+        let quoted_etag = format!("\"{expected_etag}\"");
+        assert_eq!(got.headers.get("Etag"), Some(quoted_etag.as_str()));
+        let (mut reader, length) = got.body.into_reader();
+        assert_eq!(length, Some(total as u64));
+        let mut buffer = vec![0; ssync::STREAM_CHUNK_BYTES];
+        let mut received = 0;
+        loop {
+            let n = reader.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            for (i, byte) in buffer[..n].iter().enumerate() {
+                assert_eq!(
+                    *byte,
+                    (((received + i) / ssync::STREAM_CHUNK_BYTES) % 251) as u8
+                );
+            }
+            received += n;
+        }
+        assert_eq!(received, total);
+        drop(reader);
+        assert_eq!(server.handle(get_named("empty-ssync")).status, 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6170,6 +7235,148 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn get_after_lonely_frag_quarantine_is_404_not_503() {
+        // Official test_rebuild_quarantines_lonely_frag: after reconstruct_fa
+        // quarantines the solitary fragment, direct GET must be 404, not 503.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-lonely-quar-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        assert_eq!(server.handle(put_named("lonely", "1", b"frag")).status, 201);
+        assert_eq!(server.handle(get_named("lonely")).status, 200);
+
+        let hc = HashPathConfig::new(Vec::new(), b"reserve-tests".to_vec()).unwrap();
+        let df = DiskFile::new(
+            &dir.join("sda1"),
+            0,
+            "AUTH_test",
+            "c",
+            "lonely",
+            PolicyKind::Replication,
+            0,
+            &hc,
+            DiskFileConfig::default(),
+        )
+        .unwrap();
+        let err = df.quarantine_object("Solitary fragment #0");
+        assert!(
+            matches!(err, DiskFileError::Quarantined(_)),
+            "quarantine_object must report Quarantined, got {err:?}"
+        );
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Storage-Policy-Index", "0");
+        let get = server.handle(Request {
+            method: "GET".into(),
+            path: "/sda1/0/AUTH_test/c/lonely".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        });
+        assert_eq!(
+            get.status, 404,
+            "quarantined lonely frag must GET 404, not {}: {}",
+            get.status, get.reason
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replicate_accepts_plain_dir_when_mount_check_is_false() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-mc-false-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sdb6")).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: false,
+            hash_config: HashPathConfig::new(Vec::new(), b"mc-false-repl".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(0, PolicyKind::Replication)]),
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: ContainerUpdateMode::Sync,
+        });
+        let resp = server.handle(Request {
+            method: "REPLICATE".into(),
+            path: "/sdb6/400".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        });
+        assert_eq!(
+            resp.status, 200,
+            "field g6-rust: mount_check=false must not 507 REPLICATE on a plain dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_with_default_percent_reserve_lands_when_disk_is_not_at_the_floor() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-pct-reserve-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Percent(1.0));
+        assert_eq!(
+            server.handle(put_request(b"frag")).status,
+            201,
+            "1% reserve must not 507 a small PUT on a temp FS"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replicate_507_names_the_drive_when_mount_check_rejects_a_plain_dir() {
+        // Field 57b7456: REPLICATE /sdb6/400 returned
+        // "There was not enough space… Drive: " with no device. Isolated
+        // devices are dirs on the root FS; mount_check=true is a correct
+        // 507, but the body must name the drive.
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-unmounted-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sdb6")).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: true,
+            hash_config: HashPathConfig::new(Vec::new(), b"unmounted-drive".to_vec()).unwrap(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(0, PolicyKind::Replication)]),
+            container_update_timeout: std::time::Duration::from_secs(1),
+            container_update_mode: ContainerUpdateMode::Sync,
+        });
+        let mut resp = server.handle(Request {
+            method: "REPLICATE".into(),
+            path: "/sdb6/400".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        });
+        assert_eq!(resp.status, 507, "{}", resp.reason);
+        let body = String::from_utf8_lossy(resp.body.materialize(u64::MAX).unwrap());
+        assert!(
+            body.contains("Drive: sdb6"),
+            "507 must name the device, got {body:?}"
+        );
+        assert_eq!(
+            resp.headers.get("X-Backend-No-Space-Reason"),
+            Some("unmounted")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn shipped_put_finalize_runs_on_storage_executor() {
         let dir =
@@ -6307,6 +7514,169 @@ mod fallocate_reserve_tests {
         let b2 = g2.body.materialize(u64::MAX).unwrap().to_vec();
         assert_eq!(b1, b"alpha-payload");
         assert_eq!(b2, b"beta-payload!!");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_object_if_none_match_is_rechecked_under_mutation_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cas-create-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let second_server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let observer = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut first = put_named("cas-create", "7001", b"first");
+        first.headers.set("If-None-Match", "*");
+        let first_task =
+            tokio::spawn(async move { first_server.handle_buffered_async(first).await });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        let mut second = put_named("cas-create", "7002", b"second");
+        second.headers.set("If-None-Match", "*");
+        let second_task =
+            tokio::spawn(async move { second_server.handle_buffered_async(second).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let first_response = first_task.await.unwrap();
+        let second_response = second_task.await.unwrap();
+        assert_eq!(first_response.status, 201, "{}", first_response.reason);
+        assert_eq!(second_response.status, 412, "{}", second_response.reason);
+        let mut get = observer.handle(get_named("cas-create"));
+        assert_eq!(get.status, 200);
+        assert_eq!(get.body.materialize(u64::MAX).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_object_if_match_is_rechecked_under_mutation_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cas-update-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let observer = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let seed = observer.handle(put_named("cas-update", "7100", b"seed"));
+        assert_eq!(seed.status, 201);
+        let old_etag = seed.headers.get("ETag").unwrap().to_string();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let second_server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut first = put_named("cas-update", "7101", b"first-wins");
+        first.headers.set("If-Match", &old_etag);
+        let first_task =
+            tokio::spawn(async move { first_server.handle_buffered_async(first).await });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        let mut second = put_named("cas-update", "7102", b"must-lose");
+        second.headers.set("If-Match", &old_etag);
+        let second_task =
+            tokio::spawn(async move { second_server.handle_buffered_async(second).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first_task.await.unwrap().status, 201);
+        assert_eq!(second_task.await.unwrap().status, 412);
+        let mut get = observer.handle(get_named("cas-update"));
+        assert_eq!(get.status, 200);
+        assert_eq!(get.body.materialize(u64::MAX).unwrap(), b"first-wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_etag_s3_version_aba_is_rejected_under_mutation_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-version-aba-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let observer = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut seed = put_named("version-aba", "7200", b"same-bytes");
+        seed.headers.set(S3_VERSION_ID_SYSMETA, "version-1");
+        assert_eq!(observer.handle(seed).status, 201);
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_server = tiny_server(&dir, FallocateReserve::Bytes(1)).with_commit_stall({
+            let entered = std::sync::Arc::clone(&entered);
+            let release = std::sync::Arc::clone(&release);
+            std::sync::Arc::new(move || {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        });
+        let second_server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let mut first = put_named("version-aba", "7201", b"same-bytes");
+        first.headers.set(S3_VERSION_ID_SYSMETA, "version-2");
+        first
+            .headers
+            .set(EXPECTED_S3_VERSION_ID_HEADER, "version-1");
+        let first_task =
+            tokio::spawn(async move { first_server.handle_buffered_async(first).await });
+        let start = std::time::Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        let mut second = put_named("version-aba", "7202", b"same-bytes");
+        second.headers.set(S3_VERSION_ID_SYSMETA, "version-3");
+        second
+            .headers
+            .set(EXPECTED_S3_VERSION_ID_HEADER, "version-1");
+        let second_task =
+            tokio::spawn(async move { second_server.handle_buffered_async(second).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first_task.await.unwrap().status, 201);
+        assert_eq!(second_task.await.unwrap().status, 412);
+        let head = observer.handle(Request {
+            method: "HEAD".into(),
+            path: "/sda1/0/AUTH_test/c/version-aba".into(),
+            query_string: String::new(),
+            headers: HeaderKeyDict::new(),
+            body: Body::empty(),
+        });
+        assert_eq!(head.headers.get(S3_VERSION_ID_SYSMETA), Some("version-2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6453,6 +7823,130 @@ mod fallocate_reserve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn ec_get_echoes_int_frag_index_so_proxy_can_count_the_source() {
+        use swift_diskfile::{DiskFile, DiskFileConfig, MetaValue, Metadata};
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ec-int-fi-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let hash_config =
+            HashPathConfig::new(Vec::new(), b"ec-int-frag-index-tests".to_vec()).unwrap();
+        let server = ObjectServer::new(ObjectServerConfig {
+            devices: dir.clone(),
+            mount_check: false,
+            hash_config: hash_config.clone(),
+            diskfile: DiskFileConfig::default(),
+            policies: std::collections::HashMap::from([(
+                2,
+                PolicyKind::Ec {
+                    n_unique_fragments: Some(6),
+                },
+            )]),
+            container_update_timeout: std::time::Duration::from_millis(10),
+            container_update_mode: ContainerUpdateMode::Async,
+        });
+        let body = b"int-frag-index-bytes";
+        let ts: Timestamp = "7000.00000".parse().unwrap();
+        let df = DiskFile::new(
+            &dir.join("sda1"),
+            0,
+            "AUTH_test",
+            "c",
+            "o",
+            PolicyKind::Ec {
+                n_unique_fragments: Some(6),
+            },
+            2,
+            &hash_config,
+            DiskFileConfig::default(),
+        )
+        .unwrap();
+        let mut writer = df.create(".data").unwrap();
+        writer.write(body).unwrap();
+        let metadata: Metadata = vec![
+            (
+                MetaValue::Str("name".into()),
+                MetaValue::Str("/AUTH_test/c/o".into()),
+            ),
+            (
+                MetaValue::Str("X-Timestamp".into()),
+                MetaValue::Str(ts.internal()),
+            ),
+            (
+                MetaValue::Str("Content-Type".into()),
+                MetaValue::Str("application/octet-stream".into()),
+            ),
+            (
+                MetaValue::Str("Content-Length".into()),
+                MetaValue::Str(body.len().to_string()),
+            ),
+            (
+                MetaValue::Str("ETag".into()),
+                MetaValue::Str("deadbeef".into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Etag".into()),
+                MetaValue::Str("whole-object-etag".into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Content-Length".into()),
+                MetaValue::Str("5".into()),
+            ),
+            (
+                MetaValue::Str("X-Object-Sysmeta-Ec-Frag-Index".into()),
+                MetaValue::Int(3),
+            ),
+        ];
+        writer.put(metadata).unwrap();
+        writer.commit(&ts).unwrap();
+        writer.close();
+
+        let mut headers = HeaderKeyDict::new();
+        headers.set("X-Backend-Storage-Policy-Index", "2");
+        let got = server.handle(Request {
+            method: "GET".into(),
+            path: "/sda1/0/AUTH_test/c/o".into(),
+            query_string: String::new(),
+            headers,
+            body: Body::empty(),
+        });
+        assert_eq!(got.status, 200, "{}", got.reason);
+        assert_eq!(
+            got.headers.get("X-Object-Sysmeta-Ec-Frag-Index"),
+            Some("3"),
+            "proxy EC GET drops a 200 that lacks this header: {:?}",
+            got.headers
+        );
+        assert_eq!(
+            got.headers.get("X-Backend-Durable-Timestamp"),
+            Some(ts.internal()).as_deref(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_files_recursive(devices: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        fn walk(dir: &Path, acc: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    walk(&p, acc);
+                } else if p.is_file() {
+                    acc.push(p);
+                }
+            }
+        }
+        walk(devices, &mut out);
+        out
+    }
+
     fn tmp_files(devices: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let walk = |dir: &Path, acc: &mut Vec<PathBuf>| {
@@ -6539,6 +8033,60 @@ mod fallocate_reserve_tests {
             "disconnect must not leave tmp: {:?}",
             tmp_files(&dir)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_future_cancel_unlinks_tmp_on_storage_domain() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-cancel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let before = server.storage().stats().blocking.started_total;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+        let put = tokio::spawn({
+            let server = server.clone_execution_context();
+            async move {
+                server
+                    .handle_async(async_put(
+                        "4002",
+                        "cancel-o",
+                        swift_http::IncomingBody::from_channel(rx, Some(1_048_576), None, u64::MAX),
+                        Some(1_048_576),
+                    ))
+                    .await
+            }
+        });
+        tx.send(Ok(vec![b'x'; 4096])).await.unwrap();
+        let start = std::time::Instant::now();
+        while server.storage().stats().blocking.started_total == before
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.storage().stats().blocking.started_total > before,
+            "first chunk must reach the POSIX write before cancel"
+        );
+        put.abort();
+        let _ = put.await;
+        drop(tx);
+        let start = std::time::Instant::now();
+        while !tmp_files_recursive(&dir).is_empty()
+            && start.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            tmp_files_recursive(&dir).is_empty(),
+            "cancelled PUT must unlink tmp via submit_held: {:?}",
+            tmp_files_recursive(&dir)
+        );
+        assert_eq!(server.handle(get_named("cancel-o")).status, 404);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6898,10 +8446,7 @@ mod fallocate_reserve_tests {
         override_put_h.set("X-Object-Sysmeta-Ec-Frag-Index", "1");
         override_put_h.set("X-Object-Sysmeta-Ec-Etag", "unexpected-ec-etag");
         override_put_h.set("X-Object-Sysmeta-Ec-Content-Length", "99");
-        override_put_h.set(
-            "X-Object-Sysmeta-Container-Update-Override-Size",
-            "7",
-        );
+        override_put_h.set("X-Object-Sysmeta-Container-Update-Override-Size", "7");
         override_put_h.set(
             "X-Object-Sysmeta-Container-Update-Override-Etag",
             "override-etag",
@@ -6991,7 +8536,10 @@ mod fallocate_reserve_tests {
             EXPIRER_CONTAINER_DIVISOR,
             EXPIRER_CONTAINER_PER_DIVISOR,
         );
-        assert_ne!(task_container, "9999936000", "test must exercise a non-zero shard offset");
+        assert_ne!(
+            task_container, "9999936000",
+            "test must exercise a non-zero shard offset"
+        );
         post_h.set("X-Delete-At-Container", &task_container);
         let post = server.handle(Request {
             method: "POST".into(),
@@ -7018,9 +8566,10 @@ mod fallocate_reserve_tests {
                 .map(|(_, value)| value.as_str()),
             Some("text/plain;swift_expirer_bytes=24")
         );
-        assert!(expiry.headers.iter().any(|(key, _)| {
-            key.eq_ignore_ascii_case("x-content-type-timestamp")
-        }));
+        assert!(expiry
+            .headers
+            .iter()
+            .any(|(key, _)| { key.eq_ignore_ascii_case("x-content-type-timestamp") }));
 
         let mut clear_h = HeaderKeyDict::new();
         clear_h.set("X-Timestamp", "4003");
@@ -7273,6 +8822,18 @@ mod fallocate_reserve_tests {
             resp.headers.get("X-Backend-Accept-No-Commit").unwrap_or(""),
             "True"
         );
+        let part_path = dir.join("sda1").join(get_data_dir(0)).join("0");
+        let busy = acquire_replication_session_lock(
+            server.storage(),
+            DeviceId::new("sda1"),
+            part_path.clone(),
+            0.05,
+        )
+        .await;
+        assert!(
+            matches!(busy, Err(response) if response.status == 503),
+            "the partition replication lock must remain held after the 200 head"
+        );
         let before = server.storage().stats().blocking.started_total;
         let offer = crate::ssync::encode_missing(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -7300,6 +8861,63 @@ mod fallocate_reserve_tests {
             server.storage().stats().blocking.started_total > before,
             "missing-check FS must run on StorageExecutor after 200"
         );
+        let released = acquire_replication_session_lock(
+            server.storage(),
+            DeviceId::new("sda1"),
+            part_path,
+            0.2,
+        )
+        .await;
+        assert!(
+            released.is_ok(),
+            "the replication lock must be released when the SSYNC session ends"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_ssync_busy_replication_lock_is_503_before_channel() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-obj-ssync-busy-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sda1")).unwrap();
+        let part_path = dir.join("sda1").join(get_data_dir(0)).join("0");
+        let held = swift_core::lockutil::lock_path(&part_path, 1.0, Some("replication")).unwrap();
+        let server = tiny_server(&dir, FallocateReserve::Bytes(1));
+        let response = server
+            .ssync_async_with_lock_timeout(
+                AsyncRequest {
+                    method: "SSYNC".into(),
+                    path: "/sda1/0".into(),
+                    query_string: String::new(),
+                    headers: HeaderKeyDict::new(),
+                    body: swift_http::IncomingBody::from_bytes(Vec::new(), u64::MAX),
+                },
+                0.05,
+            )
+            .await;
+        assert_eq!(response.status, 503);
+        assert!(response.headers.get("X-Backend-Accept-No-Commit").is_none());
+        assert_eq!(
+            response
+                .headers
+                .get("X-Backend-Unavailable-Reason")
+                .unwrap_or(""),
+            "replication lock timeout partition=0 timeout=0.05",
+            "field 1682fdb: 503 must name the lock, not a generic swob body"
+        );
+        let Body::Buffered(bytes) = response.body else {
+            panic!("a busy partition must fail before constructing the SSYNC channel");
+        };
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("Drive: sda1") && body.contains("replication lock timeout"),
+            "SSYNC 503 body must be greppable: {body}"
+        );
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -415,11 +415,7 @@ impl ContainerSync {
         next(req)
     }
 
-    async fn check_sync_source_update_async(
-        &self,
-        req: Request,
-        next: AsyncNextFn,
-    ) -> Response {
+    async fn check_sync_source_update_async(&self, req: Request, next: AsyncNextFn) -> Response {
         let mut head = req.clone_head();
         head.method = "HEAD".to_string();
         head.query_string.clear();
@@ -538,9 +534,7 @@ impl Middleware for ContainerSync {
     fn handle(&self, mut req: Request, next: &NextFn) -> Response {
         match self.prepare_request(&mut req) {
             Some(resp) => resp,
-            None if Self::is_sync_source_update(&req) => {
-                self.check_sync_source_update(req, next)
-            }
+            None if Self::is_sync_source_update(&req) => self.check_sync_source_update(req, next),
             None => next(req),
         }
     }
@@ -687,10 +681,8 @@ mod tests {
         let app: NextFn = Arc::new(|r: Request| {
             if r.method == "HEAD" {
                 let mut resp = Response::new(204);
-                resp.headers.set(
-                    "X-Container-Sysmeta-Versions-Container",
-                    "%00versions%00c",
-                );
+                resp.headers
+                    .set("X-Container-Sysmeta-Versions-Container", "%00versions%00c");
                 return resp;
             }
             Response::new(204)
@@ -699,10 +691,7 @@ mod tests {
         r.headers.set("X-Container-Sync-To", "//R/C/AUTH_a/d");
         let mut resp = mw.handle(r, &app);
         assert_eq!(resp.status, 400);
-        let body = resp
-            .body
-            .materialize(swift_http::MAX_CONTROL_BODY)
-            .unwrap();
+        let body = resp.body.materialize(swift_http::MAX_CONTROL_BODY).unwrap();
         assert_eq!(
             body,
             b"Cannot configure container sync on a container with object versioning configured."

@@ -29,9 +29,7 @@ fn slow_put_body_does_not_starve_a_health_get() {
                 held.push(s);
             }
             Err(e) => {
-                panic!(
-                    "ENVIRONMENT BLOCKED: slow PUT target={TARGET} opened={i}: {e}"
-                );
+                panic!("ENVIRONMENT BLOCKED: slow PUT target={TARGET} opened={i}: {e}");
             }
         }
     }

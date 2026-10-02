@@ -20,10 +20,26 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+/// `statvfs` capacity on the filesystem holding `path`.
+///
+/// `free_bytes` is `f_bavail * f_frsize` (unprivileged available).
+/// `total_bytes` is `f_blocks * f_frsize` — Python `fallocate()` percent
+/// reserve divides remaining free by this total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsSpace {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 /// Bytes available to unprivileged callers on the filesystem holding
 /// `path`: `statvfs.f_bavail * statvfs.f_frsize`, exactly what Python's
 /// `fs_has_free_space` compares against.
 pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    Ok(fs_space(path)?.free_bytes)
+}
+
+/// Free and total bytes from `statvfs` (Python `os.statvfs` / `fallocate`).
+pub fn fs_space(path: &Path) -> std::io::Result<FsSpace> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -37,7 +53,10 @@ pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
     }
     let stats = unsafe { stats.assume_init() };
     #[allow(clippy::unnecessary_cast)] // types differ per libc target
-    Ok((stats.f_bavail as u64) * (stats.f_frsize as u64))
+    Ok(FsSpace {
+        free_bytes: (stats.f_bavail as u64) * (stats.f_frsize as u64),
+        total_bytes: (stats.f_blocks as u64) * (stats.f_frsize as u64),
+    })
 }
 
 #[cfg(test)]
@@ -46,8 +65,16 @@ mod tests {
 
     #[test]
     fn temp_dir_reports_free_space() {
-        let free = free_bytes(&std::env::temp_dir()).unwrap();
-        assert!(free > 0, "temp dir should have free space, got {free}");
+        let space = fs_space(&std::env::temp_dir()).unwrap();
+        assert!(
+            space.free_bytes > 0,
+            "temp dir should have free space, got {space:?}"
+        );
+        assert!(
+            space.total_bytes >= space.free_bytes,
+            "total must cover free: {space:?}"
+        );
+        assert_eq!(free_bytes(&std::env::temp_dir()).unwrap(), space.free_bytes);
     }
 
     #[test]

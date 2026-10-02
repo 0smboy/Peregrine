@@ -66,6 +66,13 @@ pub fn match_completed_mpu_etag(
 pub const SYS_CONTAINER_UPDATE_OVERRIDE_ETAG: &str =
     "X-Object-Sysmeta-Container-Update-Override-Etag";
 
+/// Python complete MPU: `serialize_header('', {'s3_etag': etag})`.
+/// Blank base so SLO fills the listing hash; leftover `s3_etag=` survives
+/// SLO's `; slo_etag=` merge and is promoted on Swift JSON listings.
+pub fn container_update_override_s3_etag(s3_etag: &str) -> String {
+    format!("; s3_etag={s3_etag}")
+}
+
 /// Python `get_container_update_override_key('size')`. Listing `bytes`
 /// otherwise stays the SLO manifest length (137) instead of assembled size.
 pub const SYS_CONTAINER_UPDATE_OVERRIDE_SIZE: &str =
@@ -383,6 +390,14 @@ mod tests {
     }
 
     #[test]
+    fn complete_mpu_override_etag_is_blank_base_s3_etag_param() {
+        assert_eq!(
+            container_update_override_s3_etag("deadbeef-2"),
+            "; s3_etag=deadbeef-2"
+        );
+    }
+
+    #[test]
     fn aws_multipart_etag_is_md5_of_part_md5s_n() {
         // Runner multipart_etag for 5 MiB `A` + `tail-v2`.
         let got = aws_multipart_etag([
@@ -498,7 +513,13 @@ mod tests {
             "owner",
         ))
         .unwrap();
-        assert!(xml2.contains("<NextKeyMarker>obj3</NextKeyMarker>"), "{xml2}");
-        assert!(xml2.contains("<NextUploadIdMarker>u2</NextUploadIdMarker>"), "{xml2}");
+        assert!(
+            xml2.contains("<NextKeyMarker>obj3</NextKeyMarker>"),
+            "{xml2}"
+        );
+        assert!(
+            xml2.contains("<NextUploadIdMarker>u2</NextUploadIdMarker>"),
+            "{xml2}"
+        );
     }
 }

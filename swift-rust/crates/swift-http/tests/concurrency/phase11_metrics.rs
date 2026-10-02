@@ -113,7 +113,11 @@ fn snapshot_moves_on_admitted_request_and_recon_endpoint() {
         "requests_active={}",
         snap.requests_active
     );
-    assert!(snap.runtime_tasks >= 1, "runtime_tasks={}", snap.runtime_tasks);
+    assert!(
+        snap.runtime_tasks >= 1,
+        "runtime_tasks={}",
+        snap.runtime_tasks
+    );
     assert!(snap.process_threads >= 1);
     assert!(snap.open_fds >= 1);
     release.store(true, Ordering::SeqCst);
@@ -157,7 +161,9 @@ fn admission_reject_increments_snapshot() {
     });
     let _hold = harness::get_keepalive(server.addr).expect("hold the only connection");
     let mut probe = TcpStream::connect_timeout(&server.addr, Duration::from_secs(1)).unwrap();
-    probe.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    probe
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     probe
         .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -311,7 +317,10 @@ async fn commit_shield_and_device_gauges_during_put_finalize() {
     while !entered.load(Ordering::SeqCst) && Instant::now() < entered_deadline {
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(entered.load(Ordering::SeqCst), "PUT never reached commit stall");
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "PUT never reached commit stall"
+    );
     let snap = metrics.snapshot();
     assert!(
         snap.commit_shield_active >= 1,
@@ -331,8 +340,7 @@ async fn commit_shield_and_device_gauges_during_put_finalize() {
     assert_eq!(put_status, 201);
     let idle = Instant::now() + Duration::from_secs(2);
     while Instant::now() < idle {
-        if metrics.snapshot().commit_shield_active == 0
-            && metrics.snapshot().device_ops_active == 0
+        if metrics.snapshot().commit_shield_active == 0 && metrics.snapshot().device_ops_active == 0
         {
             break;
         }

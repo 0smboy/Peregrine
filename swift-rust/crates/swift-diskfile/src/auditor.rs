@@ -21,8 +21,10 @@
 //!
 //! The continuous daemon loop lives in `swift-object-auditor` (conf +
 //! interval sleep, matching Python `ObjectAuditor.interval` default 30s).
-//! Deferred: rate limiting, `hashes.pkl`-driven incremental audits, ZBF
-//! (zero-byte-file) mode, and watcher plugins.
+//! Deferred: rate limiting, `hashes.pkl`-driven incremental audits, and
+//! ZBF (zero-byte-file) mode. Watcher plugins run after a successful
+//! open+read (Python `see_object`); `action=delete` must rmtree the hash
+//! dir without creating `quarantined/`.
 
 use std::path::{Path, PathBuf};
 
@@ -88,6 +90,30 @@ pub fn audit_object(
     hash_config: &HashPathConfig,
     cfg: &DiskFileConfig,
 ) -> AuditOutcome {
+    audit_object_with_watcher(
+        device_path,
+        hash_dir,
+        policy,
+        policy_index,
+        hash_config,
+        cfg,
+        None::<&mut NoopWatcher>,
+    )
+}
+
+/// Like [`audit_object`], then run an optional watcher (Python
+/// `see_object` after a successful read). `WatcherDecision::Quarantine`
+/// moves the hash dir under `quarantined/`. Watchers that delete dark
+/// data must rmtree themselves and return [`WatcherDecision::Keep`].
+pub fn audit_object_with_watcher<W: ObjectAuditWatcher + ?Sized>(
+    device_path: &Path,
+    hash_dir: &Path,
+    policy: PolicyKind,
+    policy_index: u32,
+    hash_config: &HashPathConfig,
+    cfg: &DiskFileConfig,
+    watcher: Option<&mut W>,
+) -> AuditOutcome {
     let mut df = DiskFile::from_hash_dir(
         device_path,
         hash_dir,
@@ -110,10 +136,32 @@ pub fn audit_object(
                 return AuditOutcome::Error;
             }
             match reader.close() {
-                Ok(()) => AuditOutcome::Passed,
+                Ok(()) => apply_watcher_after_pass(&df, watcher),
                 Err(DiskFileError::Quarantined(_)) => AuditOutcome::Quarantined,
                 Err(_) => AuditOutcome::Error,
             }
+        }
+    }
+}
+
+fn apply_watcher_after_pass<W: ObjectAuditWatcher + ?Sized>(
+    df: &DiskFile,
+    watcher: Option<&mut W>,
+) -> AuditOutcome {
+    let Some(watcher) = watcher else {
+        return AuditOutcome::Passed;
+    };
+    let (Ok(meta), Ok(data_file)) = (df.get_metadata(), df.opened_data_file()) else {
+        return AuditOutcome::Passed;
+    };
+    // Clone before the watcher runs: `action=delete` rmtree's the hash dir.
+    let meta = meta.clone();
+    let data_file = data_file.to_path_buf();
+    match watcher.see_object(&meta, &data_file) {
+        WatcherDecision::Keep => AuditOutcome::Passed,
+        WatcherDecision::Quarantine => {
+            let _ = df.quarantine_object("dark data");
+            AuditOutcome::Quarantined
         }
     }
 }
@@ -127,6 +175,35 @@ pub enum AuditOutcome {
     Error,
 }
 
+/// Watcher decision after a successful object audit (Python `see_object`).
+/// `delete` is applied by the watcher itself (rmtree, no quarantine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherDecision {
+    Keep,
+    Quarantine,
+}
+
+/// Python auditor watcher hook. Invoked only after a Passed open+read.
+pub trait ObjectAuditWatcher {
+    fn see_object(
+        &mut self,
+        metadata: &crate::metadata::Metadata,
+        data_file_path: &Path,
+    ) -> WatcherDecision;
+}
+
+struct NoopWatcher;
+
+impl ObjectAuditWatcher for NoopWatcher {
+    fn see_object(
+        &mut self,
+        _metadata: &crate::metadata::Metadata,
+        _data_file_path: &Path,
+    ) -> WatcherDecision {
+        WatcherDecision::Keep
+    }
+}
+
 /// Audit every object on a device for one policy.
 pub fn audit_device(
     device_path: &Path,
@@ -135,15 +212,35 @@ pub fn audit_device(
     hash_config: &HashPathConfig,
     cfg: &DiskFileConfig,
 ) -> AuditReport {
+    audit_device_with_watcher(
+        device_path,
+        policy,
+        policy_index,
+        hash_config,
+        cfg,
+        None::<&mut NoopWatcher>,
+    )
+}
+
+/// Like [`audit_device`] with an optional post-pass watcher.
+pub fn audit_device_with_watcher<W: ObjectAuditWatcher + ?Sized>(
+    device_path: &Path,
+    policy: PolicyKind,
+    policy_index: u32,
+    hash_config: &HashPathConfig,
+    cfg: &DiskFileConfig,
+    mut watcher: Option<&mut W>,
+) -> AuditReport {
     let mut report = AuditReport::default();
     for hash_dir in audit_locations(device_path, policy_index) {
-        match audit_object(
+        match audit_object_with_watcher(
             device_path,
             &hash_dir,
             policy,
             policy_index,
             hash_config,
             cfg,
+            watcher.as_deref_mut(),
         ) {
             AuditOutcome::Passed => report.passed += 1,
             AuditOutcome::Quarantined => {
@@ -212,15 +309,35 @@ pub fn audit_devices(
     hash_config: &HashPathConfig,
     cfg: &DiskFileConfig,
 ) -> AuditReport {
+    audit_devices_with_watcher(
+        devices_root,
+        mount_check,
+        policies,
+        hash_config,
+        cfg,
+        None::<&mut NoopWatcher>,
+    )
+}
+
+/// Like [`audit_devices`] with an optional post-pass watcher.
+pub fn audit_devices_with_watcher<W: ObjectAuditWatcher + ?Sized>(
+    devices_root: &Path,
+    mount_check: bool,
+    policies: &[(u32, PolicyKind)],
+    hash_config: &HashPathConfig,
+    cfg: &DiskFileConfig,
+    mut watcher: Option<&mut W>,
+) -> AuditReport {
     let mut report = AuditReport::default();
     for device in list_devices(devices_root, mount_check) {
         for &(policy_index, policy) in policies {
-            report.merge(audit_device(
+            report.merge(audit_device_with_watcher(
                 &device,
                 policy,
                 policy_index,
                 hash_config,
                 cfg,
+                watcher.as_deref_mut(),
             ));
         }
     }
@@ -320,6 +437,126 @@ mod tests {
         assert_eq!(multi.passed, 1);
         assert_eq!(list_devices(&dir, false), vec![device]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct DeleteHashDir;
+    impl ObjectAuditWatcher for DeleteHashDir {
+        fn see_object(
+            &mut self,
+            _metadata: &crate::metadata::Metadata,
+            data_file_path: &Path,
+        ) -> WatcherDecision {
+            if let Some(hash_dir) = data_file_path.parent() {
+                let _ = std::fs::remove_dir_all(hash_dir);
+            }
+            WatcherDecision::Keep
+        }
+    }
+
+    struct QuarantineAll;
+    impl ObjectAuditWatcher for QuarantineAll {
+        fn see_object(
+            &mut self,
+            _metadata: &crate::metadata::Metadata,
+            _data_file_path: &Path,
+        ) -> WatcherDecision {
+            WatcherDecision::Quarantine
+        }
+    }
+
+    fn write_named_object(device: &Path, name: &str, body: &[u8]) {
+        let cfg = DiskFileConfig::default();
+        let df = DiskFile::new(
+            device,
+            0,
+            "a",
+            "c",
+            name,
+            PolicyKind::Replication,
+            0,
+            &hc(),
+            cfg,
+        )
+        .unwrap();
+        let etag = {
+            use md5::{Digest, Md5};
+            format!("{:x}", Md5::digest(body))
+        };
+        let meta: crate::metadata::Metadata = vec![
+            (
+                "X-Timestamp".into(),
+                MetaValue::Str("1000000000.00000".into()),
+            ),
+            ("Content-Type".into(), "text/plain".into()),
+            ("ETag".into(), MetaValue::Str(etag)),
+            (
+                "Content-Length".into(),
+                MetaValue::Str(body.len().to_string()),
+            ),
+        ];
+        let mut w = df.create(".data").unwrap();
+        w.write(body).unwrap();
+        w.put(meta).unwrap();
+        w.close();
+    }
+
+    #[test]
+    fn test_watcher_delete_does_not_create_quarantined() {
+        let dir = std::env::temp_dir().join(format!(
+            "swift-audit-del-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sdb1");
+        std::fs::create_dir_all(&device).unwrap();
+        write_named_object(&device, "dark", b"leftover");
+        assert_eq!(audit_locations(&device, 0).len(), 1);
+
+        let mut watcher = DeleteHashDir;
+        let report = audit_device_with_watcher(
+            &device,
+            PolicyKind::Replication,
+            0,
+            &hc(),
+            &DiskFileConfig::default(),
+            Some(&mut watcher),
+        );
+        assert_eq!(report.passed, 1, "{report:?}");
+        assert_eq!(report.quarantined, 0);
+        assert!(audit_locations(&device, 0).is_empty());
+        assert!(
+            !device.join("quarantined").exists(),
+            "action=delete must not create quarantined/"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_watcher_quarantine_moves_under_quarantined() {
+        let dir =
+            std::env::temp_dir().join(format!("swift-audit-q-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = dir.join("sdb1");
+        std::fs::create_dir_all(&device).unwrap();
+        write_named_object(&device, "dark", b"leftover");
+
+        let mut watcher = QuarantineAll;
+        let report = audit_device_with_watcher(
+            &device,
+            PolicyKind::Replication,
+            0,
+            &hc(),
+            &DiskFileConfig::default(),
+            Some(&mut watcher),
+        );
+        assert_eq!(report.quarantined, 1, "{report:?}");
+        assert!(audit_locations(&device, 0).is_empty());
+        assert!(
+            device.join("quarantined").exists(),
+            "action=quarantine must create quarantined/"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

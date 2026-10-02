@@ -78,6 +78,10 @@ pub struct Response {
     pub reason: String,
     pub headers: HeaderKeyDict,
     pub body: Body,
+    /// Internal hop diagnostic. Never written to the client wire.
+    /// Survives gatekeeper `X-Backend-*` response scrub so the utf8-compat
+    /// lane can name why a GET finished 404 on the same harvestable line.
+    pub g6_diag: Option<String>,
 }
 
 impl Response {
@@ -87,7 +91,18 @@ impl Response {
             reason: reason_phrase(status).to_string(),
             headers: HeaderKeyDict::new(),
             body: Body::empty(),
+            g6_diag: None,
         }
+    }
+
+    /// Stamp why this response was produced (EC gather, authorize, …).
+    pub fn set_g6_diag(&mut self, reason: impl Into<String>) {
+        self.g6_diag = Some(reason.into());
+    }
+
+    /// Take the stamp for the harvestable utf8-compat completion line.
+    pub fn take_g6_diag(&mut self) -> Option<String> {
+        self.g6_diag.take()
     }
 
     pub fn with_body(status: u16, body: impl Into<Body>) -> Response {
@@ -374,6 +389,18 @@ mod tests {
             sp("/a/c/", 1, 3, true).unwrap(),
             vec![Some("a".into()), Some("c".into()), Some("".into())]
         );
+    }
+
+    #[test]
+    fn g6_diag_survives_as_field_not_header() {
+        let mut resp = Response::new(404);
+        resp.set_g6_diag("reason=gather ndata=4 idxs=[0,2,3,4,5] ec=1 policy=1");
+        assert!(resp.headers.get("X-Backend-Peregrine-G6-Diag").is_none());
+        assert_eq!(
+            resp.take_g6_diag().as_deref(),
+            Some("reason=gather ndata=4 idxs=[0,2,3,4,5] ec=1 policy=1")
+        );
+        assert!(resp.take_g6_diag().is_none());
     }
 
     #[test]

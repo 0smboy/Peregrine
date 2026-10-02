@@ -37,8 +37,7 @@ const INVALID_SHA256_MSG: &str = "x-amz-content-sha256 must be UNSIGNED-PAYLOAD,
 STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
 STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER or a valid sha256 value.";
 
-const MISSING_SHA256_MSG: &str =
-    "Missing required header for this request: x-amz-content-sha256";
+const MISSING_SHA256_MSG: &str = "Missing required header for this request: x-amz-content-sha256";
 
 const MISSING_MD5_OR_CHECKSUM_MSG: &str =
     "Missing required header for this request: Content-MD5 OR x-amz-checksum-*";
@@ -73,7 +72,10 @@ fn header_ci<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
 }
 
 fn content_md5_raw(req: &Request) -> Option<&str> {
-    header_strip(header_ci(req, "content-md5")?)
+    // Present empty Content-MD5 must stay Some("") so InvalidDigest fires.
+    // header_strip("") is None and would skip the check.
+    let raw = header_ci(req, "content-md5")?;
+    Some(header_strip(raw).unwrap_or(""))
 }
 
 /// Standard base64 decode; `None` on alphabet/padding errors.
@@ -170,11 +172,7 @@ pub fn bad_digest_response(content_md5: &str, expected_hex: bool) -> Response {
     } else {
         content_md5.to_string()
     };
-    s3_error_response(
-        "BadDigest",
-        None,
-        &[("ExpectedDigest", expected.as_str())],
-    )
+    s3_error_response("BadDigest", None, &[("ExpectedDigest", expected.as_str())])
 }
 
 fn invalid_sha256_argument(value: &str) -> Response {
@@ -196,9 +194,30 @@ fn missing_md5_or_checksum_response() -> Response {
     s3_error_response("InvalidRequest", Some(MISSING_MD5_OR_CHECKSUM_MSG), &[])
 }
 
+/// Python `UploadsController.POST` pops Content-MD5 / ETag before writing the
+/// empty upload marker. `check_md5` is not called on Initiate.
+fn is_initiate_multipart(req: &Request) -> bool {
+    if req.method != "POST" {
+        return false;
+    }
+    let params = req.params();
+    params.iter().any(|(k, _)| k == "uploads") && !params.iter().any(|(k, _)| k == "uploadId")
+}
+
+fn is_multi_delete_post(req: &Request) -> bool {
+    req.method == "POST" && req.params().iter().any(|(k, _)| k == "delete")
+}
+
+/// Python `MultiObjectDeleteController`:
+/// `min(2 * max_multi_delete_objects * MAX_OBJECT_NAME_LENGTH, 10 MiB)`.
+const MAX_MULTI_DELETE_BODY: u64 = 2 * 1000 * 1024;
+
 /// Python `s3request._validate_sha256` + HashingInput + check_md5 for a
 /// materialized request. `v4_header_auth` is SigV4 *header* (not query).
 pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Response> {
+    if let Some(resp) = invalid_content_length_header(req) {
+        return Some(resp);
+    }
     if let Some(resp) = validate_sha256_header(req, v4_header_auth) {
         return Some(resp);
     }
@@ -212,19 +231,36 @@ pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Re
         return None;
     }
     let aws_sha256 = header_ci(req, "x-amz-content-sha256").map(str::to_string);
-    let v2_or_v4_query_streaming = aws_sha256
-        .as_deref()
-        .is_some_and(is_streaming_payload_hash)
+    let v2_or_v4_query_streaming = aws_sha256.as_deref().is_some_and(is_streaming_payload_hash)
         && (!v4_header_auth || is_v4_query_auth(req));
     if v2_or_v4_query_streaming {
-        return Some(v2_streaming_raw_mismatch(req, aws_sha256.as_deref().unwrap()));
+        return Some(v2_streaming_raw_mismatch(
+            req,
+            aws_sha256.as_deref().unwrap(),
+        ));
     }
     if let Some(resp) = require_md5_for_multi_delete(req) {
         return Some(resp);
     }
-    let body = match req.body.materialize(MAX_CONTROL_BODY) {
+    if is_multi_delete_post(req) {
+        let cl = header_ci(req, "content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| req.body.content_length());
+        if cl.is_some_and(|n| n > MAX_MULTI_DELETE_BODY) {
+            return Some(s3_error_response("MalformedXML", None, &[]));
+        }
+    }
+    let cap = if is_multi_delete_post(req) {
+        MAX_MULTI_DELETE_BODY
+    } else {
+        MAX_CONTROL_BODY
+    };
+    let body = match req.body.materialize(cap) {
         Ok(b) => b.to_vec(),
         Err(_) => {
+            if is_multi_delete_post(req) {
+                return Some(s3_error_response("MalformedXML", None, &[]));
+            }
             return Some(s3_error_response("IncompleteBody", None, &[]));
         }
     };
@@ -244,15 +280,20 @@ pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Re
             return Some(resp);
         }
     }
+    // Python `S3Request.check_md5` is invoked by Complete MPU and MultiDelete
+    // only. Initiate Multipart Upload (`POST ?uploads`) accepts a Content-MD5
+    // header (format-checked above) and then drops it.
     if let Some(raw) = content_md5_raw(req) {
-        let got = md5(&body);
-        if let Some(want) = decode_content_md5(raw) {
-            if got.as_slice() != want.as_slice() {
-                let expected_hex = req.method == "PUT";
-                return Some(bad_digest_response(raw, expected_hex));
-            }
-            if req.method == "PUT" {
-                req.headers.set("ETag", hex_encode(&want));
+        if !is_initiate_multipart(req) {
+            let got = md5(&body);
+            if let Some(want) = decode_content_md5(raw) {
+                if got.as_slice() != want.as_slice() {
+                    let expected_hex = req.method == "PUT";
+                    return Some(bad_digest_response(raw, expected_hex));
+                }
+                if req.method == "PUT" {
+                    req.headers.set("ETag", hex_encode(&want));
+                }
             }
         }
     }
@@ -260,7 +301,26 @@ pub fn validate_s3_payload(req: &mut Request, v4_header_auth: bool) -> Option<Re
 }
 
 /// Header-only checks for the streaming PUT path (body hashed incrementally).
+/// Python `_validate_headers`: Content-Length present and negative/non-int
+/// is InvalidArgument 400.
+fn invalid_content_length_header(req: &Request) -> Option<Response> {
+    let raw = header_ci(req, "content-length")?;
+    match raw.parse::<i64>() {
+        Ok(n) if n < 0 => {}
+        Ok(_) => return None,
+        Err(_) => {}
+    }
+    Some(s3_error_response(
+        "InvalidArgument",
+        Some("Content-Length"),
+        &[("ArgumentName", "Content-Length"), ("ArgumentValue", raw)],
+    ))
+}
+
 pub fn validate_s3_payload_headers(req: &Request, v4_header_auth: bool) -> Option<Response> {
+    if let Some(resp) = invalid_content_length_header(req) {
+        return Some(resp);
+    }
     if let Some(resp) = validate_sha256_header(req, v4_header_auth) {
         return Some(resp);
     }
@@ -451,9 +511,7 @@ fn checksum_spec(header: &str) -> Result<ChecksumSpec, ChecksumHeaderErr> {
             algo: "CRC32C",
             digest_size: 4,
         }),
-        "x-amz-checksum-crc64nvme" => {
-            Err(ChecksumHeaderErr::NotImplemented(header.to_string()))
-        }
+        "x-amz-checksum-crc64nvme" => Err(ChecksumHeaderErr::NotImplemented(header.to_string())),
         _ => Err(ChecksumHeaderErr::InvalidAlgorithm),
     }
 }
@@ -492,10 +550,9 @@ fn collect_checksum(req: &Request) -> Result<Option<(ChecksumSpec, String)>, Che
             .filter(|s| !s.is_empty())
             .collect()
     };
-    if trailers
-        .iter()
-        .any(|h| checksum_spec(&h.to_ascii_lowercase()).is_err() && !h.starts_with("x-amz-checksum-"))
-    {
+    if trailers.iter().any(|h| {
+        checksum_spec(&h.to_ascii_lowercase()).is_err() && !h.starts_with("x-amz-checksum-")
+    }) {
         // Python: trailer name not in CHECKSUMS_BY_HEADER → InvalidRequest
         // "The value specified in the x-amz-trailer header is not supported"
         if !trailers.iter().all(|h| {
@@ -556,8 +613,7 @@ fn collect_checksum(req: &Request) -> Result<Option<(ChecksumSpec, String)>, Che
     let spec = checksum_spec(name)?;
     let trimmed = value.trim();
     match decode_base64(trimmed) {
-        Some(raw)
-            if raw.len() == spec.digest_size && base64_encode(&raw) == trimmed => {}
+        Some(raw) if raw.len() == spec.digest_size && base64_encode(&raw) == trimmed => {}
         _ => return Err(ChecksumHeaderErr::InvalidValue(spec.header.clone())),
     }
     if let Some(algo) = header_ci(req, "x-amz-sdk-checksum-algorithm") {
@@ -831,9 +887,8 @@ impl PayloadHashTransform {
             };
             if let Some(computed) = computed {
                 if computed != expected {
-                    let msg = format!(
-                        "The {algo} you specified did not match the calculated checksum."
-                    );
+                    let msg =
+                        format!("The {algo} you specified did not match the calculated checksum.");
                     return Some(s3_error_response("BadDigest", Some(&msg), &[]));
                 }
             }
@@ -878,10 +933,7 @@ impl BodyTransform for PayloadHashTransform {
                 // Python ChecksummingInput validates on the read that
                 // reaches Content-Length and withholds that chunk on
                 // mismatch so the PUT never commits.
-                if self
-                    .content_length
-                    .is_some_and(|n| self.received >= n)
-                {
+                if self.content_length.is_some_and(|n| self.received >= n) {
                     if let Some(resp) = self.finalize_payload_errors() {
                         self.store_err(resp);
                         return Err(io::Error::other("s3 payload hash mismatch"));
@@ -906,6 +958,24 @@ mod tests {
     use crate::crypto::md5_hex;
     use swift_http::{Body, HeaderKeyDict, Request};
 
+    #[test]
+    fn negative_content_length_is_invalid_argument() {
+        let mut req = empty_put();
+        req.headers.set("Content-Length", "-1");
+        let resp = invalid_content_length_header(&req).expect("err");
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert_eq!(resp.status, 400);
+        assert!(body.contains("InvalidArgument"), "{body}");
+    }
+
+    #[test]
+    fn empty_content_length_is_invalid_argument() {
+        let mut req = empty_put();
+        req.headers.set("Content-Length", "");
+        let resp = invalid_content_length_header(&req).expect("err");
+        assert_eq!(resp.status, 400);
+    }
+
     fn empty_put() -> Request {
         let mut headers = HeaderKeyDict::new();
         headers.set("Host", "localhost");
@@ -920,7 +990,10 @@ mod tests {
 
     #[test]
     fn crc32_of_123456789_matches_aws_vector() {
-        assert_eq!(base64_encode(&crc32_ieee(b"123456789").to_be_bytes()), "y/Q5Jg==");
+        assert_eq!(
+            base64_encode(&crc32_ieee(b"123456789").to_be_bytes()),
+            "y/Q5Jg=="
+        );
     }
 
     #[test]
@@ -931,6 +1004,51 @@ mod tests {
     }
 
     #[test]
+    fn initiate_multipart_content_md5_is_not_checked_against_empty_body() {
+        let mut req = empty_put();
+        req.method = "POST".into();
+        req.path = "/bucket/obj".into();
+        req.query_string = "uploads".into();
+        // Official test_object_multi_upload: base64(16 x 0x61) on Initiate.
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.body = Body::Buffered(Vec::new());
+        assert!(
+            validate_s3_payload(&mut req, false).is_none(),
+            "Initiate MPU must not BadDigest on unrelated Content-MD5"
+        );
+    }
+
+    fn complete_multipart_content_md5_mismatch_is_bad_digest_base64() {
+        let mut req = empty_put();
+        req.method = "POST".into();
+        req.path = "/bucket/obj".into();
+        req.query_string = "uploadId=abc".into();
+        req.headers.set("Content-MD5", "YWFhYWFhYWFhYWFhYWFhYQ==");
+        req.body = Body::Buffered(b"<CompleteMultipartUpload/>".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>BadDigest</Code>"), "{body}");
+        assert!(
+            body.contains("<ExpectedDigest>YWFhYWFhYWFhYWFhYWFhYQ==</ExpectedDigest>"),
+            "{body}"
+        );
+    }
+
+    fn multi_delete_content_length_over_python_cap_is_malformed_xml() {
+        let mut req = empty_put();
+        req.method = "POST".into();
+        req.path = "/bucket".into();
+        req.query_string = "delete".into();
+        req.headers.set("Content-MD5", &base64_encode(&md5(b"x")));
+        req.headers.set("Content-Length", "3000000");
+        req.body = Body::Buffered(b"x".to_vec());
+        let resp = validate_s3_payload(&mut req, false).unwrap();
+        assert_eq!(resp.status, 400);
+        let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
+        assert!(body.contains("<Code>MalformedXML</Code>"), "{body}");
+    }
+
     fn malformed_content_md5_is_invalid_digest() {
         let mut req = empty_put();
         req.headers.set("content-md5", "invalid");
@@ -952,7 +1070,10 @@ mod tests {
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("BadDigest"), "{body}");
         assert!(
-            body.contains(&format!("<ExpectedDigest>{}</ExpectedDigest>", md5_hex(b""))),
+            body.contains(&format!(
+                "<ExpectedDigest>{}</ExpectedDigest>",
+                md5_hex(b"")
+            )),
             "{body}"
         );
     }
@@ -1058,8 +1179,10 @@ mod tests {
         let mut req = empty_put();
         req.headers.set("x-amz-sdk-checksum-algorithm", "sha256");
         req.headers.set("x-amz-checksum-crc32", "y/Q5Jg==");
-        req.headers
-            .set("x-amz-trailer", "x-amz-checksum-crc32, x-amz-checksum-crc32");
+        req.headers.set(
+            "x-amz-trailer",
+            "x-amz-checksum-crc32, x-amz-checksum-crc32",
+        );
         req.body = Body::Buffered(b"123456789".to_vec());
         let resp = validate_s3_payload(&mut req, false).unwrap();
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
@@ -1075,16 +1198,17 @@ mod tests {
         let mut req = empty_put();
         req.headers.set("x-amz-checksum-crc32", "y/Q5Jg==");
         req.headers.set("x-amz-trailer", "x-amz-checksum-crc32");
-        req.headers.set("x-amz-content-sha256", sha256_hex(b"123456789"));
+        req.headers
+            .set("x-amz-content-sha256", sha256_hex(b"123456789"));
         req.body = Body::Buffered(b"123456789".to_vec());
         let resp = validate_s3_payload(&mut req, false).unwrap();
         let body = String::from_utf8(resp.body.into_vec(u64::MAX).unwrap()).unwrap();
         assert!(body.contains("InvalidRequest"), "{body}");
-        assert!(body.contains("Expecting a single x-amz-checksum- header"), "{body}");
         assert!(
-            !body.contains("Multiple checksum Types"),
+            body.contains("Expecting a single x-amz-checksum- header"),
             "{body}"
         );
+        assert!(!body.contains("Multiple checksum Types"), "{body}");
     }
 
     #[test]
@@ -1105,8 +1229,14 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("HTTP header.</Message>"), "{body}");
-        assert!(body.contains("<NumberBytesExpected>9</NumberBytesExpected>"), "{body}");
-        assert!(body.contains("<NumberBytesProvided>15</NumberBytesProvided>"), "{body}");
+        assert!(
+            body.contains("<NumberBytesExpected>9</NumberBytesExpected>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<NumberBytesProvided>15</NumberBytesProvided>"),
+            "{body}"
+        );
     }
 
     #[test]

@@ -17,10 +17,7 @@ use swift_http::{AsyncRequest, HeaderKeyDict, IncomingBody, Request, ServerConfi
 fn tmpdir() -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "acct-dispatch-{}-{id}",
-        std::process::id(),
-    ));
+    let dir = std::env::temp_dir().join(format!("acct-dispatch-{}-{id}", std::process::id(),));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
     dir
@@ -51,7 +48,8 @@ fn put_account(account: &str) -> AsyncRequest {
 fn probe_get(addr: std::net::SocketAddr) -> (u16, Duration) {
     let started = std::time::Instant::now();
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(400)).unwrap();
-    s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
     s.write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut buf = Vec::new();
@@ -95,9 +93,7 @@ async fn handle_async_account_put_waits_on_parked_shard() {
         .recv_timeout(Duration::from_secs(2))
         .expect("shard park entered");
 
-    let put = tokio::spawn({
-        async move { server.handle_async(put_account("AUTH_test")).await }
-    });
+    let put = tokio::spawn({ async move { server.handle_async(put_account("AUTH_test")).await } });
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
         !put.is_finished(),
@@ -119,7 +115,10 @@ async fn handle_async_account_put_waits_on_parked_shard() {
 async fn handle_async_account_get_post_delete_use_shard() {
     let dir = tmpdir();
     let server = AccountServer::new(cfg(dir.clone()));
-    assert_eq!(server.handle_async(put_account("AUTH_test")).await.status, 201);
+    assert_eq!(
+        server.handle_async(put_account("AUTH_test")).await.status,
+        201
+    );
 
     for method in ["GET", "HEAD", "POST", "DELETE"] {
         let mut headers = HeaderKeyDict::new();
@@ -202,7 +201,10 @@ async fn hyper_health_get_while_account_shard_parked() {
 async fn handle_async_replicate_uses_hash_db_not_account_name() {
     let dir = tmpdir();
     let server = AccountServer::new(cfg(dir.clone()));
-    assert_eq!(server.handle_async(put_account("AUTH_test")).await.status, 201);
+    assert_eq!(
+        server.handle_async(put_account("AUTH_test")).await.status,
+        201
+    );
     let probe = Request {
         method: "PUT".into(),
         path: "/sda1/0/AUTH_test".into(),

@@ -49,6 +49,11 @@
 //! `ip={range}\n{method}\n{expires}\n{path}` (Python `get_hmac`).
 //!
 //! Deferrals: `logger.increment('tempurl.digests.*')` metrics.
+//! Field leftovers after the Hyper `prepare` fix (not HMAC/auth):
+//! `GET_DLO_outside_container` (DLO manifest segments outside the signed
+//! container — a DLO+TempURL ACL, not this filter's HMAC) and remaining
+//! UTF-8 TempURL cases beyond decoded PATH_INFO (see
+//! `test_prepare_accepts_decoded_object_path`).
 //!
 //! Wiring: the proxy supplies a [`KeyProvider`] that HEADs account/container
 //! metadata for `Temp-URL-Key[-2]`. `/info` advertising is done by the proxy
@@ -61,7 +66,7 @@ use sha2::{Sha256, Sha512};
 
 use swift_http::{http_date, split_path, title_case, HeaderKeyDict, Request, Response};
 
-use crate::{Middleware, NextFn};
+use crate::{Middleware, MwPrep, NextFn};
 
 /// Header names that may never accompany an "unsafe" (write) tempurl
 /// request, mirroring `DISALLOWED_INCOMING_HEADERS`. Blocking these prevents
@@ -347,13 +352,24 @@ impl TempUrl {
             }
         }
     }
+
+    /// True when `prepare` accepted a TempURL (Python `REMOTE_USER =
+    /// .wsgi.tempurl`). Used by `finish` so Hyper outbound decoration
+    /// does not run on ordinary authenticated responses.
+    fn is_validated_tempurl(req: &Request) -> bool {
+        req.headers.get("X-Backend-Remote-User") == Some(".wsgi.tempurl")
+    }
 }
 
 impl Middleware for TempUrl {
-    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+    /// Production Hyper serve never calls `handle()`: HMAC, incoming
+    /// scrub, query rewrite, and `X-Backend-Authorize-Override` live
+    /// here so `ProxyAsyncService` copies them onto the async request
+    /// before `authorize_async`.
+    fn prepare(&self, req: &mut Request) -> MwPrep {
         // OPTIONS is never a tempurl request.
         if req.method == "OPTIONS" {
-            return next(req);
+            return MwPrep::Continue;
         }
 
         // --- parse the tempurl query parameters (get_temp_url_info) ---
@@ -375,26 +391,26 @@ impl Middleware for TempUrl {
 
         // No signature and no expires at all: not a tempurl request.
         if raw_sig.is_none() && expires.is_none() {
-            return next(req);
+            return MwPrep::Continue;
         }
         // A tempurl attempt with a missing/empty signature or a
         // missing/expired (falsy) timestamp is invalid.
         let raw_sig = match raw_sig {
             Some(s) if !s.is_empty() => s,
-            _ => return self.invalid(&req.method),
+            _ => return MwPrep::ShortCircuit(self.invalid(&req.method)),
         };
         let expires = match expires {
             Some(e) if e != 0 => e,
-            _ => return self.invalid(&req.method),
+            _ => return MwPrep::ShortCircuit(self.invalid(&req.method)),
         };
 
         // --- decode the signature encoding (extract_digest_and_algorithm) ---
         let (algo, sig_hex) = match extract_digest_and_algorithm(&raw_sig) {
             Ok(pair) => pair,
-            Err(()) => return self.invalid(&req.method),
+            Err(()) => return MwPrep::ShortCircuit(self.invalid(&req.method)),
         };
         if !self.allowed_digests.contains(&algo) {
-            return self.invalid(&req.method);
+            return MwPrep::ShortCircuit(self.invalid(&req.method));
         }
 
         // --- resolve the path (get_path_parts) ---
@@ -403,31 +419,31 @@ impl Middleware for TempUrl {
         let (account, container, obj) =
             match self.get_path_parts(&req.path, &req.method, allow_container_root) {
                 Some(parts) => parts,
-                None => return self.invalid(&req.method),
+                None => return MwPrep::ShortCircuit(self.invalid(&req.method)),
             };
 
         // --- ip range gate (Python: REMOTE_ADDR ∈ temp_url_ip_range) ---
         if let Some(ref range) = ip_range {
-            let client = client_remote_addr(&req);
+            let client = client_remote_addr(req);
             if !client
                 .as_deref()
                 .map(|c| ip_in_range(c, range))
                 .unwrap_or(false)
             {
-                return self.invalid(&req.method);
+                return MwPrep::ShortCircuit(self.invalid(&req.method));
             }
         }
 
         // --- fetch keys and build the signed message path ---
         let keys = self.key_provider.keys_for(&account, &container);
         if keys.is_empty() {
-            return self.invalid(&req.method);
+            return MwPrep::ShortCircuit(self.invalid(&req.method));
         }
         let path = match &prefix {
             None => format!("/v1/{account}/{container}/{obj}"),
             Some(pfx) => {
                 if !obj.starts_with(pfx.as_str()) {
-                    return self.invalid(&req.method);
+                    return MwPrep::ShortCircuit(self.invalid(&req.method));
                 }
                 format!("prefix:/v1/{account}/{container}/{pfx}")
             }
@@ -455,14 +471,14 @@ impl Middleware for TempUrl {
             }
         }
         if !is_valid {
-            return self.invalid(&req.method);
+            return MwPrep::ShortCircuit(self.invalid(&req.method));
         }
 
         // --- signature is valid: scrub headers and rewrite the query ---
-        if let Some(resp) = self.clean_disallowed_headers(&req) {
-            return resp;
+        if let Some(resp) = self.clean_disallowed_headers(req) {
+            return MwPrep::ShortCircuit(resp);
         }
-        self.clean_incoming_headers(&mut req);
+        self.clean_incoming_headers(req);
 
         let mut qs_pairs: Vec<(String, String)> = vec![
             ("temp_url_sig".to_string(), sig_hex.clone()),
@@ -486,53 +502,101 @@ impl Middleware for TempUrl {
         // Bypass TempAuth + proxy ACL checks (Python authorize_override).
         req.headers.set("X-Backend-Authorize-Override", "true");
         req.headers.set("X-Backend-Remote-User", ".wsgi.tempurl");
+        // Numeric expires for finish() Content-Disposition / Expires so
+        // Hyper outbound does not re-parse ISO8601 vs epoch.
+        req.headers
+            .set("X-Backend-Tempurl-Expires", expires.to_string());
+        // Empty object marks the staticweb container-root carve-out.
+        req.headers.set("X-Backend-Tempurl-Object", &obj);
 
-        // Keep the original path for the default Content-Disposition name.
-        let path_info = req.path.clone();
-        let method = req.method.clone();
+        MwPrep::Continue
+    }
 
-        let mut resp = next(req);
-
-        // --- scrub outgoing headers, then decorate a successful GET/HEAD ---
-        self.clean_outgoing_headers(&mut resp.headers);
-
-        if matches!(method.as_str(), "GET" | "HEAD") && (200..=299).contains(&resp.status) {
-            let mut inline_disposition = inline;
-            let content_generator = resp
-                .headers
-                .get("X-Backend-Content-Generator")
-                .map(|s| s.to_string());
-            let existing_disposition = resp
-                .headers
-                .get("Content-Disposition")
-                .map(|s| s.to_string());
-
-            if content_generator.as_deref() == Some("staticweb") {
-                inline_disposition = true;
-            } else if obj.is_empty() {
-                // The container-root carve-out only stands for a staticweb
-                // response; otherwise a rootless tempurl is invalid.
-                return self.invalid(&method);
+    fn handle(&self, mut req: Request, next: &NextFn) -> Response {
+        match self.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => resp,
+            MwPrep::Continue => {
+                let head = req.clone_head();
+                self.finish(&head, next(req))
             }
+        }
+    }
 
-            let disposition_value = if inline_disposition {
-                match filename_nonempty {
-                    Some(f) => disposition_format("inline", f),
-                    None => "inline".to_string(),
-                }
-            } else if let Some(f) = filename_nonempty {
-                disposition_format("attachment", f)
-            } else if let Some(existing) = existing_disposition {
-                existing
-            } else {
-                let name = basename(path_info.trim_end_matches('/'));
-                disposition_format("attachment", &name)
-            };
-            let value = disposition_value.replace('\n', "%0A");
-            resp.headers.set("Content-Disposition", value);
-            resp.headers.set("Expires", http_date(expires));
+    fn finish(&self, req: &Request, mut resp: Response) -> Response {
+        if !Self::is_validated_tempurl(req) {
+            return resp;
         }
 
+        self.clean_outgoing_headers(&mut resp.headers);
+
+        if !matches!(req.method.as_str(), "GET" | "HEAD") || !(200..=299).contains(&resp.status) {
+            return resp;
+        }
+
+        let params = req.params();
+        let filename = params
+            .iter()
+            .find(|(k, _)| k == "filename")
+            .map(|(_, v)| v.clone())
+            .filter(|f| !f.is_empty());
+        let inline = params.iter().any(|(k, _)| k == "inline");
+        let expires = req
+            .headers
+            .get("X-Backend-Tempurl-Expires")
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| {
+                normalize_temp_url_expires(
+                    params
+                        .iter()
+                        .find(|(k, _)| k == "temp_url_expires")
+                        .map(|(_, v)| v.as_str()),
+                    now_epoch(),
+                )
+                .filter(|&e| e != 0)
+            });
+        let obj = req
+            .headers
+            .get("X-Backend-Tempurl-Object")
+            .unwrap_or("")
+            .to_string();
+
+        let mut inline_disposition = inline;
+        let content_generator = resp
+            .headers
+            .get("X-Backend-Content-Generator")
+            .map(|s| s.to_string());
+        let existing_disposition = resp
+            .headers
+            .get("Content-Disposition")
+            .map(|s| s.to_string());
+
+        if content_generator.as_deref() == Some("staticweb") {
+            inline_disposition = true;
+        } else if obj.is_empty() {
+            // The container-root carve-out only stands for a staticweb
+            // response; otherwise a rootless tempurl is invalid.
+            return self.invalid(&req.method);
+        }
+
+        let filename_ref = filename.as_deref();
+        let disposition_value = if inline_disposition {
+            match filename_ref {
+                Some(f) => disposition_format("inline", f),
+                None => "inline".to_string(),
+            }
+        } else if let Some(f) = filename_ref {
+            disposition_format("attachment", f)
+        } else if let Some(existing) = existing_disposition {
+            existing
+        } else {
+            let name = basename(req.path.trim_end_matches('/'));
+            disposition_format("attachment", &name)
+        };
+        let value = disposition_value.replace('\n', "%0A");
+        resp.headers.set("Content-Disposition", value);
+        if let Some(expires) = expires {
+            resp.headers.set("Expires", http_date(expires));
+        }
         resp
     }
 }
@@ -1880,5 +1944,132 @@ mod tests {
             ),
         );
         assert_eq!(resp.status, 401);
+    }
+
+    // ---- Hyper prepare/finish split (production ProxyAsyncService) ----
+    //
+    // Isolated :18080 never calls Middleware::handle(). HMAC and
+    // X-Backend-Authorize-Override must happen in prepare(); Content-
+    // Disposition / outgoing scrub must happen in finish().
+
+    #[test]
+    fn test_prepare_stamps_override_on_valid_signature() {
+        let tu = tempurl(&[KEY]);
+        let mut req = mk(
+            "GET",
+            "/v1/AUTH_account/container/object",
+            &query(SIG_GET_SHA256),
+            &[("X-Timestamp", "12345")],
+        );
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!(
+                    "valid TempURL must Continue on prepare, got {}",
+                    resp.status
+                )
+            }
+        }
+        assert_eq!(
+            req.headers.get("X-Backend-Authorize-Override"),
+            Some("true")
+        );
+        assert_eq!(
+            req.headers.get("X-Backend-Remote-User"),
+            Some(".wsgi.tempurl")
+        );
+        assert!(
+            req.headers.get("X-Timestamp").is_none(),
+            "incoming scrub must run in prepare so Hyper copies the cleaned head"
+        );
+        assert_eq!(
+            req.query_string,
+            format!("temp_url_sig={SIG_GET_SHA256}&temp_url_expires={EXPIRES}")
+        );
+    }
+
+    #[test]
+    fn test_prepare_short_circuits_bad_hmac() {
+        let tu = tempurl(&[KEY]);
+        let mut req = mk(
+            "GET",
+            "/v1/AUTH_account/container/object",
+            &query("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            &[],
+        );
+        match tu.prepare(&mut req) {
+            MwPrep::ShortCircuit(resp) => {
+                assert_eq!(resp.status, 401);
+                assert!(req.headers.get("X-Backend-Authorize-Override").is_none());
+            }
+            MwPrep::Continue => panic!("bad HMAC must ShortCircuit 401, not Continue"),
+        }
+    }
+
+    #[test]
+    fn test_prepare_passthrough_without_tempurl_params() {
+        let tu = tempurl(&[KEY]);
+        let mut req = mk(
+            "GET",
+            "/v1/AUTH_account/container/object",
+            "format=json",
+            &[],
+        );
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("non-tempurl GET must Continue, got {}", resp.status)
+            }
+        }
+        assert!(req.headers.get("X-Backend-Authorize-Override").is_none());
+        assert_eq!(req.query_string, "format=json");
+    }
+
+    #[test]
+    fn test_finish_scrubs_and_sets_disposition_after_prepare() {
+        let tu = tempurl(&[KEY]);
+        let mut req = mk(
+            "GET",
+            "/v1/AUTH_account/container/object",
+            &query(SIG_GET_SHA256),
+            &[],
+        );
+        assert!(matches!(tu.prepare(&mut req), MwPrep::Continue));
+        let mut resp = Response::with_body(200, b"BODY".to_vec());
+        resp.headers.set("X-Object-Meta-Secret", "leak");
+        resp.headers.set("X-Object-Meta-Public-Ok", "kept");
+        let resp = tu.finish(&req, resp);
+        assert_eq!(
+            resp.headers.get("Content-Disposition"),
+            Some("attachment; filename=\"object\"; filename*=UTF-8''object")
+        );
+        assert_eq!(
+            resp.headers.get("Expires"),
+            Some(http_date(4102444800).as_str())
+        );
+        assert!(resp.headers.get("X-Object-Meta-Secret").is_none());
+        assert_eq!(resp.headers.get("X-Object-Meta-Public-Ok"), Some("kept"));
+    }
+
+    #[test]
+    fn test_prepare_accepts_decoded_object_path() {
+        // Hyper unquotes PATH_INFO before prepare; HMAC is over the decoded
+        // `/v1/{acct}/{cont}/{obj}` (Python: do not encode the path).
+        let tu = tempurl(&[KEY]);
+        let obj = "dir/a b.txt";
+        let path = format!("/v1/{ACCT}/{CONT}/{obj}");
+        let message = format!("GET\n{EXPIRES}\n{path}");
+        let sig = hmac_hex("sha256", KEY.as_bytes(), message.as_bytes()).unwrap();
+        let mut req = mk("GET", &path, &query(&sig), &[]);
+        match tu.prepare(&mut req) {
+            MwPrep::Continue => {}
+            MwPrep::ShortCircuit(resp) => {
+                panic!("decoded-path HMAC must Continue, got {}", resp.status)
+            }
+        }
+        assert_eq!(
+            req.headers.get("X-Backend-Remote-User"),
+            Some(".wsgi.tempurl")
+        );
     }
 }

@@ -1209,23 +1209,31 @@ impl ProxyApp {
             .headers
             .get("X-Backend-Storage-Policy-Index")
             .and_then(|v| v.parse().ok());
-        let policy_index: i64 = match header_policy {
-            Some(p) => p,
-            None => {
-                self.container_info_async(account, container)
-                    .await
-                    .policy_index
-            }
-        };
+        let container_policy = self
+            .container_info_async(account, container)
+            .await
+            .policy_index;
+        // Python honors an explicit index including 0 (obj.py GETorHEAD).
+        // Do not remap Policy-0 onto an EC container: that is the
+        // expirer split-brain isolation contract.
+        let policy_index: i64 =
+            super::resolve_object_storage_policy(header_policy, container_policy);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
-            return Response::with_body(
-                503,
-                format!("No object ring configured for storage policy {policy_index}").into_bytes(),
+            return super::with_g6_diag(
+                Response::with_body(
+                    503,
+                    format!("No object ring configured for storage policy {policy_index}")
+                        .into_bytes(),
+                ),
+                format!("reason=no_object_ring policy={policy_index} ec=0"),
             );
         };
         let Ok((object_part, _)) = object_ring.get_nodes(account, Some(container), Some(object))
         else {
-            return swob_response(503);
+            return super::with_g6_diag(
+                swob_response(503),
+                format!("reason=get_nodes_failed policy={policy_index} ec=0"),
+            );
         };
         let path = format!(
             "/{}/{}/{}",
@@ -1251,23 +1259,50 @@ impl ProxyApp {
             }
         }
         self.forward_open_expired(req, &mut headers);
-        if self.ec_policies.contains_key(&policy_index) {
+        let ec_params = self.ec_params_for_object_ring(policy_index, object_ring);
+        self.emit_proxy_log(
+            false,
+            &format!(
+                "proxy-server: EC GET {path} status=route reason=object_get_head_async \
+                 header={header_policy:?} container_policy={container_policy} \
+                 policy={policy_index} ec={} ndata={} replica={}",
+                ec_params.is_some() as u8,
+                ec_params.map(|e| e.ndata).unwrap_or(0),
+                object_ring.replica_count()
+            ),
+        );
+        if ec_params.is_some() {
             return self
                 .ec_get_async(req, &path, policy_index, object_ring, object_part)
                 .await;
         }
         let nodes = self.iter_nodes(object_ring, object_part);
-        self.get_or_head_async(
-            "object",
-            nodes,
-            object_part,
-            &req.method,
-            &path,
-            &req.query_string,
-            &headers,
-        )
-        .await
-        .unwrap_or_else(|| swob_response(503))
+        let mut resp = self
+            .get_or_head_async(
+                "object",
+                nodes,
+                object_part,
+                &req.method,
+                &path,
+                &req.query_string,
+                &headers,
+            )
+            .await
+            .unwrap_or_else(|| swob_response(503));
+        if resp.status == 404 {
+            self.emit_proxy_log(
+                true,
+                &format!(
+                    "proxy-server: EC GET {path} status=404 reason=replica_get_or_head \
+                     policy={policy_index}"
+                ),
+            );
+        }
+        resp.set_g6_diag(format!(
+            "reason=replica_get_or_head policy={policy_index} ec=0 ndata=0 idxs=[] status={}",
+            resp.status
+        ));
+        resp
     }
 
     pub(crate) async fn ec_get_async(
@@ -1278,15 +1313,21 @@ impl ProxyApp {
         object_ring: &swift_ring::Ring,
         object_part: u32,
     ) -> Response {
-        let Some(&ec) = self.ec_policies.get(&policy_index) else {
-            return swob_response(503);
+        let Some(ec) = self.ec_params_for_object_ring(policy_index, object_ring) else {
+            return super::with_g6_diag(
+                swob_response(503),
+                format!("reason=ec_params_missing policy={policy_index} ec=0"),
+            );
         };
         #[cfg(not(feature = "ec"))]
         {
             let _ = (req, path, object_ring, object_part, ec);
-            return Response::with_body(
-                501,
-                b"erasure coding not built (compile with --features ec)".to_vec(),
+            return super::with_g6_diag(
+                Response::with_body(
+                    501,
+                    b"erasure coding not built (compile with --features ec)".to_vec(),
+                ),
+                format!("reason=ec_not_built policy={policy_index} ec=0"),
             );
         }
         #[cfg(feature = "ec")]
@@ -1346,9 +1387,9 @@ impl ProxyApp {
     async fn ec_get_async_inner(
         self: &Arc<Self>,
         is_head: bool,
-        headers: HeaderKeyDict,
+        mut headers: HeaderKeyDict,
         path: &str,
-        _policy_index: i64,
+        policy_index: i64,
         object_ring: &swift_ring::Ring,
         object_part: u32,
         ec: super::EcPolicyParams,
@@ -1361,33 +1402,66 @@ impl ProxyApp {
             etag: String,
             meta: Vec<(String, String)>,
             sources: std::collections::HashMap<i32, AsyncBackendHead>,
+            durable: bool,
         }
 
         let nodes = self.iter_nodes(object_ring, object_part);
+        // Official test_rebuild_quarantines_lonely_frag: GET with <ndata
+        // durable frags is 503 (cannot decode); HEAD needs only one
+        // fragment's metadata and must be 2xx before quarantine once.
         let required = if is_head { 1 } else { ec.ndata };
+        // InternalClient / copy_backend_control_headers forwards every
+        // X-Backend-* header. A leaked Fragment-Preferences on the client
+        // GET would make rust DiskFile treat `[]` as newest-including-
+        // non-durable, or exclude the remaining durable indexes. Round 0
+        // must be prefs-less regardless of what the client sent.
+        headers.remove("X-Backend-Fragment-Preferences");
+        self.emit_proxy_log(
+            false,
+            &format!(
+                "proxy-server: EC GET {path} status=start reason=gather \
+                 policy={policy_index} ndata={} nodes={} prefs=omitted",
+                ec.ndata,
+                nodes.len()
+            ),
+        );
         let mut buckets: std::collections::HashMap<String, EcResponseBucket> =
             std::collections::HashMap::new();
-        let mut durable_timestamps: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
         let mut saw_404 = false;
-        // Python may issue up to twice the replica count. The second pass is
-        // essential when every primary has a newer non-durable generation:
-        // pass one discovers and excludes those fragment indexes, then pass
-        // two asks the same nodes for the older durable generation.
-        'request_rounds: for _round in 0..2 {
+        let mut latest_404_timestamp = Timestamp::zero();
+        let mut n200 = 0usize;
+        let mut seen_idxs: Vec<i32> = Vec::new();
+        let mut skipped_no_ts = 0usize;
+        let mut skipped_no_fi = 0usize;
+        let mut skipped_etag = 0usize;
+        // Two rounds, Python ECFragGetter-shaped. Round 0 must *omit*
+        // X-Backend-Fragment-Preferences: rust DiskFile treats `[]` as
+        // "newest, including non-durable". Official
+        // `test_rebuild_missing_frags` POSTs after PUT then deletes 1–2
+        // hash dirs. A first-node `[]` 200 that we fail to mark durable
+        // (or that is a different generation) then excludes that index on
+        // every later primary; with ndata=4 a single-frag hole still 404s
+        // even though five `#d.data` archives remain. Prefs-less GET is
+        // the durable-only contract, so remaining primaries return the
+        // same PUT generation. Round 1 still sends prefs so a newer
+        // no-commit generation can be skipped in favor of the older
+        // durable set.
+        'request_rounds: for round in 0..2 {
             for node in &nodes {
-                let preferences = encode_ec_fragment_preferences(
-                    buckets.iter().map(|(timestamp, bucket)| {
-                        (
-                            timestamp.as_str(),
-                            durable_timestamps.contains(timestamp),
-                            bucket.sources.keys().copied().collect(),
-                        )
-                    }),
-                    required,
-                );
                 let mut request_headers = headers.clone();
-                request_headers.set("X-Backend-Fragment-Preferences", preferences);
+                if send_ec_fragment_preferences(round) {
+                    let preferences = encode_ec_fragment_preferences(
+                        buckets.iter().map(|(timestamp, bucket)| {
+                            (
+                                timestamp.as_str(),
+                                bucket.durable,
+                                bucket.sources.keys().copied().collect(),
+                            )
+                        }),
+                        required,
+                    );
+                    request_headers.set("X-Backend-Fragment-Preferences", preferences);
+                }
                 match backend_request_head_async(
                     node,
                     object_part,
@@ -1402,83 +1476,222 @@ impl ProxyApp {
                 .await
                 {
                     Ok(head) if head.status == 200 => {
+                        n200 += 1;
                         let explicit_data_timestamp =
                             resp_header(&head.headers, "X-Backend-Data-Timestamp");
                         let data_timestamp = explicit_data_timestamp
                             .or_else(|| resp_header(&head.headers, "X-Backend-Timestamp"))
                             .or_else(|| resp_header(&head.headers, "X-Timestamp"))
                             .map(str::to_string);
-                        let Some(data_timestamp) = data_timestamp else {
+                        // Field 4f7a82c: five Ec-Frag 200s (idxs 0,2,3,4,5)
+                        // still 404'd. A prefs-less 200 is the durable
+                        // generation — do not drop it for a missing ts.
+                        let data_timestamp = match data_timestamp {
+                            Some(ts) => ts,
+                            None if round == 0 => "0".to_string(),
+                            None => {
+                                skipped_no_ts += 1;
+                                continue;
+                            }
+                        };
+                        let durable = if round == 0 {
+                            // Prefs-less object-server GET only opens the
+                            // durable set. Count it even when POST moved
+                            // X-Timestamp / durable_ts off the data file.
+                            true
+                        } else {
+                            ec_source_is_durable(
+                                &data_timestamp,
+                                resp_header(&head.headers, "X-Backend-Durable-Timestamp"),
+                                explicit_data_timestamp.is_some(),
+                            )
+                        };
+                        let fi = ec_frag_index(&head.headers).or(node.backend_index);
+                        let Some(fi) = fi else {
+                            skipped_no_fi += 1;
                             continue;
                         };
-                        if let Some(durable_timestamp) =
-                            resp_header(&head.headers, "X-Backend-Durable-Timestamp")
-                        {
-                            durable_timestamps.insert(durable_timestamp.to_string());
-                        } else if explicit_data_timestamp.is_none() {
-                            // Compatibility with older object servers: without
-                            // a distinct data timestamp Python assumes a
-                            // successful fragment response is durable.
-                            durable_timestamps.insert(data_timestamp.clone());
+                        seen_idxs.push(fi);
+                        let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
+                            .unwrap_or_default()
+                            .to_string();
+                        // Round 0 joins POST-after-PUT timestamp noise
+                        // (same Ec-Etag). Different etags stay in their
+                        // own generation — Python keys by data_ts and
+                        // best_bucket picks the newest durable complete.
+                        let data_key = if round == 0 {
+                            ec_round0_bucket_key(
+                                buckets
+                                    .iter()
+                                    .map(|(key, bucket)| (key.as_str(), bucket.etag.as_str())),
+                                &data_timestamp,
+                                &etag,
+                            )
+                        } else {
+                            version_timestamp_key(&data_timestamp)
+                        };
+                        let bucket = buckets.entry(data_key).or_insert_with(|| EcResponseBucket {
+                            etag: etag.clone(),
+                            meta: head.headers.clone(),
+                            sources: std::collections::HashMap::new(),
+                            durable,
+                        });
+                        bucket.durable |= durable;
+                        if bucket.etag.is_empty() && !etag.is_empty() {
+                            bucket.etag = etag.clone();
+                            bucket.meta = head.headers.clone();
                         }
-                        let fi = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Frag-Index")
-                            .and_then(|value| value.parse::<i32>().ok());
-                        if let Some(fi) = fi {
-                            let etag = resp_header(&head.headers, "X-Object-Sysmeta-Ec-Etag")
-                                .unwrap_or_default()
-                                .to_string();
-                            let bucket =
-                                buckets.entry(data_timestamp.clone()).or_insert_with(|| {
-                                    EcResponseBucket {
-                                        etag: etag.clone(),
-                                        meta: head.headers.clone(),
-                                        sources: std::collections::HashMap::new(),
-                                    }
-                                });
-                            // Fragments at one timestamp with different EC
-                            // etags can never be decoded together. Python
-                            // rejects the mismatching response too.
-                            if bucket.etag == etag {
-                                bucket.sources.entry(fi).or_insert(head);
+                        if ec_etag_compatible(&bucket.etag, &etag) {
+                            bucket.sources.entry(fi).or_insert(head);
+                        } else {
+                            skipped_etag += 1;
+                        }
+                    }
+                    Ok(head) if head.status == 404 => {
+                        saw_404 = true;
+                        let ts = super::backend_404_timestamp(&head.headers);
+                        if !node.handoff || ts.is_truthy() {
+                            if ts > latest_404_timestamp {
+                                latest_404_timestamp = ts;
                             }
                         }
                     }
-                    Ok(head) if head.status == 404 => saw_404 = true,
                     Ok(head) if head.status == 507 => self.error_limiter.limit(node),
                     Ok(head) if head.status >= 500 => self.error_limiter.increment(node),
                     Ok(_) => {}
                     Err(_) => self.error_limiter.increment(node),
                 }
-                if buckets.iter().any(|(timestamp, bucket)| {
-                    durable_timestamps.contains(timestamp) && bucket.sources.len() >= required
-                }) {
+                if buckets
+                    .values()
+                    .any(|bucket| bucket.durable && bucket.sources.len() >= required)
+                {
                     break 'request_rounds;
                 }
             }
         }
-        let chosen_timestamp = buckets
-            .iter()
-            .filter(|(timestamp, bucket)| {
-                durable_timestamps.contains(*timestamp) && bucket.sources.len() >= required
-            })
-            .map(|(timestamp, _)| timestamp)
-            .max()
-            .cloned();
-        let Some(chosen_timestamp) = chosen_timestamp else {
-            let has_reconstructable_nondurable_bucket = buckets
-                .values()
-                .any(|bucket| bucket.sources.len() >= required);
-            return swob_response(ec_no_durable_status(
-                has_reconstructable_nondurable_bucket,
-                saw_404,
-                buckets.is_empty(),
-            ));
+        let tombstone_trumps = |timestamp: &str| -> bool {
+            timestamp
+                .parse::<Timestamp>()
+                .ok()
+                .map(|ts| ts < latest_404_timestamp)
+                .unwrap_or(false)
         };
+        let summaries: Vec<EcGatherBucketView> = buckets
+            .iter()
+            .map(|(key, bucket)| EcGatherBucketView {
+                key,
+                durable: bucket.durable,
+                n_sources: bucket.sources.len(),
+            })
+            .collect();
+        let chosen_timestamp =
+            match decide_ec_gather(&summaries, required, latest_404_timestamp, saw_404) {
+                EcGatherDecision::Serve(key) => key,
+                EcGatherDecision::Miss(status) => {
+                    let bucket_summary = buckets
+                        .iter()
+                        .map(|(key, bucket)| {
+                            format!(
+                                "{}:{}:{}:{}",
+                                key,
+                                bucket.sources.len(),
+                                if bucket.durable { "d" } else { "n" },
+                                bucket.etag
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let miss_reason = if status == 404
+                        && latest_404_timestamp.is_truthy()
+                        && buckets.keys().all(|timestamp| tombstone_trumps(timestamp))
+                    {
+                        "tombstone_trumps"
+                    } else if status == 404 && buckets.values().any(|b| b.sources.len() >= required)
+                    {
+                        "nondurable_only"
+                    } else if buckets.is_empty() {
+                        "empty_buckets"
+                    } else {
+                        "no_complete_bucket"
+                    };
+                    log_ec_gather_miss(
+                        self,
+                        path,
+                        status,
+                        miss_reason,
+                        policy_index,
+                        ec.ndata,
+                        n200,
+                        &seen_idxs,
+                        skipped_no_ts,
+                        skipped_no_fi,
+                        skipped_etag,
+                        &bucket_summary,
+                        &latest_404_timestamp.internal(),
+                        saw_404,
+                    );
+                    return super::with_g6_diag(
+                        super::attach_backend_timestamp(
+                            swob_response(status),
+                            latest_404_timestamp,
+                        ),
+                        g6_ec_diag(
+                            miss_reason,
+                            status,
+                            policy_index,
+                            ec.ndata,
+                            &seen_idxs,
+                            n200,
+                        ),
+                    );
+                }
+            };
         let chosen = buckets
             .remove(&chosen_timestamp)
             .expect("chosen EC response bucket must exist");
+        self.emit_proxy_log(
+            false,
+            &format_ec_gather_miss(
+                path,
+                200,
+                "ok",
+                policy_index,
+                ec.ndata,
+                n200,
+                &seen_idxs,
+                skipped_no_ts,
+                skipped_no_fi,
+                skipped_etag,
+                &format!(
+                    "{}:{}:{}:{}",
+                    chosen_timestamp,
+                    chosen.sources.len(),
+                    if chosen.durable { "d" } else { "n" },
+                    chosen.etag
+                ),
+                &latest_404_timestamp.internal(),
+                saw_404,
+            ),
+        );
         let sources = chosen.sources;
         let meta = chosen.meta;
+        // Official test_sync_expired_object: client GET (no
+        // X-Backend-Replication) must 404 once X-Delete-At is past.
+        // Object-server DiskFileExpired is the primary path; IsolatedIdentity
+        // GET still 200s if fragment meta lacked X-Delete-At or a 200
+        // slipped through. Re-check reconstructed metadata here.
+        if client_get_should_404_expired(&headers, &meta) {
+            let expired_ts = super::source_timestamp(&meta);
+            let expired_ts = if expired_ts.is_truthy() {
+                expired_ts
+            } else {
+                latest_404_timestamp
+            };
+            return super::with_g6_diag(
+                super::swob_404_with_backend_timestamp(expired_ts),
+                g6_ec_diag("expired", 404, policy_index, ec.ndata, &seen_idxs, n200),
+            );
+        }
         let ec_etag = resp_header(&meta, "X-Object-Sysmeta-Ec-Etag")
             .unwrap_or_default()
             .to_string();
@@ -1489,6 +1702,14 @@ impl ProxyApp {
             .unwrap_or("application/octet-stream")
             .to_string();
         let mut resp = Response::new(200);
+        resp.set_g6_diag(g6_ec_diag(
+            "ok",
+            200,
+            policy_index,
+            ec.ndata,
+            &seen_idxs,
+            n200,
+        ));
         for (k, v) in &meta {
             if super::keep_ec_client_metadata(&k.to_lowercase()) {
                 resp.headers.set(k, v);
@@ -1751,6 +1972,9 @@ impl ProxyApp {
     ) -> Response {
         use md5::{Digest, Md5};
         use swift_ec::EcDriver;
+        if let Err(resp) = super::apply_check_delete_headers(req, Timestamp::now().as_secs_f64()) {
+            return resp;
+        }
         let Some(&ec) = self.ec_policies.get(&policy_index) else {
             return swob_response(503);
         };
@@ -1827,6 +2051,7 @@ impl ProxyApp {
                         port: h.dev.port,
                         device: h.dev.device.clone(),
                         handoff: true,
+                        backend_index: None,
                     })
                     .filter(|node| !self.error_limiter.is_limited(node))
                     .collect()
@@ -2000,7 +2225,8 @@ impl ProxyApp {
         if !info.exists() {
             return swob_response(404);
         }
-        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let policy_index: i64 =
+            super::resolve_object_storage_policy(header_policy, info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return swob_response(503);
         };
@@ -2301,6 +2527,7 @@ impl ProxyApp {
                     fan.headers.set("X-Container-Object-Count", count);
                     fan.headers.set("X-Container-Bytes-Used", bytes);
                 }
+                super::finalize_container_listing_headers(&req, &mut fan);
                 return fan;
             }
         }
@@ -2331,6 +2558,7 @@ impl ProxyApp {
             }
             stamp_container_last_modified(&mut resp);
         }
+        super::finalize_container_listing_headers(&req, &mut resp);
         resp
     }
 
@@ -3236,7 +3464,8 @@ impl ProxyApp {
         if !info.exists() {
             return swob_response(404);
         }
-        let policy_index: i64 = header_policy.unwrap_or(info.policy_index);
+        let policy_index: i64 =
+            super::resolve_object_storage_policy(header_policy, info.policy_index);
         let Some(object_ring) = self.object_ring_for(policy_index) else {
             return swob_response(503);
         };
@@ -3474,12 +3703,154 @@ fn ec_sources_sufficient(is_head: bool, available: usize, ndata: usize) -> bool 
     available >= if is_head { 1 } else { ndata }
 }
 
+/// Client EC GET/HEAD 404 when reconstructed metadata is past X-Delete-At.
+/// Replication / open-expired GETs must still see the fragments (official
+/// expire probe uses those after the client wait 404s).
+#[cfg(feature = "ec")]
+fn client_get_should_404_expired(headers: &HeaderKeyDict, meta: &[(String, String)]) -> bool {
+    if headers
+        .get("X-Backend-Replication")
+        .is_some_and(config_true_value)
+        || headers
+            .get("X-Backend-Open-Expired")
+            .is_some_and(config_true_value)
+        || headers.get("X-Open-Expired").is_some_and(config_true_value)
+    {
+        return false;
+    }
+    let Some(raw) = resp_header(meta, "X-Delete-At") else {
+        return false;
+    };
+    let Ok(delete_at) = raw.trim().parse::<i64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now >= delete_at
+}
+
+/// Bucket key so `1751500123.45678` and `000001751500123.45678` join.
+fn version_timestamp_key(ts: &str) -> String {
+    ts.parse::<Timestamp>()
+        .map(|t| t.internal())
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+/// Python `ECGetResponseCollection.best_bucket` view used by the gather
+/// chooser. Tests cover this without linking liberasurecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EcGatherBucketView<'a> {
+    key: &'a str,
+    durable: bool,
+    n_sources: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EcGatherDecision {
+    Serve(String),
+    Miss(u16),
+}
+
+fn bucket_key_timestamp(key: &str) -> Timestamp {
+    key.parse().unwrap_or_else(|_| Timestamp::zero())
+}
+
+fn tombstone_trumps_key(key: &str, latest_404: Timestamp) -> bool {
+    let ts = bucket_key_timestamp(key);
+    ts.is_truthy() && ts < latest_404
+}
+
+/// Serve only a complete durable generation (Python
+/// `best_bucket.shortfall <= 0 and best_bucket.durable`). A reconstructable
+/// but entirely non-durable set is 404 (`test_ec_missing_all_durable_fragments`).
+/// Newest durable complete wins (`test_ec_handoff_overwrite`).
+fn decide_ec_gather(
+    buckets: &[EcGatherBucketView<'_>],
+    required: usize,
+    latest_404: Timestamp,
+    saw_404: bool,
+) -> EcGatherDecision {
+    let mut best: Option<&EcGatherBucketView<'_>> = None;
+    for bucket in buckets {
+        if !bucket.durable || bucket.n_sources < required {
+            continue;
+        }
+        if tombstone_trumps_key(bucket.key, latest_404) {
+            continue;
+        }
+        match best {
+            None => best = Some(bucket),
+            Some(cur) => {
+                if bucket_key_timestamp(bucket.key) > bucket_key_timestamp(cur.key) {
+                    best = Some(bucket);
+                }
+            }
+        }
+    }
+    if let Some(bucket) = best {
+        return EcGatherDecision::Serve(bucket.key.to_string());
+    }
+    let has_nondurable_complete = buckets.iter().any(|bucket| {
+        bucket.n_sources >= required && !tombstone_trumps_key(bucket.key, latest_404)
+    });
+    let all_trumped = latest_404.is_truthy()
+        && !buckets.is_empty()
+        && buckets
+            .iter()
+            .all(|bucket| tombstone_trumps_key(bucket.key, latest_404));
+    if all_trumped {
+        return EcGatherDecision::Miss(404);
+    }
+    EcGatherDecision::Miss(ec_no_durable_status(
+        has_nondurable_complete,
+        saw_404,
+        buckets.is_empty(),
+    ))
+}
+
+#[cfg(feature = "ec")]
+fn same_data_timestamp(left: &str, right: &str) -> bool {
+    match (left.parse::<Timestamp>(), right.parse::<Timestamp>()) {
+        (Ok(a), Ok(b)) => a.internal() == b.internal(),
+        _ => left == right,
+    }
+}
+
+#[cfg(feature = "ec")]
+fn timestamp_ge(left: &str, right: &str) -> bool {
+    match (left.parse::<Timestamp>(), right.parse::<Timestamp>()) {
+        (Ok(a), Ok(b)) => a >= b,
+        _ => left >= right,
+    }
+}
+
+/// Official probe POSTs after PUT. The data file stays at PUT ts; the
+/// durable marker / X-Timestamp may be the later POST. A 200 is durable
+/// when durable_ts is absent on an old server, equals the data ts, or is
+/// a later generation of the same object.
+#[cfg(feature = "ec")]
+fn ec_source_is_durable(
+    data_timestamp: &str,
+    durable_timestamp: Option<&str>,
+    explicit_data_timestamp: bool,
+) -> bool {
+    match durable_timestamp {
+        Some(dts) => same_data_timestamp(dts, data_timestamp) || timestamp_ge(dts, data_timestamp),
+        None => !explicit_data_timestamp,
+    }
+}
+
+fn ec_etag_compatible(bucket_etag: &str, incoming: &str) -> bool {
+    bucket_etag.is_empty() || incoming.is_empty() || bucket_etag == incoming
+}
+
 /// Match Python's EC GET classification when no durable generation can be
 /// selected.  A reconstructable generation made entirely from non-durable
 /// fragments is a known-missing object (404), not a backend availability
 /// failure.  Incomplete fragment sets remain 503 even when another backend
 /// returned 404: they do not prove that reconstruction was possible.
-#[cfg(feature = "ec")]
 fn ec_no_durable_status(
     has_reconstructable_nondurable_bucket: bool,
     saw_404: bool,
@@ -3490,6 +3861,125 @@ fn ec_no_durable_status(
     } else {
         503
     }
+}
+
+/// Round 0 of proxy EC GET omits the header (durable-only DiskFile open).
+/// Later rounds send prefs, including `[]`, so a no-commit generation can
+/// be skipped in favor of the older durable set.
+#[cfg(feature = "ec")]
+fn send_ec_fragment_preferences(round: u32) -> bool {
+    round > 0
+}
+
+/// Prefs-less round 0 joins an existing bucket only when Ec-Etag matches
+/// (POST-after-PUT timestamp noise). A newer overwrite stays its own
+/// generation so `best_bucket` can prefer it.
+fn ec_round0_bucket_key<'a>(
+    existing: impl IntoIterator<Item = (&'a str, &'a str)>,
+    data_timestamp: &str,
+    etag: &str,
+) -> String {
+    if !etag.is_empty() {
+        for (key, bucket_etag) in existing {
+            if ec_etag_compatible(bucket_etag, etag) {
+                return key.to_string();
+            }
+        }
+    }
+    version_timestamp_key(data_timestamp)
+}
+
+/// Stamp piggybacked onto `G6_DIAG utf8-compat … service-complete`.
+#[cfg(feature = "ec")]
+fn g6_ec_diag(
+    reason: &str,
+    status: u16,
+    policy_index: i64,
+    ndata: usize,
+    idxs: &[i32],
+    n200: usize,
+) -> String {
+    format!(
+        "reason={reason} status={status} ndata={ndata} idxs={idxs:?} ec=1 policy={policy_index} 200s={n200}"
+    )
+}
+
+/// Field harvest greps proxy manager.log / syslog for `EC GET` / `reason=`.
+/// Must go through `Logger` (`proxy-server:` INFO/ERROR), not `eprintln!`.
+#[cfg(feature = "ec")]
+fn format_ec_gather_miss(
+    path: &str,
+    status: u16,
+    reason: &str,
+    policy_index: i64,
+    ndata: usize,
+    n200: usize,
+    idxs: &[i32],
+    skipped_no_ts: usize,
+    skipped_no_fi: usize,
+    skipped_etag: usize,
+    buckets: &str,
+    tombstone: &str,
+    saw_404: bool,
+) -> String {
+    format!(
+        "proxy-server: EC GET {path} status={status} reason={reason} \
+         policy={policy_index} ndata={ndata} 200s={n200} idxs={idxs:?} \
+         skipped_no_ts={skipped_no_ts} skipped_no_fi={skipped_no_fi} \
+         skipped_etag={skipped_etag} buckets={buckets} \
+         tombstone={tombstone} saw_404={saw_404}"
+    )
+}
+
+#[cfg(feature = "ec")]
+fn ec_frag_index(headers: &[(String, String)]) -> Option<i32> {
+    for key in [
+        "X-Object-Sysmeta-Ec-Frag-Index",
+        "X-Backend-Ec-Frag-Index",
+        "Ec-Frag-Index",
+    ] {
+        if let Some(fi) = resp_header(headers, key).and_then(|value| value.parse::<i32>().ok()) {
+            return Some(fi);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "ec")]
+fn log_ec_gather_miss(
+    app: &ProxyApp,
+    path: &str,
+    status: u16,
+    reason: &str,
+    policy_index: i64,
+    ndata: usize,
+    n200: usize,
+    idxs: &[i32],
+    skipped_no_ts: usize,
+    skipped_no_fi: usize,
+    skipped_etag: usize,
+    buckets: &str,
+    tombstone: &str,
+    saw_404: bool,
+) {
+    app.emit_proxy_log(
+        status >= 400,
+        &format_ec_gather_miss(
+            path,
+            status,
+            reason,
+            policy_index,
+            ndata,
+            n200,
+            idxs,
+            skipped_no_ts,
+            skipped_no_fi,
+            skipped_etag,
+            buckets,
+            tombstone,
+            saw_404,
+        ),
+    );
 }
 
 /// Encode Python `ECGetResponseCollection._get_frag_prefs`. Each later
@@ -3909,6 +4399,70 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn zero_durable_complete_generation_is_404() {
+        // Official test_ec_missing_all_durable_fragments: strip every #d
+        // durable, ndata non-durable 200s must not reconstruct.
+        let buckets = [EcGatherBucketView {
+            key: "000001788840000.00000",
+            durable: false,
+            n_sources: 4,
+        }];
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), true),
+            EcGatherDecision::Miss(404)
+        );
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), false),
+            EcGatherDecision::Miss(404)
+        );
+    }
+
+    #[test]
+    fn newer_durable_handoff_bucket_beats_stale_primary() {
+        // Official test_ec_handoff_overwrite: {new:4, old:1}. Python
+        // best_bucket is the newest durable complete generation.
+        let old = "000001788830000.00000";
+        let new = "000001788830100.00000";
+        let buckets = [
+            EcGatherBucketView {
+                key: old,
+                durable: true,
+                n_sources: 1,
+            },
+            EcGatherBucketView {
+                key: new,
+                durable: true,
+                n_sources: 4,
+            },
+        ];
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), false),
+            EcGatherDecision::Serve(new.to_string())
+        );
+        assert_eq!(
+            ec_round0_bucket_key([(old, "etag-old")], new, "etag-new"),
+            version_timestamp_key(new)
+        );
+        assert_eq!(
+            ec_round0_bucket_key([(old, "etag-old")], "000001788830001.00000", "etag-old"),
+            old
+        );
+    }
+
+    #[test]
+    fn lonely_durable_below_ndata_stays_503() {
+        let buckets = [EcGatherBucketView {
+            key: "000001788830000.00000",
+            durable: true,
+            n_sources: 1,
+        }];
+        assert_eq!(
+            decide_ec_gather(&buckets, 4, Timestamp::zero(), true),
+            EcGatherDecision::Miss(503)
+        );
+    }
+
     #[cfg(feature = "ec")]
     #[test]
     fn ec_head_needs_metadata_source_but_get_still_needs_ndata() {
@@ -3916,6 +4470,35 @@ mod tests {
         assert!(!ec_sources_sufficient(true, 0, 4));
         assert!(!ec_sources_sufficient(false, 1, 4));
         assert!(ec_sources_sufficient(false, 4, 4));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn client_get_404s_when_delete_at_is_past_unless_replication() {
+        let headers = HeaderKeyDict::new();
+        let past = vec![("X-Delete-At".into(), "1".into())];
+        assert!(
+            client_get_should_404_expired(&headers, &past),
+            "client GET must 404 once X-Delete-At is past"
+        );
+        let future = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 120)
+            .to_string();
+        let future_meta = vec![("X-Delete-At".into(), future)];
+        assert!(!client_get_should_404_expired(&headers, &future_meta));
+        assert!(!client_get_should_404_expired(
+            &headers,
+            &[("ETag".into(), "abc".into())]
+        ));
+        let mut replication = HeaderKeyDict::new();
+        replication.set("X-Backend-Replication", "true");
+        assert!(
+            !client_get_should_404_expired(&replication, &past),
+            "replication GET must still open expired fragments"
+        );
     }
 
     #[cfg(feature = "ec")]
@@ -3939,7 +4522,7 @@ mod tests {
         assert_eq!(
             ec_no_durable_status(false, true, false),
             503,
-            "an incomplete fragment bucket is still unavailable"
+            "incomplete durable set (lonely frag) + sibling 404s is 503, not 404"
         );
         assert_eq!(
             ec_no_durable_status(false, false, true),
@@ -3955,11 +4538,120 @@ mod tests {
 
     #[cfg(feature = "ec")]
     #[test]
+    fn lonely_frag_head_is_ok_when_get_cannot_decode() {
+        // Official: GET 503 below ndata; HEAD 2xx from one durable frag.
+        assert!(ec_sources_sufficient(true, 1, 4));
+        assert!(!ec_sources_sufficient(false, 1, 4));
+        assert!(ec_sources_sufficient(false, 4, 4));
+        assert!(!ec_sources_sufficient(true, 0, 4));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn lonely_frag_below_ndata_is_503_not_404() {
+        // Official test_rebuild_quarantines_lonely_frag early client GET:
+        // 1 durable + 5 reclaimed 404s (no X-Backend-Timestamp). Python
+        // returns 503 so the probe can assert before quarantine once.
+        // Empty collection + 404 remains 404 (object gone).
+        assert_eq!(ec_no_durable_status(false, true, false), 503);
+        assert_eq!(ec_no_durable_status(false, true, true), 404);
+        assert_eq!(ec_no_durable_status(false, false, false), 503);
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
+    fn post_after_put_durable_header_still_counts_the_data_generation() {
+        // Field 9a95747: remaining+healed GET 200s with data_ts=PUT and
+        // durable_ts=POST must form one durable bucket. The old gather
+        // required durable_timestamps.contains(data_ts) and 404'd.
+        assert!(ec_source_is_durable(
+            "000001700000900.00000",
+            Some("000001700000901.00000"),
+            true
+        ));
+        assert!(ec_source_is_durable(
+            "1700000900.00000",
+            Some("000001700000900.00000"),
+            true
+        ));
+        assert!(!ec_source_is_durable(
+            "000001700000901.00000",
+            Some("000001700000900.00000"),
+            true
+        ));
+        assert!(!ec_source_is_durable("000001700000900.00000", None, true));
+        assert!(ec_source_is_durable("000001700000900.00000", None, false));
+        assert_eq!(
+            version_timestamp_key("1700000900.00000"),
+            version_timestamp_key("000001700000900.00000")
+        );
+        assert!(ec_etag_compatible("", "deadbeef"));
+        assert!(ec_etag_compatible("deadbeef", ""));
+        assert!(ec_etag_compatible("deadbeef", "deadbeef"));
+        assert!(!ec_etag_compatible("deadbeef", "cafebabe"));
+        // Field 4f7a82c: idxs=[0,2,3,4,5] 200s with POST X-Timestamp and
+        // PUT data_ts must stay one generation on prefs-less gather.
+        let put = version_timestamp_key("1788720311.82508");
+        assert_eq!(
+            ec_round0_bucket_key(std::iter::empty(), "1788720311.82508", "abc"),
+            put
+        );
+        assert_eq!(
+            ec_round0_bucket_key([(put.as_str(), "abc")], "000001788720312.00000", "abc"),
+            put,
+            "later POST timestamp must not open a second round-0 bucket"
+        );
+        assert_ne!(
+            ec_round0_bucket_key(
+                [(put.as_str(), "old-etag")],
+                "000001788720399.00000",
+                "new-etag"
+            ),
+            put,
+            "a newer overwrite etag must not join the stale primary bucket"
+        );
+        let line = format_ec_gather_miss(
+            "/a/c/o",
+            404,
+            "no_complete_bucket",
+            2,
+            4,
+            5,
+            &[0, 2, 3, 4, 5],
+            0,
+            0,
+            0,
+            "1788720311:5:d:abc",
+            "0",
+            true,
+        );
+        assert!(
+            line.contains("proxy-server: EC GET /a/c/o status=404 reason=no_complete_bucket"),
+            "{line}"
+        );
+        assert!(
+            line.contains("policy=2 ndata=4 200s=5 idxs=[0, 2, 3, 4, 5]"),
+            "{line}"
+        );
+        assert!(ec_frag_index(&[("X-Object-Sysmeta-Ec-Frag-Index".into(), "3".into())]) == Some(3));
+        assert!(ec_frag_index(&[("Ec-Frag-Index".into(), "5".into())]) == Some(5));
+    }
+
+    #[cfg(feature = "ec")]
+    #[test]
     fn ec_fragment_preferences_expose_non_durable_then_prioritize_durable_bucket() {
+        assert!(
+            !send_ec_fragment_preferences(0),
+            "round 0 must omit prefs so rust DiskFile opens the durable set"
+        );
+        assert!(
+            send_ec_fragment_preferences(1),
+            "round 1 may send [] to expose a non-durable generation"
+        );
         assert_eq!(
             encode_ec_fragment_preferences(std::iter::empty(), 4),
             "[]",
-            "the first EC request must make non-durable fragments eligible"
+            "an empty collection still serializes as [] for a later pass"
         );
         let encoded = encode_ec_fragment_preferences(
             [
@@ -4018,6 +4710,7 @@ mod tests {
             port: port as u32,
             device: "sda".into(),
             handoff: false,
+            backend_index: None,
         }
     }
 
@@ -4893,6 +5586,144 @@ mod tests {
         let listing: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(listing, serde_json::json!([]));
         h.abort();
+    }
+
+    async fn spawn_record_header_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut head = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while find_header_end(&head).is_none() {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buffer[..count]);
+                    assert!(head.len() <= 64 * 1024);
+                }
+                let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+                let is_head = head.starts_with("head ");
+                let record_type = if head
+                    .lines()
+                    .any(|line| line == "x-backend-record-type: shard")
+                {
+                    "shard"
+                } else {
+                    "object"
+                };
+                let body = if is_head { "" } else { "[]" };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Backend-Sharding-State: unsharded\r\nX-Container-Object-Count: 0\r\nX-Backend-Record-Type: {record_type}\r\nX-Backend-Record-Shard-Format: namespace\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn container_get_async_record_headers_match_python_direct_backend_contract() {
+        let (port, handle) = spawn_record_header_backend().await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        for record_type in [
+            None,
+            Some("auto"),
+            Some("banana"),
+            Some("object"),
+            Some("OBJECT"),
+            Some("shard"),
+            Some("SHARD"),
+        ] {
+            let mut headers = HeaderKeyDict::new();
+            if let Some(kind) = record_type {
+                headers.set("X-Backend-Record-Type", kind);
+            }
+            let req = swift_http::Request {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: "format=json".into(),
+                headers,
+                body: Body::empty(),
+            };
+            let resp = app.container_get_head_async(req, "AUTH_test", "c").await;
+            assert_eq!(resp.status, 200, "record_type={record_type:?}");
+            let explicit = record_type.is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("object") || kind.eq_ignore_ascii_case("shard")
+            });
+            let expected = record_type
+                .filter(|_| explicit)
+                .map(str::to_ascii_lowercase);
+            assert_eq!(
+                resp.headers.get("X-Backend-Record-Type"),
+                expected.as_deref(),
+                "record_type={record_type:?}"
+            );
+            assert_eq!(
+                resp.headers.get("X-Backend-Record-Shard-Format"),
+                explicit.then_some("namespace"),
+                "record_type={record_type:?}"
+            );
+            assert_eq!(
+                resp.headers.get("X-Backend-Sharding-State"),
+                Some("unsharded")
+            );
+            assert_eq!(resp.body.collect_async().await.unwrap().as_slice(), b"[]");
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn container_get_async_record_headers_are_removed_after_shard_fanout() {
+        let (port, handle) = spawn_sharded_listing_backend().await;
+        let app = StdArc::new(ProxyApp::new(
+            ring_on_port(port),
+            ring_on_port(port),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(200),
+                node_timeout: Duration::from_millis(400),
+                ..ProxyConfig::default()
+            },
+        ));
+        for record_type in [None, Some("auto"), Some("banana")] {
+            let mut headers = HeaderKeyDict::new();
+            if let Some(kind) = record_type {
+                headers.set("X-Backend-Record-Type", kind);
+            }
+            let req = swift_http::Request {
+                method: "GET".into(),
+                path: "/v1/AUTH_test/c".into(),
+                query_string: "format=json".into(),
+                headers,
+                body: Body::empty(),
+            };
+            let resp = app.container_get_head_async(req, "AUTH_test", "c").await;
+            assert_eq!(resp.status, 200, "record_type={record_type:?}");
+            assert!(!resp.headers.contains_key("X-Backend-Record-Type"));
+            assert!(!resp.headers.contains_key("X-Backend-Record-Shard-Format"));
+            let body = resp.body.collect_async().await.unwrap();
+            let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                listing,
+                serde_json::json!([{"name": "obj-a"}, {"name": "obj-b"}])
+            );
+        }
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

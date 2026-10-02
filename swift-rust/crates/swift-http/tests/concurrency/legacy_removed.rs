@@ -85,11 +85,8 @@ fn occupancy_harness_stays_spawn_server_two() {
 
 #[test]
 fn shipped_object_put_get_uses_async_serve_not_legacy_adapter() {
-    let dir = std::env::temp_dir().join(format!(
-        "legacy-removed-{}-{}",
-        std::process::id(),
-        line!()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("legacy-removed-{}-{}", std::process::id(), line!()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sda1")).unwrap();
     let server = ObjectServer::new(ObjectServerConfig {
