@@ -9,9 +9,10 @@
   "n": 20,
   "pass": 1,
   "fail": 18,
-  "blocked": 0,
-  "not_run": 1,
-  "note": "Assembled from the runner case json files on swift4:/root/work/g7-optimize-ae-20261003/out. The runner's own last verdict.json covers only the final six cases and is RED (pass 0, fail 5, not_run 1). This file does not upgrade any case.",
+  "blocked": 1,
+  "not_run": 0,
+  "missing": 0,
+  "note": "Assembled from the runner case json files on swift4:/root/work/g7-optimize-ae-20261003/out. The runner's own last verdict.json covers only the final six cases and is RED (pass 0, fail 5, not_run 1). That not_run record is eio: the runner left it NOT RUN because no EIO mapper exists. Phase D requires PASS, FAIL, or ENVIRONMENT BLOCKED, so this file records eio as ENVIRONMENT BLOCKED. The other 19 results are unchanged. No case was upgraded to PASS. Gate verdict stays RED.",
   "results": [
     {"name": "idle_keepalive_10k", "verdict": "FAIL", "opened": 10000, "target": 10000, "reason": "health_samples must be > 0"},
     {"name": "idle_keepalive_50k", "verdict": "FAIL", "opened": 50000, "target": 50000, "reason": "health_samples must be > 0"},
@@ -30,7 +31,7 @@
     {"name": "sigterm_during_durability", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "barrier_observed was not proved"},
     {"name": "fd_exhaustion", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "fd exhaustion was not armed and observed"},
     {"name": "enospc", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "enospc was not injected on an object write"},
-    {"name": "eio", "verdict": "NOT RUN", "opened": 1, "target": 1, "reason": "no EIO mapper"},
+    {"name": "eio", "verdict": "ENVIRONMENT BLOCKED", "opened": 1, "target": 1, "reason": "no EIO mapper exists"},
     {"name": "partial_write", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "missing proof field: tmp_count"},
     {"name": "backend_connect_timeout", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "network fault was not proved on the exercised path"}
   ]

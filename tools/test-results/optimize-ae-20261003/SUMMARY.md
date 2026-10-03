@@ -1,4 +1,4 @@
-A, B, C, and E met their acceptance lines. D is NOT ACCEPTED. G7 verdict is RED: 1 PASS, 18 FAIL, 1 NOT RUN (`eio`, reason `no EIO mapper`), from `tools/test-results/optimize-ae-20261003/verdict.json` (2026-10-03). Console gate stays ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02). `POST /api/apply` was not sent.
+A, B, C, and E met their acceptance lines. D is NOT ACCEPTED. G7 verdict is RED: 1 PASS, 18 FAIL, 1 ENVIRONMENT BLOCKED, 0 missing (`eio`, reason `no EIO mapper exists`), from `tools/test-results/optimize-ae-20261003/verdict.json` (2026-10-03). Console gate stays ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02). `POST /api/apply` was not sent.
 
 `16MB_read_8` stays ACCEPT_WITH_WARN (`tools/test-results/contabo-deploy-20260801/deep-verify-20260802/PERF-REMEASURE.md`, 2026-08-02).
 
