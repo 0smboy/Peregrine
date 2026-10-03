@@ -10,7 +10,10 @@ The historical binary genealogy below records the 2026-08-18 Guard roll; it is
 not the current G6 artifact and it does not mean production is ready. The
 current Rust Swift status is [dated [2026-09-15](/status-2026-09-15); prior [2026-08-31](/status-2026-08-31): source
 `17adf0b` is strict G6 GREEN through formal W068 replication, W069 EC, and W070
-merged-179 scoring. G7 is not accepted and production readiness remains NO-GO.
+merged-179 scoring. The G7 lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. Production readiness remains NO-GO because
+the production proxy was not replaced.
 </Aside>
 
 The fleet does not run "latest main"; it runs **named binary generations**
@@ -42,8 +45,9 @@ The new Drive folder contains the two Linux release archives, per-file
 checksums, and the complete W068/W069/W070 evidence directories. The auxiliary
 archive SHA-256 is
 `6b5212b262057b7d361cb04f822a3878a53273f57674aecc4079439e1637ce5a`.
-Publishing this tag makes a reproducible lab candidate available; it does not
-close G3, G4, G5, G7, or G8 and does not authorize a fleet rollout.
+Publishing this tag made a reproducible lab candidate available. That tag
+did not close G3, G4, G5, G7, or G8 and does not authorize a fleet rollout.
+The later G7 lab result is the 2026-10-03 swift1 `:18080` run cited above.
 
 ## Historical proxy generations
 

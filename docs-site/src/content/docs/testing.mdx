@@ -9,7 +9,10 @@ sidebar:
 The historical examples on this page do not constitute acceptance of the
 current release line. Formal W068 replication plus W069 EC merge exactly once
 in fail-closed scorer W070: **G6 GREEN, 179/179, zero unexpected result**.
-G7 is **NOT ACCEPTED** and production readiness remains NO-GO. The accepted
+The G7 lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. Production readiness remains NO-GO because
+the production proxy was not replaced. The accepted
 Rust Swift source is `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`; see [Current
 status](/status-2026-08-31) for the dated record and evidence paths.
 </Aside>
@@ -26,7 +29,9 @@ G6 storage/probe semantics → G7 concurrency and fault behavior → G8 performa
 and soak. The accepted G6 record has two explicit formal lanes: **147
 replication identities in W068** and **32 EC identities in W069**. W070 merges
 them against the frozen oracle exactly once; the replication lane is never
-promoted by itself. This closes G6 and opens G7, but does not close G7.
+promoted by itself. This closes G6 and opens G7. The later lab run closed the
+G7 lab gate on swift1 `:18080` only. It does not close G7 for the production
+cluster.
 
 ## 0. CI — every push, the full suite
 

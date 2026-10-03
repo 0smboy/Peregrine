@@ -11,7 +11,10 @@ operates the cluster, and a **test plane** that proves it under load and fault.
 
 The current gate state is kept separately in the [2026-08-31 status
 snapshot](/status-2026-08-31). Architecture descriptions are not evidence that
-the current release line has passed G3, G7, or production acceptance. G6 is
+the current release line has passed G3 or production acceptance. The G7
+lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. G6 is
 tracked separately and is GREEN on the dated W070 record.
 
 ## The design constraint: format fidelity
@@ -111,7 +114,10 @@ inside the async executor.
 
 G3 is therefore route-specific: counters and runtime observation must show the
 declared async path was exercised. Reload/signal preservation and the G7 load
-harness are implementation and test infrastructure; they do not become a G7
-pass until the ordered concurrency/fault evidence is captured. W070 closes G6,
+harness are implementation and test infrastructure; the harness alone is not
+the pass. The ordered lab evidence is the 2026-10-03 swift1 `:18080` run.
+W070 closes G6,
 but implementation in a clean candidate is not production acceptance: G3
-remains route-specific and G7 is not accepted.
+remains route-specific. The G7 lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7.

@@ -20,7 +20,10 @@ features, configuration, tests, and rollback copy are all known.
 - the change window explicitly authorizes production mutation.
 
 The `17adf0b` line closes G6 but does not meet production prerequisites: G3,
-current-candidate G4/G5 acceptance, G7, and G8 remain open or blocked.
+current-candidate G4/G5 acceptance, and G8 remain open or blocked. The G7
+lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7.
 
 ## Node-by-node sequence
 

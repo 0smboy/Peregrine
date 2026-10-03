@@ -8,8 +8,10 @@ audience: human
 
 <Aside type="caution" title="Matrix scope">
 Rows below describe implemented or historically evidenced surfaces; they are
-not a production certificate for the `17adf0b` release line. G6 is GREEN, G7
-is not accepted, and production readiness is NO-GO. Partial, unit-only, and lab-only
+not a production certificate for the `17adf0b` release line. G6 is GREEN.
+The G7 lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7, and production readiness is NO-GO. Partial, unit-only, and lab-only
 entries remain weaker than complete gate acceptance.
 </Aside>
 
@@ -46,7 +48,7 @@ live on [Releases](/releases).
 | Arbitrary third-party Paste plugin loading | **Not implemented**; unknown filters fail closed |
 | process_workers prefork | **Implemented** |
 | eventlet/greenlet serving semantics | **Not implemented by design**; candidate uses native Hyper/Tokio async serving instead |
-| native async HTTP/1.1 serving | **Implemented in candidate; acceptance open** (G3/G7 proof required) |
+| native async HTTP/1.1 serving | **Implemented in candidate.** G3 acceptance is still open. Lab G7 is 20/20 PASS on swift1 `:18080` (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03), not a production pass. |
 | Multi-primary auto-shrink | **Not implemented**; disabled by default |
 | Multi-cluster sync / operator PEM / KMIP | **Not implemented** |
 
@@ -110,7 +112,7 @@ live on [Releases](/releases).
 | Multi-cluster container-sync realm soak | yes | **no** |
 | process_workers prefork | yes | yes |
 | eventlet/greenlet serving semantics | yes | **no** (native async model instead; not an Eventlet clone) |
-| native async HTTP/1.1 serve | no | candidate yes; G3/G7 acceptance open |
+| native async HTTP/1.1 serve | no | candidate yes; G3 still open; lab G7 20/20 on swift1 `:18080` only |
 | Operator VIP TLS PEM go-live | yes | **no** (script GREEN; Contabo self-signed LAB) |
 | Full ansible Python role twin | yes | partial (v3 subset) |
 

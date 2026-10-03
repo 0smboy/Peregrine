@@ -12,8 +12,11 @@ gate that can be closed; mark a gate blocked with an exact cause when it cannot.
 <Aside type="danger" title="Current boundary">
 G6 is GREEN on source `17adf0b`: W068 covers all 147 replication identities,
 W069 covers all 32 EC identities, and W070 merges the frozen 179 exactly once
-with zero unexpected result and every invariant true. G7 is NOT ACCEPTED, G8
-is BLOCKED, and production readiness is NO-GO.
+with zero unexpected result and every invariant true. The G7 lab gate is
+20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. G8 stays blocked for production, and
+production readiness is NO-GO because the production proxy was not replaced.
 </Aside>
 
 ## Gate contract
@@ -76,7 +79,9 @@ Final accepted records on Swift1:
 The source, artifact, wrappers, overseer, runners, frozen input, and actual
 process executables are pinned. Before/after hashes are stable, violations are
 empty, isolated listeners/processes are gone, and production `:8080` remains
-`ab5cb95c…`. The next valid action is G7, not another reduced G6 rerun.
+`ab5cb95c…`. The later G7 lab gate on swift1 `:18080` is the 2026-10-03
+20/20 PASS in `tools/test-results/optimize-ae-20261003/verdict.json`. That is
+not a production-cluster pass and not another reduced G6 rerun.
 
 ## Claim vocabulary
 

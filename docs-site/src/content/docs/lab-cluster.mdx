@@ -10,10 +10,13 @@ This four-node Contabo topology is the **lab**, not a production rollout. As
 of 2026-08-31 the G6-accepted Rust Swift source is
 `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. Formal W068 replication and W069
 EC lanes merge exactly once in W070: 179/179 identities, zero unexpected result,
-and no leaked isolated listener or process. G6 is GREEN; G7 is not accepted.
-It is not declared deployed from this page. Do not restart or replace production
-`:8080`, the VIP, HAProxy, Keepalived, rings, Swift data, or active binaries
-while G7 evidence is being prepared or collected.
+and no leaked isolated listener or process. G6 is GREEN. The G7 lab gate is
+20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. Production readiness remains NO-GO because
+the production proxy was not replaced. It is not declared deployed from this
+page. Do not replace production `:8080`, rings, Swift data, or active binaries
+from this page.
 </Aside>
 
 The development lab is a four-node Contabo HA cluster used to prove the Rust
@@ -37,14 +40,17 @@ ansible parity. SAIO on swift1 is **NOISY** for performance; VIP path is
 | Storage | `10.0.4.1–4` | account / container / object data path |
 | Replication | `10.0.8.1–4` | replicator / reconstructor |
 
-Nodes: `swift1`–`swift4`. Keepalived VIP `10.0.0.10/22` is on **swift1**.
-swift2, swift3, and swift4 did not hold that address in the 2026-10-02 check.
-Evidence: `tools/test-results/console-accept-20261002/00-identity.md`
+Nodes: `swift1`–`swift4`. Keepalived VIP `10.0.0.10/22` is on **swift1**
+only. During the 2026-10-03 G7 lab run it moved to swift2 after
+`chk_http_port` timed out, then was restored to swift1. Evidence:
+`tools/test-results/optimize-ae-20261003/0F-vip.md` (2026-10-03). The prior
+check is `tools/test-results/console-accept-20261002/00-identity.md`
 (2026-10-02). Prefer the **real VIP** `https://10.0.0.10:8085` for clients
 and gates. Per-node `http://10.0.0.N:8085` remains valid (local HAProxy).
 Account / container / object daemons are peer-equivalent and do not follow
-the VIP. The console process listens on swift4 at `127.0.0.1:9000` (same
-evidence file, check I-console-proc).
+the VIP. The console process listens on swift4 at `127.0.0.1:9000`
+(`tools/test-results/console-accept-20261002/00-identity.md`, check
+I-console-proc, 2026-10-02).
 
 Devices: `/srv/node/{d1,d2,d3}` XFS per node (12 total). **Never format** them
 from deploy tooling.

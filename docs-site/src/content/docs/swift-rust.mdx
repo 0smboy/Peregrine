@@ -8,8 +8,10 @@ sidebar:
 <Aside type="caution" title="G6 is accepted; production is not">
 The G6-accepted Rust Swift source is
 `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. W068 replication plus W069 EC
-merge exactly once in W070 for a strict 179/179 GREEN result. G7 is not
-accepted and the complete production gate chain remains open.
+merge exactly once in W070 for a strict 179/179 GREEN result. The G7 lab
+gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7, and the production gate chain remains open.
 These implementation notes do not imply a production-ready Swift
 replacement.
 </Aside>

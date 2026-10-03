@@ -15,8 +15,10 @@ The strict frozen-179 G6 gate is **GREEN** on Rust Swift source
 `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`: formal replication W068 covers
 147 identities, formal EC W069 covers 32, and fail-closed scorer W070 reports
 zero missing, extra, duplicate, overlap, failure, error, unexpected result, or
-unexpected skip. G7 is **NOT ACCEPTED**, G8 is blocked, and no production
-promotion follows from this result.
+unexpected skip. The G7 lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. G8 stays blocked for production, and no
+production promotion follows, because the production proxy was not replaced.
 </Aside>
 
 ## What changed in the last two weeks
@@ -34,7 +36,8 @@ aggregate test count.
 | 2026-08-29–30 | [`0d5c816`](https://github.com/0smboy/Peregrine/commit/0d5c816)..[`b6e36bf`](https://github.com/0smboy/Peregrine/commit/b6e36bf) | G6 sharding, replication, object, versioning, reload, and HTTP-boundary fixes were integrated; G7 evidence was made fail-closed. |
 | 2026-08-31 | [`64446f1`](https://github.com/0smboy/Peregrine/commit/64446f1d5870ea88835506a2581039fe407c9604) | G6 EC POST/nondurable and runner lifecycle were repaired. W019/W020/W021 were an intermediate checkpoint, later superseded by the accepted W068/W069/W070 sequence. |
 | 2026-08-31 | [`17adf0b`](https://github.com/0smboy/Peregrine/commit/17adf0bfa78b30b2a7eed9f39836e0d63c715d2c) | Eight follow-up fixes close isolated sharder routing and timestamp behavior, cancellation and release service entries, reload/fixture isolation, listener rebind, and the raced keep-alive request during graceful shutdown. Two 100-attempt reload canaries pass before the formal frozen-179 rerun. |
-| 2026-09-01 | [`g6-green-20260831`](https://github.com/0smboy/Peregrine/releases/tag/g6-green-20260831) | The accepted Rust Swift source, full documentation audit, rebuilt auxiliary Linux tools, and checksummed evidence are published as a lab pre-release. G7 remains not accepted and production remains NO-GO. |
+| 2026-09-01 | [`g6-green-20260831`](https://github.com/0smboy/Peregrine/releases/tag/g6-green-20260831) | The accepted Rust Swift source, full documentation audit, rebuilt auxiliary Linux tools, and checksummed evidence are published as a lab pre-release. At this date G7 was not accepted and production remained NO-GO. |
+| 2026-10-03 | lab evidence `tools/test-results/optimize-ae-20261003/verdict.json` | G7 lab gate on swift1 `:18080` is 20/20 PASS. The production proxy was not replaced. The production cluster did not pass G7. Production readiness remains NO-GO. |
 
 The G6-accepted Rust Swift source line is identified by the full commit
 `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. The frozen comparison oracle is
@@ -62,8 +65,8 @@ a canary, or a reduced unexpected count.
 | G6-R | Frozen replication identities and accounting are exact on the accepted candidate. | **GREEN: W068**, 147 identities, 143 pass plus 4 Python-matching expected skips, no failure or error. |
 | G6-EC | Frozen EC identities and accounting are exact on the candidate. | **GREEN: W069**, 32/32 pass, no failure, error, or skip. |
 | G6 | Same-candidate replication plus EC identities, with no unexpected result. | **GREEN: W070**, exact 179/179 partition and outcome match; all strict invariants true and violations empty. |
-| G7 | Concurrency, reload, fault, and bounded-runtime evidence on the accepted G6 candidate. | **NOT ACCEPTED**; harness and scenario audit precedes any formal run. |
-| G8 | Performance and soak on the accepted G0–G7 candidate. | **BLOCKED** until every prerequisite gate, including G7, is accepted. |
+| G7 | Concurrency, reload, fault, and bounded-runtime evidence on the accepted G6 candidate. | **Lab PASS** on swift1 `:18080`: 20/20 (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The production cluster did not pass G7. |
+| G8 | Performance and soak on the accepted G0–G7 candidate. | **BLOCKED** for production. The lab G7 pass is not a production candidate. |
 
 ## Evidence hierarchy
 
@@ -134,9 +137,10 @@ oracle comparison, and rollback readiness.
 - G3 still requires route-specific proof for every migrated async path.
 - G4 and G5 require accepted current-candidate official-suite records rather
   than historical compatibility summaries.
-- G7 must run its concurrency, reload, cancellation, durability, resource-
-  bound, and fault matrix without reducing scenarios or weakening thresholds.
-- G8 remains blocked until the ordered prerequisites are accepted.
+- The G7 lab gate ran its concurrency and fault matrix on swift1 `:18080`
+  and is 20/20 PASS (`tools/test-results/optimize-ae-20261003/verdict.json`,
+  2026-10-03). The production cluster did not pass G7.
+- G8 remains blocked for production until a production candidate is accepted.
 - G6 GREEN is storage-semantics evidence; it is not permission to advertise a
   drop-in Swift replacement or production readiness.
 

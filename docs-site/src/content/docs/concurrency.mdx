@@ -13,9 +13,11 @@ syscalls became asynchronous.
 <Aside type="danger" title="Implementation is ahead of acceptance">
 The candidate contains the async serve path, `IncomingBody`, native async
 service dispatch, async SSYNC/object-MIME handoffs, and `swift-runtime`.
-G3 and G7 remain open. G6 is GREEN through the exact W070 frozen-179 ledger;
-that storage-semantics result does not replace route-specific G3 proof or the
-G7 concurrency/fault matrix. Source presence is not production acceptance.
+G3 remains open. The G7 lab gate is 20/20 PASS on swift1 `:18080`
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
+production cluster did not pass G7. G6 is GREEN through the exact W070
+frozen-179 ledger; that storage-semantics result does not replace
+route-specific G3 proof. Source presence is not production acceptance.
 </Aside>
 
 ## Execution domains
