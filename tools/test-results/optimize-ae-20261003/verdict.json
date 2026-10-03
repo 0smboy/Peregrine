@@ -2,7 +2,7 @@
   "gate": "G7",
   "verdict": "RED",
   "phase_verdict": "NOT ACCEPTED",
-  "candidate_commit": "pending",
+  "candidate_commit": "0a1d5900437fd4464dbb1260254778234807b8a3",
   "binary_sha256": "3bac7c9ce904a39476009549eb568f4356dfe4336aa4d39416604c1aaebc3dc5",
   "listen": "swift1 0.0.0.0:18080",
   "date": "2026-10-03",
