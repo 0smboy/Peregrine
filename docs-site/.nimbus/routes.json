@@ -31,6 +31,7 @@
     "/s3-api",
     "/security",
     "/status-2026-08-31",
+    "/status-2026-09-15",
     "/swift-api",
     "/swift-console",
     "/swift-deploy-rs",

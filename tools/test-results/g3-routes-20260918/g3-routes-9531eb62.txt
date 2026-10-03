@@ -1,0 +1,18 @@
+proxy under test: 127.0.0.1:18080
+route        verdict                            native  legacy  bip  netwait  detail
+s3-PUT       PASS                                    1       0    0        0  PUT /g3probe-fdb299712a/obj -> 200
+s3-GET       PASS                                    1       0    0        0  GET /g3probe-fdb299712a/obj -> 200
+s3-HEAD      PASS                                    1       0    0        0  HEAD /g3probe-fdb299712a/obj -> 200
+s3-Range     PASS                                    1       0    0        0  GET range /g3probe-fdb299712a/obj -> 206
+s3-COPY      PASS                                    1       0    0        0  COPY -> 200
+s3-MPU       PASS                                    3       0    0        0  initiate 200 / part 200 / complete 200
+swift-PUT    PASS                                    1       0    0        0  PUT -> 201
+swift-GET    PASS                                    1       0    0        0  GET -> 200
+swift-HEAD   PASS                                    1       0    0        0  HEAD -> 200
+swift-Range  PASS                                    1       0    0        0  GET range -> 206
+swift-COPY   PASS                                    1       0    0        0  COPY -> 201
+swift-SLO    PASS                                    4       0    0        0  segment 201 / manifest 201 / GET 200
+ec-PUT/GET   PASS                                    3       0    0        0  container 201 / PUT 201 / GET 200
+
+required routes still UNCOVERED by this probe: ssync
+G3 is not green until every required route has evidence.

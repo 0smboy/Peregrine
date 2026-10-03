@@ -24,9 +24,133 @@ fleet rollout authorization. Production `:8080` remains on `ab5cb95c…`.
 
 **PASS=484 · FAIL=47 · ERROR=112 · SKIP=83 · F+E=159 · conn=0**
 
-Evidence: `swift2:/root/work/peregrine-g0g7-logs/G5B-live-9531eb62/`.
+Evidence: `swift2:/root/work/peregrine-g0g7-logs/G5B-live-9531eb62/` and
+`g6-g5b-live-9531eb62-RESULT.txt` in the Drive packet (harvest ended
+2026-09-15T00:58:55Z, wall ~42 min, nosetests `EXIT=1`).
 
-Owner override still requires a full green ~725 before accepting G0–G6.
+**Owner override withdrawn 2026-09-18.** It required a full green ~725 before
+accepting G0–G6; G5 is now scored against the frozen known-failure policy that
+the [gate contract](/validation-gates#g5-known-failure-policy-owner-decision-2026-09-18)
+always specified. Under that policy this same census scores **484 passed, 156
+expected failures, 3 unexpected, 0 unexpected skips, 0 stale entries → FAIL**.
+G5-B is still not green; the difference is that the gap is three named
+identities instead of an opaque 159. Evidence:
+`tools/test-results/g5-score-20260918/`.
+
+### F+E theme bins (159, `conn_closed=0`)
+
+| Theme | Count | Tip-ask state |
+|---|---|---|
+| sts | 34 | NO (wall) |
+| select | 29 | NO (wall) |
+| encrypt | 23 | NO (wall) |
+| header harness | 14 | NO (wall) |
+| other | 13 | mixed |
+| object_lock | 13 | Bypass/Restrict NO; tagging-after-lock is H90 soft leftover |
+| lifecycle | 9 | timing/count NO (wall) |
+| policy | 8 | IfExists/tenant/IAM NO (wall) |
+| append / version / atomic | 3 / 3 / 3 | `version` includes the `test_versioned_concurrent_object_create_and_remove` flake |
+| logging / usage | 2 / 2 | — |
+| acl / multipart / tag | 1 / 1 / 1 | — |
+
+Source: theme-bins line of the same RESULT file. The lab agent parked the tip
+line as `tipable-exhausted` on 2026-09-15 pending an owner decision, on the
+reading that the walls made the residual unreachable.
+
+<Aside type="note" title="Re-attributed on 2026-09-18 — the theme bins are misleading">
+A dual-oracle re-measurement changed what these 159 mean. The Ceph suite
+asserts RGW behavior, so a raw Rust failure count cannot say whether a failure
+is a Rust regression. Scoring the same 725 identities against Python Swift and
+diffing by exact name gives **156 both-fail, 3 rust-only, 231 python-only**:
+the Rust-attributable G5-B gap is **3 identities**, and Python Swift itself
+fails 388 of the same 725. The `sts` bin (34, the largest) contains no engine
+evidence at all — the suite config has no `[iam]`/`[webidentity]` section, so
+those abort before a request is signed. The `select` bin (29) never reaches
+S3 Select either: every test hardcodes `bucket_name = "test"` and aborts in
+setup because same-owner re-create answers 409 on both Swift implementations.
+
+Each of the 3 rust-only identities was then characterized and acted on the same
+day:
+
+1. **Configuration, not a defect.** On a body shorter than its declared
+   `Content-Length` both implementations answer `400 RequestTimeout`, Python at
+   60.1s (its default) and Rust at 600.4s (the lab's `client_timeout = 600`),
+   which is longer than the harness waits. The owner approved aligning the lab
+   to 60; after the reload the identity **passes**.
+2. **Transient.** The `NameError` only fires when a just-created bucket is
+   missing from ListBuckets; 10 rounds × 5 buckets showed 0 missing and it
+   **passes** in the re-run. The underlying cause is the degraded replication
+   below, so it can recur.
+3. **Object-lock governance bypass — a deliberate divergence, not an
+   oversight.** The wall was lifted and the code dug: the engine requires the
+   bypass header *and* an explicit IAM Allow, pinned by two unit tests, making
+   it stricter than AWS, RGW, and Python Swift. Awaiting an owner choice between
+   recording the divergence and changing the authorization rule.
+   Analysis: `tools/test-results/g5-score-20260918/WALL-LIFT-OBJECT-LOCK-BYPASS.md`.
+
+The owner accepted the object-lock divergence on 2026-09-19 (class
+`stricter-than-aws`), which changes no engine behavior and leaves the parity fix
+open as engine work.
+
+**Full 725 re-run, 2026-09-19**, same tip, `client_timeout = 60`
+(`tools/test-results/g5-score-20260919/`): 485 passed, 156 expected, 1 accepted
+divergence, 0 unexpected skips, 0 stale entries, and **1 unexpected** —
+`test_buckets_create_then_list`, the ListBuckets transient. It fails under
+full-suite load and passes in isolation, exactly as the degraded replication
+below predicts, so **the last open G5-B identity is an environment defect rather
+than a product one**. No engine change can close it; a G1 repair can.
+
+Evidence: `tools/test-results/g5b-oracle-diff-20260918/` and
+`tools/test-results/g5b-classify-20260918/` (2026-09-18).
+This re-attribution does **not** make G5 green — see the caveats in that
+README, including that the oracle is not the G0-pinned Python commit, that
+configuration parity between the two deployments is unproven, and that the
+lab's container replication was degraded during the census.
+</Aside>
+
+## Board for the G0–G7 target (as of this snapshot)
+
+| Gate | State | Basis |
+|---|---|---|
+| G0 | GREEN for the G6 claim on `17adf0b` only. The `9531eb62` tip line is **permanently G0-incapable**: its lab source tree is gone (the path named in the handoff no longer exists, and the surviving tree matches only 76 of 270 files against the published commit), so the identity chain can only be re-closed by a bit-reproducible rebuild. Build the next candidate from a real commit before scoring. | [Status 2026-08-31](/status-2026-08-31), `tools/test-results/g5b-oracle-diff-20260918/SWIFT-RUST-PR1-REVIEW.md` |
+| G1 | GREEN for the isolated G6 run | [Status 2026-08-31](/status-2026-08-31) |
+| G2 | GREEN for the G6 artifact | [Status 2026-08-31](/status-2026-08-31) |
+| G3 | Open, but now has first per-route evidence: 12 route groups (S3 PUT/GET/HEAD/Range/COPY/MPU, Swift PUT/GET/HEAD/Range/COPY/SLO, EC PUT+GET) show `native_async > 0` with `legacy_sync`, `block_in_place`, and `blocking_network_wait` all 0. `ssync` remains uncovered and the tip has no G0 identity, so this is evidence, not acceptance. | `tools/test-results/g3-routes-20260918/` (2026-09-18) |
+| G4 | Historical evidence only; no current-candidate acceptance | [Status 2026-08-31](/status-2026-08-31) |
+| G5 | **NOT GREEN** — full 725 on 2026-09-19 scores 1 unexpected, and that one is the G1 environment transient rather than an engine gap. Still required before any acceptance: fix the lab replication, re-freeze the policy against the G0-pinned Python oracle, prove G2 configuration parity, and run G5-A (`test/s3api`), which has never run on this tip | `tools/test-results/g5-score-20260919/`, `tools/g5-known-failures/`, `tools/test-results/g5b-oracle-diff-20260918/` |
+| G6 | GREEN on `17adf0b` (W068 + W069 + W070, 179/179) | [Status 2026-08-31](/status-2026-08-31) |
+| G7 | NOT ACCEPTED | [Status 2026-08-31](/status-2026-08-31) |
+
+G0–G7 are therefore **not** all green, and G5-B is not the only open gate.
+
+## Lab state recorded 2026-09-18
+
+Read-only reconnaissance plus one bounded disk reclaim; prod `:8080`, the live
+tip binary, `/srv/node/d{1,2,3}`, the overseer, and remint were not touched.
+Full detail in `tools/test-results/g5b-classify-20260918/LAB-FINDINGS.md`.
+
+- **Prod `:8080` runs the Rust proxy**, not Python: pid 3114191 =
+  `/usr/local/bin/swift-proxy-server`, an ELF whose sha256 is the published
+  `ab5cb95c…`, under a unit described `Swift proxy server (rust)`. The sha
+  matches every prior claim, so nothing drifted; the 2026-09-15 Drive handoff
+  simply mislabelled it. Python Swift is the separate pyswift `:8090`.
+- **The lab's container/account replication is broken (G1), and it is now the
+  single blocker on G5-B.** Every replicator push to `10.0.4.2:6201/6202` is
+  refused because the lab rings carry the production storage topology while the
+  lab servers bind `127.0.0.1:16211/16212`. The `async_pending` backlog is
+  growing: ≈15 900 on 2026-09-18, ≈20 994 on 2026-09-19 after one more full
+  suite run. The directive requires G1 before G4/G5 scoring, so the census should
+  not be read as a pure product measurement. Remediation options and their
+  effect on the G6 GREEN claim are in
+  `tools/test-results/g5b-classify-20260918/LAB-FINDINGS.md` §2 — all three
+  touch the topology G6 was measured on, so none should be applied without
+  deciding what happens to that claim.
+- **Disk:** swift1 `/` was at 1.7 GiB free (below the 3 GiB floor) with
+  `/var/log/messages` growing ~300 MiB/day from that replication loop, and no
+  `compress` in logrotate. After adding compression and rotating, **3.2 GiB
+  free**; the 1.19 GB log compressed 36:1.
+- swift1's Python oracle on `:8090` is running from a **deleted** virtualenv, so
+  it must not be restarted. The 2026-09-18 baseline therefore used swift2.
 
 ## Product tips closed on this tip line (field-proven)
 

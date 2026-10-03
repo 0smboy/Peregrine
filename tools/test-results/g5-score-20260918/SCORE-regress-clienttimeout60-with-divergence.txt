@@ -1,0 +1,15 @@
+run      : tools/test-results/g5-score-20260918/regress-clienttimeout60-20260918.xml
+policy   : tools/g5-known-failures/g5b-ceph-s3compat-20260918.tsv
+identities scored : 106
+
+passed                : 55
+expected failure      : 13
+      13  swift-family-gap
+accepted divergence   : 1
+    s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass
+        [stricter-than-aws] tools/test-results/g5-score-20260918/WALL-LIFT-OBJECT-LOCK-BYPASS.md
+unexpected failure    : 0
+unexpected skip       : 0
+stale policy entries  : 0
+
+G5 verdict under this policy: PASS

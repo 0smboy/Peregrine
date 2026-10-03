@@ -1,0 +1,3 @@
+s3tests.functional.test_headers:test_object_create_bad_contentlength_mismatch_above
+s3tests_boto3.functional.test_s3:test_buckets_create_then_list
+s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass

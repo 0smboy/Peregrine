@@ -8,3 +8,4 @@ Cargo.lock.orig
 node_modules/
 .sync-marker
 **/__pycache__/
+.cargo-home/

@@ -1,7 +1,11 @@
 # Peregrine — session handoff
 
-> **2026-08-16 现行交接：** [`docs/fairness-lab/HANDOFF-20260816.md`](docs/fairness-lab/HANDOFF-20260816.md)
-> Live proxy Size `69d22629…` · dual-oracle **49/8 FAIL** · not GREEN.
+> **2026-09-19 现行交接（G0–G7）：** [`.agent-handoff/PEREGRINE-G0-G7-HANDOFF-20260919.md`](.agent-handoff/PEREGRINE-G0-G7-HANDOFF-20260919.md)
+> G5-B 只剩 **1 个 unexpected 且属于环境缺陷**（G1 复制损坏）；**G4 / G7 从未跑过**；
+> `9531eb62` tip 线永久无法满足 G0。prod `:8080` 是 **Rust** `ab5cb95c…`，未动。
+>
+> 更早：[`docs/fairness-lab/HANDOFF-20260816.md`](docs/fairness-lab/HANDOFF-20260816.md)
+> （live proxy Size `69d22629…` · dual-oracle 49/8 FAIL）。
 > 下文 2026-07-31 条目是更早的 console/cutover 史实。
 
 

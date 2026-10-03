@@ -1,0 +1,18 @@
+run      : /tmp/g5b-evi/rust-census.xml
+policy   : tools/g5-known-failures/g5b-ceph-s3compat-20260918.tsv
+identities scored : 725
+
+passed                : 484
+expected failure      : 156
+      78  swift-family-gap
+      40  harness-blocked
+      38  not-applicable-rgw
+unexpected failure    : 3
+    s3tests.functional.test_headers:test_object_create_bad_contentlength_mismatch_above
+    s3tests_boto3.functional.test_s3:test_buckets_create_then_list
+    s3tests_boto3.functional.test_s3:test_object_lock_changing_mode_from_governance_with_bypass
+unexpected skip       : 0
+stale policy entries  : 0
+
+G5 verdict under this policy: FAIL
+unexpected must be 0 and the policy must carry no stale entries.
