@@ -2,10 +2,10 @@
 
 | Channel | Location |
 |---------|----------|
-| Content commit | `06a78a6` on `main` (2026-10-03 green rerun, lab proxy sha `dc22cca7`). Prior product commit `0a1d590` was the RED follow-up. |
+| Content commit | `ac8a523` on `main` records the docs update and `0F-vip.md`. Product commit `06a78a6` is the green rerun (lab proxy sha `dc22cca7`). Prior product commit `0a1d590` was the RED follow-up. |
 | Evidence | `tools/test-results/optimize-ae-20261003/` |
-| Vercel | `dpl_8VjUT8H5dyS4hUT3n3roAD9qCeYt` aliased to https://docs.myswift.rs |
-| Verdict | `SUMMARY.md` and `verdict.json` (2026-10-03). Full yaml is GREEN: 20 PASS, 0 FAIL, 0 NOT RUN. Source `swift4:/root/work/g7-optimize-ae-20261003/out-rerun3/verdict.json`. Lab sha `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`. Console gate stays ACCEPT_WITH_WARN. Apply was not sent. Docs-site was not edited. |
+| Vercel | `dpl_DgWw1K3xfpaihYqyo6sLBT33G6dz` aliased to https://docs.myswift.rs (2026-10-03 docs update). Prior alias was `dpl_8VjUT8H5dyS4hUT3n3roAD9qCeYt`. |
+| Verdict | `SUMMARY.md` and `verdict.json` (2026-10-03). Full yaml is GREEN: 20 PASS, 0 FAIL, 0 NOT RUN on swift1 `:18080`. Source `swift4:/root/work/g7-optimize-ae-20261003/out-rerun3/verdict.json`. Lab sha `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`. Production proxy was not replaced (sha `5cac5960`, pid 3495932). Console gate stays ACCEPT_WITH_WARN. Apply was not sent. Live https://docs.myswift.rs/swift-console/index.md says the G7 lab gate is 20/20 PASS and production readiness remains NO-GO. VIP `10.0.0.10/22` is on swift1 only (`0F-vip.md`). |
 | Docs deploy | see Vercel row |
 | Live pages | https://docs.myswift.rs/swift-console/index.md , https://docs.myswift.rs/lab-cluster/index.md , https://docs.myswift.rs/performance/index.md |
 | Drive | `gdrive:Peregrine/2026-10-03-optimize-ae/` |
