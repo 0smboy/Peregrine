@@ -16,8 +16,10 @@
 //! Production HTTP/1.1 connection runtime: Tokio + Hyper (AGENTS.md §6).
 //!
 //! HTTP/2 is not enabled. Idle keep-alive is a Hyper connection Future.
-//! `header_read_timeout` is the slowloris bound. Title-case response
-//! headers match Swift/S3 wire casing.
+//! The first request head is bounded by `head_deadline_secs` before Hyper
+//! sees the socket. Hyper's own header timer is not installed: it runs
+//! while a response body is still being written and closes slow readers.
+//! Title-case response headers match Swift/S3 wire casing.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -133,29 +135,130 @@ pub async fn serve_http1_connection(
         let _slot = slot;
         return serve_health_keepalive(stream, more, service, config, shutdown, admission).await;
     }
-    if let Some(worker) = config.worker_pool.clone() {
+    if let Some(handoff) = config.body_handoff.clone() {
         let scheduled = std::time::Instant::now();
         let metrics = config.metrics.clone();
-        worker.spawn(async move {
-            if let Some(ref metrics) = metrics {
-                metrics.observe_scheduler_lag(scheduled.elapsed());
-            }
-            let _slot = slot;
-            let run = continue_after_head(
-                stream, more, service, config, shutdown, admission, peer_ip,
-            );
-            let result = match metrics {
-                Some(metrics) => metrics.bind(run).await,
-                None => run.await,
-            };
-            if let Err(error) = result {
-                eprintln!("G6_DIAG swift-http stage=connection-error error={error}");
-            }
-        });
+        // The head was read on the accept runtime. Tokio will not drive this
+        // socket on the body workers until it is detached and registered there.
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(true)?;
+        let job = BodyJob {
+            scheduled,
+            stream: std_stream,
+            more,
+            service,
+            config: Box::new(config),
+            shutdown,
+            admission,
+            peer_ip,
+            slot,
+            metrics,
+        };
+        // Unbounded send returns as soon as the job is queued. It does not
+        // wait for a body worker to poll the request.
+        if handoff.tx.send(job).is_err() {
+            return Err(std::io::Error::other("body workers are gone"));
+        }
         return Ok(());
     }
     let _slot = slot;
     continue_after_head(stream, more, service, config, shutdown, admission, peer_ip).await
+}
+
+pub(crate) struct BodyJob {
+    scheduled: std::time::Instant,
+    stream: std::net::TcpStream,
+    more: Vec<u8>,
+    service: Arc<dyn AsyncService>,
+    config: Box<crate::server::ServerConfig>,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+    peer_ip: Option<String>,
+    slot: crate::server::ConnectionSlot,
+    metrics: Option<ConcurrencyMetrics>,
+}
+
+pub(crate) fn spawn_body_dispatcher(handle: &tokio::runtime::Handle) -> crate::server::BodyHandoff {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    handle.spawn(async move {
+        loop {
+            let Some(first) = rx.recv().await else {
+                return;
+            };
+            note_handoff_lag(&first);
+            let mut batch = vec![first];
+            // Drain the accept burst before any request connects or copies
+            // a body. Lag is the time until this dequeue, not the later work.
+            loop {
+                while let Ok(job) = rx.try_recv() {
+                    note_handoff_lag(&job);
+                    batch.push(job);
+                }
+                tokio::task::yield_now().await;
+                match rx.try_recv() {
+                    Ok(job) => {
+                        note_handoff_lag(&job);
+                        batch.push(job);
+                    }
+                    Err(_) => break,
+                }
+            }
+            // try_recv above consumed nothing on the empty check, but a job
+            // may have arrived in between. One more drain.
+            while let Ok(job) = rx.try_recv() {
+                note_handoff_lag(&job);
+                batch.push(job);
+            }
+            for job in batch {
+                launch_body_job(job);
+            }
+        }
+    });
+    crate::server::BodyHandoff { tx }
+}
+
+fn note_handoff_lag(job: &BodyJob) {
+    if let Some(ref metrics) = job.metrics {
+        metrics.observe_scheduler_lag(job.scheduled.elapsed());
+    }
+}
+
+fn launch_body_job(job: BodyJob) {
+    tokio::spawn(async move {
+        // Let the dispatcher drain the rest of the accept queue before this
+        // request connects to backends or copies a body.
+        tokio::task::yield_now().await;
+        let BodyJob {
+            stream,
+            more,
+            service,
+            config,
+            shutdown,
+            admission,
+            peer_ip,
+            slot,
+            metrics,
+            ..
+        } = job;
+        let _slot = slot;
+        let stream = match tokio::net::TcpStream::from_std(stream) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("G6_DIAG swift-http stage=handoff-register error={error}");
+                return;
+            }
+        };
+        let run = continue_after_head(
+            stream, more, service, *config, shutdown, admission, peer_ip,
+        );
+        let result = match metrics {
+            Some(metrics) => metrics.bind(run).await,
+            None => run.await,
+        };
+        if let Err(error) = result {
+            eprintln!("G6_DIAG swift-http stage=connection-error error={error}");
+        }
+    });
 }
 
 async fn continue_after_head(
@@ -257,15 +360,15 @@ async fn serve_hyper_prefixed(
         .title_case_headers(true)
         .auto_date_header(false)
         .max_headers(config.max_header_count.max(1));
-    // Hyper's header_read_timeout also covers the idle keep-alive wait for
-    // the *next* request. A timer per idle conn (50k Sleeps) made health
-    // HEAD p50 ~140ms. Idle wait is a pending read (L1). First-line peek
-    // waits for the first byte without a timer (new-conn idle occupancy);
-    // HeaderDeadline still bounds a dripping request line after that byte.
-    // Idle keep-alives for /healthcheck do not use this timer. It only reaps
-    // Hyper connections that missed EOF, so a 30s bound cannot pile 100k sleeps
-    // onto the health-check path.
-    builder.header_read_timeout(Some(Duration::from_secs(30)));
+    // Hyper's builder default is a 30s header timer. After a GET with no
+    // body it reads the next request while this response is still being
+    // written, so the timer closed slow GET bodies (lab: headers 200/200,
+    // 6 readers then saw the socket close). Disable it. The first head is
+    // already bounded by head_deadline_secs. A configured
+    // `header_read_timeout` is not forwarded: passing it to Hyper fails
+    // the slow-reader test.
+    let _header_timer_not_applied_during_body = config.header_read_timeout;
+    builder.header_read_timeout(None);
     let max_buf = config
         .max_header_bytes
         .saturating_add(config.max_request_line_bytes)

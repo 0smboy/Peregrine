@@ -1,4 +1,4 @@
-A, B, C, and E met their acceptance lines. D is NOT ACCEPTED. The 2026-10-03 follow-up in `tools/test-results/optimize-ae-20261003/verdict.json` is RED: 1 PASS, 3 FAIL, 16 NOT RUN, 0 ENVIRONMENT BLOCKED. The three FAIL cases are `slow_put_1000` (scheduler lag p99 310.72917 ms, http_2xx 62), `slow_get_receiver` (completed 194 of 200, http_2xx 200), and `bounded_queue_overload` (scheduler lag p99 571.349475 ms, health p99 129.6479245647788 ms). `idle_keepalive_10k` passed. The other 16 cases were not re-run on this binary. Console gate stays ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02). `POST /api/apply` was not sent.
+A, B, C, D, and E met their acceptance lines. D is ACCEPTED. The 2026-10-03 full yaml run in `tools/test-results/optimize-ae-20261003/verdict.json` (source `swift4:/root/work/g7-optimize-ae-20261003/out-rerun3/verdict.json`) is GREEN: 20 PASS, 0 FAIL, 0 NOT RUN, 0 ENVIRONMENT BLOCKED. `slow_put_1000` is http_2xx 1000, http_503 0, lag p99 41.298006 ms, health p99 47.349 ms. `slow_get_receiver` is http_2xx 200, completed 200, lag p99 2.389661 ms, health p99 37.27054409682751 ms. `bounded_queue_overload` is http_2xx 545, http_503 3455, lag p99 49.51831 ms, health p99 166.6510784998536 ms. Console gate stays ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02). `POST /api/apply` was not sent. Docs-site pages that still say G7 is NOT ACCEPTED were not edited in this commit.
 
 `16MB_read_8` stays ACCEPT_WITH_WARN (`tools/test-results/contabo-deploy-20260801/deep-verify-20260802/PERF-REMEASURE.md`, 2026-08-02).
 
@@ -9,9 +9,9 @@ A, B, C, and E met their acceptance lines. D is NOT ACCEPTED. The 2026-10-03 fol
 | A tests | met | `0A-tests.md` |
 | B docs | met. `tools/docs-claim-audit.sh` exit 0. Live tokens in `0B-docs.md` | `0B-docs.md` |
 | C swift4 disk | met. `/` 939M free (98%) before, 1.5G free after. VIP still on swift1. `/info` 200 | `0C-disk.md` |
-| D G7 | NOT ACCEPTED. Follow-up 1 PASS, 3 FAIL, 16 NOT RUN | `0D-g7.md`, `verdict.json` |
+| D G7 | ACCEPTED. Full yaml 20 PASS, 0 FAIL, 0 NOT RUN (`out-rerun3`, 2026-10-03) | `0D-g7.md`, `verdict.json` |
 | E L3b failure case | met. Docs still say L3b deferred | `0E-l3b.md` |
 
 ## G7
 
-Listening binary on swift1 `:18080`: sha256 `3bac7c9ce904a39476009549eb568f4356dfe4336aa4d39416604c1aaebc3dc5` at `/root/work/g6-rust-bin/swift-proxy-server` (2026-10-03). Production binary sha256 stayed `5cac5960c45b3a206a794e0a0c52d89f51c251b0ce698de21f245da7fa6a2397`, pid 3495932. `:8080`, `:8085`, and VIP `10.0.0.10/22` stayed up. New yaml: `g7-acceptance.yaml`. Lab stayed on `/etc/g6-rust` and `:18080`.
+Listening binary on swift1 `:18080`: sha256 `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314` at `/root/work/g6-rust-bin/swift-proxy-server`, context `bin_t` (2026-10-03, `verdict.json`). Lab object server sha256 `add3f2b92f9435555801a98b2fdae9eb154a7f6d23d3af9755def3aa5a73e478`. Production binary sha256 stayed `5cac5960c45b3a206a794e0a0c52d89f51c251b0ce698de21f245da7fa6a2397`, pid 3495932. `:8080` and `:8085` stayed up. At 13:49:37 UTC keepalived removed VIP `10.0.0.10` from swift1 `eth1` after `chk_http_port` timed out. It was still absent after the green run. `http://10.0.0.10:8080/healthcheck` returned 200. Yaml: `g7-acceptance.yaml`. Lab stayed on `/etc/g6-rust` and `:18080`.

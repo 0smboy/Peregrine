@@ -174,6 +174,13 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// close the connection instead.
 const KEEPALIVE_DRAIN_CAP: u64 = 64 * 1024;
 
+/// Accept-thread queue onto the body workers. Sending does not wait for a
+/// worker to poll the request.
+#[derive(Clone)]
+pub struct BodyHandoff {
+    pub(crate) tx: tokio::sync::mpsc::UnboundedSender<crate::hyper_serve::BodyJob>,
+}
+
 /// Resource and protocol limits for the synchronous HTTP server.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -251,6 +258,13 @@ pub struct ServerConfig {
     /// Proxy sets this so `/healthcheck` is not scheduled behind object
     /// bodies. Storage servers leave it false and keep one runtime.
     pub dedicated_accept: bool,
+    /// Queue from the accept thread to the body workers. `send` does not
+    /// wait for a worker. `None` keeps the request on the accepting runtime.
+    pub body_handoff: Option<BodyHandoff>,
+    /// Retained so tests can prove a configured next-request header timer
+    /// is not installed on the Hyper connection. Applying it closes a slow
+    /// GET while the body is still being written.
+    pub header_read_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -297,6 +311,8 @@ impl std::fmt::Debug for ServerConfig {
                 &self.worker_pool.as_ref().map(|_| "<worker-pool>"),
             )
             .field("dedicated_accept", &self.dedicated_accept)
+            .field("body_handoff", &self.body_handoff.is_some())
+            .field("header_read_timeout", &self.header_read_timeout)
             .finish()
     }
 }
@@ -336,6 +352,8 @@ impl Default for ServerConfig {
             shutdown_deadline_secs: 0,
             worker_pool: None,
             dedicated_accept: false,
+            body_handoff: None,
+            header_read_timeout: None,
         }
     }
 }
@@ -573,6 +591,7 @@ fn block_on_split_runtimes(
         .enable_time()
         .build()?;
     config.worker_pool = Some(workers.handle().clone());
+    config.body_handoff = Some(crate::hyper_serve::spawn_body_dispatcher(&workers.handle()));
     let result = liveness.block_on(accept_loop_async(listeners, service, config));
     drop(liveness);
     drop(workers);

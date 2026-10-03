@@ -2,10 +2,10 @@
 
 | Channel | Location |
 |---------|----------|
-| Content commit | `0a1d590` on `main` (follow-up G7 build, still NOT ACCEPTED). Prior full matrix was `3f5ea6a` (17 PASS, 3 FAIL on sha `e6ac2931`). |
+| Content commit | main, 2026-10-03 green rerun. Lab proxy sha `dc22cca7`. Prior product commit `0a1d590` was the RED follow-up. |
 | Evidence | `tools/test-results/optimize-ae-20261003/` |
 | Vercel | `dpl_8VjUT8H5dyS4hUT3n3roAD9qCeYt` aliased to https://docs.myswift.rs |
-| Verdict | `SUMMARY.md` and `verdict.json` (2026-10-03). Follow-up is RED: 1 PASS, 3 FAIL, 16 NOT RUN. NOT ACCEPTED. Lab sha `3bac7c9ce904a39476009549eb568f4356dfe4336aa4d39416604c1aaebc3dc5`. Console gate stays ACCEPT_WITH_WARN. Apply was not sent. |
+| Verdict | `SUMMARY.md` and `verdict.json` (2026-10-03). Full yaml is GREEN: 20 PASS, 0 FAIL, 0 NOT RUN. Source `swift4:/root/work/g7-optimize-ae-20261003/out-rerun3/verdict.json`. Lab sha `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`. Console gate stays ACCEPT_WITH_WARN. Apply was not sent. Docs-site was not edited. |
 | Docs deploy | see Vercel row |
 | Live pages | https://docs.myswift.rs/swift-console/index.md , https://docs.myswift.rs/lab-cluster/index.md , https://docs.myswift.rs/performance/index.md |
 | Drive | `gdrive:Peregrine/2026-10-03-optimize-ae/` |

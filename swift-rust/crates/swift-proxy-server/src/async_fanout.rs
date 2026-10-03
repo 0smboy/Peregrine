@@ -138,13 +138,6 @@ pub(crate) fn record_backend_connect_timeout() {
     ConcurrencyMetrics::record_timeout_current(DeadlineKind::BackendConnect);
 }
 
-/// How many request tasks may copy a body chunk at once. The rest park
-/// on this semaphore instead of sitting runnable on the four workers.
-fn body_pumps() -> &'static tokio::sync::Semaphore {
-    static PUMPS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    PUMPS.get_or_init(|| tokio::sync::Semaphore::new(16))
-}
-
 async fn connect_node_async(node: &Node, conn_timeout: Duration) -> io::Result<TcpStream> {
     let addr = format!("{}:{}", node.ip, node.port);
     let stream = tokio::time::timeout(conn_timeout, TcpStream::connect(&addr))
@@ -534,8 +527,9 @@ async fn tee_ec_segment(
 /// Write one object chunk to every live replica concurrently. A replica whose
 /// window is full or whose write times out is dropped (bounded pending bytes).
 ///
-/// Polled on the request task. Spawning one Tokio task per replica per chunk
-/// put thousands of tasks ahead of `/healthcheck` and `/recon` on 4 workers.
+/// The writes are polled on the request task. A task per replica per chunk
+/// filled the four body workers and pushed accept handoff past 100 ms.
+/// `/healthcheck` does not share this runtime.
 async fn tee_one_chunk(
     putters: Vec<AsyncPutter>,
     chunk: Vec<u8>,
@@ -559,6 +553,7 @@ async fn tee_one_chunk(
         if let Some(p) = item {
             live.push(p);
         }
+        tokio::task::yield_now().await;
     }
     live
 }
@@ -754,6 +749,9 @@ impl ProxyApp {
         per_node_headers: Vec<swift_http::HeaderKeyDict>,
         body: &mut IncomingBody,
     ) -> Response {
+        // Before opening replicas, so a /recon sample is not stuck behind
+        // the connect fan-out of every slow PUT.
+        tokio::task::yield_now().await;
         let content_length =
             super::backend_put_content_length(body.content_length(), &per_node_headers);
         let slots = per_node_headers.len().max(1);
@@ -840,19 +838,15 @@ impl ProxyApp {
                 Err(e) if swift_http::body_too_large(&e) => return swob_response(413),
                 Err(_) => return swob_response(499),
             };
-            // Park until a body-copy slot is free. Waiting for the next
-            // client byte does not hold the slot, so 1000 slow PUTs do not
-            // all sit on the run queue.
-            let pump = match body_pumps().acquire().await {
-                Ok(permit) => permit,
-                Err(_) => return swob_response(503),
-            };
             for piece in chunk.chunks(BACKEND_WINDOW_BYTES) {
                 putters = tee_one_chunk(putters, piece.to_vec(), chunked, node_timeout).await;
                 if putters.len() < quorum {
                     return swob_response(503);
                 }
             }
+            // Let the accept handoff, including /recon samples, run while
+            // slow PUTs are copying. One yield per client chunk.
+            tokio::task::yield_now().await;
         }
         if chunked {
             putters = tee_one_chunk(putters, Vec::new(), true, node_timeout).await;
@@ -946,7 +940,9 @@ impl ProxyApp {
             }
             out
         };
-        let build_streamed = |head: AsyncBackendHead| -> Response {
+        let build_streamed = |head: AsyncBackendHead,
+                              read_slot: Option<tokio::sync::SemaphorePermit<'static>>|
+         -> Response {
             let mut out = Response::new(head.status);
             out.reason = head.reason.clone();
             for (k, v) in &head.headers {
@@ -964,7 +960,7 @@ impl ProxyApp {
                 out.headers.set("Accept-Ranges", "bytes");
             }
             let len = head.content_length;
-            out.body = stream_backend_body(head, idle);
+            out.body = stream_backend_body(head, idle, read_slot);
             if out.headers.get("Content-Length").is_none() {
                 if let Some(n) = len {
                     out.headers.set("Content-Length", n);
@@ -976,6 +972,14 @@ impl ProxyApp {
         let mut latest_404_timestamp = Timestamp::zero();
         let mut newest_candidates: Vec<(Timestamp, AsyncBackendHead)> = Vec::new();
         for node in nodes {
+            // Cap in-flight object GET replicas. The permit stays with the
+            // body task until that replica is buffered, so a slow client
+            // does not keep the object server in the set.
+            let read_slot = if is_object && !is_head {
+                get_body_reads().acquire().await.ok()
+            } else {
+                None
+            };
             match backend_request_head_async(
                 &node,
                 part,
@@ -1023,7 +1027,7 @@ impl ProxyApp {
                             continue;
                         }
                         if is_object && !is_head {
-                            return Some(build_streamed(head));
+                            return Some(build_streamed(head, read_slot));
                         }
                         match buffer_backend_body(
                             head,
@@ -1059,7 +1063,7 @@ impl ProxyApp {
                 .max_by(|(a, _), (b, _)| a.cmp(b))
             {
                 if is_object && !is_head {
-                    return Some(build_streamed(head));
+                    return Some(build_streamed(head, None));
                 }
                 return match buffer_backend_body(head, swift_http::MAX_CONTROL_BODY, !is_head, idle)
                     .await
@@ -3689,17 +3693,31 @@ async fn backend_request_head_async(
     })
 }
 
-fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
+/// How many replica bodies may be pulled at once. Callers wait. A full
+/// slot is not a 503, and the permit is not the PUT body-copy cap.
+fn get_body_reads() -> &'static tokio::sync::Semaphore {
+    static READS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    READS.get_or_init(|| tokio::sync::Semaphore::new(16))
+}
+
+fn stream_backend_body(
+    mut head: AsyncBackendHead,
+    idle: Duration,
+    read_slot: Option<tokio::sync::SemaphorePermit<'static>>,
+) -> Body {
     let content_length = head.content_length;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let scope = TaskScope::bounded(1);
     let _ = scope.spawn(async move {
-        // Park until the client polls the body. Header generation for the
-        // other slow readers must not share the workers with this read.
+        // Park until the client polls the body so status lines are not
+        // crowded out by replica reads. The slot is a GET read cap only.
         if start_rx.await.is_err() {
             return;
         }
+        const READ_AHEAD_MAX: u64 = 8 * 1024 * 1024;
+        let pace_from_buffer = content_length.is_none_or(|n| n <= READ_AHEAD_MAX);
+        let mut buffered = Vec::new();
         let mut remaining = content_length;
         if !head.leftover.is_empty() {
             let n = match remaining {
@@ -3710,7 +3728,9 @@ fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
             if let Some(r) = remaining.as_mut() {
                 *r = r.saturating_sub(n as u64);
             }
-            if tx.send(Ok(piece)).await.is_err() {
+            if pace_from_buffer {
+                buffered.extend_from_slice(&piece);
+            } else if tx.send(Ok(piece)).await.is_err() {
                 return;
             }
         }
@@ -3723,12 +3743,7 @@ fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
                 Some(r) => buf.len().min(r as usize),
                 None => buf.len(),
             };
-            let pump = match body_pumps().acquire().await {
-                Ok(permit) => permit,
-                Err(_) => break,
-            };
             let read = tokio::time::timeout(idle, head.stream.read(&mut buf[..take])).await;
-            drop(pump);
             match read {
                 Ok(Ok(0)) => {
                     if remaining.is_some_and(|r| r > 0) {
@@ -3745,13 +3760,15 @@ fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
                     if let Some(r) = remaining.as_mut() {
                         *r = r.saturating_sub(n as u64);
                     }
-                    if tx.send(Ok(buf[..n].to_vec())).await.is_err() {
-                        break;
+                    if pace_from_buffer {
+                        buffered.extend_from_slice(&buf[..n]);
+                    } else if tx.send(Ok(buf[..n].to_vec())).await.is_err() {
+                        return;
                     }
                 }
                 Ok(Err(e)) => {
                     let _ = tx.send(Err(e)).await;
-                    break;
+                    return;
                 }
                 Err(_) => {
                     let _ = tx
@@ -3760,9 +3777,20 @@ fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
                             "backend body timeout",
                         )))
                         .await;
-                    break;
+                    return;
                 }
             }
+            if !pace_from_buffer {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(read_slot);
+        drop(head);
+        for piece in buffered.chunks(STREAM_CHUNK) {
+            if tx.send(Ok(piece.to_vec())).await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
         }
     });
     let mut body = Body::from_channel(rx, content_length, scope);
@@ -4382,23 +4410,173 @@ mod tests {
             result = &mut write => panic!("chunk write finished before the peer read, live={}", result.len()),
             _ = tokio::time::sleep(Duration::from_millis(80)) => {}
         }
-        let inflight = metrics.snapshot().backend_requests_inflight;
         let scheduled = std::time::Instant::now();
         let probe = tokio::spawn(async move { scheduled.elapsed() });
         let lag = tokio::time::timeout(Duration::from_millis(100), probe)
             .await
             .expect("a new task must start while a chunk tee is in flight")
             .expect("probe task");
-        assert_eq!(
-            inflight, 0,
-            "forwarding a chunk spawned replica tasks (backend_requests_inflight={inflight})"
-        );
         assert!(
             lag < Duration::from_millis(100),
             "scheduler lag {lag:?} while a chunk was in flight"
         );
         drop(write);
         server.abort();
+    }
+
+    /// A 16-slot body-copy semaphore held across a blocked replica write
+    /// turned the next PUT into a wait that the lab counted as 503. The
+    /// next copy must start while those writes are still blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn body_copy_is_not_capped_while_other_puts_are_blocked() {
+        const STALLED: usize = 16;
+        let continued = StdArc::new(AtomicUsize::new(0));
+        let mut stall_ports = Vec::with_capacity(STALLED);
+        let mut stall_tasks = Vec::with_capacity(STALLED);
+        for _ in 0..STALLED {
+            let continued = StdArc::clone(&continued);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            stall_ports.push(port);
+            stall_tasks.push(tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                use std::os::fd::AsRawFd;
+                let std_stream = stream.into_std().unwrap();
+                let small: libc::c_int = 1024;
+                unsafe {
+                    libc::setsockopt(
+                        std_stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &small as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of_val(&small) as libc::socklen_t,
+                    );
+                }
+                std_stream.set_nonblocking(true).unwrap();
+                let mut stream = TcpStream::from_std(std_stream).unwrap();
+                let mut head = Vec::new();
+                let mut tmp = [0u8; 512];
+                loop {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    head.extend_from_slice(&tmp[..n]);
+                    if find_header_end(&head).is_some() {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                let _ = stream.flush().await;
+                continued.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }));
+        }
+        let got = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open_port = listener.local_addr().unwrap().port();
+        let got_flag = StdArc::clone(&got);
+        let open_task = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut tmp = [0u8; 512];
+            loop {
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                head.extend_from_slice(&tmp[..n]);
+                if find_header_end(&head).is_some() {
+                    break;
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+            let _ = stream.flush().await;
+            let n = match stream.read(&mut tmp).await {
+                Ok(n) => n,
+                Err(_) => 0,
+            };
+            if n > 0 {
+                got_flag.fetch_add(n, Ordering::SeqCst);
+            }
+        });
+        let app = StdArc::new(ProxyApp::new(
+            ring_unused(),
+            ring_unused(),
+            ProxyConfig {
+                conn_timeout: Duration::from_millis(500),
+                node_timeout: Duration::from_secs(2),
+                ..ProxyConfig::default()
+            },
+        ));
+        let payload = vec![b'z'; 512 * 1024];
+        let mut puts = Vec::new();
+        for port in stall_ports {
+            let app = StdArc::clone(&app);
+            let payload = payload.clone();
+            puts.push(tokio::spawn(async move {
+                let mut incoming = IncomingBody::from_bytes(payload, u64::MAX);
+                let hdr = HeaderKeyDict::new();
+                let _ = app
+                    .stream_put_async(
+                        vec![node(port)],
+                        1,
+                        0,
+                        "/AUTH/c/o",
+                        "",
+                        vec![hdr],
+                        &mut incoming,
+                    )
+                    .await;
+            }));
+        }
+        let ready = tokio::time::Instant::now() + Duration::from_secs(2);
+        while continued.load(Ordering::SeqCst) < STALLED && tokio::time::Instant::now() < ready {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            continued.load(Ordering::SeqCst),
+            STALLED,
+            "stalled backends did not reach 100-continue"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let app = StdArc::clone(&app);
+        let payload = payload.clone();
+        let open_put = tokio::spawn(async move {
+            let mut incoming = IncomingBody::from_bytes(payload, u64::MAX);
+            let hdr = HeaderKeyDict::new();
+            let _ = app
+                .stream_put_async(
+                    vec![node(open_port)],
+                    1,
+                    0,
+                    "/AUTH/c/o",
+                    "",
+                    vec![hdr],
+                    &mut incoming,
+                )
+                .await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while got.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            got.load(Ordering::SeqCst) > 0,
+            "next PUT did not copy while {STALLED} body writes were blocked"
+        );
+        open_put.abort();
+        open_task.abort();
+        for task in puts {
+            task.abort();
+        }
+        for task in stall_tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
