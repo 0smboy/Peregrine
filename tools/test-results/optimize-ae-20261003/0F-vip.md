@@ -62,3 +62,61 @@ At 15:57:08 UTC, `systemctl start keepalived` on swift2. It logged `Entering BAC
 From swift1 after the restore, `ip route get 10.0.0.10` is `local 10.0.0.10 dev lo`. `ss` shows `0.0.0.0:8080` and `0.0.0.0:8085` listening. `https://10.0.0.10:8085/info` is HTTP/2 200, `content-length: 1270`. `http://10.0.0.10:8080/healthcheck` is 200.
 
 Production `/usr/local/bin/swift-proxy-server` is still sha256 `5cac5960c45b3a206a794e0a0c52d89f51c251b0ce698de21f245da7fa6a2397`, pid 3495932, started Fri Oct 2 12:16:43 2026.
+
+## Script timeout
+
+Date: 2026-10-03, after the restore above. Keepalived v2.2.8 on all four. Each node has one file, `/etc/keepalived/keepalived.conf`. No include. The check command stayed `/etc/keepalived/check_haproxy.sh`. Priority, `virtual_router_id` 51, `nopreempt`, `advert_int`, `weight -10`, `interval 1`, and authentication were not changed. `track_script` stayed `chk_http_port`. Nothing was pointed at `:18080`.
+
+Before the edit, `10.0.0.10/22` was only on swift1 `eth1`. swift2, swift3, and swift4 did not have it. The script block was the same on all four:
+
+```
+vrrp_script chk_http_port {
+
+     script   "/etc/keepalived/check_haproxy.sh"
+
+    interval 1
+    weight -10
+}
+```
+
+v2.2.8's `vrrp_script` block uses `timeout <INTEGER>` for the seconds after which the script is considered failed, and `fall <INTEGER>` for how many failures are required before the KO transition. With `timeout` unset, this build uses the interval. The compiled defaults are `rise 1` and `fall 1`, so one timeout applies `weight -10`. That is the 13:49:37 UTC demotion.
+
+`timeout 4` and `fall 3` were inserted in that script block on each node. `rise` was left at its default of 1. A `ps` that returns within 4 seconds does not fail the check. Three consecutive failures are required before the weight is applied. `keepalived -t` exits 6 with the same pre-existing message on the old and new files: `SECURITY VIOLATION - scripts are being executed but script_security not enabled.` The running process accepted the file.
+
+Reload was `systemctl reload` (`kill -HUP` on the existing main pid), backups first. Parent and VRRP child pids did not change.
+
+| UTC | node | reload result | `10.0.0.10/22` |
+|---|---|---|---|
+| 16:16:03 | swift4 | same pids 3859021 / 3859027, stayed BACKUP | still only on swift1 |
+| 16:19:03 | swift3 | same pids 4035440 / 4035441, stayed BACKUP | still only on swift1 |
+| 16:20:04 | swift2 | same pids 2521489 / 2521490, stayed BACKUP | still only on swift1. A 0.2s watch on swift1 saw no absence |
+| 16:22:38 | swift1 | same pids 1588805 / 1588818. Logged `setting VIPs` and did not enter BACKUP | stayed on swift1. A 0.1s watch saw no absence |
+
+The backup reloads logged `(swift) removing VIPs` under `--log-detail`. The address was not on those nodes before or after, and swift1's journal stayed empty through those three reloads. swift1's own reload logged `(swift) setting VIPs` and kept the address.
+
+After, the script block is the same on all four:
+
+```
+vrrp_script chk_http_port {
+
+     script   "/etc/keepalived/check_haproxy.sh"
+
+    interval 1
+    timeout 4
+    fall 3
+    weight -10
+}
+```
+
+A `SIGUSR1` data dump of each VRRP child, then deleted, showed:
+
+| node | state | priority | effective | timeout | fall | rise | result | status |
+|---|---|---|---|---|---|---|---|---|
+| swift1 | MASTER | 140 | 140 | 4 sec | 3 | 1 | 3 | GOOD |
+| swift2 | BACKUP | 130 | 130 | 4 sec | 3 | 1 | 3 | GOOD |
+| swift3 | BACKUP | 120 | 120 | 4 sec | 3 | 1 | 3 | GOOD |
+| swift4 | BACKUP | 110 | 110 | 4 sec | 3 | 1 | 3 | GOOD |
+
+`10.0.0.10/22` is only on swift1. `ip route get 10.0.0.10` from swift1 is `local 10.0.0.10 dev lo`. `https://10.0.0.10:8085/info` is HTTP/2 200. Production pid 3495932 is still the process started Fri Oct 2 12:16:43 2026, and `/usr/local/bin/swift-proxy-server` is still sha256 `5cac5960c45b3a206a794e0a0c52d89f51c251b0ce698de21f245da7fa6a2397`.
+
+The live file is not in git. `swift-deploy-rs` only has the Jinja templates `bundle/roles/keepalived_servers/templates/keepalived.conf.j2` and `bundle-rust/roles/rust_keepalived/templates/keepalived.conf.j2`. Those templates still omit `timeout` and `fall`. A later render from them would drop this change. Each node kept the previous file at `/etc/keepalived/keepalived.conf.bak-20261003-flap`.
