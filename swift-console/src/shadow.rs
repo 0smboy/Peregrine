@@ -59,6 +59,12 @@ pub struct ShadowCfg {
     pub peer_base: String,
     pub peer_auth: String,
     pub peer_label: String,
+    /// Existing tempauth account on the peer. Empty user or key means the
+    /// signed-in session is used instead. The peer often keeps its own key
+    /// for the same tenant and user; the session key is the cluster's.
+    pub peer_tenant: String,
+    pub peer_user: String,
+    pub peer_key: String,
 }
 
 fn cfg() -> &'static ShadowCfg {
@@ -98,8 +104,27 @@ fn cfg() -> &'static ShadowCfg {
             peer_base,
             peer_auth,
             peer_label,
+            peer_tenant: s("shadow_peer_tenant"),
+            peer_user: s("shadow_peer_user"),
+            peer_key: s("shadow_peer_key"),
         }
     })
+}
+
+/// Login identity for the second endpoint. A configured peer account wins so
+/// a peer that does not share the cluster key is still usable. Both user and
+/// key must be set; a half-filled pair falls back to the session.
+fn peer_login(c: &ShadowCfg, tenant: &str, user: &str, key: &str) -> (String, String, String) {
+    if !c.peer_user.is_empty() && !c.peer_key.is_empty() {
+        let t = if c.peer_tenant.is_empty() {
+            tenant.to_string()
+        } else {
+            c.peer_tenant.clone()
+        };
+        (t, c.peer_user.clone(), c.peer_key.clone())
+    } else {
+        (tenant.to_string(), user.to_string(), key.to_string())
+    }
 }
 
 pub fn peer_configured() -> bool {
@@ -1230,13 +1255,14 @@ async fn sides(state: &Arc<AppState>, sid: &str, sess: &session::Session) -> Res
         .ok_or_else(|| "session expired".to_string())?;
     let b = if peer_configured() {
         let c = cfg();
+        let (tenant, user, key) = peer_login(c, &sess.tenant, &sess.user, &sess.key);
         match swift::auth(
             &state.http,
             &c.peer_auth,
             &c.peer_base,
-            &sess.tenant,
-            &sess.user,
-            &sess.key,
+            &tenant,
+            &user,
+            &key,
         )
         .await
         {
@@ -2884,6 +2910,39 @@ mod tests {
 
     fn rules(f: &[Finding]) -> Vec<&str> {
         f.iter().map(|x| x.rule.as_str()).collect()
+    }
+
+    fn sample_cfg(user: &str, key: &str) -> ShadowCfg {
+        ShadowCfg {
+            root: PathBuf::from("/var/lib/swift-console/shadow"),
+            peer_base: "http://10.0.0.3:8090".into(),
+            peer_auth: "http://10.0.0.3:8090/auth/v1.0".into(),
+            peer_label: "peer".into(),
+            peer_tenant: "test".into(),
+            peer_user: user.into(),
+            peer_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn peer_login_uses_the_configured_account() {
+        let c = sample_cfg("tester", "peer-account-key");
+        let (t, u, k) = peer_login(&c, "test", "tester", "session-key");
+        assert_eq!((t, u, k), ("test".into(), "tester".into(), "peer-account-key".into()));
+    }
+
+    #[test]
+    fn peer_login_keeps_the_session_when_unset() {
+        let c = sample_cfg("", "");
+        let (t, u, k) = peer_login(&c, "test", "tester", "session-key");
+        assert_eq!((t, u, k), ("test".into(), "tester".into(), "session-key".into()));
+    }
+
+    #[test]
+    fn peer_login_ignores_a_user_without_a_key() {
+        let c = sample_cfg("tester", "");
+        let (t, u, k) = peer_login(&c, "lab", "other", "session-key");
+        assert_eq!((t, u, k), ("lab".into(), "other".into(), "session-key".into()));
     }
 
     // ---- the noise list is the difference between a tool people read and one

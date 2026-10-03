@@ -10,7 +10,13 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
+use futures_util::StreamExt;
 use std::sync::Arc;
+
+/// swift-deploy reads a POST body only when `Content-Length` is set, and it
+/// caps that body at 1 MiB. A streamed body becomes chunked and the upstream
+/// parses zero bytes (`EOF while parsing`).
+const DEPLOY_BODY_MAX: usize = 1024 * 1024;
 
 const HOP_BY_HOP: [&str; 9] = [
     "connection",
@@ -38,6 +44,32 @@ fn wants_html(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|a| a.contains("text/html"))
         .unwrap_or(false)
+}
+
+async fn read_deploy_body(body: Body) -> Result<Vec<u8>, Response> {
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(next) = stream.next().await {
+        let chunk = match next {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("deploy request body: {e}\n"),
+                )
+                    .into_response());
+            }
+        };
+        if buf.len().saturating_add(chunk.len()) > DEPLOY_BODY_MAX {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "deploy request body exceeds 1 MiB\n",
+            )
+                .into_response());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 fn no_session(headers: &HeaderMap) -> Response {
@@ -94,8 +126,16 @@ pub async fn deploy(State(state): State<Arc<AppState>>, req: Request) -> Respons
         reqwest::header::HeaderValue::from_str(&state.deploy_basic).expect("basic header"),
     );
 
-    let body_stream = req.into_body().into_data_stream();
-    let out_body = reqwest::Body::wrap_stream(body_stream);
+    let body_bytes = match read_deploy_body(req.into_body()).await {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let body_len = body_bytes.len();
+    out_headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        reqwest::header::HeaderValue::from_str(&body_len.to_string()).expect("length"),
+    );
+    let out_body = reqwest::Body::from(body_bytes);
 
     let resp = match state
         .http

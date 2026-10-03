@@ -14,6 +14,38 @@ The console is an operator surface, not evidence that the storage engine has
 passed every gate. G6 is GREEN on `17adf0b`; G7 is NOT ACCEPTED and the overall
 production decision remains NO-GO.
 
+## Contabo console acceptance, 2026-10-02
+
+Strict acceptance of this operator surface on the live contabo-swift-2026
+cluster is **ACCEPT_WITH_WARN**. Evidence:
+`tools/test-results/console-accept-20261002/SUMMARY.md`, dated 2026-10-02.
+G7 remains NOT ACCEPTED. Production readiness remains NO-GO. This gate stays
+ACCEPT_WITH_WARN.
+
+Passed on that run: the file path, chaos, HA, autocos, shadow run, the browser
+file path, shadow mutate, and warehouse promote
+(`09-remaining.md`, `10-shadow.md`, `11-browser-disk.md`,
+`12-apply-mutate-promote.md`). After `POST /api/plan`, swift1–4 still had
+`swift-proxy`, `swift-object`, `swift-container`, and `swift-account` active,
+and VIP `10.0.0.10` stayed on swift1. `https://10.0.0.10:8085/info` returned
+200 (1270 bytes). The node-status score recorded in `09-remaining.md` and
+`10-shadow.md` was 10/10 on all four nodes. See `13-apply.md`.
+
+`POST /api/apply` was not sent. `POST /api/plan` used the Contabo identity
+inventory `/opt/swift-deploy/config_contabo_identity/swift_hosts` (hosts
+169.58.108.85, .86, .87, .121): HTTP 202, job 5, 336 tasks, digest prefix
+`d962336aac56`. The sealed plan still names disk-wipe tasks (`DD before mkfs`,
+`Format all storage nodes disks`, `Change disks partition table to mbr before
+DD`). 216 tasks name hosts and include yum upgrade, an sshd restart, firewall
+and SELinux changes, and MariaDB plus Keystone installs on swift1–3. Apply
+would change the live nodes. Detail: `13-apply.md` and
+`13-apply-plan-summary.md`.
+
+The deploy proxy reads the operator POST body, caps it at 1 MiB, and sets
+`Content-Length` before forwarding. swift-deploy reads a body only when that
+header is present. Before the fix, validate and plan returned 400
+`EOF while parsing` (`07-fix.md`).
+
 ## Surfaces
 
 <CardGrid>
@@ -98,7 +130,8 @@ balancer, not to be exposed directly.
 | `cluster_nodes` | node roster (name + storage/replication/public IPs, devices) |
 | `swift_dir` / `node_root` | ring/config and device roots used by inspection tools |
 | `ringsim_bin` / `getnodes_bin` / `objinfo_bin` | external inspection helper paths |
-| `shadow_peer_base` / `shadow_peer_auth` / `shadow_peer_label` | optional second Swift endpoint for Shadow dual-mode (same tempauth user/key as the console login) |
+| `shadow_peer_base` / `shadow_peer_auth` / `shadow_peer_label` | optional second Swift endpoint for Shadow dual-mode |
+| `shadow_peer_tenant` / `shadow_peer_user` / `shadow_peer_key` | peer account. Both user and key must be set; otherwise the signed-in session is used. Tenant falls back to the session tenant when empty |
 | `shadow_root` | on-disk corpus + mutation log directory |
 
 Account administration, real benchmark execution, lab pages, and lab mutations
@@ -123,8 +156,12 @@ notes live in the console tree at `swift-console/docs/debt-calibration.md`.
 ## Lab: Protocol Mutation (Shadow)
 
 Shadow can run a seeded mutation sequence against the logged-in cluster and,
-when `shadow_peer_*` is set, against a second implementation side-by-side.
-Findings and mutate corpus land under `shadow_root` (`mutations.jsonl`).
+when `shadow_peer_base` is set, against a second implementation side-by-side.
+A configured `shadow_peer_user` plus `shadow_peer_key` logs into that peer;
+a half-filled pair, or an empty pair, uses the signed-in session. Findings
+and the mutate corpus land under `shadow_root` (`mutations.jsonl`). On the
+2026-10-02 Contabo run, shadow run and mutate passed against the peer at
+`http://10.0.0.3:8090` (`10-shadow.md`, `12-apply-mutate-promote.md`).
 
 On Contabo swift1, Python SAIO listens on `127.0.0.1:8090` and Rust SAIO on
 `127.0.0.1:8081` (same `test:tester` / cluster key). Point `shadow_peer_base`
