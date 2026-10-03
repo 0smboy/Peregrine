@@ -67,6 +67,7 @@ pub async fn serve_http1_connection(
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
     admission: AdmissionController,
+    slot: crate::server::ConnectionSlot,
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let peer_ip = stream.peer_addr().ok().map(|a| a.ip().to_string());
@@ -120,6 +121,52 @@ pub async fn serve_http1_connection(
     if let Some((status, message)) = request_head_limit_error(&more, &config) {
         return write_handoff_error(&mut stream, status, message).await;
     }
+    if more.is_empty() {
+        return Ok(());
+    }
+    // /healthcheck keep-alive is occupancy. Hyper's read and write buffers
+    // start at 8 KiB each, so 100k idle health sockets resident ~2 GiB and
+    // the lab proxy was OOM-killed. This path answers healthcheck and parks
+    // on a small read; any other request falls through to Hyper.
+    // It stays on the accept runtime. Body work uses `worker_pool`.
+    if is_healthcheck_head(&more) {
+        let _slot = slot;
+        return serve_health_keepalive(stream, more, service, config, shutdown, admission).await;
+    }
+    if let Some(worker) = config.worker_pool.clone() {
+        let scheduled = std::time::Instant::now();
+        let metrics = config.metrics.clone();
+        worker.spawn(async move {
+            if let Some(ref metrics) = metrics {
+                metrics.observe_scheduler_lag(scheduled.elapsed());
+            }
+            let _slot = slot;
+            let run = continue_after_head(
+                stream, more, service, config, shutdown, admission, peer_ip,
+            );
+            let result = match metrics {
+                Some(metrics) => metrics.bind(run).await,
+                None => run.await,
+            };
+            if let Err(error) = result {
+                eprintln!("G6_DIAG swift-http stage=connection-error error={error}");
+            }
+        });
+        return Ok(());
+    }
+    let _slot = slot;
+    continue_after_head(stream, more, service, config, shutdown, admission, peer_ip).await
+}
+
+async fn continue_after_head(
+    stream: tokio::net::TcpStream,
+    more: Vec<u8>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+    peer_ip: Option<String>,
+) -> std::io::Result<()> {
     if request_line_is_ssync(&more) {
         return serve_ssync_handoff(
             stream,
@@ -144,9 +191,6 @@ pub async fn serve_http1_connection(
         )
         .await;
     }
-    if more.is_empty() {
-        return Ok(());
-    }
     if request_needs_swift_utf8_handoff(&more) {
         return serve_swift_utf8_handoff(
             stream,
@@ -159,17 +203,10 @@ pub async fn serve_http1_connection(
         )
         .await;
     }
-    // /healthcheck keep-alive is occupancy. Hyper's read and write buffers
-    // start at 8 KiB each, so 100k idle health sockets resident ~2 GiB and
-    // the lab proxy was OOM-killed. This path answers healthcheck and parks
-    // on a small read; any other request falls through to Hyper.
-    if is_healthcheck_head(&more) {
-        return serve_health_keepalive(stream, more, service, config, shutdown, admission).await;
-    }
-    return Box::pin(serve_hyper_prefixed(
+    Box::pin(serve_hyper_prefixed(
         stream, more, service, config, shutdown, admission, peer_ip,
     ))
-    .await;
+    .await
 }
 
 async fn serve_hyper_prefixed(
@@ -2079,6 +2116,7 @@ enum SwiftBodyInner {
     Channel {
         rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
         _scope: Option<swift_runtime::TaskScope>,
+        start: Option<tokio::sync::oneshot::Sender<()>>,
     },
 }
 
@@ -2112,9 +2150,13 @@ impl SwiftHttpBody {
         match body {
             Body::Buffered(bytes) => Self::from_bytes(bytes),
             Body::Channel(ch) => {
-                let (rx, scope, _) = ch.into_rx();
+                let (rx, scope, start) = ch.take_for_hyper();
                 Self {
-                    inner: SwiftBodyInner::Channel { rx, _scope: scope },
+                    inner: SwiftBodyInner::Channel {
+                        rx,
+                        _scope: scope,
+                        start,
+                    },
                     metrics: ConcurrencyMetrics::current(),
                     held: 0,
                 }
@@ -2143,6 +2185,7 @@ impl SwiftHttpBody {
                     inner: SwiftBodyInner::Channel {
                         rx,
                         _scope: Some(scope),
+                        start: None,
                     },
                     metrics: ConcurrencyMetrics::current(),
                     held: 0,
@@ -2185,17 +2228,22 @@ impl http_body::Body for SwiftHttpBody {
                 }
                 None => Poll::Ready(None),
             },
-            SwiftBodyInner::Channel { rx, .. } => match rx.poll_recv(cx) {
-                Poll::Ready(Some(Ok(v))) => {
-                    if let Some(ref m) = this.metrics {
-                        m.add_response_body_buffer(-(v.len() as i64));
-                    }
-                    Poll::Ready(Some(Ok(Frame::data(Bytes::from(v)))))
+            SwiftBodyInner::Channel { rx, start, .. } => {
+                if let Some(start) = start.take() {
+                    let _ = start.send(());
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            },
+                match rx.poll_recv(cx) {
+                    Poll::Ready(Some(Ok(v))) => {
+                        if let Some(ref m) = this.metrics {
+                            m.add_response_body_buffer(-(v.len() as i64));
+                        }
+                        Poll::Ready(Some(Ok(Frame::data(Bytes::from(v)))))
+                    }
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 

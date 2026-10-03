@@ -138,6 +138,13 @@ pub(crate) fn record_backend_connect_timeout() {
     ConcurrencyMetrics::record_timeout_current(DeadlineKind::BackendConnect);
 }
 
+/// How many request tasks may copy a body chunk at once. The rest park
+/// on this semaphore instead of sitting runnable on the four workers.
+fn body_pumps() -> &'static tokio::sync::Semaphore {
+    static PUMPS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PUMPS.get_or_init(|| tokio::sync::Semaphore::new(16))
+}
+
 async fn connect_node_async(node: &Node, conn_timeout: Duration) -> io::Result<TcpStream> {
     let addr = format!("{}:{}", node.ip, node.port);
     let stream = tokio::time::timeout(conn_timeout, TcpStream::connect(&addr))
@@ -526,73 +533,69 @@ async fn tee_ec_segment(
 
 /// Write one object chunk to every live replica concurrently. A replica whose
 /// window is full or whose write times out is dropped (bounded pending bytes).
+///
+/// Polled on the request task. Spawning one Tokio task per replica per chunk
+/// put thousands of tasks ahead of `/healthcheck` and `/recon` on 4 workers.
 async fn tee_one_chunk(
     putters: Vec<AsyncPutter>,
     chunk: Vec<u8>,
     chunked: bool,
     node_timeout: Duration,
 ) -> Vec<AsyncPutter> {
-    let n = putters.len();
-    if n == 0 {
+    if putters.is_empty() {
         return putters;
     }
-    let mut group: FanoutGroup<Option<AsyncPutter>> = match FanoutGroup::new(n, n) {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
-    };
-    for mut p in putters {
+    let mut pending: Vec<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Option<AsyncPutter>> + Send>>,
+    > = Vec::with_capacity(putters.len());
+    for p in putters {
         let piece = chunk.clone();
-        if group
-            .spawn(move |tx, cancel| async move {
-                if cancel.is_cancelled() {
-                    let _ = tx.send(None).await;
-                    return;
-                }
-                if p.window.try_push(piece.len()).is_err() {
-                    let _ = tx.send(None).await;
-                    return;
-                }
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => Err(()),
-                    r = async {
-                        if chunked {
-                            tokio::time::timeout(
-                                node_timeout,
-                                write_chunk_framed_async(&mut p.stream, &piece),
-                            )
-                            .await
-                            .map_err(|_| ())
-                            .and_then(|r| r.map_err(|_| ()))
-                        } else {
-                            tokio::time::timeout(node_timeout, p.stream.write_all(&piece))
-                                .await
-                                .map_err(|_| ())
-                                .and_then(|r| r.map_err(|_| ()))
-                        }
-                    } => r,
-                };
-                p.window.pop(piece.len());
-                let _ = tx.send(if result.is_ok() { Some(p) } else { None }).await;
-            })
-            .is_err()
-        {
-            group.cancel_unused();
-            break;
+        pending.push(Box::pin(write_one_replica(p, piece, chunked, node_timeout)));
+    }
+    let mut live = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let (idx, item) = next_ready(&mut pending).await;
+        drop(pending.swap_remove(idx));
+        if let Some(p) = item {
+            live.push(p);
         }
     }
-    let expected = group.spawned();
-    let mut live = Vec::new();
-    let wait = node_timeout + Duration::from_millis(50);
-    for _ in 0..expected {
-        match tokio::time::timeout(wait, group.recv()).await {
-            Ok(Some(Some(p))) => live.push(p),
-            Ok(Some(None)) | Ok(None) | Err(_) => {}
-        }
-    }
-    group.cancel_unused();
-    group.join().await;
     live
+}
+
+async fn write_one_replica(
+    mut p: AsyncPutter,
+    piece: Vec<u8>,
+    chunked: bool,
+    node_timeout: Duration,
+) -> Option<AsyncPutter> {
+    if p.window.try_push(piece.len()).is_err() {
+        return None;
+    }
+    let result = if chunked {
+        tokio::time::timeout(node_timeout, write_chunk_framed_async(&mut p.stream, &piece)).await
+    } else {
+        tokio::time::timeout(node_timeout, p.stream.write_all(&piece)).await
+    };
+    p.window.pop(piece.len());
+    match result {
+        Ok(Ok(())) => Some(p),
+        _ => None,
+    }
+}
+
+async fn next_ready<T>(
+    pending: &mut [std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>],
+) -> (usize, T) {
+    std::future::poll_fn(|cx| {
+        for (i, fut) in pending.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(value) = fut.as_mut().poll(cx) {
+                return std::task::Poll::Ready((i, value));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// How remaining replica slots are treated once write quorum is decided.
@@ -836,6 +839,13 @@ impl ProxyApp {
                 Ok(None) => break,
                 Err(e) if swift_http::body_too_large(&e) => return swob_response(413),
                 Err(_) => return swob_response(499),
+            };
+            // Park until a body-copy slot is free. Waiting for the next
+            // client byte does not hold the slot, so 1000 slow PUTs do not
+            // all sit on the run queue.
+            let pump = match body_pumps().acquire().await {
+                Ok(permit) => permit,
+                Err(_) => return swob_response(503),
             };
             for piece in chunk.chunks(BACKEND_WINDOW_BYTES) {
                 putters = tee_one_chunk(putters, piece.to_vec(), chunked, node_timeout).await;
@@ -3682,8 +3692,14 @@ async fn backend_request_head_async(
 fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
     let content_length = head.content_length;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let scope = TaskScope::bounded(1);
     let _ = scope.spawn(async move {
+        // Park until the client polls the body. Header generation for the
+        // other slow readers must not share the workers with this read.
+        if start_rx.await.is_err() {
+            return;
+        }
         let mut remaining = content_length;
         if !head.leftover.is_empty() {
             let n = match remaining {
@@ -3707,7 +3723,13 @@ fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
                 Some(r) => buf.len().min(r as usize),
                 None => buf.len(),
             };
-            match tokio::time::timeout(idle, head.stream.read(&mut buf[..take])).await {
+            let pump = match body_pumps().acquire().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let read = tokio::time::timeout(idle, head.stream.read(&mut buf[..take])).await;
+            drop(pump);
+            match read {
                 Ok(Ok(0)) => {
                     if remaining.is_some_and(|r| r > 0) {
                         let _ = tx
@@ -3743,7 +3765,11 @@ fn stream_backend_body(mut head: AsyncBackendHead, idle: Duration) -> Body {
             }
         }
     });
-    Body::from_channel(rx, content_length, scope)
+    let mut body = Body::from_channel(rx, content_length, scope);
+    if let Body::Channel(channel) = &mut body {
+        channel.arm_start(start_tx);
+    }
+    body
 }
 
 async fn buffer_backend_body(
@@ -4298,6 +4324,81 @@ mod tests {
         assert_eq!(resp.status, 201, "reason={} body={}", resp.reason, msg);
         ha.abort();
         hb.abort();
+    }
+
+    /// Body bytes used to spawn one Tokio task per replica. That queue is what
+    /// pushed scheduler lag over 100ms with 1000 slow PUTs on 4 workers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_tee_does_not_spawn_a_replica_task() {
+        let metrics = ConcurrencyMetrics::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(stream);
+        });
+        let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        use std::os::fd::AsRawFd;
+        let std_stream = client.into_std().unwrap();
+            let fd = std_stream.as_raw_fd();
+            let small: libc::c_int = 4096;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &small as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of_val(&small) as libc::socklen_t,
+                );
+            }
+            std_stream.set_nonblocking(true).unwrap();
+            let client = TcpStream::from_std(std_stream).unwrap();
+            let filler = vec![b'z'; 1024];
+            let mut filled = 0usize;
+            while filled < 256 * 1024 {
+                client.writable().await.unwrap();
+                match client.try_write(&filler) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && filled > 0 => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("fill send buffer: {e}"),
+                }
+            }
+            assert!(filled > 0, "socket accepted no bytes");
+            let putter = AsyncPutter {
+                node: node(port),
+                stream: client,
+                window: SharedWindow::new(BACKEND_WINDOW_BYTES),
+                leftover: Vec::new(),
+            };
+            let chunk = vec![b'x'; STREAM_CHUNK];
+            let write = metrics.clone().bind(async move {
+                tee_one_chunk(vec![putter], chunk, false, Duration::from_secs(2)).await
+            });
+        tokio::pin!(write);
+        tokio::select! {
+            result = &mut write => panic!("chunk write finished before the peer read, live={}", result.len()),
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
+        }
+        let inflight = metrics.snapshot().backend_requests_inflight;
+        let scheduled = std::time::Instant::now();
+        let probe = tokio::spawn(async move { scheduled.elapsed() });
+        let lag = tokio::time::timeout(Duration::from_millis(100), probe)
+            .await
+            .expect("a new task must start while a chunk tee is in flight")
+            .expect("probe task");
+        assert_eq!(
+            inflight, 0,
+            "forwarding a chunk spawned replica tasks (backend_requests_inflight={inflight})"
+        );
+        assert!(
+            lag < Duration::from_millis(100),
+            "scheduler lag {lag:?} while a chunk was in flight"
+        );
+        drop(write);
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

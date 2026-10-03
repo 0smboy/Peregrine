@@ -366,6 +366,7 @@ fn main() {
         shutdown: Some(shutdown),
         max_connections: options.max_connections,
         max_active_requests: options.max_active_requests,
+        dedicated_accept: true,
         ..Default::default()
     };
     apply_swift_http_constraints(&mut server_config, &constraints).unwrap_or_else(|error| {

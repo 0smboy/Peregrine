@@ -45,6 +45,10 @@ pub struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
     content_length: Option<u64>,
     _scope: Option<swift_runtime::TaskScope>,
+    /// Fired on the first body poll, not when the response head is built.
+    /// Object GET must hand every slow reader a status line before any of
+    /// them starts pulling the object.
+    start: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ChannelBody {
@@ -57,16 +61,39 @@ impl ChannelBody {
             rx,
             content_length,
             _scope: Some(scope),
+            start: None,
         }
     }
 
+    pub fn arm_start(&mut self, start: tokio::sync::oneshot::Sender<()>) {
+        self.start = Some(start);
+    }
+
+    fn fire_start(&mut self) {
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
+        }
+    }
+
+    /// Hyper polls the body itself. Do not start the producer here.
+    pub fn take_for_hyper(
+        mut self,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        Option<swift_runtime::TaskScope>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        (self.rx, self._scope, self.start.take())
+    }
+
     pub fn into_rx(
-        self,
+        mut self,
     ) -> (
         tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
         Option<swift_runtime::TaskScope>,
         Option<u64>,
     ) {
+        self.fire_start();
         (self.rx, self._scope, self.content_length)
     }
 

@@ -244,6 +244,13 @@ pub struct ServerConfig {
     /// `0` means 5s. After this, HTTP connections are forced off; commit-shield
     /// tasks are still joined (never aborted).
     pub shutdown_deadline_secs: u64,
+    /// Request workers. Accept and `/healthcheck` run on a separate
+    /// one-thread runtime so a saturated body pool cannot delay a probe.
+    /// `None` keeps the connection on the runtime that accepted it.
+    pub worker_pool: Option<tokio::runtime::Handle>,
+    /// Proxy sets this so `/healthcheck` is not scheduled behind object
+    /// bodies. Storage servers leave it false and keep one runtime.
+    pub dedicated_accept: bool,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -285,6 +292,11 @@ impl std::fmt::Debug for ServerConfig {
                 &self.metrics.as_ref().map(|_| "<concurrency-metrics>"),
             )
             .field("shutdown_deadline_secs", &self.shutdown_deadline_secs)
+            .field(
+                "worker_pool",
+                &self.worker_pool.as_ref().map(|_| "<worker-pool>"),
+            )
+            .field("dedicated_accept", &self.dedicated_accept)
             .finish()
     }
 }
@@ -322,6 +334,8 @@ impl Default for ServerConfig {
             max_upload_time_secs: 0,
             metrics: None,
             shutdown_deadline_secs: 0,
+            worker_pool: None,
+            dedicated_accept: false,
         }
     }
 }
@@ -500,15 +514,8 @@ pub fn serve_forever_multi(
             "serve_forever_multi requires at least one listener",
         ));
     }
-    let worker_count = config.worker_threads.max(1);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_count)
-        .thread_name("swift-http")
-        .enable_io()
-        .enable_time()
-        .build()?;
     let service: Arc<dyn AsyncService> = Arc::new(LegacyService::new(handler));
-    rt.block_on(accept_loop_async(listeners, service, config))
+    run_accept_loop(listeners, service, config)
 }
 
 /// Production serve with an [`AsyncService`] (Phase 3 ABI). Socket wait is a
@@ -524,14 +531,52 @@ pub fn serve_forever_multi_service(
             "serve_forever_multi requires at least one listener",
         ));
     }
+    run_accept_loop(listeners, service, config)
+}
+
+fn run_accept_loop(
+    listeners: Vec<TcpListener>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+) -> std::io::Result<()> {
+    if config.dedicated_accept {
+        block_on_split_runtimes(listeners, service, config)
+    } else {
+        let worker_count = config.worker_threads.max(1);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_count)
+            .thread_name("swift-http")
+            .enable_io()
+            .enable_time()
+            .build()?;
+        runtime.block_on(accept_loop_async(listeners, service, config))
+    }
+}
+
+/// Accept and `/healthcheck` use one thread. Object bodies use `worker_threads`.
+fn block_on_split_runtimes(
+    listeners: Vec<TcpListener>,
+    service: Arc<dyn AsyncService>,
+    mut config: ServerConfig,
+) -> std::io::Result<()> {
     let worker_count = config.worker_threads.max(1);
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let workers = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_count)
         .thread_name("swift-http")
         .enable_io()
         .enable_time()
         .build()?;
-    rt.block_on(accept_loop_async(listeners, service, config))
+    let liveness = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("swift-http-live")
+        .enable_io()
+        .enable_time()
+        .build()?;
+    config.worker_pool = Some(workers.handle().clone());
+    let result = liveness.block_on(accept_loop_async(listeners, service, config));
+    drop(liveness);
+    drop(workers);
+    result
 }
 
 fn derived_connection_cap(config: &ServerConfig) -> usize {
@@ -560,6 +605,23 @@ fn class_cap(explicit: usize, requests: usize) -> usize {
     } else {
         requests
     }
+}
+
+struct LiveGuard(Arc<AtomicUsize>);
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Held until the connection task that owns the socket finishes.
+/// Moved onto the worker pool for anything except `/healthcheck`.
+/// The fields are owned for their Drop impls.
+#[allow(dead_code)]
+pub(crate) struct ConnectionSlot {
+    live: LiveGuard,
+    task: RuntimeTaskGuard,
+    permit: swift_runtime::ConnectionPermit,
 }
 
 async fn accept_loop_async(
@@ -615,12 +677,6 @@ async fn accept_loop_async(
     // connection made accept O(live) under 50k idle keep-alives and
     // delayed health HEAD past the G7 p99 bound.
     let live = Arc::new(AtomicUsize::new(0));
-    struct LiveGuard(Arc<AtomicUsize>);
-    impl Drop for LiveGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
     let mut acceptors = JoinSet::new();
     for listener in tokio_listeners {
         let shutdown = Arc::clone(&shutdown);
@@ -643,14 +699,22 @@ async fn accept_loop_async(
                         live.fetch_add(1, Ordering::SeqCst);
                         metrics.runtime_tasks_inc();
                         let scheduled = Instant::now();
+                        let same_runtime = config.worker_pool.is_none();
                         tokio::spawn(async move {
-                            let _live = LiveGuard(live);
-                            metrics.observe_scheduler_lag(scheduled.elapsed());
-                            let _task = RuntimeTaskGuard(Some(metrics.clone()));
-                            let _permit = permit;
+                            let slot = ConnectionSlot {
+                                live: LiveGuard(live),
+                                task: RuntimeTaskGuard(Some(metrics.clone())),
+                                permit,
+                            };
+                            // Split runtimes record lag when the request is
+                            // handed to the body workers. One runtime records
+                            // it here, which is that spawn-to-poll delay.
+                            if same_runtime {
+                                metrics.observe_scheduler_lag(scheduled.elapsed());
+                            }
                             let connection_result = metrics
                                 .bind(handle_connection_async(
-                                    stream, service, config, shutdown, admission,
+                                    stream, service, config, shutdown, admission, slot,
                                 ))
                                 .await;
                             if let Err(error) = connection_result {
@@ -1292,8 +1356,12 @@ async fn handle_connection_async(
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
     admission: AdmissionController,
+    slot: ConnectionSlot,
 ) -> std::io::Result<()> {
-    crate::hyper_serve::serve_http1_connection(stream, service, config, shutdown, admission).await
+    crate::hyper_serve::serve_http1_connection(
+        stream, service, config, shutdown, admission, slot,
+    )
+    .await
 }
 
 #[allow(dead_code)]
