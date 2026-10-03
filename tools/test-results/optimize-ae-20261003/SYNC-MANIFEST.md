@@ -2,7 +2,7 @@
 
 | Channel | Location |
 |---------|----------|
-| Content commit | main, 2026-10-03 green rerun. Lab proxy sha `dc22cca7`. Prior product commit `0a1d590` was the RED follow-up. |
+| Content commit | `06a78a6` on `main` (2026-10-03 green rerun, lab proxy sha `dc22cca7`). Prior product commit `0a1d590` was the RED follow-up. |
 | Evidence | `tools/test-results/optimize-ae-20261003/` |
 | Vercel | `dpl_8VjUT8H5dyS4hUT3n3roAD9qCeYt` aliased to https://docs.myswift.rs |
 | Verdict | `SUMMARY.md` and `verdict.json` (2026-10-03). Full yaml is GREEN: 20 PASS, 0 FAIL, 0 NOT RUN. Source `swift4:/root/work/g7-optimize-ae-20261003/out-rerun3/verdict.json`. Lab sha `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`. Console gate stays ACCEPT_WITH_WARN. Apply was not sent. Docs-site was not edited. |
