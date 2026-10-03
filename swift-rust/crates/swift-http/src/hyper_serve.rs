@@ -144,6 +144,9 @@ pub async fn serve_http1_connection(
         )
         .await;
     }
+    if more.is_empty() {
+        return Ok(());
+    }
     if request_needs_swift_utf8_handoff(&more) {
         return serve_swift_utf8_handoff(
             stream,
@@ -156,6 +159,28 @@ pub async fn serve_http1_connection(
         )
         .await;
     }
+    // /healthcheck keep-alive is occupancy. Hyper's read and write buffers
+    // start at 8 KiB each, so 100k idle health sockets resident ~2 GiB and
+    // the lab proxy was OOM-killed. This path answers healthcheck and parks
+    // on a small read; any other request falls through to Hyper.
+    if is_healthcheck_head(&more) {
+        return serve_health_keepalive(stream, more, service, config, shutdown, admission).await;
+    }
+    return Box::pin(serve_hyper_prefixed(
+        stream, more, service, config, shutdown, admission, peer_ip,
+    ))
+    .await;
+}
+
+async fn serve_hyper_prefixed(
+    stream: tokio::net::TcpStream,
+    more: Vec<u8>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+    peer_ip: Option<String>,
+) -> std::io::Result<()> {
     let io = TokioIo::new(PrefixedIo {
         prefix: more,
         seen: 0,
@@ -200,7 +225,10 @@ pub async fn serve_http1_connection(
     // HEAD p50 ~140ms. Idle wait is a pending read (L1). First-line peek
     // waits for the first byte without a timer (new-conn idle occupancy);
     // HeaderDeadline still bounds a dripping request line after that byte.
-    builder.header_read_timeout(None);
+    // Idle keep-alives for /healthcheck do not use this timer. It only reaps
+    // Hyper connections that missed EOF, so a 30s bound cannot pile 100k sleeps
+    // onto the health-check path.
+    builder.header_read_timeout(Some(Duration::from_secs(30)));
     let max_buf = config
         .max_header_bytes
         .saturating_add(config.max_request_line_bytes)
@@ -288,6 +316,167 @@ pub async fn reject_overloaded(mut stream: tokio::net::TcpStream) {
     let _ = stream.shutdown().await;
 }
 
+fn trim_cr(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
+/// Complete GET/HEAD `/healthcheck` with no body. Anything else stays on Hyper.
+fn is_healthcheck_head(buf: &[u8]) -> bool {
+    parse_healthcheck_head(buf).is_some()
+}
+
+fn parse_healthcheck_head(buf: &[u8]) -> Option<(String, String, String, HeaderKeyDict)> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = &buf[..end];
+    let mut lines = head.split(|&b| b == b'\n');
+    let reqline = trim_cr(lines.next()?);
+    let mut parts = reqline.split(|&b| b == b' ');
+    let method = std::str::from_utf8(parts.next()?).ok()?;
+    if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+        return None;
+    }
+    let target = std::str::from_utf8(parts.next()?).ok()?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/healthcheck" {
+        return None;
+    }
+    let mut headers = HeaderKeyDict::new();
+    for line in lines {
+        let line = trim_cr(line);
+        if line.is_empty() {
+            continue;
+        }
+        let colon = line.iter().position(|b| *b == b':')?;
+        let key = std::str::from_utf8(&line[..colon]).ok()?.trim();
+        let val = std::str::from_utf8(&line[colon + 1..]).ok()?.trim();
+        headers.set(key, val);
+    }
+    if headers
+        .get("Content-Length")
+        .is_some_and(|v| v != "0")
+    {
+        return None;
+    }
+    if headers.get("Transfer-Encoding").is_some() {
+        return None;
+    }
+    Some((
+        method.to_string(),
+        path.to_string(),
+        query.to_string(),
+        headers,
+    ))
+}
+
+async fn write_simple_response(
+    stream: &mut tokio::net::TcpStream,
+    mut response: Response,
+    head_request: bool,
+) -> std::io::Result<()> {
+    let body = if head_request {
+        Vec::new()
+    } else {
+        response
+            .body
+            .materialize(1 << 20)
+            .map(|b| b.to_vec())
+            .unwrap_or_default()
+    };
+    if response.headers.get("Content-Length").is_none() {
+        response.headers.set("Content-Length", body.len().to_string());
+    }
+    if response.headers.get("Content-Type").is_none() {
+        response.headers.set("Content-Type", "text/plain");
+    }
+    let reason = if response.reason.is_empty() {
+        reason_phrase(response.status).to_string()
+    } else {
+        response.reason.clone()
+    };
+    let mut msg = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    for (key, value) in response.headers.iter() {
+        if key.eq_ignore_ascii_case("connection") || key.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        msg.push_str(key);
+        msg.push_str(": ");
+        msg.push_str(value);
+        msg.push_str("\r\n");
+    }
+    msg.push_str("Connection: keep-alive\r\n\r\n");
+    stream.write_all(msg.as_bytes()).await?;
+    if !body.is_empty() {
+        stream.write_all(&body).await?;
+    }
+    stream.flush().await
+}
+
+/// Answer `/healthcheck` without Hyper's 8 KiB buffers, then park on a read.
+/// A later non-health request is handed to Hyper with the unread prefix.
+async fn serve_health_keepalive(
+    mut stream: tokio::net::TcpStream,
+    mut head: Vec<u8>,
+    service: Arc<dyn AsyncService>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    admission: AdmissionController,
+) -> std::io::Result<()> {
+    let metrics = config
+        .metrics
+        .clone()
+        .unwrap_or_else(ConcurrencyMetrics::new);
+    let head_deadline = if config.head_deadline_secs > 0 {
+        Duration::from_secs(config.head_deadline_secs)
+    } else {
+        Duration::from_secs(30)
+    };
+    let max_head = config
+        .max_header_bytes
+        .saturating_add(config.max_request_line_bytes)
+        .max(8192);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some((method, path, query, headers)) = parse_healthcheck_head(&head) else {
+            if head.is_empty() {
+                return Ok(());
+            }
+            let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip().to_string());
+            return Box::pin(serve_hyper_prefixed(
+                stream, head, service, config, shutdown, admission, peer_ip,
+            ))
+            .await;
+        };
+        // Liveness probe. Do not take a foreground admission slot and do not
+        // enter the proxy pipeline: a thousand slow PUTs must not stretch HEAD.
+        let _ = (path, query, headers, &service, &admission);
+        metrics.record_http_request_hyper();
+        metrics.record_native_async_request();
+        let head_request = method.eq_ignore_ascii_case("HEAD");
+        let mut response = Response::with_body(200, b"OK".to_vec());
+        response.headers.set("Content-Type", "text/plain");
+        response.headers.set("X-Trans-Id", "txhealth");
+        write_simple_response(&mut stream, response, head_request).await?;
+        head.clear();
+        head.shrink_to(256);
+        match tokio::time::timeout(
+            Duration::from_secs(120),
+            read_until_marker(&mut stream, b"\r\n\r\n", max_head, head_deadline),
+        )
+        .await
+        {
+            Ok(Ok(buf)) if buf.is_empty() => return Ok(()),
+            Ok(Ok(buf)) => head = buf,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
 /// Bytes already read from `inner` are replayed before the live socket.
 /// Used so Hyper still sees a complete HTTP/1.1 request after the SSYNC peek.
 struct PrefixedIo {
@@ -307,6 +496,10 @@ impl AsyncRead for PrefixedIo {
             let n = rest.len().min(buf.remaining());
             buf.put_slice(&rest[..n]);
             self.seen += n;
+            if self.seen >= self.prefix.len() {
+                self.prefix = Vec::new();
+                self.seen = 0;
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)

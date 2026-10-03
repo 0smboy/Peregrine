@@ -51,6 +51,114 @@ fn occupancy_health(probe: &mut TcpStream, held: &mut [TcpStream]) -> String {
     last
 }
 
+#[test]
+fn healthcheck_idle_stays_under_hyper_buffer_budget() {
+    // Hyper parks an 8 KiB read buffer and an 8 KiB write buffer on every
+    // keep-alive. /healthcheck must stay under that, or 100k idle OOMs the lab.
+    let n = 400usize;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let config = ServerConfig {
+        worker_threads: 2,
+        connection_queue: 64,
+        max_connections: n + 8,
+        max_active_requests: n + 8,
+        client_timeout_secs: 5,
+        head_deadline_secs: 5,
+        shutdown: Some(Arc::clone(&shutdown)),
+        ..ServerConfig::default()
+    };
+    let handler = Arc::new(harness::tiny_ok);
+    let flag = Arc::clone(&shutdown);
+    let join = thread::spawn(move || serve_forever_with_config(listener, handler, config));
+    let ready = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < ready {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let before = process_rss_bytes();
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(b"GET /healthcheck HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
+        let (status, _) = harness::read_http_response(&mut s).unwrap();
+        assert_eq!(status, 200);
+        held.push(s);
+    }
+    thread::sleep(Duration::from_millis(50));
+    let after = process_rss_bytes();
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(held);
+    let _ = join.join();
+    assert!(after > before, "rss did not move: before {before} after {after}");
+    let per = after.saturating_sub(before) / n as u64;
+    assert!(
+        per < 8 * 1024,
+        "idle /healthcheck retained {per} bytes each (before {before}, after {after})"
+    );
+}
+
+#[test]
+fn peer_close_before_request_does_not_stick() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let config = ServerConfig {
+        worker_threads: 2,
+        max_connections: 256,
+        max_active_requests: 256,
+        client_timeout_secs: 5,
+        head_deadline_secs: 5,
+        shutdown: Some(Arc::clone(&shutdown)),
+        ..ServerConfig::default()
+    };
+    let handler = Arc::new(harness::tiny_ok);
+    let flag = Arc::clone(&shutdown);
+    let join = thread::spawn(move || serve_forever_with_config(listener, handler, config));
+    let ready = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < ready {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let before = process_fd_count();
+    for _ in 0..80 {
+        let s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        drop(s);
+    }
+    thread::sleep(Duration::from_millis(400));
+    let after = process_fd_count();
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = join.join();
+    assert!(
+        after < before + 20,
+        "closed connections stuck: before {before} after {after}"
+    );
+}
+
+fn process_fd_count() -> usize {
+    std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+}
+
+fn process_rss_bytes() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    let kb: u64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    kb.saturating_mul(1024)
+}
+
 struct IdleOutcome {
     opened: usize,
     health: String,

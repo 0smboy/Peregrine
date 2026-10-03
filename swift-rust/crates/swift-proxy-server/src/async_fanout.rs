@@ -30,7 +30,10 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use swift_http::{Body, HeaderKeyDict, IncomingBody, Response, STREAM_CHUNK};
-use swift_runtime::{CancellationToken, FanoutGroup, QuorumTracker, SharedWindow, TaskScope};
+use swift_runtime::{
+    CancellationToken, ConcurrencyMetrics, DeadlineKind, FanoutGroup, QuorumTracker, SharedWindow,
+    TaskScope,
+};
 
 use swift_core::config::config_true_value;
 use swift_core::storage_policy::quorum_size;
@@ -131,11 +134,18 @@ async fn read_http_head(
     }
 }
 
+pub(crate) fn record_backend_connect_timeout() {
+    ConcurrencyMetrics::record_timeout_current(DeadlineKind::BackendConnect);
+}
+
 async fn connect_node_async(node: &Node, conn_timeout: Duration) -> io::Result<TcpStream> {
     let addr = format!("{}:{}", node.ip, node.port);
     let stream = tokio::time::timeout(conn_timeout, TcpStream::connect(&addr))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend connect timeout"))??;
+        .map_err(|_| {
+            record_backend_connect_timeout();
+            io::Error::new(io::ErrorKind::TimedOut, "backend connect timeout")
+        })??;
     stream.set_nodelay(true).ok();
     Ok(stream)
 }
@@ -3912,6 +3922,29 @@ mod tests {
     use swift_ring::{Ring, RingData, RingDevice};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use swift_runtime::ConcurrencyMetrics;
+
+    #[tokio::test]
+    async fn backend_connect_timeout_increments_labeled_counter() {
+        let metrics = ConcurrencyMetrics::new();
+        metrics
+            .bind(async {
+                let elapsed = tokio::time::timeout(
+                    Duration::from_millis(5),
+                    std::future::pending::<()>(),
+                )
+                .await
+                .expect_err("pending future must time out");
+                let _ = elapsed;
+                super::record_backend_connect_timeout();
+            })
+            .await;
+        let text = metrics.snapshot().render();
+        assert!(
+            text.contains("timeouts_total{phase=\"backend_connect\"} 1\n"),
+            "{text}"
+        );
+    }
 
     #[cfg(feature = "ec")]
     #[test]

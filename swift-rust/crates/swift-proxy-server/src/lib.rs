@@ -351,13 +351,26 @@ impl InfoCache {
 
     /// A fresh cached entry, or `None` (removing the entry if it expired).
     ///
-    /// When shared memcache is configured it is consulted first so a clear on
-    /// another VIP backend is visible immediately (L1 alone would lag).
+    /// Local L1 is checked first. A memcache get holds the single client
+    /// mutex across a blocking TCP round trip; doing that on every streaming
+    /// PUT chunk stalls every Tokio worker, including `/healthcheck`.
+    /// Read-through fills L1 for a few seconds. `clear_*` still drops both.
     fn get_container(&self, key: &str) -> Option<ContainerInfo> {
+        if let Some(info) = self.fresh_local_container(key) {
+            return Some(info);
+        }
         if self.memcache.is_some() {
             let mkey = Self::memcache_key_container(key);
-            return self.memcache_get_container(&mkey);
+            if let Some(info) = self.memcache_get_container(&mkey) {
+                self.remember_container_local(key, &info);
+                return Some(info);
+            }
+            return None;
         }
+        None
+    }
+
+    fn fresh_local_container(&self, key: &str) -> Option<ContainerInfo> {
         let mut map = self.containers.lock().unwrap();
         match map.get(key) {
             None => None,
@@ -370,6 +383,14 @@ impl InfoCache {
                 }
             }
         }
+    }
+
+    fn remember_container_local(&self, key: &str, info: &ContainerInfo) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.containers
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (deadline, info.clone()));
     }
 
     /// Insert with a TTL in seconds. A non-positive or non-finite TTL caches
@@ -446,12 +467,24 @@ impl InfoCache {
 
     /// A fresh cached account info, or `None`.
     ///
-    /// Shared memcache is authoritative when configured (cross-proxy ACL).
+    /// Same L1-then-memcache order as [`Self::get_container`]: a blocking
+    /// memcache get must not run on the Tokio worker for a hot key.
     fn get_account(&self, account: &str) -> Option<AccountInfo> {
+        if let Some(info) = self.fresh_local_account(account) {
+            return Some(info);
+        }
         if self.memcache.is_some() {
             let mkey = Self::memcache_key_account(account);
-            return self.memcache_get_account(&mkey);
+            if let Some(info) = self.memcache_get_account(&mkey) {
+                self.remember_account_local(account, &info);
+                return Some(info);
+            }
+            return None;
         }
+        None
+    }
+
+    fn fresh_local_account(&self, account: &str) -> Option<AccountInfo> {
         let mut map = self.accounts.lock().unwrap();
         match map.get(account) {
             None => None,
@@ -464,6 +497,14 @@ impl InfoCache {
                 }
             }
         }
+    }
+
+    fn remember_account_local(&self, account: &str, info: &AccountInfo) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.accounts
+            .lock()
+            .unwrap()
+            .insert(account.to_string(), (deadline, info.clone()));
     }
 
     fn set_account(&self, account: String, info: AccountInfo, ttl_secs: f64) {
@@ -983,7 +1024,12 @@ fn connect_node(
     let sock_addr: SocketAddr = addr
         .parse()
         .map_err(|e| std::io::Error::other(format!("bad node address {addr}: {e}")))?;
-    let conn = TcpStream::connect_timeout(&sock_addr, conn_timeout)?;
+    let conn = TcpStream::connect_timeout(&sock_addr, conn_timeout).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::TimedOut {
+            async_fanout::record_backend_connect_timeout();
+        }
+        err
+    })?;
     // Small backend request/response exchanges over fresh connections are the
     // Nagle/delayed-ACK worst case; without this every proxy->backend hop eats
     // a ~40ms delayed-ACK stall (measured ~100ms+ per client op end to end).
@@ -8127,10 +8173,11 @@ fn stamp_rfc_compliant_etag_flags(app: &ProxyApp, head: &Request, resp: &mut Res
         return;
     };
     // Cache-only: object GET already populated L1 via container_info_async.
-    // A live HEAD here would block a Tokio worker (L2) and hang unit tests.
+    // A memcache get here holds the client mutex across a blocking read and
+    // stalls every Tokio worker, including /healthcheck.
     let Some(cinfo) = app
         .info_cache
-        .get_container(&format!("{account}/{container}"))
+        .fresh_local_container(&format!("{account}/{container}"))
     else {
         return;
     };
@@ -8149,7 +8196,7 @@ fn stamp_rfc_compliant_etag_flags(app: &ProxyApp, head: &Request, resp: &mut Res
         .as_deref()
         .is_some_and(|s| !s.is_empty());
     if !container_flag_set && (200..300).contains(&cinfo.status) {
-        if let Some(ainfo) = app.info_cache.get_account(account) {
+        if let Some(ainfo) = app.info_cache.fresh_local_account(account) {
             resp.headers
                 .set("X-Backend-Account-Info-Status", ainfo.status.to_string());
             if let Some(flag) = ainfo

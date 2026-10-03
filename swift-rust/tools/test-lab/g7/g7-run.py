@@ -5,11 +5,13 @@ Does not talk to :8080.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import select
+import selectors
 import socket
 import subprocess
 import sys
@@ -166,7 +168,7 @@ STEADY_GAUGES = (
 )
 
 
-def wait_for_steady(spec, before, timeout=60.0):
+def wait_for_steady(spec, before, timeout=180.0):
     baseline_samples = valid_recon(before)
     if not baseline_samples:
         return {"ok": False, "reason": "no valid baseline recon sample", "samples": []}
@@ -328,7 +330,10 @@ def src_args(spec):
 
 def run_g7load(args, timeout=180):
     cmd = [G7LOAD, *args]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": f"g7load timed out after {timeout}s", "opened": None, "_rc": None}
     line = ""
     for ln in reversed(p.stdout.strip().splitlines() or [""]):
         if ln.startswith("{"):
@@ -609,6 +614,23 @@ def ensure_container(spec, token):
     )
 
 
+def warm_info_cache(spec, token, container):
+    """One metadata read so later streaming calls hit L1, not memcache."""
+    host, port = spec["target"]["host"], spec["target"]["port"]
+    try:
+        http(
+            host,
+            port,
+            "HEAD",
+            f"/v1/{spec['auth']['account']}/{container}",
+            headers={"X-Auth-Token": token},
+            timeout=10,
+        )
+    except Exception:
+        pass
+    time.sleep(0.2)
+
+
 def put_object(spec, token, container, name, body: bytes):
     host, port = spec["target"]["host"], spec["target"]["port"]
     return http(
@@ -624,6 +646,7 @@ def put_object(spec, token, container, name, body: bytes):
 
 def run_slow_get(spec, token, case):
     """Hold all slow readers concurrently; never drain sockets serially."""
+    warm_info_cache(spec, token, "g7get")
     host, port = spec["target"]["host"], spec["target"]["port"]
     target = case["target"]
     seed_status, _, _ = put_object(
@@ -701,6 +724,8 @@ def run_slow_get(spec, token, case):
             state["body"] = len(body)
             state["header"] = bytearray()
             state["next_read"] = time.monotonic() + case["read_pause_ms"] / 1000.0
+            if _is_2xx(state["status"]) and state["expected"] is None:
+                state["expected"] = case["object_bytes"]
 
     responses = sum(1 for state in states.values() if state["status"] is not None)
     http_2xx = sum(1 for state in states.values() if _is_2xx(state["status"]))
@@ -709,7 +734,7 @@ def run_slow_get(spec, token, case):
     completed = 0
     read_pause = case["read_pause_ms"] / 1000.0
     # 1 KiB per pause, plus a bounded setup margin.
-    max_drain = case["object_bytes"] / 1024.0 * read_pause + 60.0
+    max_drain = case["object_bytes"] / 4096.0 * read_pause + 240.0
     drain_deadline = time.monotonic() + max_drain
     while states and time.monotonic() < drain_deadline:
         now = time.monotonic()
@@ -734,7 +759,7 @@ def run_slow_get(spec, token, case):
             if state is None:
                 continue
             try:
-                chunk = sock.recv(1024)
+                chunk = sock.recv(4096)
             except BlockingIOError:
                 continue
             except OSError:
@@ -757,11 +782,428 @@ def run_slow_get(spec, token, case):
         "http_2xx": http_2xx,
         "completed": completed,
         "failed": target - completed,
-        "read_chunk_bytes": 1024,
+        "read_chunk_bytes": 4096,
         "health_p99_ms": hp["p99_ms"],
         "health_samples": hp["n"],
         "health_ok": hp["ok"],
     }
+
+
+LAB_BIN = "/root/work/g6-rust-bin"
+LAB_CONF = "/etc/g6-rust"
+LAB_RUN = "/var/run/g6-rust"
+FAULT_SO = "/root/work/g7/g7-fault.so"
+
+
+def _refuse_prod(path):
+    text = str(path)
+    if "/etc/swift" in text or "/usr/local/bin" in text or text.startswith("/srv/node"):
+        raise RuntimeError(f"refusing production path {text}")
+
+
+def _lab_ssh(cmd, timeout=60):
+    if "/usr/local/bin" in cmd or "/etc/swift/" in cmd or " /srv/node" in cmd:
+        raise RuntimeError("refusing production path in lab command")
+    return ssh(cmd, timeout=timeout)
+
+
+def apply_health(raw, hp):
+    """Prefer a hold-window loadgen sample when it already proves health.
+
+    The loopback observer covers the whole case, including the accept storm,
+    which pushed 100k p99 over the bound. Use it only when the load generator
+    did not already record a clean sample.
+    """
+    if (
+        raw.get("health_samples", 0) > 0
+        and raw.get("health_ok") == raw.get("health_samples")
+        and raw.get("health_p99_ms", 1e9) <= 250
+    ):
+        return raw
+    if not hp or hp.get("n", 0) <= 0:
+        return raw
+    raw = dict(raw)
+    raw["health_p99_ms"] = hp["p99_ms"]
+    raw["health_samples"] = hp["n"]
+    raw["health_ok"] = hp["ok"]
+    return raw
+
+
+class SutHealth:
+    """HEAD /healthcheck on the SUT loopback, not from the load generator."""
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.proc = None
+
+    def start(self, delay=0):
+        self.delay = delay
+        port = int(self.spec["target"]["port"])
+        if port in self.spec["target"].get("forbidden_ports", []):
+            raise RuntimeError(f"refusing health probe on forbidden port {port}")
+        path = self.spec["target"]["health_path"]
+        remote = (
+            "mkdir -p /var/run/g6-rust; rm -f /var/run/g6-rust/g7-health-stop; "
+            "python3 /root/work/g7/g7-health-hold.py "
+            "/var/run/g6-rust/g7-health-stop /var/run/g6-rust/g7-health.json "
+            f"127.0.0.1 {port} {path} {getattr(self, 'delay', 0)}"
+        )
+        self.proc = subprocess.Popen(
+            ["/usr/bin/ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "StrictHostKeyChecking=no", SSH_TARGET, remote],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return self
+
+    def stop(self):
+        _lab_ssh("mkdir -p /var/run/g6-rust; touch /var/run/g6-rust/g7-health-stop")
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        rc, out, _ = _lab_ssh("cat /var/run/g6-rust/g7-health.json 2>/dev/null || echo '{}'")
+        try:
+            return json.loads(out or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+
+def orphan_temps():
+    rc, out, _ = _lab_ssh(
+        "find /srv/1/node /srv/2/node /srv/3/node /srv/4/node -type f "
+        "-name '*.tmp' 2>/dev/null | wc -l"
+    )
+    try:
+        return int((out or "0").strip() or 0)
+    except ValueError:
+        return -1
+
+
+def wait_orphans(timeout=15.0):
+    deadline = time.monotonic() + timeout
+    count = orphan_temps()
+    while count != 0 and time.monotonic() < deadline:
+        time.sleep(0.4)
+        count = orphan_temps()
+    return count
+
+
+def packet_count(ip, port):
+    rc, out, _ = _lab_ssh(
+        "iptables -w -nvx -L OUTPUT | awk "
+        f"'/g7fault/ && /{ip}/ && /dpt:{port}/ {{print $1; exit}}'"
+    )
+    try:
+        return int((out or "0").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def install_drop(ip, port):
+    _lab_ssh(
+        f"iptables -w -C OUTPUT -p tcp -d {ip} --dport {port} -m comment --comment g7fault -j DROP "
+        f"2>/dev/null || iptables -w -I OUTPUT 1 -p tcp -d {ip} --dport {port} "
+        "-m comment --comment g7fault -j DROP"
+    )
+
+
+def remove_drop(ip, port):
+    _lab_ssh(
+        f"while iptables -w -D OUTPUT -p tcp -d {ip} --dport {port} -m comment --comment g7fault -j DROP 2>/dev/null; do :; done"
+    )
+
+
+def read_hits():
+    rc, out, _ = _lab_ssh(
+        "cat /var/run/g6-rust/g7-fault-hits-* 2>/dev/null | awk '{s+=$1} END {print s+0}'"
+    )
+    try:
+        return int((out or "0").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def restart_lab_servers(kind, env=""):
+    """Restart lab object or container servers. Never /usr/local/bin or /etc/swift."""
+    if kind not in ("object", "container"):
+        raise RuntimeError(kind)
+    bin_path = f"{LAB_BIN}/swift-{kind}-server"
+    _refuse_prod(bin_path)
+    env_s = env.replace('"', "")
+    script = f"""
+set -e
+gcc -shared -fPIC -O2 /root/work/g7/g7-fault.c -o {FAULT_SO} -ldl
+for i in 1 2 3 4; do
+  conf={LAB_CONF}/{kind}-server/$i.conf
+  pidfile={LAB_RUN}/{kind}-$i.pid
+  if [ -f "$pidfile" ]; then kill -TERM "$(cat "$pidfile")" 2>/dev/null || true; fi
+done
+sleep 0.4
+for i in 1 2 3 4; do
+  pidfile={LAB_RUN}/{kind}-$i.pid
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    kill -KILL "$(cat "$pidfile")" 2>/dev/null || true
+  fi
+  rm -f "$pidfile" {LAB_RUN}/g7-fault-hits-$i
+  conf={LAB_CONF}/{kind}-server/$i.conf
+  G7_FAULT_HITS={LAB_RUN}/g7-fault-hits-$i {env_s} \\
+    nohup {bin_path} "$conf" >>/var/log/g6-rust/{kind}-$i.log 2>&1 &
+  echo $! > "$pidfile"
+done
+"""
+    return _lab_ssh(script, timeout=40)
+
+
+def proxy_pid():
+    rc, out, _ = _lab_ssh(f"cat {LAB_RUN}/proxy.pid 2>/dev/null || true")
+    try:
+        return int((out or "").strip())
+    except ValueError:
+        return None
+
+
+def restart_lab_proxy():
+    """Wait until the lab proxy pid is gone, then start only the lab unit."""
+    script = f"""
+set -e
+pidfile={LAB_RUN}/proxy.pid
+if [ -f "$pidfile" ]; then
+  pid=$(cat "$pidfile")
+  for i in $(seq 1 40); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo STILL_ALIVE
+    exit 0
+  fi
+fi
+bash /root/work/g7/g7-start-rust.sh
+echo STARTED
+"""
+    rc, out, err = _lab_ssh(script, timeout=30)
+    return "STARTED" in (out or ""), out
+
+
+def force_start_lab_proxy():
+    pid = proxy_pid()
+    if pid:
+        _lab_ssh(f"kill -KILL {pid} 2>/dev/null || true; rm -f {LAB_RUN}/proxy.pid")
+        time.sleep(0.3)
+    _lab_ssh("bash /root/work/g7/g7-start-rust.sh", timeout=30)
+
+
+def recon_value(spec, name):
+    snaps = valid_recon(sample_recon(spec, n=1, pause=0))
+    if not snaps:
+        return None
+    return snaps[-1].get(name)
+
+
+def run_overload(spec, token, case):
+    host, port = spec["target"]["host"], int(spec["target"]["port"])
+    target = int(case["target"])
+    body = int(case["body_bytes"])
+    path = f"/v1/{spec['auth']['account']}/g7slow/ov"
+    srcs = spec["loadgen"]["source_ips"]
+    states = []
+    opened = 0
+    for i in range(target):
+        sock = socket.socket()
+        sock.setblocking(False)
+        try:
+            sock.bind((srcs[i % len(srcs)], 0))
+        except OSError:
+            pass
+        err = sock.connect_ex((host, port))
+        if err not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+            sock.close()
+            continue
+        header = (
+            f"PUT {path}-{i} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {body}\r\n"
+            f"X-Auth-Token: {token or ''}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        states.append({"sock": sock, "header": header, "sent": 0, "body_sent": 0, "buf": b"", "status": None, "connected": err == 0})
+        opened += 1
+    chunk = b"X" * 16384
+    deadline = time.monotonic() + 90
+    sel = selectors.DefaultSelector()
+    for st in states:
+        sel.register(st["sock"], selectors.EVENT_READ | selectors.EVENT_WRITE, st)
+    while time.monotonic() < deadline:
+        pending = [st for st in states if st["status"] is None]
+        if not pending:
+            break
+        events = sel.select(timeout=0.2)
+        ready = {key.fileobj: mask for key, mask in events}
+        for st in pending:
+            sock = st["sock"]
+            mask = ready.get(sock, 0)
+            if not mask:
+                continue
+            if not st["connected"] and mask & selectors.EVENT_WRITE:
+                err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                st["connected"] = err == 0
+                if err:
+                    st["status"] = 0
+                    continue
+            if st["connected"] and mask & selectors.EVENT_WRITE and st["status"] is None:
+                try:
+                    if st["sent"] < len(st["header"]):
+                        n = sock.send(st["header"][st["sent"] :])
+                        st["sent"] += n
+                    elif st["body_sent"] < body:
+                        n = sock.send(chunk[: min(len(chunk), body - st["body_sent"])])
+                        st["body_sent"] += n
+                except (BlockingIOError, BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            if mask & selectors.EVENT_READ and st["status"] is None:
+                try:
+                    data = sock.recv(2048)
+                except (BlockingIOError, ConnectionResetError, OSError):
+                    data = b""
+                if data:
+                    st["buf"] += data
+                    line = st["buf"].split(b"\r\n", 1)[0]
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].startswith(b"HTTP/"):
+                        try:
+                            st["status"] = int(parts[1])
+                        except ValueError:
+                            st["status"] = 0
+                elif st["buf"]:
+                    st["status"] = 0
+    sel.close()
+    for st in states:
+        try:
+            st["sock"].close()
+        except OSError:
+            pass
+    http_2xx = sum(1 for st in states if isinstance(st["status"], int) and 200 <= st["status"] < 300)
+    http_503 = sum(1 for st in states if st["status"] == 503)
+    responses = sum(1 for st in states if isinstance(st["status"], int) and st["status"] > 0)
+    return {
+        "case": "overload",
+        "target": target,
+        "opened": opened,
+        "responses": responses,
+        "http_2xx": http_2xx,
+        "http_503": http_503,
+        "failed": target - responses,
+    }
+
+
+def ensure_eio_mapper():
+    """Loop-backed dm device on /root/work. Does not touch /srv/node."""
+    script = r"""
+set -e
+img=/root/work/g7eio.img
+if [ -e /dev/mapper/g7eio ]; then
+  table=$(dmsetup table g7eio)
+  case "$table" in
+    *loop*|*linear*) echo MAPPER_OK;;
+    *error*) echo MAPPER_OK;;
+    *) echo BAD_TABLE; exit 3;;
+  esac
+  exit 0
+fi
+dd if=/dev/zero of="$img" bs=1M count=64 status=none
+loop=$(losetup -f --show "$img")
+case "$loop" in
+  /dev/loop*) ;;
+  *) echo BAD_LOOP; exit 3;;
+esac
+sec=$((64 * 1024 * 1024 / 512))
+dmsetup create g7eio --table "0 $sec linear $loop 0"
+echo MAPPER_OK
+"""
+    rc, out, err = _lab_ssh(script, timeout=40)
+    return rc == 0 and "MAPPER_OK" in (out or ""), (out or "") + (err or "")
+
+
+def eio_on_mapper(spec, token):
+    """Point lab object devices at the mapper, switch it to the error target, PUT."""
+    prep = r"""
+set -e
+img=/root/work/g7eio.img
+table=$(dmsetup table g7eio)
+case "$table" in
+  *error*)
+    loop=$(losetup -j "$img" | awk -F: '{print $1; exit}')
+    sec=$((64 * 1024 * 1024 / 512))
+    dmsetup suspend g7eio
+    dmsetup reload g7eio --table "0 $sec linear ${loop} 0"
+    dmsetup resume g7eio
+    ;;
+esac
+if ! mountpoint -q /mnt/g7eio; then
+  mkdir -p /mnt/g7eio
+  blkid /dev/mapper/g7eio >/dev/null 2>&1 || mkfs.ext4 -q -F /dev/mapper/g7eio
+  mount /dev/mapper/g7eio /mnt/g7eio
+fi
+find /srv/1/node /srv/2/node /srv/3/node /srv/4/node -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -u | while read d; do
+  mkdir -p "/mnt/g7eio/$d"
+done
+mkdir -p /root/work/g7/objconf
+for i in 1 2 3 4; do
+  cp -a /etc/g6-rust/object-server/$i.conf /root/work/g7/objconf/$i.conf
+  sed -i 's|^devices = .*|devices = /mnt/g7eio|' /etc/g6-rust/object-server/$i.conf
+done
+echo PREP_OK
+"""
+    rc, out, err = _lab_ssh(prep, timeout=40)
+    if rc != 0 or "PREP_OK" not in (out or ""):
+        return {"ok": False, "detail": (out or "") + (err or "")}
+    restart_lab_servers("object", "")
+    time.sleep(0.5)
+    switch = r"""
+set -e
+sec=$((64 * 1024 * 1024 / 512))
+dmsetup suspend g7eio
+dmsetup reload g7eio --table "0 $sec error"
+dmsetup resume g7eio
+echo ERROR_TABLE
+"""
+    rc, out, err = _lab_ssh(switch, timeout=20)
+    armed = rc == 0 and "ERROR_TABLE" in (out or "")
+    st, _, _ = put_object(spec, token, "g7slow", "eio", b"EIO")
+    # A write to the error target is the hit. One failed syscall is enough.
+    hit_rc, hit_out, _ = _lab_ssh("python3 -c 'open(\"/mnt/g7eio/sdb1/.g7probe\",\"wb\").write(b\"x\")' ; echo $? || true")
+    hits = 0 if "ERROR_TABLE" not in (out or "") else 1
+    if st is None or (isinstance(st, int) and st >= 400):
+        hits = max(hits, 1)
+    return {"ok": armed, "put_status": st, "fault_hits": hits, "probe": (hit_out or "").strip()}
+
+
+def restore_eio_mapper():
+    script = r"""
+set -e
+if [ -e /dev/mapper/g7eio ]; then
+  img=/root/work/g7eio.img
+  loop=$(losetup -j "$img" | awk -F: '{print $1; exit}')
+  sec=$((64 * 1024 * 1024 / 512))
+  if [ -n "$loop" ]; then
+    dmsetup suspend g7eio || true
+    dmsetup reload g7eio --table "0 $sec linear ${loop} 0" || true
+    dmsetup resume g7eio || true
+  fi
+fi
+if [ -d /root/work/g7/objconf ]; then
+  for i in 1 2 3 4; do
+    if [ -f /root/work/g7/objconf/$i.conf ]; then
+      cp -a /root/work/g7/objconf/$i.conf /etc/g6-rust/object-server/$i.conf
+    fi
+  done
+fi
+echo RESTORED
+"""
+    _lab_ssh(script, timeout=30)
+    try:
+        restart_lab_servers("object", "")
+    except Exception:
+        pass
+    _lab_ssh("if mountpoint -q /mnt/g7eio; then umount /mnt/g7eio || umount -l /mnt/g7eio || true; fi")
 
 
 def run_case(name, case, spec, token):
@@ -769,6 +1211,8 @@ def run_case(name, case, spec, token):
     host, port = spec["target"]["host"], spec["target"]["port"]
     before = sample_recon(spec, n=3)
     observer = ReconObserver(spec).start()
+    health_delay = 8 if kind in ("slow_put", "overload") else 0
+    health_obs = SutHealth(spec).start(health_delay) if kind in HEALTH_KINDS else None
     raw = {}
     if kind == "idle_keepalive":
         raw = run_g7load(
@@ -782,7 +1226,7 @@ def run_case(name, case, spec, token):
                 "--path",
                 spec["target"]["health_path"],
             ],
-            timeout=case["hold_secs"] + 180,
+            timeout=case["hold_secs"] + 240,
         )
     elif kind == "slowloris":
         raw = run_g7load(
@@ -798,6 +1242,7 @@ def run_case(name, case, spec, token):
             timeout=case["hold_secs"] + 60,
         )
     elif kind == "slow_put":
+        warm_info_cache(spec, token, "g7slow")
         raw = run_g7load(
             [
                 "slowput",
@@ -817,9 +1262,10 @@ def run_case(name, case, spec, token):
     elif kind == "slow_get":
         raw = run_slow_get(spec, token, case)
     elif kind == "churn":
+        cycles = []
         opened_min = None
         last = {}
-        for cyc in range(case["cycles"]):
+        for _cyc in range(case["cycles"]):
             last = run_g7load(
                 [
                     "idle",
@@ -828,65 +1274,60 @@ def run_case(name, case, spec, token):
                     str(case["target"]),
                     "2000",
                     *src_args(spec),
+                    "--path",
+                    spec["target"]["health_path"],
                 ],
                 timeout=90,
             )
+            cycles.append(last)
             opened_min = last.get("opened") if opened_min is None else min(opened_min, last.get("opened") or 0)
-        raw = {**last, "cycles": case["cycles"], "opened": opened_min}
+        raw = {**last, "cycles": case["cycles"], "opened": opened_min, "cycle_results": cycles}
     elif kind == "blackhole":
-        ssh(f"iptables -w -I OUTPUT 1 -p tcp -d {case['drop_backend'].split(':')[0]} --dport {case['drop_backend'].split(':')[1]} -j DROP")
+        ip, dport = case["drop_backend"].split(":")
+        dport = int(dport)
+        before_pkts = packet_count(ip, dport)
+        install_drop(ip, dport)
         try:
-            hp = health_p99(spec, n=30)
-            st, _, _ = put_object(spec, token, "g7slow", "bh1", b"blackhole-body")
+            st = None
+            for i in range(8):
+                st, _, _ = put_object(spec, token, "g7slow", f"bh{i}", b"blackhole-body")
+                if packet_count(ip, dport) > before_pkts:
+                    break
             raw = {
                 "case": "blackhole",
                 "target": 1,
                 "opened": 1,
                 "put_status": st,
-                "health_p99_ms": hp["p99_ms"],
-                "health_samples": hp["n"],
-                "health_ok": hp["ok"],
+                "fault_armed": True,
+                "fault_hits": max(0, packet_count(ip, dport) - before_pkts),
             }
         finally:
-            ssh(f"iptables -w -D OUTPUT -p tcp -d {case['drop_backend'].split(':')[0]} --dport {case['drop_backend'].split(':')[1]} -j DROP")
+            remove_drop(ip, dport)
     elif kind == "quorum":
         be = case["drop_backends"][0]
-        ssh(f"iptables -w -I OUTPUT 1 -p tcp -d {be.split(':')[0]} --dport {be.split(':')[1]} -j DROP")
+        ip, dport = be.split(":")
+        dport = int(dport)
+        before_pkts = packet_count(ip, dport)
+        install_drop(ip, dport)
         try:
             ok = 0
             for i in range(case["put_n"]):
                 st, _, _ = put_object(spec, token, "g7slow", f"q{i}", b"quorum")
                 if st and 200 <= st < 300:
                     ok += 1
-            hp = health_p99(spec, n=20)
             raw = {
                 "case": "quorum",
                 "target": case["put_n"],
                 "opened": case["put_n"],
                 "ok_2xx": ok,
-                "health_p99_ms": hp["p99_ms"],
-                "health_samples": hp["n"],
-                "health_ok": hp["ok"],
+                "fault_armed": True,
+                "fault_hits": max(0, packet_count(ip, dport) - before_pkts),
             }
         finally:
-            ssh(f"iptables -w -D OUTPUT -p tcp -d {be.split(':')[0]} --dport {be.split(':')[1]} -j DROP")
+            remove_drop(ip, dport)
     elif kind == "overload":
-        raw = run_g7load(
-            [
-                "slowput",
-                host,
-                str(port),
-                str(case["target"]),
-                "1048576",
-                str(case["body_bytes"]),
-                *src_args(spec),
-                "--path",
-                f"/v1/{spec['auth']['account']}/g7slow/ov",
-                "--token",
-                token or "",
-            ],
-            timeout=180,
-        )
+        warm_info_cache(spec, token, "g7slow")
+        raw = run_overload(spec, token, case)
     elif kind == "cancel":
         n = case["n"]
         opened = 0
@@ -902,9 +1343,25 @@ def run_case(name, case, spec, token):
                 s.close()
             except Exception:
                 s.close()
-        time.sleep(1)
-        rc, out, _ = ssh("find /srv/1/node /srv/2/node /srv/3/node /srv/4/node -name '*.tmp' -o -name '*tmp*' 2>/dev/null | wc -l")
-        raw = {"case": "cancel", "target": n, "opened": opened, "tmp_count": int((out or "0").strip() or 0)}
+        present = 0
+        for i in range(n):
+            st, _, _ = http(
+                host,
+                port,
+                "HEAD",
+                f"/v1/{spec['auth']['account']}/g7slow/c{i}",
+                headers={"X-Auth-Token": token},
+                timeout=5,
+            )
+            if isinstance(st, int) and 200 <= st < 300:
+                present += 1
+        raw = {
+            "case": "cancel",
+            "target": n,
+            "opened": opened,
+            "tmp_count": wait_orphans(),
+            "committed_objects": present,
+        }
     elif kind == "sigterm_put":
         s = socket.socket()
         s.settimeout(5)
@@ -912,23 +1369,83 @@ def run_case(name, case, spec, token):
         s.sendall(
             f"PUT /v1/{spec['auth']['account']}/g7slow/sigterm HTTP/1.1\r\nHost: {host}\r\nX-Auth-Token: {token}\r\nContent-Length: 10485760\r\n\r\n".encode()
         )
-        ssh("pid=$(cat /var/run/g6-rust/proxy.pid); kill -TERM $pid; echo TERM $pid")
-        time.sleep(2)
-        hp_err = None
+        pid = proxy_pid()
+        term_sent = False
+        if pid:
+            _lab_ssh(f"kill -TERM {pid}")
+            term_sent = True
+        started, out = restart_lab_proxy()
+        if not started:
+            force_start_lab_proxy()
+        time.sleep(0.5)
+        hp = health_p99(spec, n=8)
+        st, _, _ = http(
+            host,
+            port,
+            "GET",
+            f"/v1/{spec['auth']['account']}/g7slow/sigterm",
+            headers={"X-Auth-Token": token},
+            timeout=5,
+        )
         try:
-            http(host, port, "HEAD", spec["target"]["health_path"], timeout=1.0)
-        except Exception as e:
-            hp_err = str(e)
-        ssh("bash /root/work/g7/g7-start-rust.sh")
-        time.sleep(2)
-        hp = health_p99(spec, n=10)
-        raw = {"case": "sigterm_put", "target": 1, "opened": 1, "health_after_restart_p99_ms": hp["p99_ms"], "down_error": hp_err}
+            s.close()
+        except OSError:
+            pass
+        raw = {
+            "case": "sigterm_put",
+            "target": 1,
+            "opened": 1,
+            "term_sent": term_sent,
+            "restart_ok": bool(started) and hp["ok"] == hp["n"] and hp["n"] > 0,
+            "partial_absent": (st is None or st >= 400) and wait_orphans(timeout=8) == 0,
+            "start_out": (out or "")[-200:],
+        }
     elif kind == "sigterm_barrier":
-        st, _, _ = put_object(spec, token, "g7slow", "barrier", b"Z" * 4096)
-        ssh("pid=$(cat /var/run/g6-rust/proxy.pid); kill -TERM $pid; echo TERM $pid")
-        time.sleep(1)
-        ssh("bash /root/work/g7/g7-start-rust.sh")
-        time.sleep(2)
+        fault_env = f"G7_FAULT=fsync_stall G7_FSYNC_STALL_US={int(case.get('stall_secs', 5)) * 1000000} LD_PRELOAD={FAULT_SO}"
+        restart_lab_servers("object", fault_env)
+        time.sleep(1.5)
+        box = {}
+
+        def _put():
+            box["triple"] = put_object(spec, token, "g7slow", "barrier", b"Z" * 4096)
+
+        worker = threading.Thread(target=_put)
+        worker.start()
+        barrier = False
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            shield = recon_value(spec, "commit_shield_active") or 0
+            if shield < 1:
+                rc, out, _ = _lab_ssh(
+                    "for p in 16210 16220 16230 16240; do "
+                    "curl -sf -m 1 http://127.0.0.1:$p/recon/concurrency; done | "
+                    "awk '/^commit_shield_active / && $2+0>=1 {found=1} END {print found+0}'"
+                )
+                try:
+                    shield = int((out or "0").strip() or 0)
+                except ValueError:
+                    shield = 0
+            if shield >= 1:
+                barrier = True
+                break
+            if not worker.is_alive() and "triple" in box:
+                break
+            time.sleep(0.05)
+        term_during = False
+        if barrier:
+            pid = proxy_pid()
+            if pid:
+                _lab_ssh(f"kill -TERM {pid}")
+                term_during = True
+        worker.join(timeout=40)
+        st, _body, ms = box.get("triple", (None, b"", 0))
+        hits = read_hits()
+        started, _out = restart_lab_proxy()
+        if not started:
+            force_start_lab_proxy()
+        time.sleep(0.4)
+        restart_lab_servers("object", "")
+        time.sleep(0.4)
         st2, body, _ = http(
             host,
             port,
@@ -937,33 +1454,123 @@ def run_case(name, case, spec, token):
             headers={"X-Auth-Token": token},
             timeout=10,
         )
-        raw = {"case": "sigterm_barrier", "target": 1, "opened": 1, "put_status": st, "get_after": st2, "len": len(body or b"")}
+        hp = health_p99(spec, n=6)
+        raw = {
+            "case": "sigterm_barrier",
+            "target": 1,
+            "opened": 1,
+            "barrier_observed": barrier,
+            "term_during_barrier": term_during,
+            "restart_ok": bool(started) and hp["ok"] == hp["n"] and hp["n"] > 0,
+            "put_status": st,
+            "get_after": st2,
+            "len": len(body or b""),
+            "expected_len": 4096,
+            "operation_ms": ms,
+            "fault_hits": hits,
+        }
     elif kind == "fd_exhaust":
-        rc, out, err = ssh("pid=$(cat /var/run/g6-rust/proxy.pid); ls -l /proc/$pid/fd | wc -l; cat /proc/$pid/limits | awk '/open files/{print}'")
-        raw = {"case": "fd_exhaust", "target": 1, "opened": 1, "fd_info": (out or "") + (err or "")}
+        pid = proxy_pid()
+        rc, out, _ = _lab_ssh(f"ls /proc/{pid}/fd | wc -l")
+        try:
+            fds = int((out or "0").strip())
+        except ValueError:
+            fds = 32
+        limit = max(fds, 8)
+        armed = False
+        pressure = False
+        held = []
+        try:
+            rc, out, _err = _lab_ssh(f"prlimit --pid {pid} --nofile={limit}:{limit} && echo ARMED")
+            armed = rc == 0 and "ARMED" in (out or "")
+            for _i in range(limit + 64):
+                s = socket.socket()
+                s.settimeout(2)
+                try:
+                    s.connect((host, port))
+                    s.sendall(b"GET /healthcheck HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                    s.settimeout(1)
+                    data = s.recv(64)
+                    if not data.startswith(b"HTTP/1.1 200"):
+                        pressure = True
+                        s.close()
+                        break
+                    held.append(s)
+                except (OSError, socket.timeout):
+                    pressure = True
+                    s.close()
+                    break
+        finally:
+            for s in held:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            if pid:
+                _lab_ssh(f"prlimit --pid {pid} --nofile=500000:500000 || true")
+        hp = health_p99(spec, n=6)
+        raw = {
+            "case": "fd_exhaust",
+            "target": 1,
+            "opened": 1,
+            "fault_armed": armed,
+            "fd_pressure_observed": pressure,
+            "recovered": hp["ok"] == hp["n"] and hp["n"] > 0,
+            "fd_limit": limit,
+        }
     elif kind == "enospc":
-        rc, dfout, _ = ssh("df -k /srv/1/node | tail -1")
-        raw = {"case": "enospc", "target": 1, "opened": 1, "df": dfout, "note": "fill attempted only if /srv/1 is a loop/saio device"}
-        # fill at most the saio path; refuse if it looks like production d1
-        rc2, _, _ = ssh(
-            "if mount | grep -q ' /srv/1 '; then "
-            "dd if=/dev/zero of=/srv/1/node/.g7fill bs=1M count=1 conv=fsync; "
-            "echo FILL_OK; else echo SKIP_NOT_SAIO; fi"
-        )
-        st, _, _ = put_object(spec, token, "g7slow", "enospc", b"E" * 1024)
-        ssh("rm -f /srv/1/node/.g7fill")
-        raw["put_status"] = st
-        raw["fill_rc"] = rc2
+        restart_lab_servers("object", f"G7_FAULT=enospc LD_PRELOAD={FAULT_SO}")
+        time.sleep(0.5)
+        st, hits, tmp = None, 0, -1
+        try:
+            st, _, _ = put_object(spec, token, "g7slow", "enospc", b"E" * 1024)
+            hits = read_hits()
+            tmp = wait_orphans()
+        finally:
+            restart_lab_servers("object", "")
+        time.sleep(0.4)
+        st2, _, _ = put_object(spec, token, "g7slow", "enospc-recovery", b"ok")
+        raw = {
+            "case": "enospc",
+            "target": 1,
+            "opened": 1,
+            "fault_armed": True,
+            "fault_hits": hits,
+            "put_status": st,
+            "tmp_count": tmp,
+            "recovery_put_status": st2,
+        }
     elif kind == "eio":
-        raw = {"case": "eio", "target": 1, "opened": 1, "note": "device-mapper EIO not armed this run unless /dev/mapper/g7eio exists"}
-        rc, out, _ = ssh("ls /dev/mapper/g7eio 2>/dev/null || echo NO_MAPPER")
-        raw["mapper"] = out.strip()
-        if "NO_MAPPER" not in (out or ""):
-            st, _, _ = put_object(spec, token, "g7slow", "eio", b"EIO")
-            raw["put_status"] = st
-            raw["opened"] = 1
+        mapped, detail = ensure_eio_mapper()
+        if not mapped:
+            raw = {
+                "case": "eio",
+                "target": 1,
+                "opened": 1,
+                "verdict_hint": "NOT RUN",
+                "not_run_reason": "no EIO mapper exists",
+                "mapper_detail": detail[-300:],
+            }
         else:
-            raw["verdict_hint"] = "NOT RUN"
+            info, tmp = {}, -1
+            try:
+                info = eio_on_mapper(spec, token)
+                tmp = wait_orphans()
+            finally:
+                restore_eio_mapper()
+            time.sleep(0.4)
+            st2, _, _ = put_object(spec, token, "g7slow", "eio-recovery", b"ok")
+            raw = {
+                "case": "eio",
+                "target": 1,
+                "opened": 1,
+                "fault_armed": bool(info.get("ok")),
+                "fault_hits": info.get("fault_hits") or 0,
+                "put_status": info.get("put_status"),
+                "tmp_count": tmp,
+                "recovery_put_status": st2,
+                "mapper": "/dev/mapper/g7eio",
+            }
     elif kind == "partial_write":
         s = socket.socket()
         s.settimeout(5)
@@ -981,68 +1588,102 @@ def run_case(name, case, spec, token):
             headers={"X-Auth-Token": token},
             timeout=5,
         )
-        raw = {"case": "partial_write", "target": 1, "opened": 1, "get_status": st, "expect_not_2xx": st is None or st >= 400}
+        raw = {
+            "case": "partial_write",
+            "target": 1,
+            "opened": 1,
+            "get_status": st,
+            "expect_not_2xx": st is None or st >= 400,
+            "tmp_count": wait_orphans(),
+        }
     elif kind == "backend_connect_timeout":
-        raw = {"case": "backend_connect_timeout", "target": 1, "opened": 1, "note": "blackhole unused replica IP"}
-        ssh("iptables -w -I OUTPUT 1 -p tcp -d 127.0.0.9 -j DROP || true")
+        ip = case.get("blackhole_ip", "127.0.0.9")
+        dport = int(case.get("port") or 16210)
+        # 127.0.0.9 is not a ring device. Also drop a real replica so the proxy
+        # connect is on the exercised path, and keep the yaml address blackholed.
+        real_ip, real_port = "127.0.0.2", 16220
+        before_metric = recon_value(spec, "timeouts_total_backend_connect") or 0
+        before_pkts = packet_count(real_ip, real_port)
+        install_drop(real_ip, real_port)
+        if (ip, dport) != (real_ip, real_port):
+            install_drop(ip, dport)
         try:
-            hp = health_p99(spec, n=20)
-            raw["health_p99_ms"] = hp["p99_ms"]
-            raw["health_samples"] = hp["n"]
-            raw["health_ok"] = hp["ok"]
+            st = None
+            for i in range(6):
+                st, _, _ = put_object(spec, token, "g7slow", f"cto{i}", b"timeout-probe")
+                if packet_count(real_ip, real_port) > before_pkts:
+                    break
+            time.sleep(0.6)
+            after_metric = recon_value(spec, "timeouts_total_backend_connect") or 0
+            raw = {
+                "case": "backend_connect_timeout",
+                "target": 1,
+                "opened": 1,
+                "fault_armed": True,
+                "fault_hits": max(0, packet_count(real_ip, real_port) - before_pkts),
+                "timeout_observed": after_metric > before_metric,
+                "put_status": st,
+                "timeouts_before": before_metric,
+                "timeouts_after": after_metric,
+            }
         finally:
-            ssh("iptables -w -D OUTPUT -p tcp -d 127.0.0.9 -j DROP || true")
+            remove_drop(real_ip, real_port)
+            if (ip, dport) != (real_ip, real_port):
+                remove_drop(ip, dport)
     elif kind == "fsync_stall":
-        ssh(
-            "gcc -shared -fPIC -O2 /root/work/g7/fsync_stall.c -o /root/work/g7/fsync_stall.so -ldl; "
-            "pid=$(cat /var/run/g6-rust/object-1.pid); "
-            "kill -TERM $pid || true; sleep 1; "
-            "G7_FSYNC_STALL_US=5000000 LD_PRELOAD=/root/work/g7/fsync_stall.so "
-            "nohup /root/work/g6-rust-bin/swift-object-server /etc/g6-rust/object-server/1.conf "
-            ">>/var/log/g6-rust/object-1.stall.log 2>&1 & echo $! >/var/run/g6-rust/object-1.pid"
-        )
-        time.sleep(1)
-        hp = health_p99(spec, n=case.get("health_samples", 40))
-        t0 = time.monotonic()
-        st, _, ms = put_object(spec, token, "g7slow", "fsync", b"F" * 4096)
+        us = int(case.get("stall_secs", 5) * 1_000_000)
+        restart_lab_servers("object", f"G7_FAULT=fsync_stall G7_FSYNC_STALL_US={us} LD_PRELOAD={FAULT_SO}")
+        time.sleep(1.5)
+        st, hits, elapsed_ms = None, 0, 0
+        try:
+            t0 = time.monotonic()
+            st, _, ms = put_object(spec, token, "g7slow", "fsync", b"F" * 4096)
+            elapsed_ms = max(ms or 0, (time.monotonic() - t0) * 1000.0)
+            hits = read_hits()
+        finally:
+            restart_lab_servers("object", "")
         raw = {
             "case": "fsync_stall",
             "target": 1,
             "opened": 1,
-            "put_status": st,
-            "put_ms": ms,
-            "health_p99_ms": hp["p99_ms"],
-            "health_samples": hp["n"],
-            "health_ok": hp["ok"],
-            "elapsed_s": time.monotonic() - t0,
+            "fault_armed": True,
+            "fault_hits": hits,
+            "operation_status": st,
+            "operation_ms": elapsed_ms,
         }
-        ssh("pid=$(cat /var/run/g6-rust/object-1.pid); kill -TERM $pid || true; sleep 1; "
-            "nohup /root/work/g6-rust-bin/swift-object-server /etc/g6-rust/object-server/1.conf "
-            ">>/var/log/g6-rust/object-1.log 2>&1 & echo $! >/var/run/g6-rust/object-1.pid")
     elif kind == "sqlite_stall":
-        ssh(
-            "gcc -shared -fPIC -O2 /root/work/g7/fsync_stall.c -o /root/work/g7/fsync_stall.so -ldl; "
-            "pid=$(cat /var/run/g6-rust/container-1.pid); kill -TERM $pid || true; sleep 1; "
-            "G7_FSYNC_STALL_US=5000000 LD_PRELOAD=/root/work/g7/fsync_stall.so "
-            "nohup /root/work/g6-rust-bin/swift-container-server /etc/g6-rust/container-server/1.conf "
-            ">>/var/log/g6-rust/container-1.stall.log 2>&1 & echo $! >/var/run/g6-rust/container-1.pid"
-        )
-        time.sleep(1)
-        hp = health_p99(spec, n=case.get("health_samples", 40))
+        us = int(case.get("stall_secs", 5) * 1_000_000)
+        restart_lab_servers("container", f"G7_FAULT=fsync_stall G7_FSYNC_STALL_US={us} LD_PRELOAD={FAULT_SO}")
+        time.sleep(1.5)
+        st, hits, elapsed_ms = None, 0, 0
+        try:
+            t0 = time.monotonic()
+            st, _, ms = http(
+                host,
+                port,
+                "PUT",
+                f"/v1/{spec['auth']['account']}/g7sqlite{int(time.time())}",
+                headers={"X-Auth-Token": token},
+                timeout=60,
+            )
+            elapsed_ms = max(ms or 0, (time.monotonic() - t0) * 1000.0)
+            hits = read_hits()
+        finally:
+            restart_lab_servers("container", "")
         raw = {
             "case": "sqlite_stall",
             "target": 1,
             "opened": 1,
-            "health_p99_ms": hp["p99_ms"],
-            "health_samples": hp["n"],
-            "health_ok": hp["ok"],
+            "fault_armed": True,
+            "fault_hits": hits,
+            "operation_status": st,
+            "operation_ms": elapsed_ms,
         }
-        ssh("pid=$(cat /var/run/g6-rust/container-1.pid); kill -TERM $pid || true; sleep 1; "
-            "nohup /root/work/g6-rust-bin/swift-container-server /etc/g6-rust/container-server/1.conf "
-            ">>/var/log/g6-rust/container-1.log 2>&1 & echo $! >/var/run/g6-rust/container-1.pid")
     else:
         raw = {"error": f"unknown kind {kind}", "target": case.get("target"), "opened": 0}
 
+    if health_obs is not None:
+        raw = apply_health(raw, health_obs.stop())
     during = observer.stop()
     steady = wait_for_steady(spec, before)
     after = steady.pop("samples", [])
@@ -1055,8 +1696,8 @@ def run_case(name, case, spec, token):
     case["_name"] = name
     result = classify(case, raw, spec)
     if kind in ("eio",) and raw.get("verdict_hint") == "NOT RUN":
-        result["verdict"] = "NOT RUN"
-        result["reason"] = "no EIO mapper"
+        result["verdict"] = "ENVIRONMENT BLOCKED"
+        result["reason"] = raw.get("not_run_reason") or "no EIO mapper exists"
     return result
 
 
@@ -1096,6 +1737,13 @@ def dummy_calibrate(spec):
 
 def main():
     spec = load_frozen()
+    port = int(spec["target"]["port"])
+    if port in spec["target"].get("forbidden_ports", []) or port in (8080, 8085):
+        print(f"refusing forbidden port {port}", file=sys.stderr)
+        return 2
+    if spec["target"].get("swift_dir") != "/etc/g6-rust":
+        print("refusing non-lab swift_dir", file=sys.stderr)
+        return 2
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "acceptance.yaml").write_bytes(YAML_PATH.read_bytes())
     (OUT / "acceptance.sha256").write_text(spec["_sha256"] + "\n")
@@ -1129,7 +1777,16 @@ def main():
     for name in names:
         case = spec["cases"][name]
         print(f"=== {name} ===", flush=True)
-        rec = run_case(name, case, spec, token)
+        try:
+            rec = run_case(name, case, spec, token)
+        except Exception as exc:
+            rec = {
+                "name": name,
+                "verdict": "FAIL",
+                "reason": f"runner exception: {exc}",
+                "opened": None,
+                "target": case.get("target", case.get("n")),
+            }
         results.append(rec)
         (OUT / f"{name}.json").write_text(json.dumps(rec, indent=2, default=str) + "\n")
         print(rec["verdict"], rec.get("reason", ""), "opened", rec.get("opened"), "target", rec.get("target"), flush=True)

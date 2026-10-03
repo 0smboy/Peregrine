@@ -256,7 +256,9 @@ static int run_idle(int argc, char **argv) {
 
     /* Independent Swift1 observer is the G7 health metric. In-process
      * Connection:close HEAD sampling during hold polluted 100k p99. */
-    struct sampler samp = {.run = 1, .go = 0, .port = port, .n = 0, .ok = 0};
+    /* n is the sample cap. 0 made the hold-only thread exit before go flipped,
+     * so idle cases reported health_samples 0. */
+    struct sampler samp = {.run = 1, .go = 0, .port = port, .n = 200, .ok = 0};
     strncpy(samp.host, host, sizeof(samp.host) - 1);
     samp.ms = calloc(200, sizeof(double));
     pthread_t th;
