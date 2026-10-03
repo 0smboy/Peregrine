@@ -6,6 +6,8 @@ was not sent.
 
 | Channel | Location |
 |---------|----------|
+| Content commit | `94871e64144116a06d9f06a7a90d30537c41e9a9` on `main` |
+| Vercel | `dpl_EirPBiXE1fHB8iKDPmAPjk4rL3WE` aliased to https://docs.myswift.rs |
 | Evidence | `tools/test-results/console-accept-20261002/` |
 | Verdict | `SUMMARY.md` (2026-10-02) |
 | Docs | `docs-site/src/content/docs/swift-console.mdx` |
