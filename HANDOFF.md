@@ -1,8 +1,14 @@
 # Peregrine — session handoff
 
-> **2026-08-16 现行交接：** [`docs/fairness-lab/HANDOFF-20260816.md`](docs/fairness-lab/HANDOFF-20260816.md)
-> Live proxy Size `69d22629…` · dual-oracle **49/8 FAIL** · not GREEN.
-> 下文 2026-07-31 条目是更早的 console/cutover 史实。
+> **Current lab record (2026-10-02):** console acceptance is ACCEPT_WITH_WARN.
+> Evidence: [`tools/test-results/console-accept-20261002/SUMMARY.md`](tools/test-results/console-accept-20261002/SUMMARY.md).
+> VIP `10.0.0.10` is on swift1
+> ([`00-identity.md`](tools/test-results/console-accept-20261002/00-identity.md)).
+> The console listens on swift4 at `127.0.0.1:9000`. G7 is not accepted.
+> Production remains NO-GO. `docs/fairness-lab/HANDOFF-20260816.md` is the
+> 2026-08-16 fairness-lab handoff, not the current site.
+>
+> The 2026-07-31 notes below are earlier console/cutover history.
 
 
 **Date:** 2026-07-31  

@@ -209,6 +209,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         hash_config: hash_cfg(),
         policies: vec![(0, "Policy-0".to_string()), (1, "Policy-1".to_string())],
         default_policy_index: 0,
+        recon_cache_path: tmp.join("cont-recon"),
         fixed_created_at: None,
     };
     std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
@@ -326,13 +327,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     // (the footers' overrides), not the fragment archive's. Check this before
     // staging a newer non-durable generation: Python still emits a container
     // update for that internal PUT, while object GET durability is independent.
-    let (status, _, listing) = http(
-        proxy_addr,
-        "GET",
-        "/v1/AUTH_ec/ecbox?format=json",
-        &[],
-        b"",
-    );
+    let (status, _, listing) = http(proxy_addr, "GET", "/v1/AUTH_ec/ecbox?format=json", &[], b"");
     assert_eq!(status, 200, "container listing");
     let entries: serde_json::Value = serde_json::from_slice(&listing).unwrap();
     let entry = entries
@@ -365,10 +360,7 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
     assert_eq!(status, 201, "non-durable EC object PUT");
     let mut nondurable = 0;
     for d in &obj_dirs {
-        nondurable += find_files(d, &|n| {
-            n.ends_with(".data") && !n.ends_with("#d.data")
-        })
-        .len();
+        nondurable += find_files(d, &|n| n.ends_with(".data") && !n.ends_with("#d.data")).len();
     }
     assert_eq!(
         nondurable, N,
@@ -627,6 +619,146 @@ fn test_ec_object_put_get_round_trip_and_fragment_loss() {
         b"some bytes",
     );
     assert_eq!(status, 422, "client etag mismatch");
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// Policy 0 with no `policy_type` is replication. A 30-byte PUT/GET must
+/// come back intact. Parsing that policy as EC `ndata=2` makes this fail:
+/// the proxy gathers two fragments and returns `Content-Length: 0`.
+#[test]
+fn policy0_without_policy_type_replicates_thirty_bytes() {
+    let conf = swift_core::config::SwiftConfig::parse_lenient(
+        "[storage-policy:0]\nname = Policy-0\n",
+        &[],
+        false,
+    )
+    .unwrap();
+    let policies = swift_core::storage_policy::parse_storage_policies(&conf).unwrap();
+    let policy = policies.get_by_index_num(0).unwrap();
+    let kind = match policy.ec() {
+        Some(ec) => swift_diskfile::PolicyKind::Ec {
+            n_unique_fragments: Some(ec.ec_n_unique_fragments() as u32),
+        },
+        None => swift_diskfile::PolicyKind::Replication,
+    };
+    let mut ec_policies = std::collections::HashMap::new();
+    if let Some(ec) = policy.ec() {
+        let ndata = ec.ec_ndata as usize;
+        let min_parity = (policy.quorum(0.0) as usize).saturating_sub(ndata).max(1);
+        ec_policies.insert(
+            0i64,
+            EcPolicyParams {
+                ndata,
+                nparity: ec.ec_nparity as usize,
+                segment_size: ec.ec_segment_size as usize,
+                min_parity,
+            },
+        );
+    }
+    assert_ne!(
+        ec_policies.get(&0).map(|params| params.ndata),
+        Some(2),
+        "policy 0 without policy_type must not be parsed as ndata=2"
+    );
+
+    let tmp = std::env::temp_dir().join(format!("swift-policy0-repl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let acct_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let acct_addr = acct_listener.local_addr().unwrap();
+    std::fs::create_dir_all(tmp.join("acct/sda1")).unwrap();
+    let acct_config = swift_account_server::AccountServerConfig {
+        devices: tmp.join("acct"),
+        mount_check: false,
+        hash_config: hash_cfg(),
+        policies: vec![(0, "Policy-0".to_string())],
+        fixed_created_at: None,
+    };
+    std::thread::spawn(move || swift_account_server::serve(acct_listener, acct_config));
+
+    let cont_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let cont_addr = cont_listener.local_addr().unwrap();
+    std::fs::create_dir_all(tmp.join("cont/sda1")).unwrap();
+    let cont_config = swift_container_server::ContainerServerConfig {
+        devices: tmp.join("cont"),
+        mount_check: false,
+        hash_config: hash_cfg(),
+        policies: vec![(0, "Policy-0".to_string())],
+        default_policy_index: 0,
+        recon_cache_path: tmp.join("cont-recon"),
+        fixed_created_at: None,
+    };
+    std::thread::spawn(move || swift_container_server::serve(cont_listener, cont_config));
+
+    let obj_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let obj_addr = obj_listener.local_addr().unwrap();
+    let obj_dir = tmp.join("obj");
+    std::fs::create_dir_all(obj_dir.join("sda1")).unwrap();
+    let obj_config = swift_object_server::ObjectServerConfig {
+        devices: obj_dir,
+        mount_check: false,
+        hash_config: hash_cfg(),
+        diskfile: swift_diskfile::DiskFileConfig::default(),
+        policies: std::collections::HashMap::from([(0, kind)]),
+        container_update_timeout: std::time::Duration::from_secs(1),
+        container_update_mode: swift_object_server::ContainerUpdateMode::Sync,
+    };
+    std::thread::spawn(move || swift_object_server::serve(obj_listener, obj_config));
+
+    // One replica: replication quorum is 1. An ndata=2 misparse cannot
+    // gather two fragments from this ring, so GET cannot return 30 bytes.
+    let object_ring = {
+        let data = RingData::from_parts(
+            vec![Some(dev(0, obj_addr.port() as u32))],
+            32,
+            vec![vec![0]],
+        );
+        Ring::new(data, hash_cfg())
+    };
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let app = Arc::new(ProxyApp::with_ec_policies(
+        single_device_ring(acct_addr.port() as u32),
+        single_device_ring(cont_addr.port() as u32),
+        object_ring.clone(),
+        std::collections::HashMap::new(),
+        ec_policies,
+        ProxyConfig {
+            account_autocreate: true,
+            ..Default::default()
+        },
+    ));
+    std::thread::spawn(move || swift_proxy_server::serve(proxy_listener, app));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let (status, _, _) = http(proxy_addr, "PUT", "/v1/AUTH_p0/box", &[], b"");
+    assert_eq!(status, 201, "container PUT");
+
+    let payload = b"policy-zero-replication-body!!";
+    assert_eq!(payload.len(), 30);
+    let (status, _, _) = http(
+        proxy_addr,
+        "PUT",
+        "/v1/AUTH_p0/box/thirty",
+        &[("Content-Type", "application/octet-stream")],
+        payload,
+    );
+    assert_eq!(status, 201, "policy 0 object PUT");
+
+    let (status, headers, body) = http(proxy_addr, "GET", "/v1/AUTH_p0/box/thirty", &[], b"");
+    assert_eq!(status, 200, "policy 0 object GET");
+    let content_length = headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("Content-Length")
+            .then_some(value.as_str())
+    });
+    assert_eq!(body, payload, "GET body must be the 30 stored bytes");
+    assert_eq!(
+        content_length,
+        Some("30"),
+        "GET Content-Length must be 30; ndata=2 misparse returns 0"
+    );
 
     std::fs::remove_dir_all(&tmp).unwrap();
 }

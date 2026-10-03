@@ -2231,6 +2231,10 @@ impl ProxyApp {
             .await
         {
             Some(resp) if resp.status == 404 && self.config.account_autocreate => {
+                if super::account_response_is_deleted(&resp) {
+                    self.cache_account_from_response(account, &resp);
+                    return resp;
+                }
                 let mut fake = super::synthesized_account_listing(&req);
                 fake.headers.set(
                     "X-Backend-Recheck-Account-Existence",

@@ -3603,6 +3603,13 @@ impl ProxyApp {
                     &headers,
                 ) {
                     Some(resp) if resp.status == 404 && self.config.account_autocreate => {
+                        if account_response_is_deleted(&resp) {
+                            // A DELETED account is not a missing one. Synthesizing
+                            // the autocreate listing hides X-Account-Status and
+                            // looks like a writable empty account.
+                            self.cache_account_from_response(account, &resp);
+                            return resp;
+                        }
                         // synthesize an empty account listing
                         let mut fake = synthesized_account_listing(req);
                         fake.headers.set(
@@ -6636,6 +6643,12 @@ fn utf8_or_null_rejected(req: &Request) -> Option<Response> {
     } else {
         None
     }
+}
+
+pub(crate) fn account_response_is_deleted(resp: &Response) -> bool {
+    resp.headers
+        .get("X-Account-Status")
+        .is_some_and(|value| value.eq_ignore_ascii_case("Deleted"))
 }
 
 /// The synthesized empty-account response for autocreate accounts

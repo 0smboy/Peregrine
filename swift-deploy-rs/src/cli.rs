@@ -114,7 +114,7 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "bundle")]
         bundle: PathBuf,
-        #[arg(long, default_value = "bundle/config_sample/swift_hosts")]
+        #[arg(long, default_value = "bundle/config_contabo_identity/swift_hosts")]
         inventory: PathBuf,
         #[arg(long, default_value = "bundle/swift.yml")]
         playbook: PathBuf,
@@ -427,4 +427,50 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("persist plan {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod default_inventory_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::{Cli, Command};
+    use crate::inventory::Inventory;
+    use crate::model::RiskClass;
+    use crate::planner::Planner;
+
+    #[test]
+    fn ui_default_inventory_does_not_arm_disk_wipe() {
+        let cli = Cli::try_parse_from(["swift-deploy", "ui"]).expect("ui defaults parse");
+        let Command::Ui { inventory, .. } = cli.command else {
+            panic!("ui subcommand");
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let inventory_path = root.join(&inventory);
+        let bundle = root.join("bundle");
+        let loaded = Inventory::load(&inventory_path).expect("load default inventory");
+        let plan = Planner::new(&bundle, &loaded)
+            .build(bundle.join("swift.yml"), "default-inventory")
+            .expect("plan default inventory");
+        plan.verify().expect("sealed default plan");
+        let mkfs_armed = plan.tasks.iter().any(|task| {
+            let args = serde_json::to_string(&task.args).unwrap_or_default();
+            args.to_lowercase().contains("mkfs") && !task.hosts.is_empty()
+        });
+        let sample_default = inventory
+            .components()
+            .any(|component| component.as_os_str() == "config_sample");
+        assert!(
+            !(sample_default && mkfs_armed),
+            "UI default {inventory:?} is config_sample and mkfs hosts are non-empty"
+        );
+        assert!(
+            plan.tasks
+                .iter()
+                .filter(|task| task.risk.contains(&RiskClass::DiskWipe))
+                .all(|task| task.hosts.is_empty()),
+            "UI default {inventory:?} must not arm disk wipe"
+        );
+    }
 }

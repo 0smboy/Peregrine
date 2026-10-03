@@ -59,7 +59,7 @@ container replicas (object hashdir untouched). One unit stays frozen:
 
 | Unit | Why it stays frozen |
 |------|---------------------|
-| `swift-account-reaper` | ring majority for `AUTH_test` still carries `DELETED`; `delay_reaping` was raised to 604800 on-node as defense in depth, but starting the reaper remains a user-gated decision |
+| `swift-account-reaper` | stays off. Before `tools/test-results/console-accept-20261002/07-fix.md` (2026-10-02) the ring majority for `AUTH_test` had `status=DELETED`. That file records the status column cleared on the three primaries. Do not start `swift-account-reaper`. |
 
 Known steady state after recovery, recorded rather than hidden: 357
 incident-era async pendings pointed at deleted `AUTH_test` containers retry

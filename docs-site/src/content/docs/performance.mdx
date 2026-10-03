@@ -79,9 +79,14 @@ with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
 
 **Clean-load re-measure (2026-08-02, client swift4 → VIP `10.0.0.10:8085`,
 HA-PATH):** 4KB write @128 ≈ **138 ops/s** fail=0; 4KB read @128 ≈ **1055 ops/s**
-fail=0; 1MB write/read @32 fail=0. **16MB read @8 remains ACCEPT_WITH_WARN**
-(normal-stage success ~9% even after prepare 80/80) — see
-`deep-verify-20260802/PERF-REMEASURE.md`. Do not treat 16MB as cleared.
+fail=0; 1MB write/read @32 fail=0. **16MB_read_8 remains ACCEPT_WITH_WARN**
+(normal-stage success ~9% even after prepare 80/80). Evidence:
+`tools/test-results/contabo-deploy-20260801/deep-verify-20260802/PERF-REMEASURE.md`
+(2026-08-02). Do not treat 16MB_read_8 as cleared.
+
+R8 ACCEPT is a different cell: `16MB_read_4`, object_count=40, runtime=180,
+2026-08-04. Evidence: `tools/test-results/fairness-lab-R8-20260803/R8-GATE.md`
+and `SCORECARD.json`. That ACCEPT does not clear `16MB_read_8`.
 
 ## Write-concurrency optimization
 

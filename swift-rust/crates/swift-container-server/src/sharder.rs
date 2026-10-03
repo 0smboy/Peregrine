@@ -11542,6 +11542,81 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_primary_automatic_shrink_leaves_remote_donor_shrinking() {
+        // The donor DB is on another primary, not on this host. Automatic
+        // shrink must not invent an empty local donor and must not mark the
+        // remote donor SHRUNK. object_count is non-zero, so the empty-donor
+        // retire path does not apply either.
+        let hash_config = HashPathConfig::new("", "changeme").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "swift-sharder-remote-shrink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d1 = dir.join("d1");
+        let account = "AUTH_test";
+        let container = "remote-shrink";
+        let hsh = hash_config
+            .hash_path(account, Some(container), None)
+            .unwrap();
+        let suf = &hsh[hsh.len() - 3..];
+        let hd = d1.join("containers/0").join(suf).join(&hsh);
+        std::fs::create_dir_all(&hd).unwrap();
+        let db = hd.join(format!("{hsh}.db"));
+        let mut source = ContainerBroker::new(&db, account, container);
+        source
+            .initialize("1751500000.00000", 0, "1751500000.00000", "id")
+            .unwrap();
+        let epoch = "1751500010.00000";
+        let mut donor = ShardRange::new(".shards_AUTH_test/remote-d0", epoch, "", "m");
+        donor.state = shard_state::SHRINKING;
+        donor.object_count = 3;
+        donor.bytes_used = 90;
+        let mut acceptor = ShardRange::new(".shards_AUTH_test/remote-a0", epoch, "", "");
+        acceptor.state = shard_state::ACTIVE;
+        source
+            .merge_shard_ranges(vec![donor.clone(), acceptor])
+            .unwrap();
+
+        let n = process_shrinking_donors(&mut source, &d1, &hash_config, "0", None).unwrap();
+        assert_eq!(n, 0, "remote multi-primary donor must not finish locally");
+
+        let after = source
+            .get_shard_ranges(&GetShardRangesArgs {
+                include_deleted: true,
+                include_own: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let d = after.iter().find(|r| r.name == donor.name).unwrap();
+        assert_eq!(d.state, shard_state::SHRINKING);
+        assert_eq!(d.object_count, 3);
+        assert_eq!(d.deleted, 0);
+
+        fn db_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    db_files(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("db") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        db_files(&dir, &mut found);
+        let donor_dbs: Vec<_> = found.into_iter().filter(|path| path != &db).collect();
+        assert!(
+            donor_dbs.is_empty(),
+            "automatic shrink must not create a donor database: {donor_dbs:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_shrink_does_not_publish_empty_local_acceptor_stats() {
         // Probe MoreUTF8 test_shrinking L1992: donor+root on d1, real
         // acceptor (50 objects) only on d2. Shrinking must not create an

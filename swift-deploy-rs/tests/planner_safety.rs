@@ -269,3 +269,76 @@ fn selected_v3_swift_playbook_builds_a_sealed_safety_classified_plan() {
             .is_some_and(|args| args.contains("{{ mariadb_root_password }}"))
     }));
 }
+
+fn seal_swift_plan(inventory_rel: &str) -> swift_deploy_rs::Plan {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundle");
+    let inventory_path = bundle.join(inventory_rel);
+    let inventory = Inventory::load(&inventory_path).expect("load inventory");
+    let plan = Planner::new(&bundle, &inventory)
+        .build(
+            bundle.join("swift.yml"),
+            fingerprint_path(&inventory_path).expect("inventory fingerprint"),
+        )
+        .expect("seal swift.yml");
+    plan.verify().expect("sealed plan digest");
+    plan
+}
+
+fn args_text(task: &swift_deploy_rs::PlannedTask) -> String {
+    serde_json::to_string(&task.args).unwrap_or_default()
+}
+
+#[test]
+fn sample_swift_plan_seals_and_mkfs_hosts_are_the_sample_pair() {
+    let plan = seal_swift_plan("config_sample/swift_hosts");
+    let mkfs: Vec<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| args_text(task).to_lowercase().contains("mkfs"))
+        .collect();
+    assert!(!mkfs.is_empty(), "sample plan must include mkfs tasks");
+    for task in mkfs {
+        let mut hosts = task.hosts.clone();
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            vec!["192.168.2.51".to_owned(), "192.168.2.52".to_owned()],
+            "sample mkfs task {} hosts",
+            task.name
+        );
+    }
+}
+
+#[test]
+fn identity_swift_plan_seals_with_empty_disk_wipe_hosts() {
+    let plan = seal_swift_plan("config_contabo_identity/swift_hosts");
+    let disk_wipe: Vec<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| task.risk.contains(&RiskClass::DiskWipe))
+        .collect();
+    assert!(
+        !disk_wipe.is_empty(),
+        "identity plan still classifies mkfs tasks; only their host lists are empty"
+    );
+    for task in disk_wipe {
+        assert!(
+            task.hosts.is_empty(),
+            "identity disk_wipe task {} must have an empty host list, got {:?}",
+            task.name,
+            task.hosts
+        );
+    }
+
+    let expect_hosts = ["Yum Upgrade", "Restart sshd", "Installing mariadb packages"];
+    for name in expect_hosts {
+        let matches: Vec<_> = plan.tasks.iter().filter(|task| task.name == name).collect();
+        assert!(!matches.is_empty(), "missing planned task {name}");
+        for task in matches {
+            assert!(
+                !task.hosts.is_empty(),
+                "{name} must keep a non-empty host list on the identity inventory"
+            );
+        }
+    }
+}

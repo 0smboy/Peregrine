@@ -135,7 +135,13 @@ pub async fn deploy(State(state): State<Arc<AppState>>, req: Request) -> Respons
         reqwest::header::CONTENT_LENGTH,
         reqwest::header::HeaderValue::from_str(&body_len.to_string()).expect("length"),
     );
-    let out_body = reqwest::Body::from(body_bytes);
+    // Unsized stream: reqwest will not invent Content-Length. The header
+    // inserted above is what swift-deploy reads. Removing it makes this POST
+    // chunked and the upstream body length no longer matches.
+    let payload = bytes::Bytes::from(body_bytes);
+    let out_body = reqwest::Body::wrap_stream(futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::convert::Infallible>(payload)
+    }));
 
     let resp = match state
         .http
@@ -155,8 +161,7 @@ pub async fn deploy(State(state): State<Arc<AppState>>, req: Request) -> Respons
         }
     };
 
-    let status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     // Theme the embedded Deploy UI. CSS responses are buffered so the console
     // token override can be appended (its :root wins, being last); HTML is
@@ -246,4 +251,108 @@ pub async fn deploy(State(state): State<Arc<AppState>>, req: Request) -> Respons
     builder
         .body(Body::from_stream(resp.bytes_stream()))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn json_body_through_deploy_proxy_sets_content_length_to_byte_length() {
+        let body = r#"{"note":"计划"}"#.as_bytes().to_vec();
+        assert!(
+            body.len() != r#"{"note":"计划"}"#.chars().count(),
+            "fixture must differ in bytes and chars"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = body.clone();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(false).unwrap();
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 2048];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                            let head = String::from_utf8_lossy(&raw[..split]).to_string();
+                            let have = raw.len() - (split + 4);
+                            let declared = head.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    value.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            });
+                            let need = declared.unwrap_or(0);
+                            if have >= need {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&raw[..split]).to_string();
+            let got = raw[split + 4..].to_vec();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            (head, got)
+        });
+
+        let cfg: crate::Config = serde_json::from_str(&format!(
+            r#"{{"auth_url":"http://127.0.0.1:1","swift_base":"http://127.0.0.1:1","deploy_upstream":"http://{addr}","deploy_token_file":"/dev/null"}}"#
+        ))
+        .unwrap();
+        let state = Arc::new(crate::AppState {
+            cfg,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            sessions: session::SessionStore::new(1),
+            deploy_basic: "Basic dGVzdDp0b2tlbg==".into(),
+            search: crate::search::new_store(),
+            policy_cache: std::sync::Mutex::new(None),
+            journal: crate::nodes::new_journal(),
+            tests: crate::testing::new_store(),
+        });
+        let sid = state.sessions.create(session::Session {
+            token: "t".into(),
+            storage_url: "http://127.0.0.1/v1/AUTH_test".into(),
+            tenant: "test".into(),
+            user: "tester".into(),
+            key: "k".into(),
+            last_seen: std::time::Instant::now(),
+            tempurl_default_secs: 60,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/plan")
+            .header("cookie", format!("sc_session={sid}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let _ = deploy(State(state), req).await;
+        let (head, got) = server.join().unwrap();
+        let declared = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        });
+        assert_eq!(declared, Some(expected.len()), "upstream headers:\n{head}");
+        assert_eq!(got, expected);
+    }
 }

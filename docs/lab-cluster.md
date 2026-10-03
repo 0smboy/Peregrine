@@ -15,7 +15,12 @@ swift1/4. See [`docs/fairness-lab/`](fairness-lab/).
 
 **Pointer 2026-08-04:** Stage 2 evidence `tools/test-results/phase-2-20260804/`;
 Stage 3 Python path FROZEN (`PYTHON_CLUSTER_ABSENT`) —
-`tools/test-results/phase-3-20260804/`. VIP may sit on swift2 (nopreempt).
+`tools/test-results/phase-3-20260804/`. That day's note allowed the VIP to sit
+on swift2 (nopreempt). It is not the current owner.
+
+**Owner 2026-10-02:** VIP `10.0.0.10/22` is on swift1. Evidence:
+`tools/test-results/console-accept-20261002/00-identity.md`. The console
+listens on swift4 at `127.0.0.1:9000` (same file, I-console-proc).
 
 ## Topology
 

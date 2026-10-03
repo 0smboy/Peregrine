@@ -37,11 +37,14 @@ ansible parity. SAIO on swift1 is **NOISY** for performance; VIP path is
 | Storage | `10.0.4.1–4` | account / container / object data path |
 | Replication | `10.0.8.1–4` | replicator / reconstructor |
 
-Nodes: `swift1`–`swift4`. Keepalived VIP `10.0.0.10` is currently on
-**swift2** (`eth1` secondary). Prefer the **real VIP**
-`https://10.0.0.10:8085` for clients and gates. Per-node
-`http://10.0.0.N:8085` remains valid (local HAProxy). Account / container /
-object daemons are peer-equivalent and do not follow the VIP.
+Nodes: `swift1`–`swift4`. Keepalived VIP `10.0.0.10/22` is on **swift1**.
+swift2, swift3, and swift4 did not hold that address in the 2026-10-02 check.
+Evidence: `tools/test-results/console-accept-20261002/00-identity.md`
+(2026-10-02). Prefer the **real VIP** `https://10.0.0.10:8085` for clients
+and gates. Per-node `http://10.0.0.N:8085` remains valid (local HAProxy).
+Account / container / object daemons are peer-equivalent and do not follow
+the VIP. The console process listens on swift4 at `127.0.0.1:9000` (same
+evidence file, check I-console-proc).
 
 Devices: `/srv/node/{d1,d2,d3}` XFS per node (12 total). **Never format** them
 from deploy tooling.
@@ -62,8 +65,10 @@ every node.
   `/usr/local/lib` — verified 2026-08-17 on all four nodes.
 - Build release binaries **with the `ec` cargo features**. Without them the
   proxy returns HTTP 501 for EC puts.
-- On swift1: Prometheus, Loki, Alloy, statsd_exporter, `swift-console`,
-  `cabt` / `autocos`; `node_exporter` on every node (`nodes_up` should be 4).
+- On swift1: Prometheus, Loki, Alloy, statsd_exporter, `cabt` / `autocos`;
+  `node_exporter` on every node (`nodes_up` should be 4). The console binary
+  is on swift4, bound to `127.0.0.1:9000`
+  (`tools/test-results/console-accept-20261002/00-identity.md`, 2026-10-02).
 - Python SAIO `:8090` + Rust SAIO `:8081` on swift1 for Lab Shadow. The
   **dual-oracle** Python instance is a separate concern: Swift 2.33 + s3api +
   object versioning on **swift3** `:8090` (with documented lab-only header
