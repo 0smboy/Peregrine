@@ -13,6 +13,8 @@ vrrp_script {{ keepalived_vrrp_script.name }} {
      script   "/etc/keepalived/check_swift.sh"
 {% endif %}
     interval {{ keepalived_vrrp_script.interval }}
+    timeout 4
+    fall 3
     weight {{ keepalived_vrrp_script.weight }}
 }
 # Peregrine_vrrp_script END
