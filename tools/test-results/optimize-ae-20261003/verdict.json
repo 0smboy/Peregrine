@@ -2,7 +2,7 @@
   "gate": "G7",
   "verdict": "RED",
   "phase_verdict": "NOT ACCEPTED",
-  "candidate_commit": "see git log for this evidence file",
+  "candidate_commit": "3f5ea6ae0d16a9ed2c3b073b5dc38813a3810a13",
   "binary_sha256": "e6ac2931b2e11925e89f60867137f45727a8344328ca03227efc06557ad897dc",
   "listen": "swift1 0.0.0.0:18080",
   "date": "2026-10-03",
