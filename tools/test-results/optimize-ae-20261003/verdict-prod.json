@@ -2,35 +2,156 @@
   "date": "2026-10-04",
   "gate": "G7",
   "endpoint": "http://10.0.0.10:8080",
-  "endpoint_note": "The harness speaks HTTP. https://10.0.0.10:8085 rejected the certificate (CaUsedAsEndEntity). http://10.0.0.10:8085 did not connect. Port 18080 was not used. Bounds were not changed.",
+  "endpoint_note": "Second production rerun after the proxy file-limit and token-cache fix. Bounds were not changed. Source swift4:/root/work/g7-prod-20261004-r3/verdict.json.",
   "verdict": "RED",
   "production_readiness": "NO-GO",
   "acceptance_sha256": "04492c4b37200421559529e58af0597a5ee4476e788057d2516c27a4794f613c",
+  "proxy_sha256": "59303115c7e51ac6bc6a07db746a2377acf6309639fd11aa03c8db2b13657224",
   "n": 20,
-  "pass": 3,
-  "fail": 17,
+  "pass": 16,
+  "fail": 4,
   "blocked": 0,
   "not_run": 0,
   "results": [
-    {"name": "idle_keepalive_10k", "verdict": "FAIL", "opened": null, "target": 10000, "reason": "g7load timed out after 270s"},
-    {"name": "idle_keepalive_50k", "verdict": "FAIL", "opened": null, "target": 50000, "reason": "g7load timed out after 270s"},
-    {"name": "idle_keepalive_100k", "verdict": "FAIL", "opened": null, "target": 100000, "reason": "g7load timed out after 270s"},
-    {"name": "slow_put_1000", "verdict": "FAIL", "opened": 1000, "target": 1000, "reason": "process thread growth was not proved bounded"},
-    {"name": "slowloris", "verdict": "PASS", "opened": 1000, "target": 1000, "reason": null},
-    {"name": "slow_get_receiver", "verdict": "FAIL", "opened": 200, "target": 200, "reason": "process thread growth was not proved bounded"},
-    {"name": "keepalive_churn", "verdict": "FAIL", "opened": null, "target": 5000, "reason": "g7load timed out after 90s"},
-    {"name": "fsync_stall", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "fsync_stall injection was not observed"},
-    {"name": "sqlite_stall", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "sqlite_stall injection was not observed"},
-    {"name": "backend_blackhole", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "network fault was not proved on the exercised path"},
-    {"name": "quorum_degradation", "verdict": "FAIL", "opened": 20, "target": 20, "reason": "network fault was not proved on the exercised path"},
-    {"name": "bounded_queue_overload", "verdict": "FAIL", "opened": 4000, "target": 4000, "reason": "process thread growth was not proved bounded"},
-    {"name": "client_cancellation", "verdict": "FAIL", "opened": 100, "target": 100, "reason": "process thread growth was not proved bounded"},
-    {"name": "sigterm_during_put", "verdict": "PASS", "opened": 1, "target": 1, "reason": null},
-    {"name": "sigterm_during_durability", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "barrier_observed was not proved"},
-    {"name": "fd_exhaustion", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "fd exhaustion was not armed and observed"},
-    {"name": "enospc", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "enospc was not injected on an object write"},
-    {"name": "eio", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "injected eio PUT unexpectedly succeeded: 201"},
-    {"name": "partial_write", "verdict": "PASS", "opened": 1, "target": 1, "reason": null},
-    {"name": "backend_connect_timeout", "verdict": "FAIL", "opened": 1, "target": 1, "reason": "network fault was not proved on the exercised path"}
+    {
+      "name": "idle_keepalive_10k",
+      "verdict": "PASS",
+      "opened": 10000,
+      "target": 10000,
+      "reason": null
+    },
+    {
+      "name": "idle_keepalive_50k",
+      "verdict": "PASS",
+      "opened": 50000,
+      "target": 50000,
+      "reason": null
+    },
+    {
+      "name": "idle_keepalive_100k",
+      "verdict": "PASS",
+      "opened": 100000,
+      "target": 100000,
+      "reason": null
+    },
+    {
+      "name": "slow_put_1000",
+      "verdict": "FAIL",
+      "opened": 1000,
+      "target": 1000,
+      "reason": "http_2xx 112 != 1000"
+    },
+    {
+      "name": "slowloris",
+      "verdict": "PASS",
+      "opened": 1000,
+      "target": 1000,
+      "reason": null
+    },
+    {
+      "name": "slow_get_receiver",
+      "verdict": "PASS",
+      "opened": 200,
+      "target": 200,
+      "reason": null
+    },
+    {
+      "name": "keepalive_churn",
+      "verdict": "PASS",
+      "opened": 5000,
+      "target": 5000,
+      "reason": null
+    },
+    {
+      "name": "fsync_stall",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "sqlite_stall",
+      "verdict": "FAIL",
+      "opened": 1,
+      "target": 1,
+      "reason": "operation_status 503 is not 2xx"
+    },
+    {
+      "name": "backend_blackhole",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "quorum_degradation",
+      "verdict": "PASS",
+      "opened": 20,
+      "target": 20,
+      "reason": null
+    },
+    {
+      "name": "bounded_queue_overload",
+      "verdict": "FAIL",
+      "opened": 4000,
+      "target": 4000,
+      "reason": "overload responses were not fully classified as 2xx or 503"
+    },
+    {
+      "name": "client_cancellation",
+      "verdict": "PASS",
+      "opened": 100,
+      "target": 100,
+      "reason": null
+    },
+    {
+      "name": "sigterm_during_put",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "sigterm_during_durability",
+      "verdict": "FAIL",
+      "opened": 1,
+      "target": 1,
+      "reason": "put_status None is not 2xx"
+    },
+    {
+      "name": "fd_exhaustion",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "enospc",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "eio",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "partial_write",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    },
+    {
+      "name": "backend_connect_timeout",
+      "verdict": "PASS",
+      "opened": 1,
+      "target": 1,
+      "reason": null
+    }
   ]
 }

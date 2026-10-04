@@ -143,6 +143,11 @@ pub struct HttpTokenValidator {
     timeout: Duration,
     cached: Mutex<Option<(Instant, String)>>,
     cache_ttl: Duration,
+    /// One Keystone round-trip per presented token per TTL. A G7 burst
+    /// otherwise starts a blocking thread for every in-flight request.
+    outcome_cache: Mutex<HashMap<String, (Instant, TokenOutcome)>>,
+    outcome_ttl: Duration,
+    inflight: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<TokenOutcome>>>>,
 }
 
 /// Alias for [`HttpTokenValidator`].
@@ -165,6 +170,9 @@ impl HttpTokenValidator {
             timeout: Duration::from_secs(5),
             cached: Mutex::new(None),
             cache_ttl: Duration::from_secs(300),
+            outcome_cache: Mutex::new(HashMap::new()),
+            outcome_ttl: Duration::from_secs(60),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -231,6 +239,12 @@ impl HttpTokenValidator {
         }
         Ok(token)
     }
+
+    fn cached_outcome(&self, token: &str) -> Option<TokenOutcome> {
+        let cache = self.outcome_cache.lock().ok()?;
+        let (at, outcome) = cache.get(token)?;
+        (at.elapsed() < self.outcome_ttl).then(|| outcome.clone())
+    }
 }
 
 impl TokenValidator for HttpTokenValidator {
@@ -242,8 +256,29 @@ impl TokenValidator for HttpTokenValidator {
         &'a self,
         token: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TokenOutcome> + Send + 'a>> {
+        let token = token.to_string();
         Box::pin(async move {
-            let token = token.to_string();
+            if let Some(hit) = self.cached_outcome(&token) {
+                return hit;
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut leader_tx = None;
+            let leader = {
+                let mut guard = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(waiters) = guard.get_mut(&token) {
+                    waiters.push(tx);
+                    false
+                } else {
+                    guard.insert(token.clone(), Vec::new());
+                    leader_tx = Some(tx);
+                    true
+                }
+            };
+            if !leader {
+                return rx.await.unwrap_or(TokenOutcome::Invalid);
+            }
+            drop(leader_tx);
+            drop(rx);
             let v = HttpTokenValidator::new(
                 self.auth_url.clone(),
                 self.username.clone(),
@@ -255,12 +290,28 @@ impl TokenValidator for HttpTokenValidator {
                 self.project_domain_name.clone(),
             )
             .with_timeout(self.timeout);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                let outcome = v.validate(&token);
-                let _ = tx.send(outcome);
-            });
-            rx.await.unwrap_or(TokenOutcome::Invalid)
+            let token_for_thread = token.clone();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let _ = std::thread::Builder::new()
+                .name("keystone-auth".into())
+                .spawn(move || {
+                    let outcome = v.validate(&token_for_thread);
+                    let _ = done_tx.send(outcome);
+                });
+            let outcome = done_rx.await.unwrap_or(TokenOutcome::Invalid);
+            if let Ok(mut cache) = self.outcome_cache.lock() {
+                cache.insert(token.clone(), (Instant::now(), outcome.clone()));
+            }
+            let waiters = self
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&token)
+                .unwrap_or_default();
+            for waiter in waiters {
+                let _ = waiter.send(outcome.clone());
+            }
+            outcome
         })
     }
 

@@ -80,7 +80,28 @@ where
         .ok_or_else(|| "storage policy 0 has no object ring".to_string())
 }
 
+/// Lab G7 starts the proxy under `ulimit -n 500000`. A systemd unit with
+/// the default soft limit of 1024 cannot hold the idle keep-alive cases.
+/// Raise the soft limit up to the hard limit, capped at 500000.
+fn raise_nofile() {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let want = 500_000u64.min(lim.rlim_max);
+        if lim.rlim_cur < want {
+            lim.rlim_cur = want;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 fn main() {
+    raise_nofile();
     let conf_path = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: swift-proxy-server <config.conf>");
         std::process::exit(1);

@@ -114,10 +114,14 @@ static int stall_ready(void) {
     return sec > 1.0;
 }
 
+static int armed(void) {
+    /* Background fsyncs on a live node consume a one-shot stall before the
+     * measured request. Stall only while the harness has armed this file. */
+    return access("/run/g7-stall-arm", F_OK) == 0;
+}
+
 static void maybe_stall(int fd) {
-    static int stalled;
-    if (mode() == 3 && on_object_fd(fd) && stall_ready() && stalled < 1) {
-        stalled++;
+    if (mode() == 3 && on_object_fd(fd) && armed()) {
         bump();
         usleep((useconds_t)stall_us());
     }

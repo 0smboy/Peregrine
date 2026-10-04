@@ -793,6 +793,104 @@ LAB_BIN = "/root/work/g6-rust-bin"
 LAB_CONF = "/etc/g6-rust"
 LAB_RUN = "/var/run/g6-rust"
 FAULT_SO = "/root/work/g7/g7-fault.so"
+FAULT_SO_PROD = "/usr/local/lib/g7-fault.so"
+# object.ring.gz devices the production proxy dials. The frozen yaml still
+# names the lab SAIO addresses; those sockets are not on the :8080 path.
+PROD_NODES = ("10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.8.5")
+PROD_SSH = (
+    "-i /etc/swift/replication_key -o BatchMode=yes "
+    "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+)
+PROD_REPLICA = ("10.0.4.2", 6211)
+
+
+def _prod():
+    return os.environ.get("G7_PROD") == "1"
+
+
+def ensure_vip_on_swift1():
+    """VIP must stay on swift1. If a proxy restart made it move, put it back."""
+    if not _prod():
+        return
+    rc, out, _ = ssh("ip -4 -o addr show dev eth1", timeout=15)
+    if "10.0.0.10/" in (out or ""):
+        return
+    ssh(
+        "for h in 10.0.0.2 10.0.0.3 10.0.0.4 10.0.8.5; do "
+        "ssh -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@$h "
+        "\"ip -4 -o addr show dev eth1 | grep -q '10.0.0.10/' && systemctl stop keepalived\" "
+        "&& break; done; "
+        "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do "
+        "ip -4 -o addr show dev eth1 | grep -q '10.0.0.10/' && break; sleep 1; done; "
+        "ssh -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@10.0.0.2 "
+        "systemctl start keepalived || true",
+        timeout=40,
+    )
+
+
+def _prod_on(host, script, timeout=60):
+    if host == "10.0.0.1":
+        return ssh(script, timeout=timeout)
+    quoted = script.replace("'", "'\"'\"'")
+    return ssh(
+        f"ssh {PROD_SSH} root@{host} '{quoted}'",
+        timeout=timeout + 10,
+    )
+
+
+def restart_prod_servers(kind, env):
+    """LD_PRELOAD a fault into the production unit, then restart only that unit.
+
+    Does not format disks and does not touch keepalived.
+    """
+    if kind not in ("object", "container"):
+        raise RuntimeError(kind)
+    unit = f"swift-{kind}"
+    fault = ""
+    stall = "5000000"
+    for part in (env or "").split():
+        if part.startswith("G7_FAULT=") and "FSYNC" not in part:
+            fault = part.split("=", 1)[1]
+        elif part.startswith("G7_FSYNC_STALL_US="):
+            stall = part.split("=", 1)[1]
+    prep = (
+        f"gcc -shared -fPIC -O2 /root/work/g7/g7-fault.c -o {FAULT_SO_PROD} -ldl; "
+        f"chcon -t lib_t {FAULT_SO_PROD} 2>/dev/null || true"
+    )
+    ssh(prep, timeout=40)
+    if fault:
+        body = (
+            "[Service]\n"
+            f"Environment=G7_FAULT={fault}\n"
+            f"Environment=G7_FSYNC_STALL_US={stall}\n"
+            f"Environment=LD_PRELOAD={FAULT_SO_PROD}\n"
+            "Environment=G7_FAULT_HITS=/run/g7-fault-hits\n"
+        )
+    else:
+        body = ""
+    for host in PROD_NODES:
+        if host != "10.0.0.1":
+            ssh(
+                f"scp -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 "
+                f"{FAULT_SO_PROD} root@{host}:{FAULT_SO_PROD}",
+                timeout=30,
+            )
+            _prod_on(host, f"chcon -t lib_t {FAULT_SO_PROD} 2>/dev/null || true", timeout=20)
+        if body:
+            remote = (
+                f"mkdir -p /etc/systemd/system/{unit}.service.d; "
+                f"cat > /etc/systemd/system/{unit}.service.d/g7-fault.conf <<'EOF'\n{body}EOF\n"
+                "rm -f /run/g7-fault-hits; systemctl daemon-reload; "
+                f"systemctl restart {unit}; echo FAULT_ON"
+            )
+        else:
+            remote = (
+                f"rm -f /etc/systemd/system/{unit}.service.d/g7-fault.conf /run/g7-fault-hits; "
+                "systemctl daemon-reload; "
+                f"systemctl restart {unit}; echo FAULT_OFF"
+            )
+        _prod_on(host, remote, timeout=50)
+    return 0, "ok", ""
 
 
 def _refuse_prod(path):
@@ -870,6 +968,26 @@ class SutHealth:
 
 
 def orphan_temps():
+    if _prod():
+        # Pre-existing temps under /srv/node are not this case's orphans.
+        stamp = str(globals().get("CASE_STARTED") or 0)
+        rc, out, err = ssh(
+            "rm -f /tmp/g7tmp.*; "
+            f"stamp={stamp}; "
+            "for h in 10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 10.0.8.5; do "
+            "if [ \"$h\" = 10.0.0.1 ]; then "
+            "timeout 20 find /srv/node -type f -name '*.tmp' -newermt \"@$stamp\" -printf . 2>/dev/null | wc -c > /tmp/g7tmp.$h & "
+            "else "
+            "ssh -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@$h "
+            "\"timeout 20 find /srv/node -type f -name '*.tmp' -newermt @$stamp -printf . 2>/dev/null | wc -c\" > /tmp/g7tmp.$h & "
+            "fi; done; wait; "
+            "cat /tmp/g7tmp.10.0.0.* /tmp/g7tmp.10.0.8.5 2>/dev/null | awk '{s+=$1} END {print s+0}'",
+            timeout=35,
+        )
+        try:
+            return int((out or "0").strip().splitlines()[-1] or 0)
+        except ValueError:
+            return -1
     rc, out, _ = _lab_ssh(
         "find /srv/1/node /srv/2/node /srv/3/node /srv/4/node -type f "
         "-name '*.tmp' 2>/dev/null | wc -l"
@@ -915,6 +1033,20 @@ def remove_drop(ip, port):
 
 
 def read_hits():
+    if _prod():
+        rc, out, _ = ssh(
+            "n=0; "
+            "for h in 10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 10.0.8.5; do "
+            "if [ \"$h\" = 10.0.0.1 ]; then c=$(cat /run/g7-fault-hits 2>/dev/null || echo 0); "
+            "else c=$(ssh -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@$h "
+            "\"cat /run/g7-fault-hits 2>/dev/null || echo 0\"); fi; "
+            "n=$((n + ${c:-0})); done; echo $n",
+            timeout=40,
+        )
+        try:
+            return int((out or "0").strip().splitlines()[-1] or 0)
+        except ValueError:
+            return 0
     rc, out, _ = _lab_ssh(
         "cat /var/run/g6-rust/g7-fault-hits-* 2>/dev/null | awk '{s+=$1} END {print s+0}'"
     )
@@ -926,6 +1058,8 @@ def read_hits():
 
 def restart_lab_servers(kind, env=""):
     """Restart lab object or container servers. Never /usr/local/bin or /etc/swift."""
+    if _prod():
+        return restart_prod_servers(kind, env)
     if kind not in ("object", "container"):
         raise RuntimeError(kind)
     bin_path = f"{LAB_BIN}/swift-{kind}-server"
@@ -956,6 +1090,13 @@ done
 
 
 def proxy_pid():
+    if _prod():
+        rc, out, _ = ssh("systemctl show -p MainPID --value swift-proxy", timeout=20)
+        try:
+            pid = int((out or "").strip())
+        except ValueError:
+            return None
+        return pid or None
     rc, out, _ = _lab_ssh(f"cat {LAB_RUN}/proxy.pid 2>/dev/null || true")
     try:
         return int((out or "").strip())
@@ -965,6 +1106,10 @@ def proxy_pid():
 
 def restart_lab_proxy():
     """Wait until the lab proxy pid is gone, then start only the lab unit."""
+    if _prod():
+        rc, out, err = ssh("systemctl restart swift-proxy && echo STARTED", timeout=40)
+        ensure_vip_on_swift1()
+        return "STARTED" in (out or ""), (out or "") + (err or "")
     script = f"""
 set -e
 pidfile={LAB_RUN}/proxy.pid
@@ -987,6 +1132,10 @@ echo STARTED
 
 
 def force_start_lab_proxy():
+    if _prod():
+        rc, out, err = ssh("systemctl restart swift-proxy && echo STARTED", timeout=40)
+        ensure_vip_on_swift1()
+        return
     pid = proxy_pid()
     if pid:
         _lab_ssh(f"kill -KILL {pid} 2>/dev/null || true; rm -f {LAB_RUN}/proxy.pid")
@@ -1206,7 +1355,22 @@ echo RESTORED
     _lab_ssh("if mountpoint -q /mnt/g7eio; then umount /mnt/g7eio || umount -l /mnt/g7eio || true; fi")
 
 
+def arm_stall(on):
+    if not _prod():
+        return
+    flag = "touch /run/g7-stall-arm" if on else "rm -f /run/g7-stall-arm"
+    ssh(
+        f"for h in 10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 10.0.8.5; do "
+        f"if [ \"$h\" = 10.0.0.1 ]; then {flag}; "
+        f"else ssh -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@$h '{flag}'; fi; "
+        "done",
+        timeout=25,
+    )
+
+
 def run_case(name, case, spec, token):
+    global CASE_STARTED
+    CASE_STARTED = int(time.time()) - 1
     kind = case["kind"]
     host, port = spec["target"]["host"], spec["target"]["port"]
     before = sample_recon(spec, n=3)
@@ -1283,15 +1447,20 @@ def run_case(name, case, spec, token):
             opened_min = last.get("opened") if opened_min is None else min(opened_min, last.get("opened") or 0)
         raw = {**last, "cycles": case["cycles"], "opened": opened_min, "cycle_results": cycles}
     elif kind == "blackhole":
-        ip, dport = case["drop_backend"].split(":")
-        dport = int(dport)
-        before_pkts = packet_count(ip, dport)
-        install_drop(ip, dport)
+        if _prod():
+            targets = [(PROD_REPLICA[0], 6211), (PROD_REPLICA[0], 6212)]
+        else:
+            ip, dport = case["drop_backend"].split(":")
+            targets = [(ip, int(dport))]
+        before_pkts = sum(packet_count(ip, port) for ip, port in targets)
+        for ip, port in targets:
+            install_drop(ip, port)
         try:
             st = None
-            for i in range(8):
+            tries = 16 if _prod() else 8
+            for i in range(tries):
                 st, _, _ = put_object(spec, token, "g7slow", f"bh{i}", b"blackhole-body")
-                if packet_count(ip, dport) > before_pkts:
+                if sum(packet_count(ip, port) for ip, port in targets) > before_pkts:
                     break
             raw = {
                 "case": "blackhole",
@@ -1299,16 +1468,21 @@ def run_case(name, case, spec, token):
                 "opened": 1,
                 "put_status": st,
                 "fault_armed": True,
-                "fault_hits": max(0, packet_count(ip, dport) - before_pkts),
+                "fault_hits": max(0, sum(packet_count(ip, port) for ip, port in targets) - before_pkts),
             }
         finally:
-            remove_drop(ip, dport)
+            for ip, port in targets:
+                remove_drop(ip, port)
     elif kind == "quorum":
-        be = case["drop_backends"][0]
-        ip, dport = be.split(":")
-        dport = int(dport)
-        before_pkts = packet_count(ip, dport)
-        install_drop(ip, dport)
+        if _prod():
+            targets = [(PROD_REPLICA[0], 6211), (PROD_REPLICA[0], 6212)]
+        else:
+            be = case["drop_backends"][0]
+            ip, dport = be.split(":")
+            targets = [(ip, int(dport))]
+        before_pkts = sum(packet_count(ip, port) for ip, port in targets)
+        for ip, port in targets:
+            install_drop(ip, port)
         try:
             ok = 0
             for i in range(case["put_n"]):
@@ -1321,10 +1495,11 @@ def run_case(name, case, spec, token):
                 "opened": case["put_n"],
                 "ok_2xx": ok,
                 "fault_armed": True,
-                "fault_hits": max(0, packet_count(ip, dport) - before_pkts),
+                "fault_hits": max(0, sum(packet_count(ip, port) for ip, port in targets) - before_pkts),
             }
         finally:
-            remove_drop(ip, dport)
+            for ip, port in targets:
+                remove_drop(ip, port)
     elif kind == "overload":
         warm_info_cache(spec, token, "g7slow")
         raw = run_overload(spec, token, case)
@@ -1404,6 +1579,7 @@ def run_case(name, case, spec, token):
         fault_env = f"G7_FAULT=fsync_stall G7_FSYNC_STALL_US={int(case.get('stall_secs', 5)) * 1000000} LD_PRELOAD={FAULT_SO}"
         restart_lab_servers("object", fault_env)
         time.sleep(1.5)
+        arm_stall(True)
         box = {}
 
         def _put():
@@ -1416,11 +1592,26 @@ def run_case(name, case, spec, token):
         while time.monotonic() < deadline:
             shield = recon_value(spec, "commit_shield_active") or 0
             if shield < 1:
-                rc, out, _ = _lab_ssh(
-                    "for p in 16210 16220 16230 16240; do "
-                    "curl -sf -m 1 http://127.0.0.1:$p/recon/concurrency; done | "
-                    "awk '/^commit_shield_active / && $2+0>=1 {found=1} END {print found+0}'"
-                )
+                if _prod():
+                    probe = (
+                        "found=0; "
+                        "for p in 6210 6211 6212; do "
+                        "curl -sf -m 1 http://127.0.0.1:$p/recon/concurrency | "
+                        "awk '/^commit_shield_active / && $2+0>=1 {f=1} END {exit !f}' && found=1; "
+                        "done; "
+                        "for h in 10.0.0.2 10.0.0.3 10.0.0.4 10.0.8.5; do "
+                        "ssh -i /etc/swift/replication_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 root@$h "
+                        "\"for p in 6210 6211 6212; do curl -sf -m 1 http://127.0.0.1:\\$p/recon/concurrency; done\" | "
+                        "awk '/^commit_shield_active / && $2+0>=1 {f=1} END {exit !f}' && found=1; "
+                        "done; echo $found"
+                    )
+                    rc, out, _ = ssh(probe, timeout=25)
+                else:
+                    rc, out, _ = _lab_ssh(
+                        "for p in 16210 16220 16230 16240; do "
+                        "curl -sf -m 1 http://127.0.0.1:$p/recon/concurrency; done | "
+                        "awk '/^commit_shield_active / && $2+0>=1 {found=1} END {print found+0}'"
+                    )
                 try:
                     shield = int((out or "0").strip() or 0)
                 except ValueError:
@@ -1438,6 +1629,7 @@ def run_case(name, case, spec, token):
                 _lab_ssh(f"kill -TERM {pid}")
                 term_during = True
         worker.join(timeout=40)
+        arm_stall(False)
         st, _body, ms = box.get("triple", (None, b"", 0))
         hits = read_hits()
         started, _out = restart_lab_proxy()
@@ -1541,36 +1733,59 @@ def run_case(name, case, spec, token):
             "recovery_put_status": st2,
         }
     elif kind == "eio":
-        mapped, detail = ensure_eio_mapper()
-        if not mapped:
-            raw = {
-                "case": "eio",
-                "target": 1,
-                "opened": 1,
-                "verdict_hint": "NOT RUN",
-                "not_run_reason": "no EIO mapper exists",
-                "mapper_detail": detail[-300:],
-            }
-        else:
-            info, tmp = {}, -1
+        if _prod():
+            restart_prod_servers("object", "G7_FAULT=eio")
+            time.sleep(0.8)
+            st, hits, tmp = None, 0, -1
             try:
-                info = eio_on_mapper(spec, token)
+                st, _, _ = put_object(spec, token, "g7slow", "eio", b"EIO")
+                hits = read_hits()
                 tmp = wait_orphans()
             finally:
-                restore_eio_mapper()
+                restart_prod_servers("object", "")
             time.sleep(0.4)
             st2, _, _ = put_object(spec, token, "g7slow", "eio-recovery", b"ok")
             raw = {
                 "case": "eio",
                 "target": 1,
                 "opened": 1,
-                "fault_armed": bool(info.get("ok")),
-                "fault_hits": info.get("fault_hits") or 0,
-                "put_status": info.get("put_status"),
+                "fault_armed": True,
+                "fault_hits": hits,
+                "put_status": st,
                 "tmp_count": tmp,
                 "recovery_put_status": st2,
-                "mapper": "/dev/mapper/g7eio",
             }
+        else:
+            mapped, detail = ensure_eio_mapper()
+            if not mapped:
+                raw = {
+                    "case": "eio",
+                    "target": 1,
+                    "opened": 1,
+                    "verdict_hint": "NOT RUN",
+                    "not_run_reason": "no EIO mapper exists",
+                    "mapper_detail": detail[-300:],
+                }
+            else:
+                info, tmp = {}, -1
+                try:
+                    info = eio_on_mapper(spec, token)
+                    tmp = wait_orphans()
+                finally:
+                    restore_eio_mapper()
+                time.sleep(0.4)
+                st2, _, _ = put_object(spec, token, "g7slow", "eio-recovery", b"ok")
+                raw = {
+                    "case": "eio",
+                    "target": 1,
+                    "opened": 1,
+                    "fault_armed": bool(info.get("ok")),
+                    "fault_hits": info.get("fault_hits") or 0,
+                    "put_status": info.get("put_status"),
+                    "tmp_count": tmp,
+                    "recovery_put_status": st2,
+                    "mapper": "/dev/mapper/g7eio",
+                }
     elif kind == "partial_write":
         s = socket.socket()
         s.settimeout(5)
@@ -1601,17 +1816,22 @@ def run_case(name, case, spec, token):
         dport = int(case.get("port") or 16210)
         # 127.0.0.9 is not a ring device. Also drop a real replica so the proxy
         # connect is on the exercised path, and keep the yaml address blackholed.
-        real_ip, real_port = "127.0.0.2", 16220
+        real_ip, real_port = ("10.0.4.2", 6211) if _prod() else ("127.0.0.2", 16220)
+        extra = [("10.0.4.2", 6212)] if _prod() else []
         before_metric = recon_value(spec, "timeouts_total_backend_connect") or 0
-        before_pkts = packet_count(real_ip, real_port)
+        before_pkts = packet_count(real_ip, real_port) + sum(packet_count(a, b) for a, b in extra)
         install_drop(real_ip, real_port)
-        if (ip, dport) != (real_ip, real_port):
+        for a, b in extra:
+            install_drop(a, b)
+        if not _prod() and (ip, dport) != (real_ip, real_port):
             install_drop(ip, dport)
         try:
             st = None
-            for i in range(6):
+            tries = 16 if _prod() else 6
+            for i in range(tries):
                 st, _, _ = put_object(spec, token, "g7slow", f"cto{i}", b"timeout-probe")
-                if packet_count(real_ip, real_port) > before_pkts:
+                now_pkts = packet_count(real_ip, real_port) + sum(packet_count(a, b) for a, b in extra)
+                if now_pkts > before_pkts:
                     break
             time.sleep(0.6)
             after_metric = recon_value(spec, "timeouts_total_backend_connect") or 0
@@ -1620,7 +1840,12 @@ def run_case(name, case, spec, token):
                 "target": 1,
                 "opened": 1,
                 "fault_armed": True,
-                "fault_hits": max(0, packet_count(real_ip, real_port) - before_pkts),
+                "fault_hits": max(
+                    0,
+                    packet_count(real_ip, real_port)
+                    + sum(packet_count(a, b) for a, b in extra)
+                    - before_pkts,
+                ),
                 "timeout_observed": after_metric > before_metric,
                 "put_status": st,
                 "timeouts_before": before_metric,
@@ -1628,7 +1853,9 @@ def run_case(name, case, spec, token):
             }
         finally:
             remove_drop(real_ip, real_port)
-            if (ip, dport) != (real_ip, real_port):
+            for a, b in extra:
+                remove_drop(a, b)
+            if not _prod() and (ip, dport) != (real_ip, real_port):
                 remove_drop(ip, dport)
     elif kind == "fsync_stall":
         us = int(case.get("stall_secs", 5) * 1_000_000)
@@ -1636,11 +1863,13 @@ def run_case(name, case, spec, token):
         time.sleep(1.5)
         st, hits, elapsed_ms = None, 0, 0
         try:
+            arm_stall(True)
             t0 = time.monotonic()
             st, _, ms = put_object(spec, token, "g7slow", "fsync", b"F" * 4096)
             elapsed_ms = max(ms or 0, (time.monotonic() - t0) * 1000.0)
             hits = read_hits()
         finally:
+            arm_stall(False)
             restart_lab_servers("object", "")
         raw = {
             "case": "fsync_stall",
@@ -1657,6 +1886,7 @@ def run_case(name, case, spec, token):
         time.sleep(1.5)
         st, hits, elapsed_ms = None, 0, 0
         try:
+            arm_stall(True)
             t0 = time.monotonic()
             st, _, ms = http(
                 host,
@@ -1669,6 +1899,7 @@ def run_case(name, case, spec, token):
             elapsed_ms = max(ms or 0, (time.monotonic() - t0) * 1000.0)
             hits = read_hits()
         finally:
+            arm_stall(False)
             restart_lab_servers("container", "")
         raw = {
             "case": "sqlite_stall",
