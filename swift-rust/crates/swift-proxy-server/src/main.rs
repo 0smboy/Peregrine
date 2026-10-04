@@ -388,6 +388,9 @@ fn main() {
         max_connections: options.max_connections,
         max_active_requests: options.max_active_requests,
         dedicated_accept: true,
+        // SIGTERM during an object or container commit must still write the
+        // status the client is waiting on. Storage servers do not set this.
+        finish_inflight_on_shutdown: true,
         ..Default::default()
     };
     apply_swift_http_constraints(&mut server_config, &constraints).unwrap_or_else(|error| {

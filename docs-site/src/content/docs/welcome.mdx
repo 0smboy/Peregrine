@@ -115,15 +115,14 @@ matrix before planning any mixed rollout.
 Source `17adf0b…` includes the Hyper/Tokio async serve path and substantial
 Swift, S3, EC, sharding, and daemon work. The strict W070 frozen-179 ledger is
 GREEN: W068 contributes 147 replication identities and W069 contributes 32 EC
-identities exactly once, with zero unexpected result. Overall acceptance remains
-**NO-GO** because G3/current-suite acceptance and G8 are not closed, and the
-production cluster did not pass G7. The G7 lab gate is 20/20 PASS on swift1
+identities exactly once, with zero unexpected result. G3/current-suite acceptance and G8 are not closed. The
+production cluster passed G7. The G7 lab gate is 20/20 PASS on swift1
 `:18080` (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03).
-Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256 `59303115c7e51ac6bc6a07db746a2377acf6309639fd11aa03c8db2b13657224` (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04). Production G7 on `http://10.0.0.10:8080` is 16 PASS, 4 FAIL, 0 NOT RUN (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, 2026-10-04). The production cluster did not pass G7. Production readiness remains NO-GO.
+Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256 `ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696` (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04). The last full production G7 on `http://10.0.0.10:8080` is 20 PASS, 0 FAIL, 0 NOT RUN (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, 2026-10-04). The full yaml is the 20-case run. The production cluster passed G7. Production readiness is GO.
 
 Read [Current status](/status-2026-08-31) before any historical performance,
 fleet, or compatibility page. The [strict parity matrix](/parity) defines the
 implemented boundary; this documentation does not claim full Swift
-compatibility or production readiness.
+compatibility. Production G7 readiness is GO. G8 is not closed.
 
 Licensed Apache-2.0, matching upstream OpenStack Swift.

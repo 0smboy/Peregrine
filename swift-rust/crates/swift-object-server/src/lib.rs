@@ -723,6 +723,11 @@ pub struct ObjectServer {
     /// see [`swift_http::clock_health`].
     pub worm_clock: std::sync::Arc<ClockHealth>,
     storage: std::sync::OnceLock<StorageExecutor>,
+    /// `(thread_cap, queue_bound, device_ops)` used the first time
+    /// [`Self::storage`] builds an executor. The HTTP process has already
+    /// admitted `device_ops` connections; a smaller fail-closed disk queue
+    /// turns that burst into object-server 500s and proxy 503s.
+    storage_admission: (usize, usize, usize),
     /// Invoked on the storage thread immediately before durability commit
     /// (xattr/fsync/rename). Production is `None`. Tests use it to occupy
     /// the executor during finalize without a dummy `run_finite`.
@@ -1262,8 +1267,22 @@ impl ObjectServer {
             fallocate_reserve: FallocateReserve::Percent(1.0),
             worm_clock: std::sync::Arc::new(ClockHealth::disabled()),
             storage: std::sync::OnceLock::new(),
+            storage_admission: (8, 32, 32),
             commit_stall: None,
         }
+    }
+
+    /// Size the lazy storage executor to the connections this process accepts.
+    /// Applied on the first [`Self::storage`] call, which runs on the server
+    /// runtime. [`Self::with_storage`] still wins when a test injects one.
+    pub fn with_storage_admission(
+        mut self,
+        thread_cap: usize,
+        queue_bound: usize,
+        device_ops: usize,
+    ) -> Self {
+        self.storage_admission = (thread_cap.max(1), queue_bound.max(1), device_ops.max(1));
+        self
     }
 
     /// Builder-style override for the `fallocate_reserve` parsed by
@@ -1300,9 +1319,14 @@ impl ObjectServer {
 
     pub fn storage(&self) -> &StorageExecutor {
         self.storage.get_or_init(|| {
+            let (thread_cap, queue_bound, device_ops) = self.storage_admission;
             StorageExecutor::new(
-                StorageExecutorConfig::new(8, 32, DeviceIoLimits::new(32, 32, 32, 32, 32))
-                    .expect("storage executor config"),
+                StorageExecutorConfig::new(
+                    thread_cap,
+                    queue_bound,
+                    DeviceIoLimits::new(device_ops, device_ops, 32, 32, 32),
+                )
+                .expect("storage executor config"),
             )
             .expect("storage executor")
         })
@@ -1449,6 +1473,7 @@ impl ObjectServer {
                         fallocate_reserve,
                         worm_clock,
                         storage: std::sync::OnceLock::new(),
+                        storage_admission: (8, 32, 32),
                         commit_stall: None,
                     }
                     .delete_apply_tombstone(
@@ -1518,6 +1543,7 @@ impl ObjectServer {
                     fallocate_reserve,
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
+                    storage_admission: (8, 32, 32),
                     commit_stall: None,
                 }
                 .handle(req)
@@ -1927,6 +1953,7 @@ impl ObjectServer {
                     fallocate_reserve,
                     worm_clock,
                     storage: std::sync::OnceLock::new(),
+                    storage_admission: (8, 32, 32),
                     commit_stall: None,
                 };
                 tmp.get(

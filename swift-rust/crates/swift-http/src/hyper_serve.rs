@@ -428,14 +428,21 @@ async fn serve_hyper_prefixed(
                         return Ok(());
                     }
                     if drain.as_ref().is_some_and(|d| d.is_expired()) {
-                        metrics.record_timeout(DeadlineKind::Shutdown);
-                        if inflight > 0 || conn_commits > 0 {
-                            metrics.record_cancellation(CancelReason::Shutdown);
+                        let mutating = inflight > read_only;
+                        if config.finish_inflight_on_shutdown && (mutating || conn_commits > 0)
+                        {
+                            // The handler still owes the client a status.
+                            // Its own backend deadline ends the request.
+                        } else {
+                            metrics.record_timeout(DeadlineKind::Shutdown);
+                            if inflight > 0 || conn_commits > 0 {
+                                metrics.record_cancellation(CancelReason::Shutdown);
+                            }
+                            // HTTP is now forced off. Global durability shields
+                            // are still joined by the accept loop after every
+                            // connection task has returned.
+                            return Ok(());
                         }
-                        // HTTP is now forced off. Global durability shields
-                        // are still joined by the accept loop after every
-                        // connection task has returned.
-                        return Ok(());
                     }
                 }
             }
@@ -450,9 +457,19 @@ pub async fn reject_overloaded(mut stream: tokio::net::TcpStream) {
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
+    let _ = stream.set_nodelay(true);
     let _ = stream.write_all(msg.as_bytes()).await;
     let _ = stream.write_all(body).await;
     let _ = stream.flush().await;
+    // Closing with unread request bytes sends RST and can discard the 503
+    // before the client reads it. Drop what is already buffered, then FIN.
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.try_read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
     let _ = stream.shutdown().await;
 }
 
@@ -2053,7 +2070,13 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
             let _inflight = InFlight(in_flight);
             let _req_permit = match admission.try_acquire_request(TrafficClass::Foreground) {
                 Ok(p) => p,
-                Err(_) => return Ok(error_hyper(503, "Service Unavailable", false)),
+                Err(_) => {
+                    // Last-slot race: Hyper already has the body. Finish it
+                    // before the 503 so close is a FIN, not an RST.
+                    let (_parts, incoming) = req.into_parts();
+                    discard_incoming_for_close(incoming).await;
+                    return Ok(error_hyper(503, "Service Unavailable", false));
+                }
             };
 
             let on_upgrade = hyper::upgrade::on(&mut req);
@@ -2137,6 +2160,19 @@ impl Service<HyperRequest<Incoming>> for HyperToSwift {
                 client_connection.as_deref(),
             ))
         })
+    }
+}
+
+async fn discard_incoming_for_close(mut body: Incoming) {
+    use http_body_util::BodyExt;
+    // Finish the body before the 503 is written. A timed-out drain still
+    // leaves bytes in the socket, and Hyper then aborts with RST, which the
+    // overload client records as status 0.
+    loop {
+        match body.frame().await {
+            Some(Ok(_)) => continue,
+            _ => break,
+        }
     }
 }
 

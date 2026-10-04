@@ -1210,7 +1210,9 @@ def run_overload(spec, token, case):
             if mask & selectors.EVENT_READ and st["status"] is None:
                 try:
                     data = sock.recv(2048)
-                except (BlockingIOError, ConnectionResetError, OSError):
+                except BlockingIOError:
+                    data = None
+                except (ConnectionResetError, OSError):
                     data = b""
                 if data:
                     st["buf"] += data
@@ -1221,7 +1223,8 @@ def run_overload(spec, token, case):
                             st["status"] = int(parts[1])
                         except ValueError:
                             st["status"] = 0
-                elif st["buf"]:
+                elif data == b"":
+                    # EOF or reset before a status line. Not a 2xx and not a 503.
                     st["status"] = 0
     sel.close()
     for st in states:
@@ -1232,6 +1235,13 @@ def run_overload(spec, token, case):
     http_2xx = sum(1 for st in states if isinstance(st["status"], int) and 200 <= st["status"] < 300)
     http_503 = sum(1 for st in states if st["status"] == 503)
     responses = sum(1 for st in states if isinstance(st["status"], int) and st["status"] > 0)
+    other = {}
+    for st in states:
+        status = st["status"]
+        if isinstance(status, int) and (200 <= status < 300 or status == 503):
+            continue
+        key = "none" if status is None else str(status)
+        other[key] = other.get(key, 0) + 1
     return {
         "case": "overload",
         "target": target,
@@ -1240,6 +1250,7 @@ def run_overload(spec, token, case):
         "http_2xx": http_2xx,
         "http_503": http_503,
         "failed": target - responses,
+        "other_status": other,
     }
 
 
@@ -1583,7 +1594,10 @@ def run_case(name, case, spec, token):
         box = {}
 
         def _put():
-            box["triple"] = put_object(spec, token, "g7slow", "barrier", b"Z" * 4096)
+            try:
+                box["triple"] = put_object(spec, token, "g7slow", "barrier", b"Z" * 4096)
+            except Exception as exc:
+                box["put_error"] = f"{type(exc).__name__}: {exc}"
 
         worker = threading.Thread(target=_put)
         worker.start()
@@ -1655,6 +1669,7 @@ def run_case(name, case, spec, token):
             "term_during_barrier": term_during,
             "restart_ok": bool(started) and hp["ok"] == hp["n"] and hp["n"] > 0,
             "put_status": st,
+            "put_error": box.get("put_error"),
             "get_after": st2,
             "len": len(body or b""),
             "expected_len": 4096,

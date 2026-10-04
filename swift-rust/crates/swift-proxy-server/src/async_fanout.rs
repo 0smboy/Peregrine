@@ -138,16 +138,82 @@ pub(crate) fn record_backend_connect_timeout() {
     ConcurrencyMetrics::record_timeout_current(DeadlineKind::BackendConnect);
 }
 
-async fn connect_node_async(node: &Node, conn_timeout: Duration) -> io::Result<TcpStream> {
+/// A full accept queue drops the SYN. `conn_timeout` (0.5s) is shorter than
+/// the kernel's first retransmit, so one attempt marks a live node down and
+/// every later PUT in the same burst becomes a client 503. Retry inside a
+/// short budget. A refused connection is the node actually being down.
+fn connect_budget(per_attempt: Duration) -> Duration {
+    per_attempt
+        .saturating_mul(4)
+        .min(Duration::from_secs(2))
+        .max(per_attempt)
+}
+
+/// Status read for a write the backend has already accepted. `node_timeout`
+/// still bounds connect and the header write. sqlite on the production
+/// container servers fsyncs more than once under the G7 stall, and giving up
+/// at the first `node_timeout` turns that commit into a client 503.
+fn commit_response_wait(method: &str, node_timeout: Duration) -> Duration {
+    if matches!(method, "PUT" | "POST" | "DELETE" | "UPDATE") {
+        node_timeout.max(Duration::from_secs(60))
+    } else {
+        node_timeout
+    }
+}
+
+async fn connect_node_async(node: &Node, per_attempt: Duration) -> io::Result<TcpStream> {
     let addr = format!("{}:{}", node.ip, node.port);
-    let stream = tokio::time::timeout(conn_timeout, TcpStream::connect(&addr))
-        .await
-        .map_err(|_| {
+    // Numeric ring IPs must not go through getaddrinfo. A string connect
+    // blocks a worker per lookup, and 1000 simultaneous PUTs then time out.
+    let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("bad node address {addr}: {e}"),
+        )
+    })?;
+    let budget = connect_budget(per_attempt);
+    let started = tokio::time::Instant::now();
+    loop {
+        let left = budget.saturating_sub(started.elapsed());
+        if left.is_zero() {
             record_backend_connect_timeout();
-            io::Error::new(io::ErrorKind::TimedOut, "backend connect timeout")
-        })??;
-    stream.set_nodelay(true).ok();
-    Ok(stream)
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "backend connect timeout",
+            ));
+        }
+        match tokio::time::timeout(per_attempt.min(left), TcpStream::connect(sock_addr)).await {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true).ok();
+                return Ok(stream);
+            }
+            Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                return Err(error);
+            }
+            Ok(Err(error)) if started.elapsed() >= budget => return Err(error),
+            Ok(Err(_)) => {}
+            Err(_) if started.elapsed() >= budget => {
+                record_backend_connect_timeout();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "backend connect timeout",
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// An unread client body, dropped while a 503 is returned, makes Hyper RST
+/// the socket and the client never sees the status. Finish or abandon the
+/// body first so the 503 is what the client reads.
+async fn discard_client_body(body: &mut IncomingBody) {
+    loop {
+        match body.next_chunk().await {
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
 }
 
 async fn read_backend_line_async(
@@ -256,8 +322,10 @@ pub(crate) async fn backend_request_async(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend write timeout"))??;
     }
+    let response_wait = commit_response_wait(method, node_timeout);
     let mut reader = BufReader::new(stream);
-    let (status, reason, resp_headers) = read_backend_head_async(&mut reader, node_timeout).await?;
+    let (status, reason, resp_headers) =
+        read_backend_head_async(&mut reader, response_wait).await?;
     let content_length =
         resp_header(&resp_headers, "content-length").and_then(|v| v.parse::<u64>().ok());
     let body = if method != "HEAD" {
@@ -265,7 +333,7 @@ pub(crate) async fn backend_request_async(
             &mut reader,
             content_length,
             swift_http::MAX_CONTROL_BODY,
-            node_timeout,
+            response_wait,
         )
         .await?
     } else {
@@ -335,8 +403,11 @@ async fn connect_putter_async(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend flush timeout"))??;
     let mut leftover = Vec::new();
+    // 100-continue follows temp-file create. A 1000-PUT burst queues that
+    // create behind in-flight bodies, so this wait is the commit budget.
+    let continue_wait = commit_response_wait("PUT", node_timeout);
     let (status, reason, resp_headers) =
-        read_http_head(&mut stream, &mut leftover, node_timeout).await?;
+        read_http_head(&mut stream, &mut leftover, continue_wait).await?;
     if status == 100 {
         return Ok(AsyncPutterOutcome::Live(AsyncPutter {
             node: node.clone(),
@@ -680,7 +751,11 @@ impl ProxyApp {
         let mut results: Vec<BackendResponse> = Vec::new();
         let expected = group.spawned();
         let mut finished = 0usize;
-        let wait = self.config.conn_timeout + self.config.node_timeout;
+        let wait = if matches!(method, "PUT" | "POST" | "DELETE" | "UPDATE") {
+            commit_response_wait(method, self.config.node_timeout)
+        } else {
+            self.config.conn_timeout + self.config.node_timeout
+        };
         for _ in 0..expected {
             match tokio::time::timeout(wait, group.recv()).await {
                 Ok(Some(Some(resp))) => {
@@ -758,7 +833,10 @@ impl ProxyApp {
         let quorum = quorum_size(node_number.max(1) as f64) as usize;
         let mut group: FanoutGroup<AsyncPutterOutcome> = match FanoutGroup::new(slots, slots) {
             Ok(g) => g,
-            Err(_) => return swob_response(503),
+            Err(_) => {
+                discard_client_body(body).await;
+                return swob_response(503);
+            }
         };
         let node_pool = Arc::new(Mutex::new(nodes.into_iter().collect::<VecDeque<_>>()));
         for headers in per_node_headers {
@@ -783,10 +861,11 @@ impl ProxyApp {
                 })
                 .is_err()
             {
+                discard_client_body(body).await;
                 return swob_response(503);
             }
         }
-        let wait = self.config.conn_timeout + self.config.node_timeout;
+        let wait = commit_response_wait("PUT", self.config.node_timeout);
         let expected = group.spawned();
         let mut earlies: Vec<BackendResponse> = Vec::new();
         let mut putters: Vec<AsyncPutter> = Vec::new();
@@ -815,10 +894,15 @@ impl ProxyApp {
                     body: Vec::new(),
                 });
             }
+            discard_client_body(body).await;
             return self.best_response(&results, node_number);
         }
         let chunked = content_length.is_none();
         let node_timeout = self.config.node_timeout;
+        // A replica that is still reading a slow body must not be dropped at
+        // node_timeout. Losing it under the 1000-PUT burst is what turns a
+        // durable PUT into a client 503.
+        let write_wait = commit_response_wait("PUT", node_timeout);
         loop {
             if !putters.is_empty()
                 && putters
@@ -828,6 +912,7 @@ impl ProxyApp {
                 // Every live replica is at its window: do not read the client.
                 putters.retain(|p| p.window.pending() < p.window.limit());
                 if putters.len() < quorum {
+                    discard_client_body(body).await;
                     return swob_response(503);
                 }
                 continue;
@@ -836,11 +921,15 @@ impl ProxyApp {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
                 Err(e) if swift_http::body_too_large(&e) => return swob_response(413),
-                Err(_) => return swob_response(499),
+                Err(_) => {
+                    discard_client_body(body).await;
+                    return swob_response(503);
+                }
             };
             for piece in chunk.chunks(BACKEND_WINDOW_BYTES) {
-                putters = tee_one_chunk(putters, piece.to_vec(), chunked, node_timeout).await;
+                putters = tee_one_chunk(putters, piece.to_vec(), chunked, write_wait).await;
                 if putters.len() < quorum {
+                    discard_client_body(body).await;
                     return swob_response(503);
                 }
             }
@@ -849,16 +938,17 @@ impl ProxyApp {
             tokio::task::yield_now().await;
         }
         if chunked {
-            putters = tee_one_chunk(putters, Vec::new(), true, node_timeout).await;
+            putters = tee_one_chunk(putters, Vec::new(), true, write_wait).await;
             // Empty chunked write sends "0\r\n\r\n" via write_chunk_framed_async
             // which is the terminator. write_chunk_framed of empty is "0\r\n\r\n".
         }
         let mut results = earlies;
+        let response_wait = commit_response_wait("PUT", node_timeout);
         for mut p in putters {
             let _ = p.stream.flush().await;
             let mut leftover = std::mem::take(&mut p.leftover);
             let mut stream = p.stream;
-            match read_http_head(&mut stream, &mut leftover, node_timeout).await {
+            match read_http_head(&mut stream, &mut leftover, response_wait).await {
                 Ok((status, reason, headers)) => {
                     let content_length =
                         resp_header(&headers, "content-length").and_then(|v| v.parse::<u64>().ok());
@@ -868,7 +958,7 @@ impl ProxyApp {
                         &mut leftover,
                         &mut reader,
                         content_length,
-                        node_timeout,
+                        response_wait,
                     )
                     .await
                     .unwrap_or(saved);

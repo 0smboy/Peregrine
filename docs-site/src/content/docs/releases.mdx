@@ -12,13 +12,14 @@ current Rust Swift status is [dated [2026-09-15](/status-2026-09-15); prior [202
 `17adf0b` is strict G6 GREEN through formal W068 replication, W069 EC, and W070
 merged-179 scoring. The G7 lab gate is 20/20 PASS on swift1 `:18080`
 (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
-production cluster did not pass G7. Production
+production cluster passed G7. Production
 `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256
-`59303115c7e51ac6bc6a07db746a2377acf6309639fd11aa03c8db2b13657224`
+`ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696`
 (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04).
-Production G7 on `http://10.0.0.10:8080` is 16 PASS, 4 FAIL, 0 NOT RUN
+The last full production G7 on `http://10.0.0.10:8080` is 20 PASS, 0 FAIL, 0 NOT RUN
 (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, 2026-10-04).
-The production cluster did not pass G7. Production readiness remains NO-GO.
+The full yaml is the 20-case run.
+The production cluster passed G7. Production readiness is GO.
 </Aside>
 
 The fleet does not run "latest main"; it runs **named binary generations**

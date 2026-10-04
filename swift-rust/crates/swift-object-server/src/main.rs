@@ -32,6 +32,29 @@ use swift_object_server::{
     serve_with_config_multi, ContainerUpdateMode, ObjectServer, ObjectServerConfig,
 };
 
+/// Disk admission for one object-server process: thread cap, queue, device ops.
+///
+/// The HTTP server already accepted the connection under `max_clients`.
+/// The storage executor's lazy default (8 threads, queue 32, 32 in-flight
+/// ops per device) is smaller than that, and it fails closed. A 1000-PUT
+/// burst then gets 500 from the object server, which the proxy reports as
+/// 503 once write quorum is lost.
+fn object_storage_admission(
+    worker_threads: usize,
+    connection_queue: usize,
+    max_clients: usize,
+) -> Result<(usize, usize, usize), String> {
+    let threads = worker_threads.max(1);
+    let queue = connection_queue.max(1);
+    let admitted = max_clients.max(1);
+    if threads.saturating_add(queue) < admitted {
+        return Err(format!(
+            "storage executor cannot hold {admitted} admitted PUTs (threads={threads} queue={queue})"
+        ));
+    }
+    Ok((threads, queue, admitted))
+}
+
 fn parse_conf_file(path: &str) -> Result<SwiftConfig, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     SwiftConfig::parse_lenient(&content, &[], false).map_err(|e| e.to_string())
@@ -265,6 +288,9 @@ fn main() {
         reuse_port,
         worker_threads: eff.worker_threads,
         connection_queue: eff.connection_queue,
+        // Slow PUTs pin body workers. Accept has to stay on its own thread
+        // or the listen queue fills and the proxy's connect times out as 503.
+        dedicated_accept: true,
         ..Default::default()
     };
 
@@ -276,6 +302,12 @@ fn main() {
             ));
             std::process::exit(1);
         });
+    for lis in &listeners {
+        if let Err(e) = swift_http::set_listen_backlog(lis, 65535) {
+            logger.error(&format!("listen backlog: {e}"));
+            std::process::exit(1);
+        }
+    }
     for (i, lis) in listeners.iter().enumerate() {
         let addr = lis
             .local_addr()
@@ -287,9 +319,20 @@ fn main() {
         ));
     }
 
+    let (storage_threads, storage_queue, storage_devices) =
+        object_storage_admission(eff.worker_threads, eff.connection_queue, max_clients)
+            .unwrap_or_else(|e| {
+                logger.error(&format!("storage executor: {e}"));
+                std::process::exit(1);
+            });
+    logger.info(&format!(
+        "storage executor: threads={storage_threads} queue={storage_queue} device_ops={storage_devices}"
+    ));
+
     let mut server = ObjectServer::new(config)
         .with_fallocate_reserve(fallocate_reserve)
-        .with_recon_cache_path(get("recon_cache_path", "/var/cache/swift").into());
+        .with_recon_cache_path(get("recon_cache_path", "/var/cache/swift").into())
+        .with_storage_admission(storage_threads, storage_queue, storage_devices);
     if worm_clock_max_offset_ms > 0 {
         server = server.with_worm_clock(std::sync::Arc::new(swift_http::ClockHealth::chrony(
             worm_clock_max_offset_ms,
@@ -323,6 +366,15 @@ mod startup_policy_tests {
         )
         .unwrap();
         assert!(storage_policy_kinds(&conf).is_err());
+    }
+
+    #[test]
+    fn admitted_puts_fit_in_the_storage_executor() {
+        let (threads, queue, device_ops) =
+            super::object_storage_admission(128, 1024, 1024).expect("admission");
+        assert!(threads.saturating_add(queue) >= 1024);
+        assert!(device_ops >= 1024);
+        assert!(super::object_storage_admission(8, 32, 1024).is_err());
     }
 
     #[test]

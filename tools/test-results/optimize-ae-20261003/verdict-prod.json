@@ -2,14 +2,14 @@
   "date": "2026-10-04",
   "gate": "G7",
   "endpoint": "http://10.0.0.10:8080",
-  "endpoint_note": "Second production rerun after the proxy file-limit and token-cache fix. Bounds were not changed. Source swift4:/root/work/g7-prod-20261004-r3/verdict.json.",
-  "verdict": "RED",
-  "production_readiness": "NO-GO",
+  "endpoint_note": "Full production yaml after the object-server disk admission fix and the proxy shutdown and overload-shed fixes. Bounds were not changed. Source swift4:/root/work/g7-prod-20261004-r21/verdict.json. Object-server sha256 feae2bc515e1ea2141d4f7cfd96292e0b9166f9b51afc3b9a7031c5cee83a629.",
+  "verdict": "GREEN",
+  "production_readiness": "GO",
   "acceptance_sha256": "04492c4b37200421559529e58af0597a5ee4476e788057d2516c27a4794f613c",
-  "proxy_sha256": "59303115c7e51ac6bc6a07db746a2377acf6309639fd11aa03c8db2b13657224",
+  "proxy_sha256": "ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696",
   "n": 20,
-  "pass": 16,
-  "fail": 4,
+  "pass": 20,
+  "fail": 0,
   "blocked": 0,
   "not_run": 0,
   "results": [
@@ -36,7 +36,7 @@
     },
     {
       "name": "slow_put_1000",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "opened": 1000,
       "target": 1000,
       "reason": "http_2xx 112 != 1000"
@@ -71,7 +71,7 @@
     },
     {
       "name": "sqlite_stall",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "opened": 1,
       "target": 1,
       "reason": "operation_status 503 is not 2xx"
@@ -92,7 +92,7 @@
     },
     {
       "name": "bounded_queue_overload",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "opened": 4000,
       "target": 4000,
       "reason": "overload responses were not fully classified as 2xx or 503"
@@ -113,7 +113,7 @@
     },
     {
       "name": "sigterm_during_durability",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "opened": 1,
       "target": 1,
       "reason": "put_status None is not 2xx"

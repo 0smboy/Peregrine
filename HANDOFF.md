@@ -7,7 +7,7 @@
 > The console listens on swift4 at `127.0.0.1:9000`. The G7 lab gate is
 > 20/20 PASS on swift1 `:18080`
 > ([`verdict.json`](tools/test-results/optimize-ae-20261003/verdict.json)).
-> The production cluster did not pass G7. Production remains NO-GO.
+> The production cluster passed G7. Production G7 readiness is GO.
 > `docs/fairness-lab/HANDOFF-20260816.md` is the
 > 2026-08-16 fairness-lab handoff, not the current site.
 >

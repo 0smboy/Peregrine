@@ -251,6 +251,11 @@ pub struct ServerConfig {
     /// `0` means 5s. After this, HTTP connections are forced off; commit-shield
     /// tasks are still joined (never aborted).
     pub shutdown_deadline_secs: u64,
+    /// When set, SIGTERM does not drop a connection that still has a mutating
+    /// request in flight. The handler writes the real status, then the process
+    /// exits. Storage servers leave this false so a stalled local fsync cannot
+    /// pin shutdown.
+    pub finish_inflight_on_shutdown: bool,
     /// Request workers. Accept and `/healthcheck` run on a separate
     /// one-thread runtime so a saturated body pool cannot delay a probe.
     /// `None` keeps the connection on the runtime that accepted it.
@@ -307,6 +312,10 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("shutdown_deadline_secs", &self.shutdown_deadline_secs)
             .field(
+                "finish_inflight_on_shutdown",
+                &self.finish_inflight_on_shutdown,
+            )
+            .field(
                 "worker_pool",
                 &self.worker_pool.as_ref().map(|_| "<worker-pool>"),
             )
@@ -350,6 +359,7 @@ impl Default for ServerConfig {
             max_upload_time_secs: 0,
             metrics: None,
             shutdown_deadline_secs: 0,
+            finish_inflight_on_shutdown: false,
             worker_pool: None,
             dedicated_accept: false,
             body_handoff: None,
@@ -829,10 +839,13 @@ async fn accept_loop_async(
     } else {
         5
     };
+    // Unread client bodies end with this drain. A commit that has already
+    // taken the body still finishes under finish_inflight_on_shutdown.
+    metrics.arm_shutdown_body_deadline(Duration::from_secs(drain_secs));
     let drain_until = Instant::now() + Duration::from_secs(drain_secs);
     while live.load(Ordering::SeqCst) > 0 {
         metrics.set_shutdown_waiting_requests(live.load(Ordering::SeqCst));
-        if Instant::now() >= drain_until {
+        if !config.finish_inflight_on_shutdown && Instant::now() >= drain_until {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1204,28 +1217,54 @@ impl IncomingBody {
                 "upload lifetime exceeded",
             ));
         }
-        let idle = self.body_idle.map(|d| d.remaining());
-        let idle_expired = self.body_idle.is_some() && idle == Some(Duration::ZERO);
-        if idle_expired {
-            self.record_timeout(DeadlineKind::BodyIdle);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "body idle timeout",
-            ));
-        }
-        let result = if let Some(idle) = idle.filter(|d| !d.is_zero()) {
-            match tokio::time::timeout(idle, self.next_chunk_inner()).await {
-                Ok(r) => r,
-                Err(_) => {
-                    self.record_timeout(DeadlineKind::BodyIdle);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "body idle timeout",
-                    ))
+        let idle_snapshot = self.body_idle;
+        let metrics = self.metrics.clone();
+        let waited = {
+            let read = self.next_chunk_inner();
+            tokio::pin!(read);
+            loop {
+                if idle_snapshot.is_some_and(|deadline| deadline.is_expired()) {
+                    break Err(());
+                }
+                let shutdown_left = metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.shutdown_body_remaining());
+                if shutdown_left == Some(Duration::ZERO) {
+                    break Err(());
+                }
+                let idle_left = idle_snapshot
+                    .map(|deadline| deadline.remaining())
+                    .filter(|left| !left.is_zero());
+                let cap = match (idle_left, shutdown_left) {
+                    (Some(idle_left), Some(shutdown)) => Some(idle_left.min(shutdown)),
+                    (Some(idle_left), None) => Some(idle_left),
+                    (None, Some(shutdown)) => Some(shutdown),
+                    (None, None) => None,
+                };
+                tokio::select! {
+                    result = &mut read => break Ok(result),
+                    _ = tokio::time::sleep(cap.unwrap_or(Duration::from_secs(1))), if cap.is_some() => {
+                        break Err(());
+                    }
+                    _ = async {
+                        if let Some(metrics) = &metrics {
+                            metrics.shutdown_body_notified().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => continue,
                 }
             }
-        } else {
-            self.next_chunk_inner().await
+        };
+        let result = match waited {
+            Err(()) => {
+                self.record_timeout(DeadlineKind::BodyIdle);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "body idle timeout",
+                ));
+            }
+            Ok(result) => result,
         };
         if let Ok(Some(chunk)) = &result {
             if let Some(idle) = self.body_idle.as_mut() {

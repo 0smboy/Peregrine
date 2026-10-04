@@ -23,7 +23,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::admission::AdmissionController;
 use crate::db_exec::DbExecutor;
@@ -445,6 +445,13 @@ struct Inner {
     block_in_place: AtomicU64,
     spawn_blocking_other: AtomicU64,
     blocking_network_wait: AtomicU64,
+    /// Earliest moment an in-flight request body must stop waiting on the
+    /// client. Armed when the process begins shutdown. A PUT that has not
+    /// finished reading its body must not pin `systemctl restart` for the
+    /// whole client timeout. A handler that has already finished the body
+    /// and is inside a commit is not blocked on this deadline.
+    shutdown_body_deadline: Mutex<Option<Instant>>,
+    shutdown_body_notify: tokio::sync::Notify,
 }
 
 impl fmt::Debug for Inner {
@@ -486,8 +493,46 @@ impl ConcurrencyMetrics {
                 block_in_place: AtomicU64::new(0),
                 spawn_blocking_other: AtomicU64::new(0),
                 blocking_network_wait: AtomicU64::new(0),
+                shutdown_body_deadline: Mutex::new(None),
+                shutdown_body_notify: tokio::sync::Notify::new(),
             }),
         }
+    }
+
+    /// Bound unread request bodies once shutdown has started.
+    ///
+    /// `within` is the same drain the accept loop already uses. Notifying
+    /// wakes a `next_chunk` that is already waiting on a longer client timeout.
+    pub fn arm_shutdown_body_deadline(&self, within: Duration) {
+        let at = Instant::now() + within;
+        {
+            let mut slot = self
+                .inner
+                .shutdown_body_deadline
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let replace = slot.map(|current| at < current).unwrap_or(true);
+            if replace {
+                *slot = Some(at);
+            }
+        }
+        self.inner.shutdown_body_notify.notify_waiters();
+    }
+
+    /// Time left until shutdown will not wait for more client body bytes.
+    /// `Some(0)` means the deadline has already passed. `None` means shutdown
+    /// has not armed a body deadline.
+    pub fn shutdown_body_remaining(&self) -> Option<Duration> {
+        let slot = self
+            .inner
+            .shutdown_body_deadline
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        slot.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn shutdown_body_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.shutdown_body_notify.notified()
     }
 
     /// Run `fut` with this registry as the request-path current metrics.
