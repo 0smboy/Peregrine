@@ -1,6 +1,24 @@
 # Console reaccept, 2026-10-04
 
-**ACCEPT_WITH_WARN.** Dated 2026-10-04. The file path passed, the VIP download sha256 matched, and the bucket name is gone. `GET /lab/api/node/status` still omits hkserver. Monitor `nodes_up` is 4.0, not empty. The warn is the missing hkserver row. Create and sha256 did not fail.
+**ACCEPT.** Addendum dated 2026-10-04. The file path below still stands. `GET /lab/api/node/status` lists five nodes, swift1–swift4 and hkserver, each reachable and 10/10 up. Monitor `nodes_up` stays 4.0. Prometheus job `node` on swift4 scrapes only `10.0.0.1:9100` through `10.0.0.4:9100`. hkserver does not run node_exporter. That number was not changed.
+
+## Addendum, 2026-10-04
+
+WireGuard handshakes from swift1–4 to hkserver had stopped at 2026-10-04 08:02:54 UTC. Inbound UDP from `169.58.108.85`, `.86`, `.87`, and `.121` reaches hkserver (`103.117.121.203`) when the source port is 53 or 123. Other source ports, including 51820, do not arrive. swift1–4 now SNAT WireGuard UDP with source port 51820, destined to `103.117.121.203`, to source port 123. The rule is live in the nat table, in each node's `/etc/wireguard/wg-hk.conf` `PostUp`/`PostDown`, and in firewalld's permanent direct rules. No object port was opened on the public NIC. hkserver's public zone stays DROP except ssh. Disks were not formatted. `POST /api/apply` was not sent. The VIP was not moved.
+
+After that, TCP from swift1 and from swift4 to `10.0.4.5` and to `10.0.8.5` on ports 22, 6201, 6202, and 6211 succeeded. Handshakes on all four peers were fresh.
+
+`PUT` of `AUTH_test/console-reaccept-hk-20261004/hello.txt` through `https://10.0.0.10:8085` returned 504. The three object primaries still stored it. Partition 4251. Primaries: `10.0.4.2:6212/d3`, `10.0.4.4:6212/d3`, `10.0.4.5:6211/d2`. Direct GET from swift4 and from swift1 of `http://10.0.4.5:6211/d2/4251/AUTH_test/console-reaccept-hk-20261004/hello.txt` returned 200, 16 bytes, etag `0c75e8e84aa4a71f3bcf525a84206fa3`, sha256 `9b663f4d57fd44d4e6d5fa7099fa650164b1f6fd1997609cc0787f40f33ab685`. VIP `DELETE` of the object and of the container returned 204. A later HEAD of the container on the VIP was 404. A local HEAD on hkserver `127.0.0.1:6211` of that object path was 404.
+
+swift4 `/etc/swift-console/config.json` `cluster_nodes` now includes hkserver: storage `10.0.4.5`, replication `10.0.8.5`, public `10.0.0.5`, region 3, zone 1, device `d2`. The flat `proxy_nodes` list is still `10.0.0.1` through `10.0.0.4`. With `cluster_nodes` set, the console derives proxy SSH targets from those storage addresses, so hkserver is included. Tunnel TCP to port 22 on `10.0.4.5` still stalls after the banner. swift4 `/root/.ssh/config` sends `Host 10.0.4.5` to `103.117.121.203`, the existing public ssh. The console key `/root/.ssh/id_ed25519` is authorized on hkserver. Its public fingerprint is `SHA256:73RP5qckfKh2yO0guVolxbBIcUtVC1psaHWwJ8B3qyA`. The private key is not in this repo. Only `swift-console` was restarted.
+
+`GET /lab/api/node/status` then returned five rows, each `reachable` true, `active_services` 10, `total_services` 10, `up` true. `GET /monitor/api/panel?id=svc_grid` returned five rows, same nodes, each reachable. `GET /monitor/api/panel?id=nodes_up` returned `4.0`.
+
+`https://10.0.0.10:8085/info` was 200, 1668 bytes. `10.0.0.10/22` was on swift1 `eth1`.
+
+## Morning run, before the addendum
+
+The morning run was **ACCEPT_WITH_WARN**. The file path passed, the VIP download sha256 matched, and the bucket name was gone. `GET /lab/api/node/status` then omitted hkserver. Monitor `nodes_up` was 4.0. The warn was the missing hkserver row. Create and sha256 did not fail. The addendum above closes that warn.
 
 Console: swift4 `127.0.0.1:9000`, cluster `contabo-swift-2026`. Disposable container `console-reaccept-20261004`, object `hello.txt`. The login key was read at runtime from swift4 `/etc/swift/proxy-server.conf` (`user_test_tester`, 64 characters, first token only). This file has no key, token, cookie, or password.
 

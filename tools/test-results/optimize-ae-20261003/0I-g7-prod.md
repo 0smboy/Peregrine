@@ -28,6 +28,6 @@ Bounds were not changed. Container and account binaries were not replaced.
 
 VIP `10.0.0.10/22` stayed on swift1. `https://10.0.0.10:8085/info` stayed 200. Proxy context is `bin_t` on swift1–4. hkserver SELinux is Disabled, so `restorecon` does not attach `bin_t` there. Object-server context is `bin_t` on swift1–4.
 
-Console gate stays ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02). `16MB_read_8` stays ACCEPT (`0J-16mb.md`, 2026-10-04). This run did not re-run it.
+Console gate is ACCEPT (`tools/test-results/console-reaccept-20261004/SUMMARY.md`, addendum 2026-10-04). The 2026-10-02 gate remains ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`). `16MB_read_8` stays ACCEPT (`0J-16mb.md`, 2026-10-04). This run did not re-run it.
 
 Production readiness is GO.

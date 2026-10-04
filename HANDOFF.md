@@ -1,7 +1,9 @@
 # Peregrine — session handoff
 
-> **Current lab record (2026-10-02):** console acceptance is ACCEPT_WITH_WARN.
-> Evidence: [`tools/test-results/console-accept-20261002/SUMMARY.md`](tools/test-results/console-accept-20261002/SUMMARY.md).
+> **Current lab record (2026-10-04):** console acceptance is ACCEPT.
+> Evidence: [`tools/test-results/console-reaccept-20261004/SUMMARY.md`](tools/test-results/console-reaccept-20261004/SUMMARY.md).
+> The 2026-10-02 gate remains ACCEPT_WITH_WARN
+> ([`console-accept-20261002/SUMMARY.md`](tools/test-results/console-accept-20261002/SUMMARY.md)).
 > VIP `10.0.0.10` is on swift1
 > ([`0F-vip.md`](tools/test-results/optimize-ae-20261003/0F-vip.md), 2026-10-03).
 > The console listens on swift4 at `127.0.0.1:9000`. The G7 lab gate is

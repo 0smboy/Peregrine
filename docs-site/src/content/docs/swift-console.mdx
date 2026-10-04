@@ -19,8 +19,9 @@ Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha
 ## Contabo console acceptance, 2026-10-04
 
 Strict acceptance of this operator surface on the live contabo-swift-2026
-cluster is **ACCEPT_WITH_WARN**. Evidence:
-`tools/test-results/console-reaccept-20261004/SUMMARY.md`, dated 2026-10-04.
+cluster is **ACCEPT**. Evidence:
+`tools/test-results/console-reaccept-20261004/SUMMARY.md`, dated 2026-10-04,
+including the addendum of the same date.
 
 The file path passed. Container `console-reaccept-20261004` and object
 `hello.txt` (37 bytes) came back with sha256
@@ -28,12 +29,14 @@ The file path passed. Container `console-reaccept-20261004` and object
 from the console download and from `https://10.0.0.10:8085` using the
 `test:tester` token. `swift-get-nodes` placed primaries on `10.0.4.1`,
 `10.0.4.3`, and `10.0.4.5`. The name is gone from the account listing and
-from the console bucket list. `GET /lab/api/node/status` still names four
-nodes, swift1–swift4, all reachable. Monitor `nodes_up` was 4.0. The warn
-is that the console roster omits hkserver. `cluster_nodes` in the console
-config on swift4 does not include it. TCP from swift1 and swift4 to
-`10.0.4.5` on ports 22, 6201, and 6211 timed out, so the config was not
-edited to add a row the console cannot probe. `POST /api/apply` was not sent.
+from the console bucket list. The addendum opened TCP from swift1 and swift4
+to `10.0.4.5` and `10.0.8.5` on ports 22, 6201, 6202, and 6211, and a direct
+GET of a primary on `10.0.4.5:6211` returned 200. That probe object was
+deleted. `GET /lab/api/node/status` lists five nodes, swift1–swift4 and
+hkserver, each reachable and 10/10 up. Monitor `nodes_up` stayed 4.0.
+That panel is `count(up{job="node"} == 1)`. Prometheus job `node` on swift4
+scrapes only `10.0.0.1:9100` through `10.0.0.4:9100`. hkserver does not run
+node_exporter, so the number was left at 4.0. `POST /api/apply` was not sent.
 
 ## Contabo console acceptance, 2026-10-02
 
