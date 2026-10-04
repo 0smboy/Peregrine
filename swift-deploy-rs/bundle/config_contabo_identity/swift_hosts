@@ -38,16 +38,15 @@ account_servers
 container_servers
 object_servers
 
-# Galera odd quorum on swift1–3 (NOT swift4)
+# Empty on purpose (2026-10-04). A sealed swift.yml plan for these four
+# live nodes must not install MariaDB or Keystone. The hosts are already
+# running. Putting them back here arms those tasks again.
 [mariadb_servers]
-169.58.108.85
-169.58.108.86
-169.58.108.87
 
 [keystones]
-169.58.108.85
-169.58.108.86
-169.58.108.87
+
+# Empty on purpose. Yum upgrade and sshd restart live in this group.
+[mutable_base_servers]
 
 # Empty on purpose: Contabo Swift VIP HAProxy is owned by bundle-rust.
 # Identity frontends are added via rust haproxy identity overlay, not

@@ -18,8 +18,12 @@ deployment as blocked for that use case.
 - The G7 lab gate is 20/20 PASS on swift1 `:18080`
   (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
   production cluster did not pass G7. G8 stays blocked for production.
-- Production readiness is **NO-GO** because the production proxy was not
-  replaced. The G6-accepted artifact is not that production binary.
+- Production `/usr/local/bin/swift-proxy-server` on swift1–4 is sha256
+  `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`
+  (`tools/test-results/optimize-ae-20261003/0G-prod-roll.md`, 2026-10-04).
+  The production G7 suite was not re-run on `:8085`. Production readiness is
+  **NO-GO** until a prod-port G7 verdict exists. The G6-accepted artifact is
+  not this production binary.
 - The candidate artifact bundle carries auxiliary component source, but the
   offline pass did not build new Linux binaries for swift-console,
   swift-deploy-rs, cosbench-rs, or autocos because the cache lacked `axum`.

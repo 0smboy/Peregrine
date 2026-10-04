@@ -17,8 +17,13 @@ The strict frozen-179 G6 gate is **GREEN** on Rust Swift source
 zero missing, extra, duplicate, overlap, failure, error, unexpected result, or
 unexpected skip. The G7 lab gate is 20/20 PASS on swift1 `:18080`
 (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
-production cluster did not pass G7. G8 stays blocked for production, and no
-production promotion follows, because the production proxy was not replaced.
+production cluster did not pass G7. Production
+`/usr/local/bin/swift-proxy-server` on swift1–4 is sha256
+`dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`
+(`tools/test-results/optimize-ae-20261003/0G-prod-roll.md`, 2026-10-04). The
+production G7 suite was not re-run on `:8085`. G8 stays blocked for
+production, and production readiness remains NO-GO until a prod-port G7
+verdict exists.
 </Aside>
 
 ## What changed in the last two weeks
@@ -37,7 +42,8 @@ aggregate test count.
 | 2026-08-31 | [`64446f1`](https://github.com/0smboy/Peregrine/commit/64446f1d5870ea88835506a2581039fe407c9604) | G6 EC POST/nondurable and runner lifecycle were repaired. W019/W020/W021 were an intermediate checkpoint, later superseded by the accepted W068/W069/W070 sequence. |
 | 2026-08-31 | [`17adf0b`](https://github.com/0smboy/Peregrine/commit/17adf0bfa78b30b2a7eed9f39836e0d63c715d2c) | Eight follow-up fixes close isolated sharder routing and timestamp behavior, cancellation and release service entries, reload/fixture isolation, listener rebind, and the raced keep-alive request during graceful shutdown. Two 100-attempt reload canaries pass before the formal frozen-179 rerun. |
 | 2026-09-01 | [`g6-green-20260831`](https://github.com/0smboy/Peregrine/releases/tag/g6-green-20260831) | The accepted Rust Swift source, full documentation audit, rebuilt auxiliary Linux tools, and checksummed evidence are published as a lab pre-release. At this date G7 was not accepted and production remained NO-GO. |
-| 2026-10-03 | lab evidence `tools/test-results/optimize-ae-20261003/verdict.json` | G7 lab gate on swift1 `:18080` is 20/20 PASS. The production proxy was not replaced. The production cluster did not pass G7. Production readiness remains NO-GO. |
+| 2026-10-03 | lab evidence `tools/test-results/optimize-ae-20261003/verdict.json` | G7 lab gate on swift1 `:18080` is 20/20 PASS. On this date the production proxy was still sha256 `5cac5960c45b3a206a794e0a0c52d89f51c251b0ce698de21f245da7fa6a2397`. The production cluster did not pass G7. Production readiness remains NO-GO. |
+| 2026-10-04 | `tools/test-results/optimize-ae-20261003/0G-prod-roll.md` | Production `/usr/local/bin/swift-proxy-server` on swift1–4 is sha256 `dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`. The production G7 suite was not re-run on `:8085`. The production cluster did not pass G7. Production readiness remains NO-GO. |
 
 The G6-accepted Rust Swift source line is identified by the full commit
 `17adf0bfa78b30b2a7eed9f39836e0d63c715d2c`. The frozen comparison oracle is

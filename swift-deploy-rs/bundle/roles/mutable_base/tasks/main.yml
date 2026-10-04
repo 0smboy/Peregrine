@@ -1,0 +1,17 @@
+---
+# Host-mutation tasks pulled out of `common` and `security`.
+# `swift.yml` targets `mutable_base_servers`. The Contabo identity
+# inventory leaves that group empty, so these tasks seal with no hosts.
+- name: Restart sshd
+  service: name=sshd
+           state=restarted
+           enabled=yes
+
+- name: Yum Upgrade
+  command: yum upgrade --best --allowerasing -y --disableplugin=fastestmirror
+  become: True
+
+- name: Restart SSH service
+  service:
+    name: sshd
+    state: restarted

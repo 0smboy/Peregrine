@@ -18,8 +18,3 @@
         - "ListenAddress {{ management_network_address }}"
 
 - include: firewall.yml
-
-- name: Restart SSH service
-  service:
-    name: sshd
-    state: restarted

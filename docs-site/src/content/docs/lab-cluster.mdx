@@ -13,10 +13,14 @@ EC lanes merge exactly once in W070: 179/179 identities, zero unexpected result,
 and no leaked isolated listener or process. G6 is GREEN. The G7 lab gate is
 20/20 PASS on swift1 `:18080`
 (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
-production cluster did not pass G7. Production readiness remains NO-GO because
-the production proxy was not replaced. It is not declared deployed from this
-page. Do not replace production `:8080`, rings, Swift data, or active binaries
-from this page.
+production cluster did not pass G7. Production
+`/usr/local/bin/swift-proxy-server` on swift1–4 is sha256
+`dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`
+(`tools/test-results/optimize-ae-20261003/0G-prod-roll.md`, 2026-10-04). The
+production G7 suite was not re-run on `:8085`. Production readiness remains
+NO-GO until a prod-port G7 verdict exists. This page is not a deploy
+procedure. Do not replace production rings, Swift data, or binaries from
+this page.
 </Aside>
 
 The development lab is a four-node Contabo HA cluster used to prove the Rust

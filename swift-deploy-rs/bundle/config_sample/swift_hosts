@@ -41,6 +41,11 @@ object_servers
 # 没有则为空
 [keystones]
 
+# Sample lab hosts still receive package upgrade and sshd restart.
+# The Contabo identity inventory leaves this group empty.
+[mutable_base_servers]
+192.168.2.[51:52]
+
 [format_disk_servers]
 192.168.2.[51:52]
 

@@ -13,9 +13,12 @@ without a client-side framework.
 The console is an operator surface, not evidence that the storage engine has
 passed every gate. G6 is GREEN on `17adf0b`. The G7 lab gate is 20/20 PASS on
 swift1 `:18080` (`tools/test-results/optimize-ae-20261003/verdict.json`,
-2026-10-03). That run used the lab proxy under `/root/work/g6-rust-bin`. The
-production cluster did not pass G7. Production readiness remains NO-GO because
-the production proxy was not replaced.
+2026-10-03). That run used the lab proxy under `/root/work/g6-rust-bin`.
+Production `/usr/local/bin/swift-proxy-server` on swift1–4 is sha256
+`dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`
+(`tools/test-results/optimize-ae-20261003/0G-prod-roll.md`, 2026-10-04). The
+production G7 suite was not re-run on `:8085`. The production cluster did not
+pass G7. Production readiness remains NO-GO until a prod-port G7 verdict exists.
 
 ## Contabo console acceptance, 2026-10-02
 
@@ -23,11 +26,14 @@ Strict acceptance of this operator surface on the live contabo-swift-2026
 cluster is **ACCEPT_WITH_WARN**. Evidence:
 `tools/test-results/console-accept-20261002/SUMMARY.md`, dated 2026-10-02.
 The G7 lab gate is 20/20 PASS on swift1 `:18080`
-(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03). The
-production cluster did not pass G7. Production readiness remains NO-GO because
-the production proxy was not replaced. This console gate stays
-ACCEPT_WITH_WARN (`tools/test-results/console-accept-20261002/SUMMARY.md`,
-2026-10-02).
+(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03).
+Production `/usr/local/bin/swift-proxy-server` on swift1–4 is sha256
+`dc22cca7b45e6bbc4a096f99675aeab8855282276fc9f8caaa2d6ed00f402314`
+(`tools/test-results/optimize-ae-20261003/0G-prod-roll.md`, 2026-10-04). The
+production G7 suite was not re-run on `:8085`. The production cluster did not
+pass G7. Production readiness remains NO-GO until a prod-port G7 verdict
+exists. This console gate stays ACCEPT_WITH_WARN
+(`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02).
 
 Passed on that run: the file path, chaos, HA, autocos, shadow run, the browser
 file path, shadow mutate, and warehouse promote
@@ -38,7 +44,7 @@ and VIP `10.0.0.10` stayed on swift1. `https://10.0.0.10:8085/info` returned
 200 (1270 bytes). The node-status score recorded in `09-remaining.md` and
 `10-shadow.md` was 10/10 on all four nodes. See `13-apply.md`.
 
-`POST /api/apply` was not sent. `POST /api/plan` used the Contabo identity
+`POST /api/apply` was not sent on 2026-10-02. `POST /api/plan` used the Contabo identity
 inventory `/opt/swift-deploy/config_contabo_identity/swift_hosts` (hosts
 169.58.108.85, .86, .87, .121): HTTP 202, job 5, 336 tasks, digest prefix
 `d962336aac56`. The sealed plan still names disk-wipe tasks (`DD before mkfs`,
@@ -47,6 +53,16 @@ DD`). 216 tasks name hosts and include yum upgrade, an sshd restart, firewall
 and SELinux changes, and MariaDB plus Keystone installs on swift1–3. Apply
 would change the live nodes. Detail: `13-apply.md` and
 `13-apply-plan-summary.md`.
+
+On 2026-10-04 the repo inventory was sealed again. Digest
+`8195ef0adca513ae7c67c2966ff4aaaa11693bfb19d4efea6bf386d7abe6a9b9`. Disk-wipe,
+yum upgrade, sshd restart, and MariaDB/Keystone install tasks have empty host
+lists. 117 other tasks still name the four live hosts, including `Install
+common pkgs`, `Install swift`, `Disable selinux`, `Restart crond`, and
+`Import iptables rules`. That plan is not empty and it does not restate the
+live keepalived timeout. `POST /api/apply` was not sent for this digest.
+`config_sample` was not applied. Detail:
+`tools/test-results/optimize-ae-20261003/0G-prod-roll.md` (2026-10-04).
 
 The deploy proxy reads the operator POST body, caps it at 1 MiB, and sets
 `Content-Length` before forwarding. swift-deploy reads a body only when that

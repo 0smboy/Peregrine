@@ -14,6 +14,14 @@
   roles:
   - common
 
+# Package upgrade and sshd restart are not part of `hosts: all`.
+# Live inventories leave this group empty so a sealed plan cannot
+# upgrade packages or restart sshd on the four Contabo nodes.
+- hosts: mutable_base_servers
+  any_errors_fatal: true
+  roles:
+  - mutable_base
+
 - hosts: performance_tuning
   roles:
   - performance_tuning

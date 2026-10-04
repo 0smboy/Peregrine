@@ -309,6 +309,23 @@ fn sample_swift_plan_seals_and_mkfs_hosts_are_the_sample_pair() {
     }
 }
 
+fn is_destructive_live_task(task: &swift_deploy_rs::PlannedTask) -> bool {
+    let name = task.name.to_lowercase();
+    let args = args_text(task).to_lowercase();
+    let disk = args.contains("mkfs")
+        || name.contains("dd before")
+        || args.contains("dd if=")
+        || name.contains("partition table")
+        || args.contains("parted ")
+        || args.contains("sfdisk");
+    let yum_upgrade = name.contains("yum upgrade") || args.contains("yum upgrade");
+    let restart_sshd = name.contains("restart ssh")
+        || (args.contains("sshd") && (args.contains("restarted") || args.contains("restart")));
+    let install_identity = (name.contains("mariadb") || name.contains("keystone"))
+        && name.contains("install");
+    disk || yum_upgrade || restart_sshd || install_identity
+}
+
 #[test]
 fn identity_swift_plan_seals_with_empty_disk_wipe_hosts() {
     let plan = seal_swift_plan("config_contabo_identity/swift_hosts");
@@ -330,15 +347,21 @@ fn identity_swift_plan_seals_with_empty_disk_wipe_hosts() {
         );
     }
 
-    let expect_hosts = ["Yum Upgrade", "Restart sshd", "Installing mariadb packages"];
-    for name in expect_hosts {
-        let matches: Vec<_> = plan.tasks.iter().filter(|task| task.name == name).collect();
-        assert!(!matches.is_empty(), "missing planned task {name}");
-        for task in matches {
-            assert!(
-                !task.hosts.is_empty(),
-                "{name} must keep a non-empty host list on the identity inventory"
-            );
-        }
+    let destructive: Vec<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| is_destructive_live_task(task))
+        .collect();
+    assert!(
+        !destructive.is_empty(),
+        "identity plan must still list mkfs, dd, yum upgrade, sshd restart, and MariaDB/Keystone install tasks"
+    );
+    for task in destructive {
+        assert!(
+            task.hosts.is_empty(),
+            "identity destructive task {} must have an empty host list, got {:?}",
+            task.name,
+            task.hosts
+        );
     }
 }

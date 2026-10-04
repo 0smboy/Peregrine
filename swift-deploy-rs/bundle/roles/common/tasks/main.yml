@@ -28,10 +28,6 @@
     lineinfile: dest=/etc/ssh/sshd_config
                 state=absent
                 regexp="^AcceptEnv.*"
-  - name: Restart sshd
-    service: name=sshd
-             state=restarted
-             enabled=yes
   - name: Change all locale related configs into /etc/profile
     blockinfile:
       dest: /etc/profile
@@ -79,10 +75,6 @@
     become: True
 
 - include: prepare_local_yum_repo.yml
-
-- name: Yum Upgrade
-  command: yum upgrade --best --allowerasing -y --disableplugin=fastestmirror
-  become: True
 
 - include: prepare_local_yum_repo.yml
 
