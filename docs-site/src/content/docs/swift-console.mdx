@@ -14,17 +14,34 @@ The console is an operator surface, not evidence that the storage engine has
 passed every gate. G6 is GREEN on `17adf0b`. The G7 lab gate is 20/20 PASS on
 swift1 `:18080` (`tools/test-results/optimize-ae-20261003/verdict.json`,
 2026-10-03). That run used the lab proxy under `/root/work/g6-rust-bin`.
-Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256 `ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696` (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04). The last full production G7 on `http://10.0.0.10:8080` is 20 PASS, 0 FAIL, 0 NOT RUN (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, 2026-10-04). The full yaml is the 20-case run. The production cluster passed G7. Production readiness is GO.
+Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256 `ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696` (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04). The last full production G7 on `http://10.0.0.10:8080` is 20 PASS, 0 FAIL, 0 NOT RUN (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, the copy of `swift4:/root/work/g7-prod-20261004-r21/verdict.json`, Drive `verdict-prod-r21.json` id `18v832QtB3_xH5O1BMsVTUSrE6iOE2xL7`, 2026-10-04). The full yaml is the 20-case run. The production cluster passed G7. Production readiness is GO.
 
-## Contabo console acceptance, 2026-10-02
+## Contabo console acceptance, 2026-10-04
 
 Strict acceptance of this operator surface on the live contabo-swift-2026
 cluster is **ACCEPT_WITH_WARN**. Evidence:
-`tools/test-results/console-accept-20261002/SUMMARY.md`, dated 2026-10-02.
+`tools/test-results/console-reaccept-20261004/SUMMARY.md`, dated 2026-10-04.
+
+The file path passed. Container `console-reaccept-20261004` and object
+`hello.txt` (37 bytes) came back with sha256
+`c6d5d52dfd36c62073cc0daaa92eda73d9f59d141eabed38d06e1e2ea4aca396`
+from the console download and from `https://10.0.0.10:8085` using the
+`test:tester` token. `swift-get-nodes` placed primaries on `10.0.4.1`,
+`10.0.4.3`, and `10.0.4.5`. The name is gone from the account listing and
+from the console bucket list. `GET /lab/api/node/status` still names four
+nodes, swift1–swift4, all reachable. Monitor `nodes_up` was 4.0. The warn
+is that the console roster omits hkserver. `cluster_nodes` in the console
+config on swift4 does not include it. TCP from swift1 and swift4 to
+`10.0.4.5` on ports 22, 6201, and 6211 timed out, so the config was not
+edited to add a row the console cannot probe. `POST /api/apply` was not sent.
+
+## Contabo console acceptance, 2026-10-02
+
+The previous gate, dated 2026-10-02, was **ACCEPT_WITH_WARN**. Evidence:
+`tools/test-results/console-accept-20261002/SUMMARY.md`.
 The G7 lab gate is 20/20 PASS on swift1 `:18080`
 (`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03).
-Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256 `ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696` (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04). The last full production G7 on `http://10.0.0.10:8080` is 20 PASS, 0 FAIL, 0 NOT RUN (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, 2026-10-04). The full yaml is the 20-case run. The production cluster passed G7. Production readiness is GO. This console gate stays ACCEPT_WITH_WARN
-(`tools/test-results/console-accept-20261002/SUMMARY.md`, 2026-10-02).
+Production `/usr/local/bin/swift-proxy-server` on swift1–4 and hkserver is sha256 `ce738dc3a7adb01167c16660924e79a1e215a3245d5d90bbe682d36b7cfa5696` (`tools/test-results/optimize-ae-20261003/0I-g7-prod.md`, 2026-10-04). The last full production G7 on `http://10.0.0.10:8080` is 20 PASS, 0 FAIL, 0 NOT RUN (`tools/test-results/optimize-ae-20261003/verdict-prod.json`, the copy of `swift4:/root/work/g7-prod-20261004-r21/verdict.json`, Drive `verdict-prod-r21.json` id `18v832QtB3_xH5O1BMsVTUSrE6iOE2xL7`, 2026-10-04). The full yaml is the 20-case run. The production cluster passed G7. Production readiness is GO. The current console gate is the 2026-10-04 reaccept above.
 
 Passed on that run: the file path, chaos, HA, autocos, shadow run, the browser
 file path, shadow mutate, and warehouse promote
