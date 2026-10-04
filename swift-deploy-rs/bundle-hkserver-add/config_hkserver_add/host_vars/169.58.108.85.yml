@@ -1,0 +1,5 @@
+management_network_address: 169.58.108.85
+business_network_address: 10.0.0.1
+storage_network_address: 10.0.4.1
+replication_network_address: 10.0.8.1
+custom_disks: []

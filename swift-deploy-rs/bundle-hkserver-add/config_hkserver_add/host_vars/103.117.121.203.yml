@@ -1,0 +1,7 @@
+# Public SSH address is ansible_host. The address assigned on eth0 is the
+# management address preflight checks. Swift planes are on wg-hk.
+management_network_address: 10.0.36.5
+business_network_address: 10.0.0.5
+storage_network_address: 10.0.4.5
+replication_network_address: 10.0.8.5
+custom_disks: []

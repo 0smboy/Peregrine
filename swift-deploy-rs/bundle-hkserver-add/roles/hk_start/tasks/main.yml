@@ -1,0 +1,22 @@
+---
+- name: Start hkserver swift services
+  shell: |
+    set -euo pipefail
+    systemctl daemon-reload
+    for unit in \
+      swift-account swift-container swift-object \
+      swift-account-replicator swift-container-replicator swift-object-replicator \
+      swift-object-reconstructor swift-object-updater swift-container-updater \
+      swift-account-auditor swift-container-auditor swift-object-auditor \
+      swift-container-sharder swift-container-reconciler swift-object-expirer \
+      swift-proxy
+    do
+      systemctl enable "$unit"
+      systemctl restart "$unit"
+    done
+    systemctl is-active swift-proxy swift-object swift-container swift-account
+    if ip -4 addr show | grep -q '10.0.0.10/'; then
+      echo VIP_PRESENT_ON_HK
+      exit 1
+    fi
+    echo HK_SERVICES_UP

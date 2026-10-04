@@ -1,0 +1,61 @@
+---
+- name: Backup existing rings before distribute
+  shell: |
+    set -euo pipefail
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dest="/root/work/hkserver-add/ring-pre-distribute-$stamp"
+    mkdir -p "$dest"
+    shopt -s nullglob
+    files=(/etc/swift/*.ring.gz /etc/swift/*.builder.json)
+    if [ ${#files[@]} -gt 0 ]; then
+      cp -a "${files[@]}" "$dest/"
+    fi
+    echo BACKUP_OK
+
+- name: Install account ring
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/account.ring.gz
+    dest: /etc/swift/account.ring.gz
+    mode: "0644"
+
+- name: Install account builder
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/account.ring.gz.builder.json
+    dest: /etc/swift/account.ring.gz.builder.json
+    mode: "0644"
+
+- name: Install container ring
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/container.ring.gz
+    dest: /etc/swift/container.ring.gz
+    mode: "0644"
+
+- name: Install container builder
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/container.ring.gz.builder.json
+    dest: /etc/swift/container.ring.gz.builder.json
+    mode: "0644"
+
+- name: Install object ring
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/object.ring.gz
+    dest: /etc/swift/object.ring.gz
+    mode: "0644"
+
+- name: Install object builder
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/object.ring.gz.builder.json
+    dest: /etc/swift/object.ring.gz.builder.json
+    mode: "0644"
+
+- name: Install object-1 ring
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/object-1.ring.gz
+    dest: /etc/swift/object-1.ring.gz
+    mode: "0644"
+
+- name: Install object-1 builder
+  copy:
+    src: /tmp/hkserver-add-20261004/rings/object-1.ring.gz.builder.json
+    dest: /etc/swift/object-1.ring.gz.builder.json
+    mode: "0644"

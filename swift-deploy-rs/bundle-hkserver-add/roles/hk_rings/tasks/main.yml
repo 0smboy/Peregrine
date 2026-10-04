@@ -1,0 +1,51 @@
+---
+- name: Add hkserver devices and rebalance
+  script: expand.sh
+
+- name: Fetch account ring
+  fetch:
+    src: /etc/swift/account.ring.gz
+    dest: /tmp/hkserver-add-20261004/rings/account.ring.gz
+    flat: true
+
+- name: Fetch account builder
+  fetch:
+    src: /etc/swift/account.ring.gz.builder.json
+    dest: /tmp/hkserver-add-20261004/rings/account.ring.gz.builder.json
+    flat: true
+
+- name: Fetch container ring
+  fetch:
+    src: /etc/swift/container.ring.gz
+    dest: /tmp/hkserver-add-20261004/rings/container.ring.gz
+    flat: true
+
+- name: Fetch container builder
+  fetch:
+    src: /etc/swift/container.ring.gz.builder.json
+    dest: /tmp/hkserver-add-20261004/rings/container.ring.gz.builder.json
+    flat: true
+
+- name: Fetch object ring
+  fetch:
+    src: /etc/swift/object.ring.gz
+    dest: /tmp/hkserver-add-20261004/rings/object.ring.gz
+    flat: true
+
+- name: Fetch object builder
+  fetch:
+    src: /etc/swift/object.ring.gz.builder.json
+    dest: /tmp/hkserver-add-20261004/rings/object.ring.gz.builder.json
+    flat: true
+
+- name: Fetch object-1 ring
+  fetch:
+    src: /etc/swift/object-1.ring.gz
+    dest: /tmp/hkserver-add-20261004/rings/object-1.ring.gz
+    flat: true
+
+- name: Fetch object-1 builder
+  fetch:
+    src: /etc/swift/object-1.ring.gz.builder.json
+    dest: /tmp/hkserver-add-20261004/rings/object-1.ring.gz.builder.json
+    flat: true

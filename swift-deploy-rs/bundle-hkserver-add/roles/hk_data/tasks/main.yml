@@ -1,0 +1,46 @@
+---
+# Hosts: hk_new only. There is no non-root block device on hkserver.
+# This creates a 40G XFS image file and mounts it at /srv/node/d2.
+# It refuses to mkfs the root disk (/dev/vda, the filesystem mounted on /).
+- name: Create hkserver data volume
+  shell: |
+    set -euo pipefail
+    ROOT_SRC=$(findmnt -n -o SOURCE /)
+    IMG=/var/lib/peregrine-node/d2.img
+    case "$IMG" in
+      /dev/vda|/dev/vda1|"$ROOT_SRC")
+        echo REFUSE_ROOT
+        exit 1
+        ;;
+    esac
+    if findmnt -n /srv/node/d2 >/dev/null 2>&1; then
+      SRC=$(findmnt -n -o SOURCE /srv/node/d2)
+      case "$SRC" in
+        /dev/vda|/dev/vda1|"$ROOT_SRC")
+          echo REFUSE_ROOT
+          exit 1
+          ;;
+      esac
+      echo ALREADY_MOUNTED "$SRC"
+      exit 0
+    fi
+    mkdir -p /var/lib/peregrine-node /srv/node/d2
+    if [ ! -f "$IMG" ]; then
+      fallocate -l 40G "$IMG"
+    fi
+    if ! blkid "$IMG" >/dev/null 2>&1; then
+      mkfs.xfs -f "$IMG"
+    fi
+    if ! grep -q '/var/lib/peregrine-node/d2.img' /etc/fstab; then
+      echo '/var/lib/peregrine-node/d2.img /srv/node/d2 xfs loop,noatime,nodiratime 0 0' >> /etc/fstab
+    fi
+    mountpoint -q /srv/node/d2 || mount /srv/node/d2
+    SRC=$(findmnt -n -o SOURCE /srv/node/d2)
+    case "$SRC" in
+      /dev/vda|/dev/vda1|"$ROOT_SRC")
+        echo REFUSE_ROOT
+        exit 1
+        ;;
+    esac
+    findmnt -n /srv/node/d2
+    echo DATA_READY

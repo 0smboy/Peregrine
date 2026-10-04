@@ -22,8 +22,8 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-YAML_PATH = HERE / "acceptance.yaml"
-JSON_PATH = HERE / "acceptance.json"
+YAML_PATH = Path(os.environ.get("G7_YAML", str(HERE / "acceptance.yaml")))
+JSON_PATH = Path(os.environ.get("G7_JSON", str(HERE / "acceptance.json")))
 OUT = Path(os.environ.get("G7_OUT", "/root/work/g7-out"))
 G7LOAD = os.environ.get("G7LOAD", str(HERE / "g7load"))
 SSH_TARGET = os.environ.get("G7_TARGET_SSH", "root@10.0.0.1")
@@ -1738,10 +1738,14 @@ def dummy_calibrate(spec):
 def main():
     spec = load_frozen()
     port = int(spec["target"]["port"])
-    if port in spec["target"].get("forbidden_ports", []) or port in (8080, 8085):
+    prod = os.environ.get("G7_PROD") == "1"
+    if not prod and (port in spec["target"].get("forbidden_ports", []) or port in (8080, 8085)):
         print(f"refusing forbidden port {port}", file=sys.stderr)
         return 2
-    if spec["target"].get("swift_dir") != "/etc/g6-rust":
+    if prod and port == 18080:
+        print("refusing lab port 18080 for a production run", file=sys.stderr)
+        return 2
+    if not prod and spec["target"].get("swift_dir") != "/etc/g6-rust":
         print("refusing non-lab swift_dir", file=sys.stderr)
         return 2
     OUT.mkdir(parents=True, exist_ok=True)

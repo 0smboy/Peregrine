@@ -8,8 +8,9 @@ sidebar:
 <Aside type="danger" title="Historical measurements only">
 No number on this page is a current G8 result. The `17adf0b…` line closes G6,
 but the production cluster did not pass G7
-(`tools/test-results/optimize-ae-20261003/verdict.json`, 2026-10-03, is a
-20/20 PASS on the swift1 `:18080` lab proxy only) and the other ordered
+(`tools/test-results/optimize-ae-20261003/verdict-prod.json`, 2026-10-04:
+3 PASS, 17 FAIL, 0 NOT RUN on `http://10.0.0.10:8080`; the 2026-10-03
+`verdict.json` is a 20/20 PASS on the swift1 `:18080` lab proxy only) and the other ordered
 prerequisites are not all closed,
 so formal performance acceptance is blocked. Keep
 the route/noise labels attached to every number.
@@ -82,14 +83,17 @@ with 0 failures; reads reached 4,180 ops/s (4 KB), 1,346 MB/s (1 MB), and
 
 **Clean-load re-measure (2026-08-02, client swift4 → VIP `10.0.0.10:8085`,
 HA-PATH):** 4KB write @128 ≈ **138 ops/s** fail=0; 4KB read @128 ≈ **1055 ops/s**
-fail=0; 1MB write/read @32 fail=0. **16MB_read_8 remains ACCEPT_WITH_WARN**
-(normal-stage success ~9% even after prepare 80/80). Evidence:
-`tools/test-results/contabo-deploy-20260801/deep-verify-20260802/PERF-REMEASURE.md`
-(2026-08-02). Do not treat 16MB_read_8 as cleared.
+fail=0; 1MB write/read @32 fail=0. **16MB_read_8 is ACCEPT** on the
+2026-10-04 remeasure: normal stage ok 785, fail 0, success 100%, 6.54 ops/s,
+p99 4.440 s, prepare 80/80. Evidence:
+`tools/test-results/optimize-ae-20261003/0J-16mb.md` (2026-10-04). The
+2026-08-02 cell was success 9.16% and stayed ACCEPT_WITH_WARN
+(`tools/test-results/contabo-deploy-20260801/deep-verify-20260802/PERF-REMEASURE.md`).
+That older cell is not the current verdict.
 
 R8 ACCEPT is a different cell: `16MB_read_4`, object_count=40, runtime=180,
 2026-08-04. Evidence: `tools/test-results/fairness-lab-R8-20260803/R8-GATE.md`
-and `SCORECARD.json`. That ACCEPT does not clear `16MB_read_8`.
+and `SCORECARD.json`. That cell is not `16MB_read_8`.
 
 ## Write-concurrency optimization
 

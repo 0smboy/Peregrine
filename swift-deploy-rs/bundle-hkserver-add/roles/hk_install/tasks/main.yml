@@ -1,0 +1,19 @@
+---
+- name: Install haproxy on hkserver
+  package:
+    name: haproxy
+    state: present
+
+- name: Install rsync on hkserver
+  package:
+    name: rsync
+    state: present
+
+- name: Unpack hkserver swift payload
+  unarchive:
+    src: /tmp/hkserver-add-20261004/payload.tar.gz
+    dest: /tmp
+    remote_src: false
+
+- name: Install rust swift files on hkserver
+  script: install.sh

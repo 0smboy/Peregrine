@@ -1,0 +1,26 @@
+---
+- name: Add hkserver to haproxy
+  lineinfile:
+    path: /etc/haproxy/haproxy.cfg
+    regexp: 'server proxy5 '
+    line: '    server proxy5 10.0.0.5:8080 check inter 5s fall 3 rise 2'
+    insertafter: 'server proxy4 '
+
+- name: Validate haproxy configuration
+  shell: haproxy -c -f /etc/haproxy/haproxy.cfg
+
+- name: Reload haproxy
+  shell: |
+    set -euo pipefail
+    systemctl enable haproxy
+    if systemctl is-active --quiet haproxy; then
+      systemctl reload haproxy
+    else
+      systemctl start haproxy
+    fi
+    systemctl is-active haproxy
+    if ip -4 addr show | grep -q '10.0.0.10/' && [ "$(hostname -s)" != "swift1" ]; then
+      echo VIP_NOT_ON_SWIFT1
+      exit 1
+    fi
+    echo HAPROXY_OK

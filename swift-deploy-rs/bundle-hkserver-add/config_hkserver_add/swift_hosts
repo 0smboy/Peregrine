@@ -1,0 +1,67 @@
+# hkserver node-add inventory. Not config_sample.
+# Management SSH is the public address. Swift planes are the assigned addresses.
+169.58.108.85 ansible_user=root ansible_port=22
+169.58.108.86 ansible_user=root ansible_port=22
+169.58.108.87 ansible_user=root ansible_port=22
+169.58.108.121 ansible_user=root ansible_port=22
+103.117.121.203 ansible_user=root ansible_port=22 ansible_host=103.117.121.203
+
+[proxy_servers]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+169.58.108.121
+103.117.121.203
+
+[account_servers]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+169.58.108.121
+103.117.121.203
+
+[container_servers]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+169.58.108.121
+103.117.121.203
+
+[object_servers]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+169.58.108.121
+103.117.121.203
+
+[swift_nodes:children]
+proxy_servers
+account_servers
+container_servers
+object_servers
+
+[hk_new]
+103.117.121.203
+
+[ring_builder]
+169.58.108.85
+
+[haproxy_servers]
+169.58.108.85
+169.58.108.86
+169.58.108.87
+169.58.108.121
+103.117.121.203
+
+# Empty on purpose. Disk format, package upgrade, and sshd restart roles
+# are not in hkserver-add.yml. These groups stay empty so a sealed plan
+# cannot schedule them onto swift1–4.
+[format_disk_servers]
+
+[mutable_base_servers]
+
+[keepalived_servers]
+
+[ntp_server]
+
+[ntp_clients]

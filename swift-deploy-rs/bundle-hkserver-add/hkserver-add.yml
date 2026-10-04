@@ -1,0 +1,24 @@
+---
+# Add hkserver as Swift node 5. No play in this file targets swift1–4 with
+# mkfs, dd, partition, yum upgrade, sshd restart, SELinux, iptables import,
+# or "Install swift". format_disk_servers and mutable_base_servers are empty.
+- hosts: hk_new
+  roles:
+    - hk_data
+    - hk_install
+
+- hosts: ring_builder
+  roles:
+    - hk_rings
+
+- hosts: swift_nodes
+  roles:
+    - hk_ring_distribute
+
+- hosts: hk_new
+  roles:
+    - hk_start
+
+- hosts: haproxy_servers
+  roles:
+    - hk_haproxy
